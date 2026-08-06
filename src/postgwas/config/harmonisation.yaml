@@ -1,0 +1,17 @@
+default_eaf: "panukb"               # ['fingen', 'panukb', '1000G']
+default_info: "panukb"              # ['fingen', 'panukb']
+default_eaf_column: "EAS"
+default_info_column: "INFO"
+default_comparison_af_column: "EAS"  # "INFO/AFR,INFO/EAS,INFO/EUR,INFO/SAS"
+default_dbsnp: "dbSNP157"
+default_comparison_af_file: "1000G"      # ['1000G', "ALFA"]
+maf_eaf_decision_cutoff: 0.95
+
+resource_folder: "/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf/"
+grch37_file: "/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf/GRCh37_38_check_files/GRCh37_check_file.tsv"
+grch38_file: "/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf/GRCh37_38_check_files/GRCh38_check_file.tsv"
+gwastovcf_main_script_path : "/Users/JJOHN41/Documents/developing_software/postgwas_underdevelopment/postgwas/src/gwas2vcf/main.py"
+
+required_columns_in_sumstat: [ "CHR", "BP", "A1", "A2", "SNP", "BETA", "SE", "Z", "LP",'FRQ', "N_CON", "NEFF"]
+optional_columns_in_sumstat: ["N_CAS", "INFO"]
+extrnal_eaf_colmap: { "chr": "CHROM", "pos": "POS", "a1": "ALT","a2": "REF"}

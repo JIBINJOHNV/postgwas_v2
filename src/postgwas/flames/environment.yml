@@ -1,0 +1,15 @@
+name: FLAMES
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python==3.8.13
+  - scikit-learn==1.2.2
+  - pyliftover==0.4
+  - fastparquet==2023.7.0
+  - pyarrow==8.0.0
+  - pandas=2.0.3
+  - pip=24.0
+  - pip:
+      - xgboost==1.7.5

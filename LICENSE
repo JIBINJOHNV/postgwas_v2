@@ -1,0 +1,2 @@
+[tool.poetry.scripts]
+postgwas = "postgwas.__main__:main"

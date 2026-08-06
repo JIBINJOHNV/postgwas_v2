@@ -1,0 +1,360 @@
+2026-05-15 23:39:33,972 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:34,056 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr10_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr10_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr10.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr10.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:34,057 INFO Reading JSON parameters
+2026-05-15 23:39:34,100 INFO Parameters: {'delimiter': '\t', 'snp_col': 2, 'header': True, 'pval_col': 9, 'ncase_col': 11, 'chr_col': 0, 'beta_col': 6, 'imp_info_col': 12, 'ncontrol_col': 10, 'pos_col': 1, 'imp_z_col': 8, 'oa_col': 4, 'ea_col': 3, 'se_col': 7, 'eaf_col': 5, 'build': 'GRCh37'}
+2026-05-15 23:39:34,114 INFO Checking input arguments
+2026-05-15 23:39:34,305 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr10_vcf_input.tsv
+2026-05-15 23:39:34,306 INFO Reading plain text file
+2026-05-15 23:39:34,312 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:35,735 INFO Total variants: 22494
+2026-05-15 23:39:35,736 INFO Variants could not be read: 0
+2026-05-15 23:39:35,736 INFO Variants harmonised: 22494
+2026-05-15 23:39:35,736 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:35,736 INFO Alleles switched: 22494
+2026-05-15 23:39:35,737 INFO Normalised variants: 0
+2026-05-15 23:39:35,739 INFO Skipped 0 of 22494
+2026-05-15 23:39:35,741 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr10_GRCh37.vcf
+2026-05-15 23:39:35,749 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr10_GRCh37.vcf
+2026-05-15 23:39:38,079 INFO Indexing output file
+2026-05-15 23:41:39,127 INFO Gwas2VCF 1.4.3
+2026-05-15 23:41:39,135 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr11_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr11_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr11.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr11.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:41:39,138 INFO Reading JSON parameters
+2026-05-15 23:41:39,165 INFO Parameters: {'ncontrol_col': 10, 'build': 'GRCh37', 'chr_col': 0, 'ea_col': 3, 'snp_col': 2, 'pval_col': 9, 'se_col': 7, 'beta_col': 6, 'ncase_col': 11, 'imp_info_col': 12, 'imp_z_col': 8, 'oa_col': 4, 'header': True, 'delimiter': '\t', 'pos_col': 1, 'eaf_col': 5}
+2026-05-15 23:41:39,181 INFO Checking input arguments
+2026-05-15 23:41:39,267 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr11_vcf_input.tsv
+2026-05-15 23:41:39,267 INFO Reading plain text file
+2026-05-15 23:41:39,269 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:41:45,217 INFO Total variants: 103835
+2026-05-15 23:41:45,217 INFO Variants could not be read: 0
+2026-05-15 23:41:45,218 INFO Variants harmonised: 103835
+2026-05-15 23:41:45,218 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:41:45,218 INFO Alleles switched: 103835
+2026-05-15 23:41:45,218 INFO Normalised variants: 0
+2026-05-15 23:41:45,218 INFO Skipped 0 of 103835
+2026-05-15 23:41:45,219 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr11_GRCh37.vcf
+2026-05-15 23:41:45,226 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr11_GRCh37.vcf
+2026-05-15 23:41:53,159 INFO Indexing output file
+2026-05-15 23:39:34,710 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:34,741 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr12_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr12_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr12.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr12.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:34,824 INFO Reading JSON parameters
+2026-05-15 23:39:34,836 INFO Parameters: {'pos_col': 1, 'pval_col': 9, 'delimiter': '\t', 'imp_info_col': 12, 'ncase_col': 11, 'eaf_col': 5, 'oa_col': 4, 'se_col': 7, 'ncontrol_col': 10, 'chr_col': 0, 'imp_z_col': 8, 'build': 'GRCh37', 'snp_col': 2, 'header': True, 'ea_col': 3, 'beta_col': 6}
+2026-05-15 23:39:34,842 INFO Checking input arguments
+2026-05-15 23:39:34,854 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr12_vcf_input.tsv
+2026-05-15 23:39:34,855 INFO Reading plain text file
+2026-05-15 23:39:34,859 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:42,752 INFO Total variants: 124006
+2026-05-15 23:39:42,752 INFO Variants could not be read: 0
+2026-05-15 23:39:42,753 INFO Variants harmonised: 124006
+2026-05-15 23:39:42,753 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:42,753 INFO Alleles switched: 124006
+2026-05-15 23:39:42,753 INFO Normalised variants: 0
+2026-05-15 23:39:42,753 INFO Skipped 0 of 124006
+2026-05-15 23:39:42,754 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr12_GRCh37.vcf
+2026-05-15 23:39:42,767 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr12_GRCh37.vcf
+2026-05-15 23:39:58,904 INFO Indexing output file
+2026-05-15 23:39:33,482 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:33,483 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr13_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr13_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr13.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr13.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:33,483 INFO Reading JSON parameters
+2026-05-15 23:39:33,488 INFO Parameters: {'delimiter': '\t', 'snp_col': 2, 'ncase_col': 11, 'eaf_col': 5, 'imp_z_col': 8, 'ncontrol_col': 10, 'pos_col': 1, 'se_col': 7, 'oa_col': 4, 'beta_col': 6, 'chr_col': 0, 'header': True, 'imp_info_col': 12, 'pval_col': 9, 'ea_col': 3, 'build': 'GRCh37'}
+2026-05-15 23:39:33,500 INFO Checking input arguments
+2026-05-15 23:39:33,570 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr13_vcf_input.tsv
+2026-05-15 23:39:33,580 INFO Reading plain text file
+2026-05-15 23:39:33,596 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:34,010 INFO Total variants: 2594
+2026-05-15 23:39:34,053 INFO Variants could not be read: 0
+2026-05-15 23:39:34,056 INFO Variants harmonised: 2594
+2026-05-15 23:39:34,062 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:34,067 INFO Alleles switched: 2594
+2026-05-15 23:39:34,099 INFO Normalised variants: 0
+2026-05-15 23:39:34,100 INFO Skipped 0 of 2594
+2026-05-15 23:39:34,115 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr13_GRCh37.vcf
+2026-05-15 23:39:34,188 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr13_GRCh37.vcf
+2026-05-15 23:39:34,538 INFO Indexing output file
+2026-05-15 23:39:33,617 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:33,621 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr14_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr14_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr14.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr14.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:33,622 INFO Reading JSON parameters
+2026-05-15 23:39:33,632 INFO Parameters: {'ea_col': 3, 'ncase_col': 11, 'snp_col': 2, 'beta_col': 6, 'build': 'GRCh37', 'pval_col': 9, 'header': True, 'delimiter': '\t', 'pos_col': 1, 'eaf_col': 5, 'oa_col': 4, 'imp_z_col': 8, 'ncontrol_col': 10, 'imp_info_col': 12, 'chr_col': 0, 'se_col': 7}
+2026-05-15 23:39:33,634 INFO Checking input arguments
+2026-05-15 23:39:33,666 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr14_vcf_input.tsv
+2026-05-15 23:39:33,667 INFO Reading plain text file
+2026-05-15 23:39:33,672 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:35,253 INFO Total variants: 13008
+2026-05-15 23:39:35,254 INFO Variants could not be read: 0
+2026-05-15 23:39:35,255 INFO Variants harmonised: 13008
+2026-05-15 23:39:35,255 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:35,255 INFO Alleles switched: 13008
+2026-05-15 23:39:35,256 INFO Normalised variants: 0
+2026-05-15 23:39:35,256 INFO Skipped 0 of 13008
+2026-05-15 23:39:35,258 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr14_GRCh37.vcf
+2026-05-15 23:39:35,267 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr14_GRCh37.vcf
+2026-05-15 23:39:36,753 INFO Indexing output file
+2026-05-15 23:41:05,587 INFO Gwas2VCF 1.4.3
+2026-05-15 23:41:05,588 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr15_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr15_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr15.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr15.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:41:05,588 INFO Reading JSON parameters
+2026-05-15 23:41:05,601 INFO Parameters: {'pval_col': 9, 'se_col': 7, 'header': True, 'snp_col': 2, 'imp_info_col': 12, 'imp_z_col': 8, 'pos_col': 1, 'delimiter': '\t', 'eaf_col': 5, 'oa_col': 4, 'ea_col': 3, 'ncontrol_col': 10, 'ncase_col': 11, 'chr_col': 0, 'build': 'GRCh37', 'beta_col': 6}
+2026-05-15 23:41:05,601 INFO Checking input arguments
+2026-05-15 23:41:05,656 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr15_vcf_input.tsv
+2026-05-15 23:41:05,658 INFO Reading plain text file
+2026-05-15 23:41:05,661 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:41:10,540 INFO Total variants: 72131
+2026-05-15 23:41:10,540 INFO Variants could not be read: 0
+2026-05-15 23:41:10,541 INFO Variants harmonised: 72131
+2026-05-15 23:41:10,541 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:41:10,541 INFO Alleles switched: 72131
+2026-05-15 23:41:10,541 INFO Normalised variants: 0
+2026-05-15 23:41:10,542 INFO Skipped 0 of 72131
+2026-05-15 23:41:10,542 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr15_GRCh37.vcf
+2026-05-15 23:41:10,551 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr15_GRCh37.vcf
+2026-05-15 23:41:20,863 INFO Indexing output file
+2026-05-15 23:39:33,447 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:33,452 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr16_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr16_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr16.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr16.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:33,452 INFO Reading JSON parameters
+2026-05-15 23:39:33,473 INFO Parameters: {'chr_col': 0, 'imp_info_col': 12, 'imp_z_col': 8, 'header': True, 'oa_col': 4, 'delimiter': '\t', 'ncontrol_col': 10, 'ncase_col': 11, 'eaf_col': 5, 'pval_col': 9, 'se_col': 7, 'beta_col': 6, 'snp_col': 2, 'ea_col': 3, 'build': 'GRCh37', 'pos_col': 1}
+2026-05-15 23:39:33,473 INFO Checking input arguments
+2026-05-15 23:39:33,527 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr16_vcf_input.tsv
+2026-05-15 23:39:33,528 INFO Reading plain text file
+2026-05-15 23:39:33,548 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:35,715 INFO Total variants: 21349
+2026-05-15 23:39:35,715 INFO Variants could not be read: 0
+2026-05-15 23:39:35,715 INFO Variants harmonised: 21349
+2026-05-15 23:39:35,716 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:35,716 INFO Alleles switched: 21349
+2026-05-15 23:39:35,716 INFO Normalised variants: 0
+2026-05-15 23:39:35,716 INFO Skipped 0 of 21349
+2026-05-15 23:39:35,718 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr16_GRCh37.vcf
+2026-05-15 23:39:35,729 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr16_GRCh37.vcf
+2026-05-15 23:39:37,953 INFO Indexing output file
+2026-05-15 23:40:46,307 INFO Gwas2VCF 1.4.3
+2026-05-15 23:40:46,308 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr17_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr17_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr17.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr17.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:40:46,308 INFO Reading JSON parameters
+2026-05-15 23:40:46,316 INFO Parameters: {'header': True, 'imp_info_col': 12, 'ea_col': 3, 'pos_col': 1, 'beta_col': 6, 'imp_z_col': 8, 'snp_col': 2, 'ncase_col': 11, 'se_col': 7, 'build': 'GRCh37', 'ncontrol_col': 10, 'chr_col': 0, 'oa_col': 4, 'pval_col': 9, 'eaf_col': 5, 'delimiter': '\t'}
+2026-05-15 23:40:46,317 INFO Checking input arguments
+2026-05-15 23:40:46,360 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr17_vcf_input.tsv
+2026-05-15 23:40:46,360 INFO Reading plain text file
+2026-05-15 23:40:46,363 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:40:49,308 INFO Total variants: 29603
+2026-05-15 23:40:49,309 INFO Variants could not be read: 0
+2026-05-15 23:40:49,311 INFO Variants harmonised: 29603
+2026-05-15 23:40:49,313 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:40:49,321 INFO Alleles switched: 29603
+2026-05-15 23:40:49,323 INFO Normalised variants: 0
+2026-05-15 23:40:49,329 INFO Skipped 0 of 29603
+2026-05-15 23:40:49,332 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr17_GRCh37.vcf
+2026-05-15 23:40:49,365 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr17_GRCh37.vcf
+2026-05-15 23:40:54,111 INFO Indexing output file
+2026-05-15 23:39:34,697 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:34,698 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr1_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr1_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr1.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr1.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:34,701 INFO Reading JSON parameters
+2026-05-15 23:39:34,829 INFO Parameters: {'oa_col': 4, 'chr_col': 0, 'header': True, 'snp_col': 2, 'imp_info_col': 12, 'imp_z_col': 8, 'ncontrol_col': 10, 'delimiter': '\t', 'ea_col': 3, 'se_col': 7, 'eaf_col': 5, 'beta_col': 6, 'build': 'GRCh37', 'pval_col': 9, 'ncase_col': 11, 'pos_col': 1}
+2026-05-15 23:39:34,830 INFO Checking input arguments
+2026-05-15 23:39:34,848 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr1_vcf_input.tsv
+2026-05-15 23:39:34,849 INFO Reading plain text file
+2026-05-15 23:39:34,850 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:41,997 INFO Total variants: 114011
+2026-05-15 23:39:41,997 INFO Variants could not be read: 0
+2026-05-15 23:39:41,998 INFO Variants harmonised: 114011
+2026-05-15 23:39:41,998 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:41,998 INFO Alleles switched: 114011
+2026-05-15 23:39:41,999 INFO Normalised variants: 0
+2026-05-15 23:39:41,999 INFO Skipped 0 of 114011
+2026-05-15 23:39:42,000 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr1_GRCh37.vcf
+2026-05-15 23:39:42,008 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr1_GRCh37.vcf
+2026-05-15 23:39:56,575 INFO Indexing output file
+2026-05-15 23:40:23,907 INFO Gwas2VCF 1.4.3
+2026-05-15 23:40:23,908 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr20_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr20_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr20.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr20.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:40:23,909 INFO Reading JSON parameters
+2026-05-15 23:40:23,916 INFO Parameters: {'se_col': 7, 'imp_z_col': 8, 'eaf_col': 5, 'ncase_col': 11, 'imp_info_col': 12, 'build': 'GRCh37', 'pval_col': 9, 'ea_col': 3, 'pos_col': 1, 'delimiter': '\t', 'header': True, 'beta_col': 6, 'chr_col': 0, 'ncontrol_col': 10, 'oa_col': 4, 'snp_col': 2}
+2026-05-15 23:40:23,916 INFO Checking input arguments
+2026-05-15 23:40:23,941 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr20_vcf_input.tsv
+2026-05-15 23:40:23,941 INFO Reading plain text file
+2026-05-15 23:40:23,942 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:40:25,067 INFO Total variants: 14892
+2026-05-15 23:40:25,068 INFO Variants could not be read: 0
+2026-05-15 23:40:25,068 INFO Variants harmonised: 14892
+2026-05-15 23:40:25,069 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:40:25,069 INFO Alleles switched: 14892
+2026-05-15 23:40:25,069 INFO Normalised variants: 0
+2026-05-15 23:40:25,069 INFO Skipped 0 of 14892
+2026-05-15 23:40:25,071 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr20_GRCh37.vcf
+2026-05-15 23:40:25,082 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr20_GRCh37.vcf
+2026-05-15 23:40:27,507 INFO Indexing output file
+2026-05-15 23:41:16,784 INFO Gwas2VCF 1.4.3
+2026-05-15 23:41:16,788 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr21_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr21_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr21.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr21.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:41:16,789 INFO Reading JSON parameters
+2026-05-15 23:41:16,803 INFO Parameters: {'chr_col': 0, 'ncontrol_col': 10, 'header': True, 'eaf_col': 5, 'se_col': 7, 'ea_col': 3, 'imp_info_col': 12, 'pval_col': 9, 'ncase_col': 11, 'beta_col': 6, 'imp_z_col': 8, 'oa_col': 4, 'build': 'GRCh37', 'pos_col': 1, 'delimiter': '\t', 'snp_col': 2}
+2026-05-15 23:41:16,804 INFO Checking input arguments
+2026-05-15 23:41:16,820 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr21_vcf_input.tsv
+2026-05-15 23:41:16,822 INFO Reading plain text file
+2026-05-15 23:41:16,826 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:41:17,719 INFO Total variants: 10906
+2026-05-15 23:41:17,719 INFO Variants could not be read: 0
+2026-05-15 23:41:17,719 INFO Variants harmonised: 10906
+2026-05-15 23:41:17,720 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:41:17,720 INFO Alleles switched: 10906
+2026-05-15 23:41:17,721 INFO Normalised variants: 0
+2026-05-15 23:41:17,721 INFO Skipped 0 of 10906
+2026-05-15 23:41:17,723 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr21_GRCh37.vcf
+2026-05-15 23:41:17,735 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr21_GRCh37.vcf
+2026-05-15 23:41:19,236 INFO Indexing output file
+2026-05-15 23:39:34,044 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:34,055 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr22_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr22_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr22.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr22.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:34,056 INFO Reading JSON parameters
+2026-05-15 23:39:34,100 INFO Parameters: {'snp_col': 2, 'imp_z_col': 8, 'oa_col': 4, 'ncase_col': 11, 'imp_info_col': 12, 'beta_col': 6, 'pos_col': 1, 'delimiter': '\t', 'ncontrol_col': 10, 'ea_col': 3, 'se_col': 7, 'build': 'GRCh37', 'chr_col': 0, 'pval_col': 9, 'header': True, 'eaf_col': 5}
+2026-05-15 23:39:34,114 INFO Checking input arguments
+2026-05-15 23:39:34,307 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr22_vcf_input.tsv
+2026-05-15 23:39:34,308 INFO Reading plain text file
+2026-05-15 23:39:34,309 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:37,318 INFO Total variants: 46958
+2026-05-15 23:39:37,319 INFO Variants could not be read: 0
+2026-05-15 23:39:37,319 INFO Variants harmonised: 46958
+2026-05-15 23:39:37,319 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:37,319 INFO Alleles switched: 46958
+2026-05-15 23:39:37,319 INFO Normalised variants: 0
+2026-05-15 23:39:37,320 INFO Skipped 0 of 46958
+2026-05-15 23:39:37,320 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr22_GRCh37.vcf
+2026-05-15 23:39:37,331 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr22_GRCh37.vcf
+2026-05-15 23:39:42,997 INFO Indexing output file
+2026-05-15 23:41:11,878 INFO Gwas2VCF 1.4.3
+2026-05-15 23:41:11,880 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr2_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr2_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr2.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr2.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:41:11,882 INFO Reading JSON parameters
+2026-05-15 23:41:11,912 INFO Parameters: {'imp_z_col': 8, 'delimiter': '\t', 'header': True, 'imp_info_col': 12, 'pos_col': 1, 'beta_col': 6, 'pval_col': 9, 'build': 'GRCh37', 'ea_col': 3, 'ncase_col': 11, 'snp_col': 2, 'ncontrol_col': 10, 'chr_col': 0, 'oa_col': 4, 'eaf_col': 5, 'se_col': 7}
+2026-05-15 23:41:11,912 INFO Checking input arguments
+2026-05-15 23:41:11,931 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr2_vcf_input.tsv
+2026-05-15 23:41:11,932 INFO Reading plain text file
+2026-05-15 23:41:11,933 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:41:15,454 INFO Total variants: 54041
+2026-05-15 23:41:15,454 INFO Variants could not be read: 0
+2026-05-15 23:41:15,454 INFO Variants harmonised: 54041
+2026-05-15 23:41:15,454 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:41:15,454 INFO Alleles switched: 54041
+2026-05-15 23:41:15,455 INFO Normalised variants: 0
+2026-05-15 23:41:15,455 INFO Skipped 0 of 54041
+2026-05-15 23:41:15,456 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr2_GRCh37.vcf
+2026-05-15 23:41:15,463 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr2_GRCh37.vcf
+2026-05-15 23:41:23,430 INFO Indexing output file
+2026-05-15 23:39:34,828 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:34,830 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr3_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr3_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr3.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr3.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:34,831 INFO Reading JSON parameters
+2026-05-15 23:39:34,844 INFO Parameters: {'beta_col': 6, 'imp_info_col': 12, 'ncase_col': 11, 'header': True, 'snp_col': 2, 'pval_col': 9, 'ea_col': 3, 'oa_col': 4, 'chr_col': 0, 'build': 'GRCh37', 'delimiter': '\t', 'ncontrol_col': 10, 'pos_col': 1, 'eaf_col': 5, 'se_col': 7, 'imp_z_col': 8}
+2026-05-15 23:39:34,845 INFO Checking input arguments
+2026-05-15 23:39:34,854 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr3_vcf_input.tsv
+2026-05-15 23:39:34,856 INFO Reading plain text file
+2026-05-15 23:39:34,859 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:40,405 INFO Total variants: 94525
+2026-05-15 23:39:40,405 INFO Variants could not be read: 0
+2026-05-15 23:39:40,405 INFO Variants harmonised: 94525
+2026-05-15 23:39:40,406 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:40,406 INFO Alleles switched: 94525
+2026-05-15 23:39:40,407 INFO Normalised variants: 0
+2026-05-15 23:39:40,407 INFO Skipped 0 of 94525
+2026-05-15 23:39:40,408 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr3_GRCh37.vcf
+2026-05-15 23:39:40,417 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr3_GRCh37.vcf
+2026-05-15 23:39:52,670 INFO Indexing output file
+2026-05-15 23:40:07,778 INFO Gwas2VCF 1.4.3
+2026-05-15 23:40:07,780 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr4_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr4_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr4.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr4.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:40:07,780 INFO Reading JSON parameters
+2026-05-15 23:40:07,814 INFO Parameters: {'chr_col': 0, 'snp_col': 2, 'oa_col': 4, 'pval_col': 9, 'eaf_col': 5, 'ncase_col': 11, 'ncontrol_col': 10, 'beta_col': 6, 'build': 'GRCh37', 'se_col': 7, 'imp_info_col': 12, 'delimiter': '\t', 'imp_z_col': 8, 'pos_col': 1, 'header': True, 'ea_col': 3}
+2026-05-15 23:40:07,820 INFO Checking input arguments
+2026-05-15 23:40:07,912 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr4_vcf_input.tsv
+2026-05-15 23:40:07,913 INFO Reading plain text file
+2026-05-15 23:40:07,914 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:40:09,512 INFO Total variants: 23288
+2026-05-15 23:40:09,514 INFO Variants could not be read: 0
+2026-05-15 23:40:09,515 INFO Variants harmonised: 23288
+2026-05-15 23:40:09,515 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:40:09,515 INFO Alleles switched: 23288
+2026-05-15 23:40:09,516 INFO Normalised variants: 0
+2026-05-15 23:40:09,516 INFO Skipped 0 of 23288
+2026-05-15 23:40:09,517 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr4_GRCh37.vcf
+2026-05-15 23:40:09,523 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr4_GRCh37.vcf
+2026-05-15 23:40:13,910 INFO Indexing output file
+2026-05-15 23:39:34,073 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:34,077 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr5_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr5_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr5.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr5.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:34,089 INFO Reading JSON parameters
+2026-05-15 23:39:34,185 INFO Parameters: {'chr_col': 0, 'oa_col': 4, 'eaf_col': 5, 'imp_z_col': 8, 'pos_col': 1, 'header': True, 'se_col': 7, 'snp_col': 2, 'build': 'GRCh37', 'beta_col': 6, 'ncontrol_col': 10, 'imp_info_col': 12, 'pval_col': 9, 'delimiter': '\t', 'ncase_col': 11, 'ea_col': 3}
+2026-05-15 23:39:34,188 INFO Checking input arguments
+2026-05-15 23:39:34,309 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr5_vcf_input.tsv
+2026-05-15 23:39:34,311 INFO Reading plain text file
+2026-05-15 23:39:34,316 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:35,968 INFO Total variants: 25202
+2026-05-15 23:39:35,968 INFO Variants could not be read: 0
+2026-05-15 23:39:35,968 INFO Variants harmonised: 25202
+2026-05-15 23:39:35,969 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:35,969 INFO Alleles switched: 25202
+2026-05-15 23:39:35,969 INFO Normalised variants: 0
+2026-05-15 23:39:35,969 INFO Skipped 0 of 25202
+2026-05-15 23:39:35,970 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr5_GRCh37.vcf
+2026-05-15 23:39:35,979 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr5_GRCh37.vcf
+2026-05-15 23:39:38,615 INFO Indexing output file
+2026-05-15 23:41:08,387 INFO Gwas2VCF 1.4.3
+2026-05-15 23:41:08,389 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr6_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr6_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr6.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr6.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:41:08,389 INFO Reading JSON parameters
+2026-05-15 23:41:08,405 INFO Parameters: {'chr_col': 0, 'build': 'GRCh37', 'oa_col': 4, 'ncase_col': 11, 'delimiter': '\t', 'imp_info_col': 12, 'ea_col': 3, 'beta_col': 6, 'eaf_col': 5, 'ncontrol_col': 10, 'snp_col': 2, 'pos_col': 1, 'header': True, 'imp_z_col': 8, 'pval_col': 9, 'se_col': 7}
+2026-05-15 23:41:08,405 INFO Checking input arguments
+2026-05-15 23:41:08,474 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr6_vcf_input.tsv
+2026-05-15 23:41:08,474 INFO Reading plain text file
+2026-05-15 23:41:08,475 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:41:10,240 INFO Total variants: 25420
+2026-05-15 23:41:10,241 INFO Variants could not be read: 0
+2026-05-15 23:41:10,241 INFO Variants harmonised: 25420
+2026-05-15 23:41:10,245 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:41:10,245 INFO Alleles switched: 25420
+2026-05-15 23:41:10,245 INFO Normalised variants: 0
+2026-05-15 23:41:10,245 INFO Skipped 0 of 25420
+2026-05-15 23:41:10,248 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr6_GRCh37.vcf
+2026-05-15 23:41:10,257 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr6_GRCh37.vcf
+2026-05-15 23:41:13,755 INFO Indexing output file
+2026-05-15 23:39:34,203 INFO Gwas2VCF 1.4.3
+2026-05-15 23:39:34,299 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr7_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr7_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr7.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr7.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:39:34,300 INFO Reading JSON parameters
+2026-05-15 23:39:34,306 INFO Parameters: {'chr_col': 0, 'pos_col': 1, 'imp_info_col': 12, 'ea_col': 3, 'delimiter': '\t', 'header': True, 'se_col': 7, 'ncase_col': 11, 'oa_col': 4, 'pval_col': 9, 'eaf_col': 5, 'imp_z_col': 8, 'ncontrol_col': 10, 'beta_col': 6, 'build': 'GRCh37', 'snp_col': 2}
+2026-05-15 23:39:34,306 INFO Checking input arguments
+2026-05-15 23:39:34,313 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr7_vcf_input.tsv
+2026-05-15 23:39:34,314 INFO Reading plain text file
+2026-05-15 23:39:34,316 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:39:37,436 INFO Total variants: 52392
+2026-05-15 23:39:37,437 INFO Variants could not be read: 0
+2026-05-15 23:39:37,437 INFO Variants harmonised: 52392
+2026-05-15 23:39:37,438 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:39:37,438 INFO Alleles switched: 52392
+2026-05-15 23:39:37,438 INFO Normalised variants: 0
+2026-05-15 23:39:37,438 INFO Skipped 0 of 52392
+2026-05-15 23:39:37,439 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr7_GRCh37.vcf
+2026-05-15 23:39:37,447 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr7_GRCh37.vcf
+2026-05-15 23:39:43,622 INFO Indexing output file
+2026-05-15 23:40:26,610 INFO Gwas2VCF 1.4.3
+2026-05-15 23:40:26,612 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr8_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr8_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr8.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr8.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:40:26,612 INFO Reading JSON parameters
+2026-05-15 23:40:26,640 INFO Parameters: {'ncase_col': 11, 'imp_info_col': 12, 'ea_col': 3, 'chr_col': 0, 'se_col': 7, 'delimiter': '\t', 'ncontrol_col': 10, 'imp_z_col': 8, 'oa_col': 4, 'eaf_col': 5, 'pos_col': 1, 'build': 'GRCh37', 'beta_col': 6, 'header': True, 'pval_col': 9, 'snp_col': 2}
+2026-05-15 23:40:26,640 INFO Checking input arguments
+2026-05-15 23:40:26,735 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr8_vcf_input.tsv
+2026-05-15 23:40:26,735 INFO Reading plain text file
+2026-05-15 23:40:26,737 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:40:35,338 INFO Total variants: 112296
+2026-05-15 23:40:35,339 INFO Variants could not be read: 0
+2026-05-15 23:40:35,339 INFO Variants harmonised: 112296
+2026-05-15 23:40:35,339 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:40:35,340 INFO Alleles switched: 112295
+2026-05-15 23:40:35,340 INFO Normalised variants: 0
+2026-05-15 23:40:35,340 INFO Skipped 0 of 112296
+2026-05-15 23:40:35,342 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr8_GRCh37.vcf
+2026-05-15 23:40:35,350 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr8_GRCh37.vcf
+2026-05-15 23:40:54,497 INFO Indexing output file
+2026-05-15 23:40:23,056 INFO Gwas2VCF 1.4.3
+2026-05-15 23:40:23,058 INFO Arguments: {'out': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr9_GRCh37.vcf', 'data': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr9_vcf_input.tsv', 'ref': '/Users/JJOHN41/Documents/software_resources/resourses/postgwas/gwas2vcf//GRCh37/fasta_files/GRCh37_chr9.fa', 'dbsnp': None, 'json': '/Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr9.dict', 'id': 'ADHD2022_iPSYCH_deCODE_PGC', 'cohort_controls': None, 'cohort_cases': None, 'csi': False, 'log': 'INFO', 'alias': None}
+2026-05-15 23:40:23,058 INFO Reading JSON parameters
+2026-05-15 23:40:23,081 INFO Parameters: {'beta_col': 6, 'imp_z_col': 8, 'snp_col': 2, 'build': 'GRCh37', 'header': True, 'pos_col': 1, 'pval_col': 9, 'ncase_col': 11, 'imp_info_col': 12, 'se_col': 7, 'ea_col': 3, 'ncontrol_col': 10, 'eaf_col': 5, 'chr_col': 0, 'delimiter': '\t', 'oa_col': 4}
+2026-05-15 23:40:23,081 INFO Checking input arguments
+2026-05-15 23:40:23,151 INFO Reading summary stats and mapping to FASTA: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr9_vcf_input.tsv
+2026-05-15 23:40:23,152 INFO Reading plain text file
+2026-05-15 23:40:23,153 INFO Skipping header: CHR	BP	SNP	A1	A2	FRQ_U_186843	beta	SE	imp_z_col	LP	Nco	Nca	INFO
+2026-05-15 23:40:25,891 INFO Total variants: 34640
+2026-05-15 23:40:25,892 INFO Variants could not be read: 0
+2026-05-15 23:40:25,892 INFO Variants harmonised: 34640
+2026-05-15 23:40:25,895 INFO Variants discarded during harmonisation: 0
+2026-05-15 23:40:25,898 INFO Alleles switched: 34640
+2026-05-15 23:40:25,898 INFO Normalised variants: 0
+2026-05-15 23:40:25,898 INFO Skipped 0 of 34640
+2026-05-15 23:40:25,899 INFO Writing headers to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr9_GRCh37.vcf
+2026-05-15 23:40:25,907 INFO Writing variants to BCF/VCF: /Users/JJOHN41/Documents/developing_software/postgwas/tests/ADHD2022_iPSYCH_deCODE_PGC/00_harmonised_sumstat/ADHD2022_iPSYCH_deCODE_PGC_chr9_GRCh37.vcf
+2026-05-15 23:40:32,516 INFO Indexing output file

@@ -1,0 +1,6 @@
+pytest==5.3.5
+biopython==1.72
+marshmallow==2.18.1
+numpy==1.22.0
+Cython==0.29.17
+dask

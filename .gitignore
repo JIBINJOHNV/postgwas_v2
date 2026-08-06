@@ -1,0 +1,57 @@
+# ==========================
+# Project-specific ignores
+# ==========================
+
+# Ignore logs
+logs/
+
+# Ignore large raw data files (add if exists)
+data/
+resource_file_preparation/
+resourse_preparation_installation/
+
+# Ignore helper scripts if they should not be versioned
+installation_comans.sh
+data_resourse_preparation.sh
+
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dylib
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.env/
+.venv/
+env/
+venv/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# ==========================
+# System / IDE files
+# ==========================
+.DS_Store
+.idea/
+.vscode/
+# PostGWAS generated outputs
+imputed_harmonised/
+*.vcf.gz
+*.tsv.gz
+*.bed
+*.bim
+*.fam
+*.log

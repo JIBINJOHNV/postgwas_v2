@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "postgwas"
+version = "1.0.0"
+description = "PostGWAS analysis toolkit"  # Customize
+authors = [{name = "Jibin", email = "johnjibinv@email.com"}]  # Customize
+requires-python = ">=3.8"
+dependencies = [
+    # Add pip-installable runtime deps here if not in environment.yml, e.g., "click" if your CLI uses it
+]
+
+[project.scripts]
+postgwas = "postgwas.__main__:main"  # Assumes src/postgwas/main.py has def cli(): ... (update if different)
+
+[tool.setuptools.packages.find]
+where = ["src"]  # Look for packages under src/
+namespaces = false  # Optional: Avoid implicit namespaces

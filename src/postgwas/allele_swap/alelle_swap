@@ -1,0 +1,210 @@
+
+import subprocess
+import os
+import polars as pl
+import gzip
+
+def extract_vcf_variants(vcf_input, potential_flips_tsv, safe_variants_vcf, threshold=0.2):
+    """
+    Extracts 'Safe' variants and tags them as ALIGNED_PROPERLY.
+    Extracts 'Potential Swaps' to TSV for later tagging.
+    """
+    header_file = "allele_swap_header.hdr"
+    with open(header_file, "w") as f:
+        f.write('##INFO=<ID=ALLELE_SWAP,Number=1,Type=String,Description="Status: ALIGNED_PROPERLY, SWAPPED, or FAILED_OUTLIER">\n')
+
+    # Mapping standard VCF fields and the FORMAT fields into a flat TSV
+    query_fmt = (
+        "%CHROM\\t%POS\\t%ID\\t%REF\\t%ALT\\t"
+        "%INFO/AF\\t%INFO/EUR\\t"
+        "[%ES]\\t[%SE]\\t[%EZ]\\t[%LP]\\t"
+        "[%AF]\\t[%SI]\\t[%SS]\\t[%NC]\\t"
+        "[%NCO]\\t[%NEF]\\t[%ID]\\n"
+    )
+
+    try:
+        # --- PART 1: Extract Safe Variants ---
+        print(f"--- Tagging Safe Variants as ALIGNED_PROPERLY ---")
+        cmd_safe = (
+            f"bcftools view -i 'abs(INFO/AF - INFO/EUR) <= {threshold}' {vcf_input} | "
+            f"bcftools annotate -h {header_file} --info-plus ALLELE_SWAP=ALIGNED_PROPERLY -Oz -o {safe_variants_vcf}"
+        )
+        subprocess.run(cmd_safe, shell=True, check=True)
+        subprocess.run(f"bcftools index -t {safe_variants_vcf}", shell=True, check=True)
+
+        # --- PART 2: Extract Potential Swaps ---
+        print(f"--- Extracting Potential Swaps to TSV ---")
+        cmd_potential = (
+            f"bcftools view -e 'abs(INFO/AF - INFO/EUR) <= {threshold}' {vcf_input} | "
+            f"bcftools query -f '{query_fmt}' > {potential_flips_tsv}"
+        )
+        subprocess.run(cmd_potential, shell=True, check=True)
+
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error in extraction: {e}")
+        raise e
+    finally:
+        if os.path.exists(header_file):
+            os.remove(header_file)
+
+def harmonize_gwas_flips_polars(input_tsv, threshold=0.2):
+    """
+    Uses Polars to determine if a swap is necessary or if the variant is an outlier.
+    """
+    column_names = [
+        "CHR", "POS", "SNP", "REF", "ALT", 
+        "AF_GWAS", "AF_EUR", "BETA", "SE", 
+        "EZ", "LP", "AF_FORMAT", "SI", 
+        "SS", "NC", "NCO", "NEF", "ID_INFO"
+    ]
+
+    # Use Scan for larger datasets
+    lazy_df = pl.scan_csv(
+        input_tsv,
+        separator="\t",
+        has_header=False,
+        new_columns=column_names,
+        null_values=".",
+        infer_schema_length=10000
+    )
+
+    harmonized = (
+        lazy_df
+        .with_columns([
+            (pl.col("AF_GWAS") - pl.col("AF_EUR")).abs().alias("d_orig"),
+            ((1 - pl.col("AF_GWAS")) - pl.col("AF_EUR")).abs().alias("d_swap")
+        ])
+        .with_columns([
+            pl.when(pl.col("AF_EUR").is_null())
+            .then(pl.lit("FAILED_OUTLIER"))
+            .when((pl.col("d_swap") < pl.col("d_orig")) & (pl.col("d_swap") <= threshold))
+            .then(pl.lit("SWAPPED"))
+            .when(pl.col("d_orig") <= threshold)
+            .then(pl.lit("ALIGNED_PROPERLY"))
+            .otherwise(pl.lit("FAILED_OUTLIER"))
+            .alias("ALLELE_SWAP")
+        ])
+        .with_columns([
+            # Apply Swaps
+            pl.when(pl.col("ALLELE_SWAP") == "SWAPPED").then(pl.col("ALT")).otherwise(pl.col("REF")).alias("REF_FINAL"),
+            pl.when(pl.col("ALLELE_SWAP") == "SWAPPED").then(pl.col("REF")).otherwise(pl.col("ALT")).alias("ALT_FINAL"),
+            pl.when(pl.col("ALLELE_SWAP") == "SWAPPED").then(pl.col("BETA") * -1).otherwise(pl.col("BETA")).alias("BETA_FINAL"),
+            pl.when(pl.col("ALLELE_SWAP") == "SWAPPED").then(pl.col("EZ") * -1).otherwise(pl.col("EZ")).alias("EZ_FINAL"),
+            pl.when(pl.col("ALLELE_SWAP") == "SWAPPED").then(1 - pl.col("AF_GWAS")).otherwise(pl.col("AF_GWAS")).alias("AF_FINAL")
+        ])
+    )
+
+    return harmonized.collect()
+
+def save_harmonized_to_vcf(df, original_vcf_path, output_vcf_path):
+    """
+    Reconstructs the VCF lines for the processed variants.
+    """
+    header_lines = []
+    with gzip.open(original_vcf_path, 'rt') as f:
+        for line in f:
+            if line.startswith("##"):
+                header_lines.append(line)
+            elif line.startswith("#CHROM"):
+                # Ensure custom INFO tag is added to header
+                info_def = '##INFO=<ID=ALLELE_SWAP,Number=1,Type=String,Description="Status: ALIGNED_PROPERLY, SWAPPED, or FAILED_OUTLIER">\n'
+                if info_def not in header_lines:
+                    header_lines.insert(-1, info_def)
+                header_lines.append(line)
+                break
+
+    # Key by SNP ID for fast lookup
+    harmonized_data = {str(r['SNP']): r for r in df.to_dicts()}
+
+    with gzip.open(output_vcf_path, 'wt') as out:
+        out.writelines(header_lines)
+        
+        with gzip.open(original_vcf_path, 'rt') as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                
+                cols = line.strip().split('\t')
+                vcf_id = cols[2]
+                
+                if vcf_id in harmonized_data:
+                    data = harmonized_data[vcf_id]
+                    
+                    cols[3] = str(data['REF_FINAL'])
+                    cols[4] = str(data['ALT_FINAL'])
+                    
+                    # Update INFO: Match exact AF key to avoid hitting AF_EUR
+                    info_items = cols[7].split(';')
+                    new_info = []
+                    for item in info_items:
+                        if item.startswith("AF=") and "=" in item:
+                            new_info.append(f"AF={data['AF_FINAL']:.4f}")
+                        else:
+                            new_info.append(item)
+                    new_info.append(f"ALLELE_SWAP={data['ALLELE_SWAP']}")
+                    cols[7] = ";".join(new_info)
+                    
+                    # Update FORMAT: ES:SE:EZ:LP:AF:SI:SS:NC:NCO:NEF:ID
+                    sample_vals = [
+                        f"{data['BETA_FINAL']:.4f}", str(data['SE']), f"{data['EZ_FINAL']:.4f}",
+                        str(data['LP']), f"{data['AF_FINAL']:.4f}", str(data['SI']),
+                        str(data['SS']), str(data['NC']), str(data['NCO']),
+                        str(data['NEF']), str(data['ID_INFO'])
+                    ]
+                    cols[9] = ":".join(sample_vals)
+                    
+                    out.write("\t".join(cols) + "\n")
+
+def run_harmonization_pipeline(input_vcf, output_vcf, threshold=0.2):
+    """
+    Main Orchestrator
+    """
+    safe_vcf = "temp_safe.vcf.gz"
+    potential_tsv = "temp_potential.tsv"
+    harmonized_vcf = "temp_harmonized.vcf.gz"
+    
+    print(f"🚀 Starting Harmonization: {input_vcf}")
+
+    try:
+        # 1. Split Safe vs Potential
+        extract_vcf_variants(input_vcf, potential_tsv, safe_vcf, threshold)
+
+        # 2. Process Potential Swaps in Polars
+        df_harmonized = harmonize_gwas_flips_polars(potential_tsv, threshold)
+        print(f"--- Harmonization Summary ---\n{df_harmonized['ALLELE_SWAP'].value_counts()}")
+
+        # 3. Create the processed VCF
+        save_harmonized_to_vcf(df_harmonized, input_vcf, harmonized_vcf)
+        subprocess.run(f"bcftools index -t {harmonized_vcf}", shell=True, check=True)
+
+        # 4. Final Merge
+        print("--- Finalizing: Merging and Sorting ---")
+        cmd_merge = (
+            f"bcftools concat {safe_vcf} {harmonized_vcf} -a | "
+            f"bcftools sort -Oz -o {output_vcf}"
+        )
+        subprocess.run(cmd_merge, shell=True, check=True)
+        subprocess.run(f"bcftools index -t {output_vcf}", shell=True, check=True)
+
+        print(f"✅ Pipeline Complete! Output: {output_vcf}")
+
+    except Exception as e:
+        print(f"❌ Pipeline Failed: {e}")
+    
+    finally:
+        # Comprehensive Cleanup
+        for tmp in [safe_vcf, f"{safe_vcf}.tbi", potential_tsv, 
+                    harmonized_vcf, f"{harmonized_vcf}.tbi"]:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+if __name__ == "__main__":
+    # Parameters
+    IN_FILE = "input_data.vcf.gz"  # Change to your input
+    OUT_FILE = "harmonized_final.vcf.gz"
+    THRESHOLD = 0.15
+    
+    if os.path.exists(IN_FILE):
+        run_harmonization_pipeline(IN_FILE, OUT_FILE, THRESHOLD)
+    else:
+        print(f"File {IN_FILE} not found. Please provide a valid VCF.")
