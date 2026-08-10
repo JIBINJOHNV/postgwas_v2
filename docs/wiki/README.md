@@ -1,13 +1,15 @@
-# Wiki maintenance
+# Documentation maintenance
 
-The public GitHub Wiki is a generated view of canonical Markdown maintained in
-the main PostGWAS repository. Do not maintain an independent copy of the same
-documentation in the Wiki repository.
+The PostGWAS user guide is maintained as canonical Markdown in the main
+repository. The root [`README.md`](../../README.md) links every published page,
+so the complete guide can be browsed directly in a private repository without
+GitHub Wiki access.
 
 ## Source contract
 
-[`docs/wiki.yml`](../wiki.yml) is the publication manifest. Its page order is
-the sidebar order, and each entry defines:
+[`docs/wiki.yml`](../wiki.yml) is the documentation manifest. Its page order is
+the order used by the root README and optional generated navigation, and each
+entry defines:
 
 - the user-facing page title;
 - a unique, stable Wiki slug;
@@ -34,7 +36,7 @@ local assets that do not yet have a defined publication rule.
 Pull requests and pushes to the default branch run the same contract through
 `.github/workflows/wiki-docs.yml`.
 
-## Build the Wiki tree
+## Build an optional Wiki-compatible tree
 
 Generate the publishable files locally:
 
@@ -59,22 +61,16 @@ The builder refuses to use an existing non-empty directory unless that
 directory contains its managed-file inventory. This prevents accidental
 replacement of a Wiki clone or another user-owned directory.
 
-## Publish
+## Publication
 
-Wiki publication runs automatically after validation succeeds on a push to the
-default branch. The first publication still requires the repository Wiki to be
-enabled and initialized with a Home page:
+GitHub Wiki publication is not configured for this private repository. Users
+browse the canonical pages through the complete documentation index in the
+root README. The workflow validates the Markdown, generated navigation, links,
+and documented commands, but does not attempt to push a `.wiki.git` repository.
 
-1. Enable the repository Wiki under **Settings → Features**.
-2. Create and save its initial Home page.
-3. Run the validation workflow again or push a documentation change to the
-   default branch.
-
-The publication job clones the repository's `.wiki.git` repository, writes the
-generated tree through the same managed-file builder, reviews the Git diff, and
-adopts only the initial `Home.md` as managed on the first run, and pushes only
-when content changed. It uses the workflow's ephemeral,
-repository-scoped token; do not add a broad personal token.
+If Wiki access is enabled in the future, the optional generated tree can be
+reviewed and published as a separate change. The canonical Markdown and the
+root README index must remain the source of truth.
 
 ## Add a page
 
@@ -82,8 +78,9 @@ repository-scoped token; do not add a broad personal token.
 2. Start the page with one level-one heading.
 3. Add the page to `docs/wiki.yml` with a stable, unique slug.
 4. Use relative links between canonical Markdown sources.
-5. Run the Wiki validation tests.
-6. Inspect the generated page and navigation before publication.
+5. Add its canonical source link to the root README in manifest order.
+6. Run the documentation validation tests.
+7. Inspect the source page and optional generated navigation.
 
 For module documentation, begin with
 [`docs/templates/module-page.md`](../templates/module-page.md). Configuration and

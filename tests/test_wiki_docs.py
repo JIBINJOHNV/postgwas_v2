@@ -143,24 +143,35 @@ def test_harmonisation_cross_page_step_and_info_contracts_match_runtime():
 def test_readme_uses_current_repository_and_version_two_interfaces():
     text = ROOT_README.read_text(encoding="utf-8")
 
-    assert "JIBINJOHNV/postgwas_v2/wiki" in text
+    assert "## Documentation" in text
+    assert "GitHub Wiki access is not enabled" in text
+    assert "JIBINJOHNV/postgwas_v2/wiki" not in text
     assert "JIBINJOHNV/postgwas.git" not in text
     assert "jibinjv/postgwas:1.3" not in text
     assert "sumstat_file" not in text
     assert "--sample-sheet studies.csv" in text
 
 
-def test_wiki_workflow_publishes_only_after_main_validation():
+def test_readme_indexes_every_manifest_page_in_order():
+    text = ROOT_README.read_text(encoding="utf-8")
+    positions = []
+    for page in _wiki_pages():
+        link = f']({page["source"]})'
+        assert link in text, page
+        positions.append(text.index(link))
+
+    assert positions == sorted(positions)
+
+
+def test_documentation_workflow_validates_without_wiki_publication():
     workflow = WIKI_WORKFLOW.read_text(encoding="utf-8")
 
     assert workflow.count('- "README.md"') == 2
-    assert "needs: validate" in workflow
-    assert "github.event_name == 'push'" in workflow
-    assert "github.ref == 'refs/heads/main'" in workflow
-    assert "python tools/docs/build_wiki.py --output wiki-repository" in workflow
-    assert "printf '%s\\n' Home.md > wiki-repository/.postgwas-wiki-files" in workflow
-    assert "${{ github.token }}" in workflow
-    assert "git push origin HEAD" in workflow
+    assert "name: Validate user documentation" in workflow
+    assert "python -m pytest -p no:cacheprovider tests/test_wiki_docs.py -q" in workflow
+    assert "python tools/docs/validate_wiki_cli.py" in workflow
+    assert "publish:" not in workflow
+    assert ".wiki.git" not in workflow
 
 
 def test_harmonisation_wiki_visualises_execution_scope_and_variant_outcomes():

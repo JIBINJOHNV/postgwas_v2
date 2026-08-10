@@ -12,14 +12,72 @@ integration.
 
 ## Documentation
 
-- [GitHub Wiki](https://github.com/JIBINJOHNV/postgwas_v2/wiki) — complete user
-  guide, workflows, module pages, inputs, outputs, and troubleshooting.
-- [Canonical documentation sources](docs/wiki/home.md) — the version-controlled
-  source used to generate the Wiki.
-- [Harmonisation guide](docs/wiki/harmonisation/overview.md) — preparing raw
-  summary statistics and creating GWAS-VCF.
-- [Live command reference](docs/wiki/reference/command-reference.md) — use with
-  the `--help` output from the exact checkout being run.
+The complete user guide is stored as version-controlled Markdown in this
+repository, so it remains available when GitHub Wiki access is not enabled.
+Start with the [PostGWAS User Guide](docs/wiki/home.md), or open a topic below.
+
+### Getting started
+
+- [Home](docs/wiki/home.md)
+- [Installation](docs/wiki/getting-started/installation.md)
+- [Quick Start](docs/wiki/getting-started/quick-start.md)
+- [Resource Setup](docs/wiki/getting-started/resource-setup.md)
+
+### Core concepts
+
+- [Configuration](docs/wiki/core/configuration.md)
+- [Pipeline Workflow](docs/wiki/core/pipeline-workflow.md)
+- [Input and Output Contracts](docs/wiki/core/input-output-contracts.md)
+- [Logging and Reproducibility](docs/wiki/core/logging-and-reproducibility.md)
+- [Scientific Considerations](docs/wiki/core/scientific-considerations.md)
+- [Running Modules Independently](docs/wiki/core/running-modules-independently.md)
+
+### Harmonisation
+
+- [Harmonisation Overview](docs/wiki/harmonisation/overview.md)
+- [Harmonisation Sample Sheet](docs/wiki/harmonisation/sample-sheet.md)
+- [Harmonisation Configuration](docs/modules/harmonisation/configuration.md)
+- [Harmonisation Processing Order](docs/wiki/harmonisation/processing-order.md)
+- [Harmonisation Outputs and QC](docs/wiki/harmonisation/outputs-and-qc.md)
+
+### Analysis modules
+
+- [Filtering](docs/wiki/modules/filtering.md)
+- [Formatting](docs/wiki/modules/formatting.md)
+- [QC Summary](docs/wiki/modules/qc-summary.md)
+- [Manhattan Plots](docs/wiki/modules/manhattan.md)
+- [Imputation](docs/wiki/modules/imputation.md)
+- [LD Annotation](docs/wiki/modules/ld-annotation.md)
+- [LD Clumping](docs/wiki/modules/ld-clumping.md)
+- [LDSC Heritability](docs/wiki/modules/ldsc.md)
+- [Fine Mapping](docs/wiki/modules/fine-mapping.md)
+- [MAGMA](docs/wiki/modules/magma.md)
+- [GCTA Gene Analysis](docs/wiki/modules/gcta-gene.md)
+- [MAGMAcovar](docs/wiki/modules/magmacovar.md)
+- [Single-Cell Integration](docs/wiki/modules/single-cell.md)
+- [PoPS](docs/wiki/modules/pops.md)
+- [K-POPS](docs/modules/kpops.md)
+- [CALDERA](docs/modules/caldera.md)
+- [FLAMES](docs/wiki/modules/flames.md)
+- [MiXeR](docs/wiki/modules/mixer.md)
+- [Pathway Enrichment](docs/wiki/modules/pathway-enrichment.md)
+
+### Reference
+
+- [Input Data](docs/wiki/reference/input-data.md)
+- [Reference Resources](docs/wiki/reference/reference-resources.md)
+- [Configuration Defaults](docs/wiki/reference/configuration-defaults.md)
+- [Output Structure](docs/wiki/reference/output-structure.md)
+- [Command Reference](docs/wiki/reference/command-reference.md)
+- [Validation Reference](docs/wiki/reference/validation.md)
+- [Scientific References](docs/wiki/reference/scientific-references.md)
+- [scDRS Evidence Review](docs/wiki/reference/scdrs-evidence-review.md)
+
+### Help
+
+- [Troubleshooting](docs/wiki/help/troubleshooting.md)
+- [Frequently Asked Questions](docs/wiki/help/faq.md)
+- [Error Messages](docs/wiki/help/error-messages.md)
 
 ## Installation
 
