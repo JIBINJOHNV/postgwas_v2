@@ -1,0 +1,74 @@
+resource:
+  name: NCBI dbSNP Build 157 current and historical rsID reference
+  genome_build: GRCh37.p13
+  assembly_accession: GCF_000001405.25
+  dbsnp_build: 157
+  output_directory: /Users/JJOHN41/Documents/software_resources/resourses/postgwas_v2/dbsnp_build157_grch37
+
+downloads:
+  - name: assembly_report
+    filename: GCF_000001405.25_GRCh37.p13_assembly_report.txt
+    url: https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/405/GCF_000001405.25_GRCh37.p13/GCF_000001405.25_GRCh37.p13_assembly_report.txt
+  - name: json_readme
+    filename: JSON_README.txt
+    url: https://ftp.ncbi.nih.gov/snp/latest_release/JSON/JSON_README.txt
+  - name: merged_json
+    filename: refsnp-merged.json.bz2
+    url: https://ftp.ncbi.nih.gov/snp/latest_release/JSON/refsnp-merged.json.bz2
+    md5_filename: refsnp-merged.json.bz2.md5
+    md5_url: https://ftp.ncbi.nih.gov/snp/latest_release/JSON/refsnp-merged.json.bz2.md5
+  - name: withdrawn_json
+    filename: refsnp-withdrawn.json.bz2
+    url: https://ftp.ncbi.nih.gov/snp/latest_release/JSON/refsnp-withdrawn.json.bz2
+    md5_filename: refsnp-withdrawn.json.bz2.md5
+    md5_url: https://ftp.ncbi.nih.gov/snp/latest_release/JSON/refsnp-withdrawn.json.bz2.md5
+  - name: grch37_vcf
+    filename: GCF_000001405.25.gz
+    url: https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.25.gz
+    md5_filename: GCF_000001405.25.gz.md5
+    md5_url: https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.25.gz.md5
+  - name: grch37_vcf_index
+    filename: GCF_000001405.25.gz.tbi
+    url: https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.25.gz.tbi
+    md5_filename: GCF_000001405.25.gz.tbi.md5
+    md5_url: https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.25.gz.tbi.md5
+
+inputs:
+  grch37_vcf: grch37_vcf
+  grch37_vcf_index: grch37_vcf_index
+  merged_json: merged_json
+  withdrawn_json: withdrawn_json
+  assembly_report: assembly_report
+
+chromosome_policy:
+  assembly_report_sequence_column: Sequence-Name
+  assembly_report_role_column: Sequence-Role
+  assembly_report_accession_column: RefSeq-Accn
+  assembly_report_length_column: Sequence-Length
+  included_sequence_role: assembled-molecule
+  expected_primary_labels: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", X, Y, MT]
+
+processing:
+  curl_executable: curl
+  bcftools_executable: bcftools
+  download_workers: 2
+  download_retries: 8
+  bcftools_threads: 4
+  partial_suffix: .partial
+  output_index_type: csi
+  alias_compression_level: 6
+
+directories:
+  downloads: downloads
+  derived: derived
+  metadata: metadata
+  logs: logs
+
+outputs:
+  standardized_vcf: dbsnp_build157.GRCh37.primary_chromosomes.vcf.gz
+  chromosome_map: GRCh37p13_refseq_to_standard_chromosomes.tsv
+  primary_targets: GRCh37p13_primary_chromosomes.txt
+  merged_alias_table: dbsnp_build157_merged_rsid_aliases.tsv.gz
+  withdrawn_status_table: dbsnp_build157_withdrawn_rsid_status.tsv.gz
+  manifest: resource_manifest.yaml
+  log: preparation.jsonl

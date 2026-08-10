@@ -1,0 +1,10 @@
+execution:
+  threads: 1
+  memory_gb: 4
+pipeline:
+  modules: [filtering, qc_summary]
+modules:
+  filtering:
+    enabled: true
+  qc_summary:
+    enabled: true

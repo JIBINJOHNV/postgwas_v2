@@ -1,0 +1,132 @@
+enabled: false
+
+# With no SNP list, reproduce the standard paper-style COJO discovery analysis:
+# stepwise selection of independently associated signals.
+mode: slct
+input_file: null
+genome_build: null
+reference:
+  prefix: null
+  population: null
+  required_extensions: [.bed, .bim, .fam]
+  bim_columns: [chromosome, variant_id, genetic_distance, position, allele1, allele2]
+  table_delimiter_pattern: '\s+'
+inputs:
+  condition_snps: null
+  joint_snps: null
+  extract_snps: null
+  exclude_snps: null
+input_validation:
+  minimum_reference_overlap_fraction: 0.50
+  reference_sample_size_warning_threshold: 4000
+  sqlite_batch_size: 10000
+  table_delimiter_pattern: '\s+'
+  temporary_database_prefix: .gcta_cojo_validation_
+  temporary_database_suffix: .sqlite
+analysis:
+  significance_threshold: 5.0e-8
+  top_snp_count: 10
+  window_kb: 10000
+  collinearity_cutoff: 0.9
+  frequency_difference_max: 0.2
+  reference_maf_min: 0.01
+  genomic_control: false
+  genomic_control_lambda: null
+  chromosome: null
+reporting:
+  top_result_count: 10
+  p_value_significant_digits: 4
+  finding_threshold: 5.0e-8
+log_parsing:
+  warning_pattern: '(?i)\bwarning\b'
+  maximum_warning_messages: 20
+minimum_gcta_version: 1.94.1
+version_arguments: [--version]
+version_pattern: '(?i)(?:gcta[^0-9]*)?v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+version_probe_output_argument: --out
+version_probe_output_name: probe
+version_probe_temporary_prefix: .gcta_cojo_version_probe_
+output_layout:
+  log_file: 'logs/{dataset_id}_{mode}_gcta_cojo.log'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  completion_manifest: 'run_metadata/{dataset_id}_{mode}_gcta_cojo_completion.yaml'
+  output_prefix: 'raw/{dataset_id}_{mode}'
+  staging_directory: '.partial/{dataset_id}_{mode}'
+  normalized_result: 'results/{dataset_id}_{mode}_gcta_cojo.tsv'
+  primary_results:
+    slct: 'raw/{dataset_id}_{mode}.jma.cojo'
+    top_snps: 'raw/{dataset_id}_{mode}.jma.cojo'
+    joint: 'raw/{dataset_id}_{mode}.jma.cojo'
+    cond: 'raw/{dataset_id}_{mode}.cma.cojo'
+  ld_matrix_result: 'raw/{dataset_id}_{mode}.jma.ldr.cojo'
+  gcta_log_result: 'raw/{dataset_id}_{mode}.log'
+results:
+  delimiter: auto
+  delimiter_candidates: [tab, whitespace]
+  sample_lines: 25
+  infer_schema_length: 1000
+  maximum_columns: 32
+  null_values: [NA, NaN, nan, .]
+  normalized_delimiter: "\t"
+  normalized_null_value: NA
+  atomic_output_suffix: .tmp
+  estimation_status_column: estimation_status
+  estimated_status: estimated
+  not_estimable_status: not_estimable_collinearity
+  schemas:
+    slct:
+      required_columns: [Chr, SNP, bp, freq, refA, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
+      numeric_columns: [bp, freq, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
+      required_numeric_columns: [bp, freq, b, se, p, n, freq_geno]
+      positive_columns: [bp, se, n]
+      integer_columns: [bp]
+      closed_unit_interval_columns: [freq, freq_geno]
+      identifier_column: SNP
+      chromosome_column: Chr
+      position_column: bp
+      marginal_p_value_column: p
+      p_value_column: pJ
+      adjusted_effect_column: bJ
+      adjusted_standard_error_column: bJ_se
+    top_snps:
+      required_columns: [Chr, SNP, bp, freq, refA, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
+      numeric_columns: [bp, freq, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
+      required_numeric_columns: [bp, freq, b, se, p, n, freq_geno]
+      positive_columns: [bp, se, n]
+      integer_columns: [bp]
+      closed_unit_interval_columns: [freq, freq_geno]
+      identifier_column: SNP
+      chromosome_column: Chr
+      position_column: bp
+      marginal_p_value_column: p
+      p_value_column: pJ
+      adjusted_effect_column: bJ
+      adjusted_standard_error_column: bJ_se
+    joint:
+      required_columns: [Chr, SNP, bp, freq, refA, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
+      numeric_columns: [bp, freq, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
+      required_numeric_columns: [bp, freq, b, se, p, n, freq_geno]
+      positive_columns: [bp, se, n]
+      integer_columns: [bp]
+      closed_unit_interval_columns: [freq, freq_geno]
+      identifier_column: SNP
+      chromosome_column: Chr
+      position_column: bp
+      marginal_p_value_column: p
+      p_value_column: pJ
+      adjusted_effect_column: bJ
+      adjusted_standard_error_column: bJ_se
+    cond:
+      required_columns: [Chr, SNP, bp, freq, refA, b, se, p, n, freq_geno, bC, bC_se, pC]
+      numeric_columns: [bp, freq, b, se, p, n, freq_geno, bC, bC_se, pC]
+      required_numeric_columns: [bp, freq, b, se, p, n, freq_geno]
+      positive_columns: [bp, se, n]
+      integer_columns: [bp]
+      closed_unit_interval_columns: [freq, freq_geno]
+      identifier_column: SNP
+      chromosome_column: Chr
+      position_column: bp
+      marginal_p_value_column: p
+      p_value_column: pC
+      adjusted_effect_column: bC
+      adjusted_standard_error_column: bC_se

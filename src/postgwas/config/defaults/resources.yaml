@@ -1,0 +1,34 @@
+root: null
+executables:
+  bash: bash
+  bcftools: bcftools
+  tabix: tabix
+  plink: plink
+  plink2: plink2
+  magma: magma
+  scdrs: scdrs
+  finemap: finemap
+  gcta: gcta64
+  rscript: Rscript
+  python: python
+  mixer: /tools/mixer/precimed/mixer.py
+  mixer_figures: /tools/mixer/precimed/mixer_figures.py
+  pigz: pigz
+containers:
+  mixer:
+    runtime: docker
+    image: ghcr.io/precimed/gsa-mixer:2.2.1
+    platform: linux/amd64
+    python: python
+    mixer: /tools/mixer/precimed/mixer.py
+    mixer_figures: /tools/mixer/precimed/mixer_figures.py
+    use_host_user: true
+genomes:
+  GRCh37: {}
+  GRCh38: {}
+populations:
+  EUR: {}
+  AFR: {}
+  EAS: {}
+  SAS: {}
+  AMR: {}

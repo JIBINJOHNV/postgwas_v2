@@ -1,0 +1,165 @@
+enabled: false
+genome_build: GRCh37
+population: EUR
+gene_window_upstream_kb: 35
+gene_window_downstream_kb: 10
+gene_model: snp-wise=mean
+input:
+  snp_location_file: null
+  p_value_file: null
+  ld_reference_prefix: null
+  gene_location_file: null
+  gene_set_file: null
+  sample_size_column: N_COL
+  table_delimiter_pattern: '\s+'
+  output_table_delimiter: "\t"
+  chromosome_prefix_pattern: '(?i)^chr'
+  chromosome_aliases: {'23': X, '24': Y, '25': XY, '26': MT, M: MT}
+  invalid_chromosome_labels: ['', '.']
+  invalid_allele_labels: ['', '.']
+  variant_id_column: SNP
+  chromosome_column: CHR
+  position_column: BP
+  reference_allele_column: REF
+  alternate_allele_column: ALT
+  p_value_column: P
+  required_reference_extensions: [.bed, .bim, .fam]
+  bim_extension: .bim
+  bim_columns: [chromosome, variant_id, genetic_distance, position, allele1, allele2]
+  gene_location_has_header: false
+  gene_location_columns: [gene_id, chromosome, start, end]
+snp_harmonisation:
+  resolve_variants_to_reference: false
+  minimum_overlap_fraction: 0.50
+  duplicate_policy: lowest_p
+gene_sets:
+  input_format: auto
+  minimum_gene_id_overlap_fraction: 0.50
+  membership_delimiter_pattern: '\s+'
+  membership_has_header: false
+  membership_set_column: 0
+  membership_gene_column: 1
+annotation_validation:
+  minimum_bim_variant_overlap_fraction: 0.50
+  coordinate_pattern: '^(?P<chromosome>[^:]+):(?P<start>[0-9]+):(?P<end>[0-9]+)$'
+  comment_prefix: '#'
+  invalid_variant_identifiers: ['.']
+mapping:
+  selected: [positional]
+  primary: positional
+  definitions:
+    positional:
+      method: positional
+      display_name: Positional MAGMA
+      genome_build: GRCh37
+      population: EUR
+      gene_id_type: entrez
+      context: protein-coding gene body with configured windows
+      source_name: NCBI gene locations distributed by MAGMA
+      source_version: NCBI37.3
+      source_url: https://cncr.nl/research/magma/
+      result_statistic_type: calibrated_gene_p_value
+      result_statistic_interpretation: MAGMA gene association p-value
+      gene_location_file: null
+      gene_annotation_file: null
+      gene_annotation_files: []
+      gene_set_file: null
+      gene_set_format: auto
+      minimum_gene_id_overlap_fraction: null
+      gene_settings: []
+      annotation_window_upstream_kb: null
+      annotation_window_downstream_kb: null
+      regulatory_element_location_file: null
+      element_to_gene_file: null
+chrom_magma_mapping:
+  mapping_delimiter_pattern: '\s+'
+  mapping_has_header: false
+  location_delimiter_pattern: '\s+'
+  location_has_header: false
+  element_id_column: 0
+  chromosome_column: 1
+  start_column: 2
+  end_column: 3
+  gene_id_column: 4
+  score_column: 5
+  minimum_element_mapping_fraction: 0.95
+  gene_assignment_policy: lowest_p
+  result_element_column: GENE
+  result_p_value_column: P
+  report_element_column: selected_regulatory_element
+  report_element_count_column: mapped_regulatory_element_count
+  report_source_score_column: element_to_gene_source_score
+  report_original_column_prefix: element_
+  tie_breaker: element_id
+batching:
+  enabled: true
+  minimum_genes_per_batch: 1000
+  memory_per_process_gb: 16
+multiple_testing:
+  reporting_significance_threshold: 0.05
+  reporting_method_labels:
+    bonferroni: Bonferroni
+    sidak: Šidák
+    holm: Holm
+    fdr_bh: BH-FDR
+  gene_methods: [bonferroni, fdr_bh]
+  global_methods: [bonferroni, sidak, holm, fdr_bh]
+  families:
+    go_kegg_reactome:
+      pattern: '^(?:GOBP_|GOCC_|GOMF_|KEGG_|REACTOME_)'
+      methods: [bonferroni, fdr_bh]
+    go:
+      pattern: '^(?:GOBP_|GOCC_|GOMF_)'
+      methods: [bonferroni, fdr_bh]
+    reactome:
+      pattern: '^REACTOME_'
+      methods: [bonferroni, fdr_bh]
+    kegg:
+      pattern: '^KEGG_'
+      methods: [bonferroni, fdr_bh]
+result_schema:
+  table_delimiter_pattern: '\s+'
+  gene_set_name_column: VARIABLE
+  gene_set_p_value_column: P
+  gene_set_full_name_column: FULL_NAME
+  gene_id_column: GENE
+  gene_p_value_column: P
+  global_correction_column_pattern: 'P_{method}_corr'
+  family_correction_column_pattern: '{family}_P_{method}_corr'
+  report_dataset_column: dataset_id
+  report_gene_set_description_column: gene_set_description
+  report_input_genes_column: input_genes
+  report_common_genes_column: CommonGenes
+  report_common_gene_p_values_column: CommonGenes_Pvalues
+  report_total_genes_column: TotalGenes
+  report_common_gene_count_column: CommonGeneCount
+  report_mapping_name_column: mapping_analysis
+  report_mapping_method_column: mapping_method
+  report_mapping_context_column: biological_context
+  report_gene_id_type_column: gene_id_type
+  report_source_name_column: annotation_source
+  report_source_version_column: annotation_version
+  report_statistic_type_column: result_statistic_type
+  report_statistic_interpretation_column: result_statistic_interpretation
+  report_delimiter: "\t"
+  report_null_value: NA
+minimum_magma_version: '1.10'
+version_arguments: [--version]
+version_pattern: '(?i)MAGMA\s+(?:version:\s+)?v([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+output_layout:
+  log_file: 'logs/{dataset_id}_magma.log'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  staging_directory: '.partial/{dataset_id}_magma'
+  harmonised_p_values: 'inputs/{dataset_id}_magma_p_values_harmonised.tsv'
+  harmonised_snp_locations: 'inputs/{dataset_id}_magma_snp_locations_harmonised.tsv'
+  annotation_prefix: 'raw/{dataset_id}_magma_annotation'
+  component_annotation_prefix: 'raw/{dataset_id}_magma_positional_component'
+  gene_result_prefix: 'results/{dataset_id}_magma_{upstream}up_{downstream}down'
+  gene_set_prefix: 'raw/{dataset_id}_magma_gene_sets'
+  corrected_genes: 'results/{dataset_id}_magma_genes_corrected.tsv'
+  corrected_gene_sets: 'results/{dataset_id}_magma_gene_sets_corrected.tsv'
+  annotated_gene_sets: 'results/{dataset_id}_magma_gene_sets_annotated.tsv'
+  prepared_gene_sets: 'inputs/{dataset_id}_magma_gene_sets.txt'
+  chrom_magma_genes: 'results/{dataset_id}_chrom_magma_genes.tsv'
+  mapping_directory: 'mappings/{analysis}'
+  mapping_comparison: 'results/{dataset_id}_magma_mapping_comparison.tsv'

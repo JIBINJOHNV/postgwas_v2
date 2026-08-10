@@ -1,0 +1,7 @@
+enabled: true
+genome_build: GRCh37
+gene_annotation_file: null
+kernel_matrix_prefix: null
+magma_association_prefix: null
+training_chromosomes: [loco]
+device: cpu

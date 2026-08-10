@@ -1,0 +1,159 @@
+
+# ===========================================================================
+# What every row of the --config CSV must supply, in the CONFIG COLUMN NAMES
+# used in that file.  A group is satisfied when every key of ANY ONE
+# alternative is set (not blank, not NA).  A config that fails this is
+# rejected before the summary statistics file is opened.
+#
+# Editing this changes what is accepted.  Set `required: false` to stop
+# demanding a group, or add an alternative to accept another source.
+# ===========================================================================
+required_inputs:
+
+  # the input summary statistics file   ->   sumstat_file
+  sumstat_file:
+    required: true
+    any_of:
+      - [sumstat_file]
+
+  # the output name for this dataset   ->   gwas_outputname
+  gwas_outputname:
+    required: true
+    any_of:
+      - [gwas_outputname]
+
+  # chromosome and position   ->   chr_col + pos_col  or  chr_pos_col
+  coordinates:
+    required: true
+    any_of:
+      - [chr_col, pos_col]
+      - [chr_pos_col]
+
+  # effect and other allele   ->   ea_col + oa_col
+  alleles:
+    required: true
+    any_of:
+      - [ea_col, oa_col]
+
+  # effect allele frequency   ->   eaf_col  or  eaffile + eafcolumn
+  eaf:
+    required: true
+    any_of:
+      - [eaf_col]
+      - [eaffile, eafcolumn]
+
+  # effect estimate   ->   beta_or_col  or  imp_z_col
+  effect:
+    required: true
+    any_of:
+      - [beta_or_col]
+      - [imp_z_col]
+
+  # p-value   ->   pval_col
+  pvalue:
+    required: true
+    any_of:
+      - [pval_col]
+
+  # sample size   ->   ncontrol_col  or  ncontrol
+  sample_size:
+    required: true
+    any_of:
+      - [ncontrol_col]
+      - [ncontrol]
+
+  # imputation quality   ->   imp_info_col  or  infofile + infocolumn
+  info:
+    required: true
+    any_of:
+      - [imp_info_col]
+      - [infofile, infocolumn]
+
+  # the resource folder   ->   resourse_folder
+  resourse_folder:
+    required: true
+    any_of:
+      - [resourse_folder]
+
+  # the output folder   ->   output_folder
+  output_folder:
+    required: true
+    any_of:
+      - [output_folder]
+# postgwas - the settings most runs need.
+# Every value shown is the shipped default; delete any line you are not
+# changing.  For the complete set:  python -m harmonisation.policies --yaml
+# Pass this file with --parameter-config.
+policies:
+
+  # 01  dataset 03 / chromosome 02   chromosome naming and filtering
+  chromosome:
+    drop_mt:                   true            # What it does: Whether mitochondrial variants are thrown…
+
+  # 02  dataset 03 / chromosome 02   position parsing and bounds
+  position:
+    min_value:                 0               # What it does: The smallest base-pair position a variant…
+
+  # 03  dataset 05      genome build inference
+  build:
+    mode:                      auto            # auto | GRCh37 | GRCh38
+    min_match_fraction:        0.0             # What it does: Sets the smallest share of comparable…
+
+  # 04  dataset 07      beta or odds ratio - decided ONCE for the study
+  effect:
+    type:                      auto            # auto | beta | odds_ratio
+
+  # 05  dataset 07      p-value scale - decided ONCE for the study
+  pvalue:
+    type:                      auto            # auto | raw | neglog10 | negln
+
+  # 06  chromosome 04   effect allele frequency
+  eaf:
+    out_of_range:              clip            # clip | null | reject | fail
+    palindromic_handling:      ignore          # ignore | resolve_by_frequency | null | reject
+    degenerate:                reject          # reject | null | keep | fail
+    on_maf_check_inconclusive: accept          # accept | reject | fail
+
+  # 07  chromosome 05   sample size and effective N
+  sample_size:
+    cases_only:                use_ncase       # use_ncase | fail
+
+  # 08  chromosome 11   the SE / BETA / Z gates
+  validation:
+    se_invalid:                reject          # reject | keep | fail
+    beta_zero:                 reject          # keep | reject | fail
+    z_pval_concordance:        "off"           # off | warn | reject | fail
+    max_reject_fraction:       1.0             # What it does: Sets the share of a chromosome's variants…
+
+  # 09  chromosome 12   imputation quality
+  info:
+    out_of_range:              clip            # clip | null | reject | fail
+
+  # 10  chromosome 14   final completeness gate
+  final_check:
+    on_missing:                reject          # reject | keep | fail
+
+  # 11  post-merge 04   the QC-passed variant filter
+  filter:
+    af_diff_cutoff:            0.2             # What it does: Sets how far the study's allele frequency…
+    maf_cutoff:                0.01            # What it does: Sets the minor allele frequency below…
+    info_cutoff:               0.7             # What it does: Sets the lowest imputation quality score a…
+    include_indels:            false           # What it does: Decides whether insertions and deletions…
+    lp_cutoff:                 null            # What it does: Sets a significance threshold for the…
+    exclude_palindromic:       true            # What it does: Removes strand-ambiguous variants (A/T and…
+    remove_mhc:                true            # What it does: Cuts the major histocompatibility complex…
+
+  # 12  post-merge 03 and 05   QC summary
+  qc:
+    target_build:              GRCh37          # GRCh37 | GRCh38 | input
+
+  # 13  throughout      threads, retries, memory
+  execution:
+    threads_per_chromosome:    5               # What it does: How many threads one chromosome worker…
+    max_retry_rounds:          2               # What it does: How many extra passes over the…
+    fail_dataset_on_chr_error: true            # What it does: Decides whether a dataset with an…
+    max_mem_per_job:           12G             # What it does: The memory ceiling handed to bcftools sort…
+
+  # 14  throughout      logging and screen output
+  logging:
+    level:                     INFO            # DEBUG | INFO | WARNING | ERROR

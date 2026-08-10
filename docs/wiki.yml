@@ -1,0 +1,183 @@
+wiki:
+  title: PostGWAS User Guide
+  footer_source: docs/wiki/footer.md
+  pages:
+    - title: Home
+      slug: Home
+      source: docs/wiki/home.md
+    - title: Installation
+      slug: Installation
+      source: docs/wiki/getting-started/installation.md
+      section: Getting Started
+    - title: Quick Start
+      slug: Quick-Start
+      source: docs/wiki/getting-started/quick-start.md
+      section: Getting Started
+    - title: Resource Setup
+      slug: Resource-Setup
+      source: docs/wiki/getting-started/resource-setup.md
+      section: Getting Started
+    - title: Configuration
+      slug: Configuration
+      source: docs/wiki/core/configuration.md
+      section: Core Concepts
+    - title: Pipeline Workflow
+      slug: Pipeline-Workflow
+      source: docs/wiki/core/pipeline-workflow.md
+      section: Core Concepts
+    - title: Input and Output Contracts
+      slug: Input-and-Output-Contracts
+      source: docs/wiki/core/input-output-contracts.md
+      section: Core Concepts
+    - title: Logging and Reproducibility
+      slug: Logging-and-Reproducibility
+      source: docs/wiki/core/logging-and-reproducibility.md
+      section: Core Concepts
+    - title: Scientific Considerations
+      slug: Scientific-Considerations
+      source: docs/wiki/core/scientific-considerations.md
+      section: Core Concepts
+    - title: Running Modules Independently
+      slug: Running-Modules-Independently
+      source: docs/wiki/core/running-modules-independently.md
+      section: Core Concepts
+    - title: Harmonisation Overview
+      slug: Harmonisation
+      source: docs/wiki/harmonisation/overview.md
+      section: Harmonisation
+    - title: Harmonisation Sample Sheet
+      slug: Harmonisation-Sample-Sheet
+      source: docs/wiki/harmonisation/sample-sheet.md
+      section: Harmonisation
+    - title: Harmonisation Configuration
+      slug: Harmonisation-Configuration
+      source: docs/modules/harmonisation/configuration.md
+      section: Harmonisation
+    - title: Harmonisation Processing Order
+      slug: Harmonisation-Processing-Order
+      source: docs/wiki/harmonisation/processing-order.md
+      section: Harmonisation
+    - title: Harmonisation Outputs and QC
+      slug: Harmonisation-Outputs-and-QC
+      source: docs/wiki/harmonisation/outputs-and-qc.md
+      section: Harmonisation
+    - title: Filtering
+      slug: Filtering
+      source: docs/wiki/modules/filtering.md
+      section: Analysis Modules
+    - title: Formatting
+      slug: Formatting
+      source: docs/wiki/modules/formatting.md
+      section: Analysis Modules
+    - title: QC Summary
+      slug: QC-Summary
+      source: docs/wiki/modules/qc-summary.md
+      section: Analysis Modules
+    - title: Manhattan Plots
+      slug: Manhattan-Plots
+      source: docs/wiki/modules/manhattan.md
+      section: Analysis Modules
+    - title: Imputation
+      slug: Imputation
+      source: docs/wiki/modules/imputation.md
+      section: Analysis Modules
+    - title: LD Annotation
+      slug: LD-Annotation
+      source: docs/wiki/modules/ld-annotation.md
+      section: Analysis Modules
+    - title: LD Clumping
+      slug: LD-Clumping
+      source: docs/wiki/modules/ld-clumping.md
+      section: Analysis Modules
+    - title: LDSC Heritability
+      slug: LDSC-Heritability
+      source: docs/wiki/modules/ldsc.md
+      section: Analysis Modules
+    - title: Fine Mapping
+      slug: Fine-Mapping
+      source: docs/wiki/modules/fine-mapping.md
+      section: Analysis Modules
+    - title: MAGMA
+      slug: MAGMA
+      source: docs/wiki/modules/magma.md
+      section: Analysis Modules
+    - title: GCTA Gene Analysis
+      slug: GCTA-Gene-Analysis
+      source: docs/wiki/modules/gcta-gene.md
+      section: Analysis Modules
+    - title: MAGMAcovar
+      slug: MAGMAcovar
+      source: docs/wiki/modules/magmacovar.md
+      section: Analysis Modules
+    - title: Single-Cell Integration
+      slug: Single-Cell-Integration
+      source: docs/wiki/modules/single-cell.md
+      section: Analysis Modules
+    - title: PoPS
+      slug: PoPS
+      source: docs/wiki/modules/pops.md
+      section: Analysis Modules
+    - title: K-POPS
+      slug: K-POPS
+      source: docs/modules/kpops.md
+      section: Analysis Modules
+    - title: CALDERA
+      slug: CALDERA
+      source: docs/modules/caldera.md
+      section: Analysis Modules
+    - title: FLAMES
+      slug: FLAMES
+      source: docs/wiki/modules/flames.md
+      section: Analysis Modules
+    - title: MiXeR
+      slug: MiXeR
+      source: docs/wiki/modules/mixer.md
+      section: Analysis Modules
+    - title: Pathway Enrichment
+      slug: Pathway-Enrichment
+      source: docs/wiki/modules/pathway-enrichment.md
+      section: Analysis Modules
+    - title: Input Data
+      slug: Input-Data
+      source: docs/wiki/reference/input-data.md
+      section: Reference
+    - title: Reference Resources
+      slug: Reference-Resources
+      source: docs/wiki/reference/reference-resources.md
+      section: Reference
+    - title: Configuration Defaults
+      slug: Configuration-Defaults
+      source: docs/wiki/reference/configuration-defaults.md
+      section: Reference
+    - title: Output Structure
+      slug: Output-Structure
+      source: docs/wiki/reference/output-structure.md
+      section: Reference
+    - title: Command Reference
+      slug: Command-Reference
+      source: docs/wiki/reference/command-reference.md
+      section: Reference
+    - title: Validation Reference
+      slug: Validation-Reference
+      source: docs/wiki/reference/validation.md
+      section: Reference
+    - title: Scientific References
+      slug: Scientific-References
+      source: docs/wiki/reference/scientific-references.md
+      section: Reference
+    - title: scDRS Evidence Review
+      slug: scDRS-Evidence-Review
+      source: docs/wiki/reference/scdrs-evidence-review.md
+      section: Reference
+    - title: Troubleshooting
+      slug: Troubleshooting
+      source: docs/wiki/help/troubleshooting.md
+      section: Help
+    - title: Frequently Asked Questions
+      slug: Frequently-Asked-Questions
+      source: docs/wiki/help/faq.md
+      section: Help
+    - title: Error Messages
+      slug: Error-Messages
+      source: docs/wiki/help/error-messages.md
+      section: Help

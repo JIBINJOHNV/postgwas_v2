@@ -1,0 +1,60 @@
+enabled: false
+genome_build: null
+minimum_gene_count: 10
+magma_association_prefix: null
+feature_matrix_prefix: null
+feature_matrix_chunks: 2
+gene_location_file: null
+control_features_file: null
+target_score_file: null
+target_covariates_file: null
+target_error_covariance_file: null
+use_magma_covariates: true
+use_magma_error_covariance: true
+covariate_projection_chromosomes: null
+remove_hla_during_covariate_projection: true
+feature_subset_file: null
+feature_selection_chromosomes: null
+feature_selection_p_cutoff: 0.05
+maximum_selected_features: null
+forward_selected_features: null
+remove_hla_during_feature_selection: true
+training_chromosomes: null
+remove_hla_during_training: true
+method: ridge
+save_matrix_files: false
+verbose: false
+reporting:
+  top_gene_count: 10
+  score_decimal_places: 4
+input_schema:
+  table_delimiter_pattern: '\s+'
+  target_table_delimiter: "\t"
+  gene_annotation_id_column: ENSGID
+  gene_annotation_name_column: NAME
+  gene_annotation_chromosome_column: CHR
+  gene_annotation_tss_column: TSS
+  magma_gene_id_column: GENE
+  magma_score_column: ZSTAT
+  target_gene_id_column: ENSGID
+  target_score_column: Score
+  feature_rows_suffix: .rows.txt
+  feature_columns_pattern: '.cols.{chunk}.txt'
+  feature_matrix_pattern: '.mat.{chunk}.npy'
+  magma_genes_out_suffix: .genes.out
+  magma_genes_raw_suffix: .genes.raw
+  prediction_score_column: PoPS_Score
+  prediction_training_column: training_gene
+  marginal_selected_column: selected
+output_layout:
+  output_prefix: '{dataset_id}_pops'
+  staging_directory: '.partial/{dataset_id}_pops'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  completion_manifest: 'run_metadata/{dataset_id}_pops_completion.yaml'
+  service_log_file: 'logs/{dataset_id}_pops_service.log'
+  predictions_suffix: .preds
+  coefficients_suffix: .coefs
+  marginals_suffix: .marginals
+  upstream_log_suffix: .log
+  training_data_suffix: .traindata
+  matrix_data_suffix: .matdata

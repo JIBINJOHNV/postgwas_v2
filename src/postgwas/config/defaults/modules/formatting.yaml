@@ -1,0 +1,181 @@
+enabled: false
+formats: []
+format_order: [magma, gcta_gene, susie, finemap, pred_ld, ldsc, mixer]
+module_formats:
+  imputation: [pred_ld]
+  heritability: [ldsc]
+  ldsc: [ldsc]
+  magma: [magma]
+  magmacovar: [magma]
+  pops: [magma]
+  flames: [magma, susie, finemap]
+  finemap: [susie, finemap]
+  fine_mapping: [susie, finemap]
+  mixer: [mixer]
+  gcta_cojo: [gcta_gene]
+  gcta_gene: [gcta_gene]
+
+# Only fields consumed by the selected formatter targets are written to
+# per-step resolved metadata. Omitted values reload from these canonical defaults.
+resolved_config:
+  common_fields: [formats, minimum_p_value, vcf_fields, numeric_columns, canonical_columns, chromosome_labels, variant_identifiers, study_design, runtime, vcf_include_expression]
+  format_fields:
+    magma: [exports.magma]
+    gcta_gene: [exports.gcta_gene]
+    susie: [exports.susie]
+    finemap: [exports.finemap]
+    pred_ld: [chromosomes, exports.pred_ld]
+    ldsc: [exports.ldsc]
+    mixer: [chromosomes, exports.mixer, mixer]
+chromosomes: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22']
+minimum_p_value: 1.0e-300
+
+# Canonical formatter-table column -> bcftools query expression.
+vcf_fields:
+  CHROM: '%CHROM'
+  POS: '%POS'
+  ID: '%ID'
+  REF: '%REF'
+  ALT: '%ALT'
+  BETA: '[%ES]'
+  SE: '[%SE]'
+  Z: '[%EZ]'
+  LP: '[%LP]'
+  EAF: '[%AF]'
+  INFO: '[%SI]'
+  N: '[%SS]'
+  NEFF: '[%NEF]'
+  N_CASE: '[%NC]'
+  N_CONTROL: '[%NCO]'
+
+numeric_columns: [BETA, SE, Z, LP, EAF, INFO, N, NEFF, N_CASE, N_CONTROL]
+canonical_columns:
+  chromosome: CHROM
+  position: POS
+  variant_id: ID
+  reference_allele: REF
+  alternate_allele: ALT
+  resolved_variant_id: SNP
+chromosome_labels:
+  prefix_pattern: '(?i)^chr'
+  aliases: {}
+variant_identifiers:
+  default_type: rsid
+  target_types: {}
+  rsid_pattern: '(?i)^rs[0-9]+$'
+  rsid_extraction_pattern: '(?i)(?:^|;)(rs[0-9]+)(?:;|$)'
+  unique_id_template: '{chromosome}_{position}_{reference_allele}_{alternate_allele}'
+study_design:
+  case_count_column: N_CASE
+  control_count_column: N_CONTROL
+runtime:
+  log_file: 'logs/{dataset_id}_formatter.log'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  completion_manifest_file: run_metadata/formatter_completion.yaml
+  temporary_table_prefix: '.{dataset_id}_formatter_'
+  temporary_table_suffix: .tsv
+  atomic_output_suffix: .tmp
+  atomic_uncompressed_suffix: .uncompressed.tmp
+  table_delimiter: "\t"
+  input_null_values: ['', '.']
+  output_null_value: NA
+  compressed_suffixes: [.gz]
+  io_buffer_bytes: 1048576
+vcf_include_expression: 'N_ALT=1'
+
+# Every mapping is canonical formatter-table column -> downstream column name.
+exports:
+  magma:
+    validation:
+      required_columns: [SNP, CHROM, POS, REF, ALT, LP, N]
+      positive_columns: [N]
+      nonnegative_columns: [LP]
+    outputs:
+      snp_location:
+        output_file: '{dataset_id}_magma_snp_loc.tsv'
+        columns: {SNP: SNP, CHROM: CHR, POS: BP, REF: REF, ALT: ALT}
+      p_values:
+        output_file: '{dataset_id}_magma_p_values.tsv'
+        columns: {SNP: SNP, LP: P, N: N_COL}
+        transformations: {LP: negative_log10_to_raw_p}
+        integer_columns: [N]
+
+  gcta_gene:
+    outputs:
+      summary_statistics:
+        output_file: '{dataset_id}_gcta.ma'
+        columns: {SNP: SNP, ALT: A1, REF: A2, EAF: freq, BETA: BETA, SE: SE, LP: P, N: N}
+        transformations: {LP: negative_log10_to_raw_p}
+        integer_columns: [N]
+        validation:
+          required_columns: [SNP, ALT, REF, EAF, BETA, SE, LP, N]
+          positive_columns: [SE, N]
+          nonnegative_columns: [LP]
+          open_unit_interval_columns: [EAF]
+
+  susie:
+    output_file: '{dataset_id}_susie.tsv'
+    columns: {SNP: SNP, CHROM: CHR, POS: BP, REF: REF, ALT: ALT, Z: EZ, LP: LP, NEFF: NEF}
+    integer_columns: [NEFF]
+    validation:
+      required_columns: [SNP, CHROM, POS, REF, ALT, Z, LP, NEFF]
+      positive_columns: [NEFF]
+      nonnegative_columns: [LP]
+
+  finemap:
+    output_file: '{dataset_id}_finemap.tsv'
+    columns: {SNP: rsid, CHROM: chromosome, POS: position, ALT: allele1, REF: allele2, EAF: maf, BETA: beta, SE: se, NEFF: NEF}
+    transformations: {EAF: effect_frequency_to_minor_frequency}
+    integer_columns: [NEFF]
+    validation:
+      required_columns: [SNP, CHROM, POS, ALT, REF, EAF, BETA, SE, NEFF]
+      positive_columns: [SE, NEFF]
+      open_unit_interval_columns: [EAF]
+
+  pred_ld:
+    output_directory: pred_ld
+    partition_file: '{dataset_id}_chr{partition}_pred_ld_input.tsv'
+    partition_by: CHROM
+    columns: {SNP: snp, CHROM: chr, POS: pos, ALT: A1, REF: A2, BETA: beta, SE: SE, N_CONTROL: NC, N: SS, EAF: AF, LP: LP, INFO: SI}
+    integer_columns: [N_CONTROL, N]
+    validation:
+      required_columns: [SNP, CHROM, POS, ALT, REF, BETA, SE, N_CONTROL, N, EAF, LP, INFO]
+      positive_columns: [SE, N_CONTROL, N]
+      nonnegative_columns: [LP]
+      closed_unit_interval_columns: [EAF]
+
+  ldsc:
+    output_file: '{dataset_id}_ldsc_input.tsv'
+    columns: {SNP: SNP, ALT: A1, REF: A2, Z: Z, LP: P}
+    trait_columns:
+      binary: {N_CASE: N_CAS, N_CONTROL: N_CON}
+      quantitative: {N_CONTROL: N}
+    trailing_columns: {EAF: FRQ, INFO: INFO}
+    transformations: {LP: negative_log10_to_raw_p}
+    integer_columns: [N_CASE, N_CONTROL]
+    validation:
+      required_columns: [SNP, ALT, REF, Z, LP]
+      nonnegative_columns: [LP]
+    trait_required_columns:
+      binary: [N_CASE, N_CONTROL]
+      quantitative: [N_CONTROL]
+
+  mixer:
+    output_file: '{dataset_id}_mixer.sumstats.gz'
+    columns: {SNP: SNP, CHROM: CHR, POS: BP, ALT: A1, REF: A2, NEFF: N, Z: Z}
+    validation:
+      required_columns: [SNP, CHROM, POS, ALT, REF, NEFF, Z]
+      positive_columns: [POS, NEFF]
+
+# MiXeR-specific scientific QC parameters; all values remain configurable.
+mixer:
+  minimum_info: 0.8
+  minimum_sample_size_fraction: 0.5
+  snps_only: true
+  chromosome_column: CHROM
+  position_column: POS
+  effect_allele_column: ALT
+  other_allele_column: REF
+  sample_size_column: NEFF
+  info_column: INFO
+  allowed_alleles: [A, C, G, T]

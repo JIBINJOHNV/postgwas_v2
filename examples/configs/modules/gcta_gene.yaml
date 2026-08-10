@@ -1,0 +1,39 @@
+enabled: true
+method: fastbat_gene
+input_file: /path/to/STUDY_gcta.ma
+genome_build: GRCh37
+reference:
+  prefix: /path/to/1000G_EUR
+  population: EUR
+variant_harmonisation:
+  coordinate_fallback: true
+  chromosome_label_policy: strip_chr_prefix
+  minimum_overlap_fraction: 0.50
+  allow_strand_complement: false
+gene_annotation:
+  file: /path/to/glist_ensgid_hg19_v40.txt
+set_annotation:
+  file: null
+  gmt_file: null
+# For method: fastbat_set, set exactly one of set_annotation.file or
+# set_annotation.gmt_file. GMT conversion uses gene_annotation.file and the
+# PLINK BIM belonging to reference.prefix.
+print_component_p_values: true
+write_snpset: false
+reporting:
+  top_result_count: 10
+  p_value_significant_digits: 4
+  nominal_alpha: 0.05
+  familywise_alpha: 0.05
+  fdr_alpha: 0.05
+  correction_columns:
+    nominal_significant: significant_nominal
+    bonferroni_adjusted_p: P_bonferroni
+    bonferroni_significant: significant_bonferroni
+    fdr_bh_adjusted_p: P_fdr_bh
+    fdr_bh_significant: significant_fdr_bh
+  chromosome_columns:
+    fastbat_gene: Chr
+    fastbat_segment: Chr
+    fastbat_set: null
+    mbat_combo: Chr

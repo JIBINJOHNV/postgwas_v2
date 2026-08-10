@@ -1,0 +1,1 @@
+"""MAGMA gene-property module."""

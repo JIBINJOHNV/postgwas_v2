@@ -1,0 +1,110 @@
+enabled: false
+tools: [magma_celltype]
+magma_celltype:
+  workflow: base
+  magmacovar_use_case: tissue_specificity
+  average_property: Average
+  input:
+    gene_results_file: null
+    covariates_file: null
+scdrs:
+  input:
+    h5ad_file: null
+    gene_set_file: null
+    magma_gene_results_file: null
+    gene_identifier_map_file: null
+    covariate_file: null
+  magma_gene_set:
+    source: file
+    gene_id_column: GENE
+    z_score_column: ZSTAT
+    statistics_gene_column: GENE
+    statistics_null_value: NA
+    table_delimiter_pattern: '\s+'
+    source_identifier_type: entrez
+    target_identifier_type: symbol
+    mapping_mode: crosswalk
+    mapping_source_column: ENTREZID
+    mapping_target_column: SYMBOL
+    mapping_delimiter: "\t"
+    unmapped_policy: exclude
+    ambiguous_policy: error
+    trait_pattern: '{dataset_id}'
+    weight: zscore
+    minimum_genes: 100
+    maximum_genes: 1000
+  h5ad_species: human
+  gene_set_species: human
+  matrix_state: raw_counts
+  weight_option: vs
+  adjust_proportion_column: null
+  filter_data: true
+  control_gene_sets: 1000
+  minimum_genes_per_cell: 250
+  minimum_cells_per_gene: 50
+  return_control_raw_score: false
+  return_control_normalized_score: true
+  version_probe_arguments: [scdrs, __version__]
+  supported_versions: ['1.0.3']
+  downstream:
+    group_analysis: []
+    correlation_analysis: []
+    gene_analysis: false
+    knn_neighbors: 15
+    knn_principal_components: 20
+  gene_set_format:
+    trait_column: TRAIT
+    gene_set_column: GENESET
+    delimiter: "\t"
+    gene_separator: ','
+    weight_separator: ':'
+  covariate_format:
+    delimiter: "\t"
+    require_exact_cell_ids: true
+    minimum_cell_overlap_fraction: 0.75
+    constant_column: const
+    constant_tolerance: 0.000000000001
+  validation:
+    matrix_chunk_rows: 4096
+    raw_count_integer_tolerance: 0.000001
+    minimum_effective_genes: 51
+    maximum_effective_gene_fraction: 0.2
+    allow_missing_annotation_values: false
+multiple_testing:
+  methods: [bonferroni, fdr_bh]
+  primary_method: bonferroni
+  significance_threshold: 0.05
+result_schema:
+  normalized_schema_version: 1
+  dataset_column: dataset_id
+  method_column: method
+  workflow_column: workflow
+  cell_type_column: cell_type
+  gene_count_column: n_genes
+  beta_column: beta
+  standardized_beta_column: beta_standardized
+  standard_error_column: standard_error
+  p_value_column: p_value
+  adjusted_p_value_column_pattern: 'p_{method}'
+  significance_column_pattern: 'significant_{method}'
+  delimiter: "\t"
+  null_value: NA
+output_layout:
+  engine_directory: 'engines/{dataset_id}_magma_celltype'
+  results_file: 'results/{dataset_id}_magma_celltype.tsv'
+  log_file: 'logs/{dataset_id}_single_cell.log'
+  resolved_config_file: 'run_metadata/{dataset_id}_single_cell_resolved_config.yaml'
+  completion_manifest: 'run_metadata/{dataset_id}_single_cell_completion.yaml'
+  staging_directory: '.partial/{dataset_id}_single_cell'
+  scdrs_engine_directory: 'engines/{dataset_id}_scdrs'
+  scdrs_qc_report: 'engines/{dataset_id}_scdrs/{dataset_id}_scdrs_qc.yaml'
+  scdrs_completion_manifest: 'run_metadata/{dataset_id}_scdrs_completion.yaml'
+  scdrs_staging_directory: '.partial/{dataset_id}_scdrs'
+  scdrs_score_file_pattern: '{trait}.score.gz'
+  scdrs_full_score_file_pattern: '{trait}.full_score.gz'
+  scdrs_group_file_pattern: '{trait}.scdrs_group.{annotation}'
+  scdrs_correlation_file_pattern: '{trait}.scdrs_cell_corr'
+  scdrs_gene_file_pattern: '{trait}.scdrs_gene'
+  scdrs_generated_gene_statistics: 'engines/{dataset_id}_scdrs/inputs/{dataset_id}_magma_gene_statistics.tsv'
+  scdrs_generated_gene_set: 'engines/{dataset_id}_scdrs/inputs/{dataset_id}.gs'
+  scdrs_gene_mapping_report: 'engines/{dataset_id}_scdrs/inputs/{dataset_id}_gene_mapping.yaml'

@@ -1,0 +1,21 @@
+pipeline:
+  modules:
+    - filtering
+    - ld_annotation
+    - formatting
+    - imputation
+    - ld_clumping
+    - fine_mapping
+    - magma
+    - pops
+    - qc_summary
+modules:
+  filtering: {enabled: true}
+  ld_annotation: {enabled: true}
+  formatting: {enabled: true}
+  imputation: {enabled: true}
+  ld_clumping: {enabled: true}
+  fine_mapping: {enabled: true}
+  magma: {enabled: true}
+  pops: {enabled: true}
+  qc_summary: {enabled: true}

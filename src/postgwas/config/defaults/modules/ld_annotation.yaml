@@ -1,0 +1,4 @@
+enabled: false
+genome_build: GRCh37
+population: EUR
+include_unassigned: false

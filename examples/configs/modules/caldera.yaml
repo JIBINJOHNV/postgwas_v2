@@ -1,0 +1,6 @@
+enabled: true
+genome_build: GRCh37
+repository_path: null
+adapter_script_path: null
+pops_file: null
+credible_set_file: null

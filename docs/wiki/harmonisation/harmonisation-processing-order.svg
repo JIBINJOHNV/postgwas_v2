@@ -1,0 +1,225 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 2570" role="img" aria-labelledby="workflow-title workflow-description">
+  <title id="workflow-title">PostGWAS harmonisation workflow</title>
+  <desc id="workflow-description">A top-to-bottom workflow separating operations performed once for the complete study, operations repeated for every chromosome, allele-orientation outcomes, chromosome retries, final VCF quality control, and optional input-to-VCF validation.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path class="arrow-head" d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+    <style>
+      text {
+        fill: #172033;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-weight: 400;
+      }
+      .canvas { fill: #ffffff; }
+      .title { font-size: 42px; font-weight: 500; }
+      .subtitle { fill: #526079; font-size: 23px; }
+      .section-title { font-size: 27px; font-weight: 500; }
+      .node-label { font-size: 21px; font-weight: 500; }
+      .node-detail { fill: #526079; font-size: 18px; }
+      .edge-label { fill: #526079; font-size: 17px; font-weight: 500; }
+      .section-study { fill: #eff6ff; stroke: #4f86d9; }
+      .section-chromosome { fill: #effbf3; stroke: #40a966; }
+      .section-final { fill: #faf5ff; stroke: #9b72cf; }
+      .section-study, .section-chromosome, .section-final {
+        stroke-width: 3;
+      }
+      .node { fill: #ffffff; stroke: #66758d; stroke-width: 2.5; }
+      .decision { fill: #fff8e8; stroke: #d99b26; stroke-width: 3; }
+      .rejected { fill: #fff1f2; stroke: #dc5964; stroke-width: 3; }
+      .retry { fill: #fff8e8; stroke: #d99b26; stroke-width: 3; }
+      .complete { fill: #ecfdf3; stroke: #35a867; stroke-width: 3; }
+      .arrow { fill: none; stroke: #526079; stroke-width: 3; marker-end: url(#arrow); }
+      .arrow-head { fill: #526079; }
+      @media (prefers-color-scheme: dark) {
+        text { fill: #e6edf7; }
+        .canvas { fill: #101827; }
+        .subtitle, .node-detail, .edge-label { fill: #b6c2d4; }
+        .section-study { fill: #12253d; stroke: #6ca4ef; }
+        .section-chromosome { fill: #122d22; stroke: #59c780; }
+        .section-final { fill: #281c38; stroke: #bd96ee; }
+        .node { fill: #1b2638; stroke: #8b9bb3; }
+        .decision, .retry { fill: #332814; stroke: #e8b44c; }
+        .rejected { fill: #381c22; stroke: #ee7c86; }
+        .complete { fill: #163225; stroke: #58c786; }
+        .arrow { stroke: #b6c2d4; }
+        .arrow-head { fill: #b6c2d4; }
+      }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1400" height="2570"/>
+  <text class="title" x="700" y="58" text-anchor="middle">PostGWAS harmonisation: processing order</text>
+  <text class="subtitle" x="700" y="96" text-anchor="middle">What runs once, what repeats by chromosome, and what happens to each variant</text>
+
+  <rect class="node" x="450" y="135" width="500" height="72" rx="18"/>
+  <text class="node-label" x="700" y="179" text-anchor="middle">Raw GWAS summary statistics</text>
+  <path class="arrow" d="M700 207 V248"/>
+
+  <rect class="node" x="250" y="250" width="900" height="96" rx="18"/>
+  <text class="node-label" x="700" y="289" text-anchor="middle">Run preflight</text>
+  <text class="node-detail" x="700" y="319" text-anchor="middle">Validate settings, sample sheet, resource root, output location, and software</text>
+
+  <rect class="section-study" x="70" y="400" width="1260" height="300" rx="26"/>
+  <text class="section-title" x="110" y="446">Once for the complete study</text>
+
+  <rect class="node" x="95" y="500" width="260" height="120" rx="16"/>
+  <text class="node-label" x="225" y="544" text-anchor="middle">
+    <tspan x="225">Read, type, and</tspan>
+    <tspan x="225" dy="27">normalize rows</tspan>
+  </text>
+  <text class="node-detail" x="225" y="602" text-anchor="middle">Reject unusable input</text>
+
+  <rect class="node" x="410" y="500" width="260" height="120" rx="16"/>
+  <text class="node-label" x="540" y="558" text-anchor="middle">Infer genome build</text>
+  <text class="node-detail" x="540" y="588" text-anchor="middle">Use testable loci only</text>
+
+  <rect class="node" x="725" y="500" width="260" height="120" rx="16"/>
+  <text class="node-label" x="855" y="539" text-anchor="middle">
+    <tspan x="855">Make study-wide</tspan>
+    <tspan x="855" dy="27">scientific decisions</tspan>
+  </text>
+  <text class="node-detail" x="855" y="582" text-anchor="middle">Strand · effect · SE · P · AF</text>
+  <text class="node-detail" x="855" y="606" text-anchor="middle">Preflight exact resources</text>
+
+  <rect class="node" x="1040" y="500" width="260" height="120" rx="16"/>
+  <text class="node-label" x="1170" y="544" text-anchor="middle">
+    <tspan x="1170">Split retained rows</tspan>
+    <tspan x="1170" dy="27">by chromosome</tspan>
+  </text>
+  <text class="node-detail" x="1170" y="602" text-anchor="middle">Only after resources pass</text>
+
+  <path class="arrow" d="M700 346 V475 H225 V500"/>
+  <path class="arrow" d="M355 560 H410"/>
+  <path class="arrow" d="M670 560 H725"/>
+  <path class="arrow" d="M985 560 H1040"/>
+
+  <rect class="section-chromosome" x="70" y="760" width="1260" height="830" rx="26"/>
+  <text class="section-title" x="110" y="806">Repeated for every chromosome</text>
+
+  <rect class="node" x="140" y="850" width="430" height="92" rx="16"/>
+  <text class="node-label" x="355" y="889" text-anchor="middle">Load chromosome rows</text>
+  <text class="node-detail" x="355" y="919" text-anchor="middle">Reuse checked resources and raw provenance</text>
+
+  <rect class="node" x="830" y="850" width="430" height="92" rx="16"/>
+  <text class="node-label" x="1045" y="889" text-anchor="middle">Standardize the effect scale</text>
+  <text class="node-detail" x="1045" y="919" text-anchor="middle">OR → BETA; OR-scale SE → log-odds SE</text>
+
+  <path class="arrow" d="M1170 620 V725 H355 V850"/>
+  <path class="arrow" d="M570 896 H830"/>
+  <path class="arrow" d="M1045 942 V968 H700 V980"/>
+
+  <polygon class="decision" points="700,980 850,1060 700,1140 550,1060"/>
+  <text class="node-label" x="700" y="1048" text-anchor="middle">How do the alleles</text>
+  <text class="node-label" x="700" y="1076" text-anchor="middle">match the reference?</text>
+
+  <rect class="node" x="80" y="1200" width="360" height="110" rx="16"/>
+  <text class="node-label" x="260" y="1240" text-anchor="middle">Direct or complement</text>
+  <text class="node-detail" x="260" y="1273" text-anchor="middle">Keep the effect direction</text>
+
+  <rect class="node" x="520" y="1200" width="360" height="110" rx="16"/>
+  <text class="node-label" x="700" y="1238" text-anchor="middle">Swapped or complement-swapped</text>
+  <text class="node-detail" x="700" y="1268" text-anchor="middle">Swap alleles · negate BETA/Z</text>
+  <text class="node-detail" x="700" y="1292" text-anchor="middle">use 1 − EAF</text>
+
+  <rect class="rejected" x="960" y="1200" width="360" height="110" rx="16"/>
+  <text class="node-label" x="1140" y="1240" text-anchor="middle">Ambiguous or unmatched</text>
+  <text class="node-detail" x="1140" y="1273" text-anchor="middle">Reject or fail according to policy</text>
+
+  <path class="arrow" d="M550 1060 H260 V1200"/>
+  <path class="arrow" d="M700 1140 V1200"/>
+  <path class="arrow" d="M850 1060 H1140 V1200"/>
+  <text class="edge-label" x="348" y="1042" text-anchor="middle">Direct</text>
+  <text class="edge-label" x="700" y="1177" text-anchor="middle">Swapped</text>
+  <text class="edge-label" x="1052" y="1042" text-anchor="middle">Unresolved</text>
+
+  <rect class="node" x="370" y="1360" width="660" height="82" rx="16"/>
+  <text class="node-label" x="700" y="1394" text-anchor="middle">Complete and validate Neff, BETA, SE, Z, P, INFO, EAF, and IDs</text>
+  <text class="node-detail" x="700" y="1422" text-anchor="middle">Check required fields and row accounting</text>
+  <path class="arrow" d="M260 1310 V1340 H520 V1360"/>
+  <path class="arrow" d="M700 1310 V1360"/>
+
+  <rect class="node" x="370" y="1480" width="660" height="82" rx="16"/>
+  <text class="node-label" x="700" y="1514" text-anchor="middle">Create, normalize, annotate, and lift over the chromosome VCF</text>
+  <text class="node-detail" x="700" y="1542" text-anchor="middle">Write counts, logs, and required indexes</text>
+  <path class="arrow" d="M700 1442 V1480"/>
+
+  <polygon class="decision" points="700,1640 830,1720 700,1800 570,1720"/>
+  <text class="node-label" x="700" y="1708" text-anchor="middle">All expected</text>
+  <text class="node-label" x="700" y="1736" text-anchor="middle">chromosomes complete?</text>
+  <path class="arrow" d="M700 1562 V1640"/>
+
+  <rect class="retry" x="80" y="1670" width="360" height="100" rx="16"/>
+  <text class="node-label" x="260" y="1711" text-anchor="middle">Retry failed chromosome only</text>
+  <text class="node-detail" x="260" y="1742" text-anchor="middle">Completed chromosomes are not repeated</text>
+  <path class="arrow" d="M570 1720 H440"/>
+  <text class="edge-label" x="505" y="1703" text-anchor="middle">No + retry</text>
+  <path class="arrow" d="M260 1670 H38 V896 H140"/>
+
+  <rect class="rejected" x="960" y="1670" width="360" height="100" rx="16"/>
+  <text class="node-label" x="1140" y="1711" text-anchor="middle">Fail by default</text>
+  <text class="node-detail" x="1140" y="1742" text-anchor="middle">Continue only under explicit PARTIAL policy</text>
+  <path class="arrow" d="M830 1720 H960"/>
+  <text class="edge-label" x="895" y="1703" text-anchor="middle">No retries</text>
+
+  <rect class="node" x="420" y="1860" width="560" height="88" rx="16"/>
+  <text class="node-label" x="700" y="1897" text-anchor="middle">Combine rejection evidence and reconcile the study</text>
+  <text class="node-detail" x="700" y="1926" text-anchor="middle">Finalize the EAF/MAF decision</text>
+  <path class="arrow" d="M700 1800 V1860"/>
+  <text class="edge-label" x="720" y="1836">Yes</text>
+  <path class="arrow" d="M1140 1770 V1904 H980"/>
+
+  <rect class="section-final" x="70" y="2010" width="1260" height="500" rx="26"/>
+  <text class="section-title" x="110" y="2056">Once after chromosome processing</text>
+
+  <rect class="node" x="80" y="2100" width="220" height="120" rx="16"/>
+  <text class="node-label" x="190" y="2143" text-anchor="middle">
+    <tspan x="190">Merge and validate</tspan>
+    <tspan x="190" dy="27">required VCF groups</tspan>
+  </text>
+
+  <rect class="node" x="335" y="2100" width="220" height="120" rx="16"/>
+  <text class="node-label" x="445" y="2143" text-anchor="middle">
+    <tspan x="445">Compare population</tspan>
+    <tspan x="445" dy="27">allele frequencies</tspan>
+  </text>
+
+  <rect class="node" x="590" y="2100" width="220" height="120" rx="16"/>
+  <text class="node-label" x="700" y="2143" text-anchor="middle">
+    <tspan x="700">Combine side files</tspan>
+    <tspan x="700" dy="27">and clean safely</tspan>
+  </text>
+
+  <rect class="node" x="845" y="2100" width="220" height="120" rx="16"/>
+  <text class="node-label" x="955" y="2143" text-anchor="middle">
+    <tspan x="955">Assess raw VCF</tspan>
+    <tspan x="955" dy="27">and virtual QC</tspan>
+  </text>
+
+  <rect class="node" x="1100" y="2100" width="220" height="120" rx="16"/>
+  <text class="node-label" x="1210" y="2143" text-anchor="middle">
+    <tspan x="1210">Validate outputs</tspan>
+    <tspan x="1210" dy="27">and final status</tspan>
+  </text>
+
+  <path class="arrow" d="M700 1948 V1985 H190 V2100"/>
+  <path class="arrow" d="M300 2160 H335"/>
+  <path class="arrow" d="M555 2160 H590"/>
+  <path class="arrow" d="M810 2160 H845"/>
+  <path class="arrow" d="M1065 2160 H1100"/>
+
+  <polygon class="decision" points="700,2270 805,2330 700,2390 595,2330"/>
+  <text class="node-label" x="700" y="2338" text-anchor="middle">--validate?</text>
+  <path class="arrow" d="M1210 2220 V2250 H700 V2270"/>
+
+  <rect class="node" x="160" y="2420" width="520" height="68" rx="16"/>
+  <text class="node-label" x="420" y="2462" text-anchor="middle">Optional input-to-VCF validation</text>
+  <path class="arrow" d="M595 2330 H420 V2420"/>
+  <text class="edge-label" x="505" y="2313" text-anchor="middle">Yes</text>
+
+  <rect class="complete" x="860" y="2420" width="380" height="68" rx="16"/>
+  <text class="node-label" x="1050" y="2462" text-anchor="middle">Finished with recorded status</text>
+  <path class="arrow" d="M805 2330 H1050 V2420"/>
+  <text class="edge-label" x="895" y="2313" text-anchor="middle">No</text>
+  <path class="arrow" d="M680 2454 H860"/>
+</svg>

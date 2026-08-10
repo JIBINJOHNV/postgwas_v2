@@ -1,0 +1,88 @@
+resource:
+  name: 1000 Genomes Phase 3 population genotype reference
+  genome_build: GRCh37
+  release: "20130502 Phase 3 integrated call set"
+  source_url: https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502
+  output_directory: /Users/JJOHN41/Documents/software_resources/resourses/postgwas_v2/1000_genomes_phase3
+
+panel:
+  filename: integrated_call_samples_v3.20130502.ALL.panel
+  sample_column: sample
+  grouping_column: super_pop
+  groups: [AFR, AMR, EAS, EUR, SAS]
+
+# These are all genotype-bearing VCFs in the release directory. The sites-only
+# whole-genome VCF is intentionally not duplicated because it has no samples to
+# split and contains the same released sites.
+contigs:
+  - {label: "1", filename: ALL.chr1.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "2", filename: ALL.chr2.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "3", filename: ALL.chr3.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "4", filename: ALL.chr4.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "5", filename: ALL.chr5.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "6", filename: ALL.chr6.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "7", filename: ALL.chr7.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "8", filename: ALL.chr8.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "9", filename: ALL.chr9.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "10", filename: ALL.chr10.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "11", filename: ALL.chr11.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "12", filename: ALL.chr12.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "13", filename: ALL.chr13.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "14", filename: ALL.chr14.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "15", filename: ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "16", filename: ALL.chr16.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "17", filename: ALL.chr17.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "18", filename: ALL.chr18.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "19", filename: ALL.chr19.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "20", filename: ALL.chr20.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "21", filename: ALL.chr21.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: "22", filename: ALL.chr22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz}
+  - {label: X, filename: ALL.chrX.phase3_shapeit2_mvncall_integrated_v1c.20130502.genotypes.vcf.gz}
+  - {label: Y, filename: ALL.chrY.phase3_integrated_v2b.20130502.genotypes.vcf.gz}
+  - {label: MT, filename: ALL.chrMT.phase3_callmom-v0_4.20130502.genotypes.vcf.gz}
+
+# Autosomes share an identical 2,504-sample header and can be concatenated.
+# X, Y, and MT are kept separate because Y is male-only and MT lacks NA19159;
+# forcing them into one VCF would create inconsistent sample columns.
+output_sets:
+  - name: autosomes
+    contigs: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22"]
+    filename_template: "{group}.GRCh37.phase3.autosomes.vcf.gz"
+  - name: chromosome_x
+    contigs: [X]
+    filename_template: "{group}.GRCh37.phase3.chrX.vcf.gz"
+  - name: chromosome_y
+    contigs: [Y]
+    filename_template: "{group}.GRCh37.phase3.chrY.vcf.gz"
+  - name: mitochondrial
+    contigs: [MT]
+    filename_template: "{group}.GRCh37.phase3.chrMT.vcf.gz"
+
+processing:
+  bcftools_executable: bcftools
+  curl_executable: curl
+  bcftools_threads: 4
+  download_workers: 5
+  download_retries: 8
+  index_suffix: .tbi
+  output_index_type: csi
+  recalculate_info_tags: [AC, AN, AF, NS]
+  remove_per_contig_outputs_after_success: true
+  keep_downloads_after_success: true
+
+directories:
+  downloads: downloads
+  metadata: metadata
+  per_contig: working/per_contig
+  final: population_vcfs
+  logs: logs
+
+naming:
+  partial_suffix: .partial
+  group_sample_list_template: "{group}.samples.txt"
+  per_contig_vcf_template: "{group}.vcf.gz"
+  split_groups_filename: groups.tsv
+  split_prepared_vcf_template: "{group}.prepared.vcf.gz"
+  concat_input_list_filename: inputs.txt
+  log_filename: preparation.jsonl
+  manifest_filename: resource_manifest.yaml

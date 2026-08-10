@@ -137,18 +137,59 @@ RUN micromamba install -y -n postgwas -c conda-forge \
 ENV PATH="/opt/conda/envs/postgwas/bin:$PATH"
 
 # =====================================================================
-# 2. VEP & LDSC ENV (Combined Cleanups)
+# 2. VEP
 # =====================================================================
 RUN micromamba create -y -n vep -c conda-forge -c bioconda ensembl-vep=113 && \
     micromamba clean --all --yes
 
-RUN micromamba create -y -n ldsc -c conda-forge -c bioconda \
-    python=2.7 numpy=1.16 scipy=1.2.1 pandas=0.24.2 bitarray nose pybedtools && \
+# LDSC runs in the main PostGWAS environment. Pinning the upstream commit keeps
+# image builds reproducible while using CBIIT's maintained Python 3 branch.
+ARG LDSC_REPOSITORY=https://github.com/CBIIT/ldsc.git
+ARG LDSC_COMMIT=6c673952cee74bd5c57aef1555a03b1c015399a0
+RUN mkdir -p /opt/ldsc && \
+    git -C /opt/ldsc init && \
+    git -C /opt/ldsc remote add origin "${LDSC_REPOSITORY}" && \
+    git -C /opt/ldsc fetch --depth 1 origin "${LDSC_COMMIT}" && \
+    git -C /opt/ldsc checkout --detach FETCH_HEAD && \
+    test "$(git -C /opt/ldsc rev-parse HEAD)" = "${LDSC_COMMIT}" && \
+    rm -rf /opt/ldsc/.git && \
+    micromamba run -n postgwas \
+    python -m pip install --no-deps --no-cache-dir /opt/ldsc && \
+    micromamba run -n postgwas ldsc.py --help >/dev/null && \
+    micromamba run -n postgwas munge_sumstats.py --help >/dev/null && \
     micromamba clean --all --yes
 
-WORKDIR /opt
-RUN git clone https://github.com/bulik/ldsc.git && \
-    rm -rf ldsc/.git
+# K-POPS and CALDERA run in the same PostGWAS conda environment. Both
+# repositories are pinned to immutable commits because neither project
+# currently publishes a versioned conda package.
+ARG KPOPS_REPOSITORY=https://github.com/JasonTan-code/k-pops.git
+ARG KPOPS_COMMIT=8acd49ed8c96565b17c2997420f514f24b65e096
+ARG CALDERA_REPOSITORY=https://github.com/kheilbron/caldera.git
+ARG CALDERA_COMMIT=81a8a0308741ae986660f711bbf6a7abbd3bca19
+RUN mkdir -p /opt/kpops /opt/caldera && \
+    git -C /opt/kpops init && \
+    git -C /opt/kpops remote add origin "${KPOPS_REPOSITORY}" && \
+    git -C /opt/kpops fetch --depth 1 origin "${KPOPS_COMMIT}" && \
+    git -C /opt/kpops checkout --detach FETCH_HEAD && \
+    test "$(git -C /opt/kpops rev-parse HEAD)" = "${KPOPS_COMMIT}" && \
+    git -C /opt/caldera init && \
+    git -C /opt/caldera remote add origin "${CALDERA_REPOSITORY}" && \
+    git -C /opt/caldera fetch --depth 1 origin "${CALDERA_COMMIT}" && \
+    git -C /opt/caldera checkout --detach FETCH_HEAD && \
+    test "$(git -C /opt/caldera rev-parse HEAD)" = "${CALDERA_COMMIT}" && \
+    rm -rf /opt/kpops/.git /opt/caldera/.git && \
+    test -s /opt/kpops/k-pops.py && \
+    test -s /opt/kpops/prepare_kernel.py && \
+    install -m 0755 /opt/kpops/k-pops.py /opt/conda/envs/postgwas/bin/k-pops.py && \
+    mkdir -p /opt/conda/envs/postgwas/share/postgwas && \
+    mv /opt/caldera /opt/conda/envs/postgwas/share/postgwas/caldera && \
+    test -s /opt/conda/envs/postgwas/share/postgwas/caldera/z_caldera.R && \
+    test -s /opt/conda/envs/postgwas/share/postgwas/caldera/trained_models/caldera_model_no_covs.rds && \
+    micromamba run -n postgwas python /opt/conda/envs/postgwas/bin/k-pops.py --help >/dev/null && \
+    micromamba run -n postgwas Rscript -e \
+    "parse(file='/opt/conda/envs/postgwas/share/postgwas/caldera/z_caldera.R'); library(data.table); library(dplyr)" \
+    >/dev/null && \
+    micromamba clean --all --yes
 
 # =====================================================================
 # 3. ENRICHER ENV (New Module)
@@ -180,29 +221,29 @@ WORKDIR /opt/tools
 SHELL ["/bin/bash", "-c"]
 
 # Download -> Compile -> Install -> DELETE SOURCE.
-RUN wget https://github.com/samtools/bcftools/releases/download/1.23/bcftools-1.23.tar.bz2 && \
-    wget https://github.com/samtools/htslib/releases/download/1.23/htslib-1.23.tar.bz2 && \
-    tar -xvjf bcftools-1.23.tar.bz2 && \
-    tar -xvjf htslib-1.23.tar.bz2 && \
-    cd htslib-1.23 && \
+RUN wget https://github.com/samtools/bcftools/releases/download/1.23.1/bcftools-1.23.1.tar.bz2 && \
+    wget https://github.com/samtools/htslib/releases/download/1.23.1/htslib-1.23.1.tar.bz2 && \
+    tar -xvjf bcftools-1.23.1.tar.bz2 && \
+    tar -xvjf htslib-1.23.1.tar.bz2 && \
+    cd htslib-1.23.1 && \
     ./configure --enable-libcurl --prefix=/usr/local && \
     make -j && make install && \
-    cd ../bcftools-1.23/plugins && \
-    wget https://raw.githubusercontent.com/freeseek/score/master/score.c && \
-    wget https://raw.githubusercontent.com/freeseek/score/master/score.h && \
-    wget https://raw.githubusercontent.com/freeseek/score/master/munge.c && \
-    wget https://raw.githubusercontent.com/freeseek/score/master/liftover.c && \
-    wget https://raw.githubusercontent.com/freeseek/score/master/metal.c && \
-    wget https://raw.githubusercontent.com/freeseek/score/master/blup.c && \
-    wget https://raw.githubusercontent.com/freeseek/score/master/pgs.c && \
-    wget https://raw.githubusercontent.com/freeseek/score/master/pgs.mk && \
+    cd ../bcftools-1.23.1/plugins && \
+    wget https://raw.githubusercontent.com/freeseek/score/909d23019e19aeadf3bf6fe1407fd6afc094592a/score.c && \
+    wget https://raw.githubusercontent.com/freeseek/score/909d23019e19aeadf3bf6fe1407fd6afc094592a/score.h && \
+    wget https://raw.githubusercontent.com/freeseek/score/909d23019e19aeadf3bf6fe1407fd6afc094592a/munge.c && \
+    wget https://raw.githubusercontent.com/freeseek/score/909d23019e19aeadf3bf6fe1407fd6afc094592a/liftover.c && \
+    wget https://raw.githubusercontent.com/freeseek/score/909d23019e19aeadf3bf6fe1407fd6afc094592a/metal.c && \
+    wget https://raw.githubusercontent.com/freeseek/score/909d23019e19aeadf3bf6fe1407fd6afc094592a/blup.c && \
+    wget https://raw.githubusercontent.com/freeseek/score/909d23019e19aeadf3bf6fe1407fd6afc094592a/pgs.c && \
+    wget https://raw.githubusercontent.com/freeseek/score/909d23019e19aeadf3bf6fe1407fd6afc094592a/pgs.mk && \
     cd .. && \
     sed -i '2254s/^/\/\//' plugins/pgs.c && \
     sed -i '2255s/^/\/\//' plugins/pgs.c && \
-    ./configure --prefix=/usr/local --with-htslib=/opt/tools/htslib-1.23 CPPFLAGS="-I/usr/include/suitesparse" CFLAGS="-I/usr/include/suitesparse" && \
+    ./configure --prefix=/usr/local --with-htslib=/opt/tools/htslib-1.23.1 CPPFLAGS="-I/usr/include/suitesparse" CFLAGS="-I/usr/include/suitesparse" && \
     make -j && make install && \
     cd /opt/tools && \
-    rm -rf bcftools-1.23 htslib-1.23 *.tar.bz2
+    rm -rf bcftools-1.23.1 htslib-1.23.1 *.tar.bz2
 
 ENV BCFTOOLS_PLUGINS="/usr/local/libexec/bcftools"
 
@@ -229,8 +270,24 @@ RUN wget http://www.christianbenner.com/ldstore_v2.0_x86_64.tgz && \
     chmod +x /usr/local/bin/smr && \
     rm -rf /tmp/install_tools
 
-COPY magma/magma /usr/local/bin/magma
-RUN chmod +x /usr/local/bin/magma
+WORKDIR /tmp
+
+# MAGMA v1.10 is downloaded from the static Linux link published by CNCR.
+# CNCR states that post-v1.0 MAGMA binaries may not be redistributed. This
+# installation is therefore appropriate for local image builds; permission
+# from the MAGMA authors is required before publishing the resulting image.
+ARG MAGMA_VERSION=1.10
+ARG MAGMA_URL=https://vu.data.surf.nl/index.php/s/lxDgt2dNdNr6DYt/download
+ARG MAGMA_SHA256=d8b20778b773f47b4fb0f1020baefebc92b11ee65946e708a618d494d6819e39
+RUN mkdir -p /tmp/magma-install && \
+    curl --fail --location --silent --show-error \
+    "${MAGMA_URL}" -o /tmp/magma-install/magma.zip && \
+    echo "${MAGMA_SHA256}  /tmp/magma-install/magma.zip" | sha256sum --check - && \
+    unzip -q /tmp/magma-install/magma.zip -d /tmp/magma-install && \
+    install -m 0755 /tmp/magma-install/magma /usr/local/bin/magma && \
+    /usr/local/bin/magma --version > /tmp/magma-install/version.txt 2>&1
+RUN grep -Eq "MAGMA version: v${MAGMA_VERSION}" /tmp/magma-install/version.txt && \
+    rm -rf /tmp/magma-install
 
 # =====================================================================
 # Install SnpEff
@@ -288,6 +345,9 @@ COPY . /opt/postgwas
 # that R and its libraries depend on.
 RUN micromamba run -n postgwas pip install --upgrade pip && \
     micromamba run -n postgwas pip install --no-deps --no-cache-dir -e . && \
+    micromamba run -n postgwas Rscript -e \
+    "parse(file='/opt/postgwas/src/postgwas/modules/caldera/run_caldera.R')" \
+    >/dev/null && \
     micromamba remove -n postgwas -y \
     cmake \
     mkl-include && \

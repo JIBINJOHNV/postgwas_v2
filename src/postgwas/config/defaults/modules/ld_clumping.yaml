@@ -1,0 +1,12 @@
+enabled: false
+population: EUR
+lead_pvalue: 5.0e-8
+clump_r2: 0.6
+lead_r2: 0.1
+window_kb: 250
+merge_distance_bp: 250000
+remove_mhc: true
+mhc:
+  chromosome: "6"
+  start: 25000000
+  end: 34000000

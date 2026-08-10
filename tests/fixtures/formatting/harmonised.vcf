@@ -1,0 +1,18 @@
+##fileformat=VCFv4.2
+##contig=<ID=1,length=1000000>
+##contig=<ID=2,length=1000000>
+##FORMAT=<ID=ES,Number=A,Type=Float,Description="Effect size for ALT">
+##FORMAT=<ID=SE,Number=A,Type=Float,Description="Standard error">
+##FORMAT=<ID=EZ,Number=A,Type=Float,Description="Z score for ALT">
+##FORMAT=<ID=LP,Number=A,Type=Float,Description="Minus log10 p-value">
+##FORMAT=<ID=AF,Number=A,Type=Float,Description="ALT allele frequency">
+##FORMAT=<ID=SI,Number=A,Type=Float,Description="Imputation quality">
+##FORMAT=<ID=SS,Number=A,Type=Integer,Description="Total sample size">
+##FORMAT=<ID=NEF,Number=A,Type=Integer,Description="Effective sample size">
+##FORMAT=<ID=NC,Number=A,Type=Integer,Description="Case count">
+##FORMAT=<ID=NCO,Number=A,Type=Integer,Description="Control count">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	STUDY
+1	100	rs1	A	G	.	PASS	.	ES:SE:EZ:LP:AF:SI:SS:NEF:NC:NCO	0.2:0.1:2:8:0.8:0.9:1000:800:400:600
+1	200	.	C	T	.	PASS	.	ES:SE:EZ:LP:AF:SI:SS:NEF:NC:NCO	-0.1:0.05:-2:6:0.2:0.95:1000:800:400:600
+2	300	rs3	G	A	.	PASS	.	ES:SE:EZ:LP:AF:SI:SS:NEF:NC:NCO	0.3:0.1:3:400:0.1:0.8:900:700:350:550
+2	400	rs4	T	C	.	PASS	.	ES:SE:EZ:LP:AF:SI:SS:NEF:NC:NCO	0.0:0:0:0:0.4:1:1000:800:400:600

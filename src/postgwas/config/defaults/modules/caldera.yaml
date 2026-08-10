@@ -1,0 +1,50 @@
+enabled: false
+genome_build: GRCh37
+repository_path: null
+adapter_script_path: null
+installed_repository_relative_path: share/postgwas/caldera
+pops_file: null
+credible_set_file: null
+minimum_credible_set_coverage: 0.95
+assembly_by_genome_build: {GRCh37: 37, GRCh38: 38}
+upstream_script_relative_path: z_caldera.R
+coding_variants_relative_path: data/high_h2_coding_SNPs.tsv
+gene_locations_relative_pattern: 'data/gene_locations_gencode_v47_grch{assembly}_all_protein_coding.tsv'
+model_relative_path: trained_models/caldera_model_no_covs.rds
+input_schema:
+  table_delimiter: "\t"
+  pops_gene_id_column: ENSGID
+  pops_score_column: PoPS_Score
+  credible_set_locus_column: locus
+  credible_set_chromosome_column: chr
+  credible_set_position_column: bp
+  credible_set_probability_column: pip
+  credible_set_coding_gene_column: c_gene
+  credible_set_rsid_column: rsid
+pipeline_input:
+  index_file_names: [indexfile.txt, indexfile_rows.tsv]
+  index_filename_column: Filename
+  index_locus_column: GenomicLocus
+  credible_variant_column: cred1
+  credible_probability_column: prob1
+  variant_identifier_pattern: '^(?:chr)?(?P<chromosome>[^:]+):(?P<position>[0-9]+):[^:]+$'
+  locus_separator: '::'
+result_schema:
+  locus_column: locus
+  locus_position_column: locus_pos
+  gene_name_column: gene
+  normalized_probability_column: caldera
+  raw_probability_column: multi
+  locus_gene_count_column: n_genes
+  distance_column: dist
+  pops_score_column: pops
+  coding_probability_column: coding
+  imputed_pops_column: impute_pops
+  gene_id_column: ensgid
+output_layout:
+  results_file: 'results/{dataset_id}_caldera.tsv'
+  pipeline_credible_sets_file: 'inputs/{dataset_id}_caldera_credible_sets.tsv'
+  staging_directory: '.partial/{dataset_id}_caldera'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  completion_manifest: 'run_metadata/{dataset_id}_caldera_completion.yaml'
+  service_log_file: 'logs/{dataset_id}_caldera.log'

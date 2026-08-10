@@ -1,0 +1,305 @@
+schema_version: 1
+default_output_directory: ~/Documents/software_resources/resourses/postgwas/magma/functional_mapping
+default_cache_directory: ~/.cache/postgwas/magma_functional_mapping
+partial_suffix: .partial
+download_retries: 4
+download_executable: curl
+archive_member_exclude: [.DS_Store, '**/.DS_Store', __MACOSX, '__MACOSX/**', '**/__MACOSX', '**/__MACOSX/**']
+manifest_file: resource_manifest.yaml
+generated_config_file: configs/magma_functional_mapping.yaml
+run_log_file: logs/resource_preparation.jsonl
+downloads:
+  magma_gene_locations:
+    archive_name: postgwas_magma_ncbi37_3.zip
+    url: https://vu.data.surf.nl/index.php/s/Pj2orwuF2JYyKxq/download
+    sha256: 8c2bc9cba581819b2df5a63e741a360d92efef7d819f553a06e2d946ae60a90b
+    archive_type: zip
+    archive_root: ''
+    destination: base/gene_locations/NCBI37.3
+    include: [README, REPORT, NCBI37.3.gene.loc]
+    exclude: []
+    nested: []
+    source_name: MAGMA auxiliary files
+    source_version: NCBI37.3
+    license: Refer to the included upstream README
+  magma_ld_reference:
+    archive_name: postgwas_magma_g1000_eur.zip
+    url: https://vu.data.surf.nl/index.php/s/VZNByNwpD8qqINe/download
+    sha256: 83a48fd9dcaa0b9a874b18c63143a4ede93f05505b215b0bd8790130a0d7a954
+    archive_type: zip
+    archive_root: ''
+    destination: base/ld_reference/g1000_eur
+    include: ['*']
+    exclude: []
+    nested: []
+    source_name: MAGMA 1000 Genomes European LD reference
+    source_version: MAGMA current GRCh37 distribution
+    license: Refer to the included upstream files and 1000 Genomes data policy
+  magma_synonyms:
+    archive_name: postgwas_magma_synonyms.zip
+    url: https://vu.data.surf.nl/index.php/s/MSeFJuAVKJ4HLHv/download
+    sha256: f7ffea65946eefff57eb01032c5a5faefd70fc1657dd3e758c3d2f114f45d22a
+    archive_type: zip
+    archive_root: ''
+    destination: base/synonyms/dbsnp151
+    include: ['*']
+    exclude: []
+    nested: []
+    source_name: MAGMA dbSNP synonym data
+    source_version: dbSNP151
+    license: Refer to the included upstream files
+  emagma:
+    archive_name: postgwas_emagma_87746c3c.tar.gz
+    url: https://github.com/eskederks/eMAGMA-tutorial/archive/87746c3c658e4ee8351e059173f17d2ae6b1a959.tar.gz
+    sha256: e0b786f2a24f77654e8dcc0f9dc56a93dbe8e861d562f16ea2d1488bc26d58ac
+    archive_type: tar.gz
+    archive_root: eMAGMA-tutorial-87746c3c658e4ee8351e059173f17d2ae6b1a959
+    destination: emagma/source
+    include: [README.md, 'eMAGMA tutorial PART_1.md', 'eMAGMA Tutorial PART_2.md', emagma_Amygdala_script]
+    exclude: [Amygdala_outputs.zip]
+    nested:
+      - {pattern: 'emagma_annot_*.tar.gz', archive_type: tar.gz, destination: emagma/annotations}
+      - {pattern: gtex_v8_unsigned_networks.tar.gz, archive_type: tar.gz, destination: emagma/networks}
+    source_name: eMAGMA tutorial
+    source_version: 87746c3c658e4ee8351e059173f17d2ae6b1a959
+    license: No machine-readable licence in the pinned repository; verify reuse terms before redistribution
+  h_magma_core:
+    archive_name: postgwas_hmagma_ffe05419.tar.gz
+    url: https://github.com/thewonlab/H-MAGMA/archive/ffe05419d9130f25d3d99248fde9437035f328a0.tar.gz
+    sha256: 68632e7dc51c2d3c32a86201ae364a215af7db15ffa3dbccd092acce25d7bdd4
+    archive_type: tar.gz
+    archive_root: H-MAGMA-ffe05419d9130f25d3d99248fde9437035f328a0
+    destination: h_magma/core
+    include: [README.md, 'Codes/**/*', 'Input_Files/**/*']
+    exclude: ['Output_Files/**']
+    renames: {'Input_Files/ iPSC_derived_neuro.genes.annot': Input_Files/iPSC_derived_neuron.genes.annot}
+    nested: []
+    source_name: H-MAGMA
+    source_version: ffe05419d9130f25d3d99248fde9437035f328a0
+    license: Refer to the pinned upstream repository and associated publication
+  h_magma_protocol:
+    archive_name: postgwas_hmagma_zenodo_v1.02.zip
+    url: https://zenodo.org/records/6382668/files/HMAGMA_Protocol_v1.02.zip?download=1
+    sha256: d565bb46fdf7496e6f9002efb2142d463dceda4eb6f3c8678995fd4c632ae1ba
+    archive_type: zip
+    archive_root: HMAGMA_Protocol
+    destination: h_magma/protocol_v1_02
+    include: [EUR.bim.gz, Gencode26_gene.bed, Gencode26_promoter.bed, Gencode26_exon.bed, adultbrain_hic.bedpe, geneAnno_allgenes.rda, '*.rmd', 'Annotation_Files/**/*']
+    exclude: [PD.summary.stat.txt]
+    nested: []
+    source_name: H-MAGMA protocol resource
+    source_version: '1.02'
+    license: CC-BY-4.0
+  n_magma:
+    archive_name: postgwas_nmagma_cb75ff67.tar.gz
+    url: https://github.com/sldrcyang/nMAGMA/archive/cb75ff67e5a3ecd9a6a39bcd8cba3e1a3c18d067.tar.gz
+    sha256: b4a457261acdbb2e80b8f7ff675c8b1517a36d80bcf12b4eaa143373c5a2ccfb
+    archive_type: tar.gz
+    archive_root: nMAGMA-cb75ff67e5a3ecd9a6a39bcd8cba3e1a3c18d067
+    destination: n_magma/source
+    include: ['**/*']
+    exclude: []
+    nested:
+      - {pattern: 'TOM_annot/*_TOM.zip', archive_type: zip, destination: n_magma/components/tom}
+      - {pattern: RE_to_genes.zip, archive_type: zip, destination: n_magma/components/re_to_genes}
+      - {pattern: Signifgenepairs.zip, archive_type: zip, destination: n_magma/components/significant_gene_pairs}
+      - {pattern: RELOC/RELOC_hg19.zip, archive_type: zip, destination: n_magma/components/regulatory_elements}
+      - {pattern: 'RELOC/combined_regulatory_elements_for_hg*.bed.zip', archive_type: zip, destination: n_magma/components/regulatory_elements}
+    source_name: nMAGMA
+    source_version: cb75ff67e5a3ecd9a6a39bcd8cba3e1a3c18d067
+    license: No machine-readable licence in the pinned repository; verify reuse terms before redistribution
+  chrom_magma:
+    archive_name: postgwas_chrommagma_dbbd9524.tar.gz
+    url: https://github.com/lawrenson-lab/chromMAGMA-public/archive/dbbd9524180d6b5f2a190889d7f33a92b7cdb97e.tar.gz
+    sha256: 62ca4ef4dbc6a939c39aafa6c614e68a4fda5ee94b8d2e329b717420476ff043
+    archive_type: tar.gz
+    archive_root: chromMAGMA-public-dbbd9524180d6b5f2a190889d7f33a92b7cdb97e
+    destination: chrom_magma/source
+    include: [README.md, 'Processing/README.md', 'Processing/*.Rmd', 'Processing/*.sh', 'Processing/Data/*', 'Analysis/README.md', 'Analysis/Data/*', 'Analysis/Rscripts/**/*']
+    exclude: ['Processing/Data/gwas_sample_sizes.txt', 'Processing/Data/snp_to_genes/**', 'Processing/Data/snp_to_subsetted_enhancers/**', '**/.RData', '**/.Rhistory']
+    nested: []
+    source_name: chromMAGMA
+    source_version: dbbd9524180d6b5f2a190889d7f33a92b7cdb97e
+    license: No machine-readable licence in the pinned repository; verify reuse terms before redistribution
+configuration:
+  genome_build: GRCh37
+  population: EUR
+  ld_reference_prefix: base/ld_reference/g1000_eur/g1000_eur
+  gene_location_file: base/gene_locations/NCBI37.3/NCBI37.3.gene.loc
+  selected: [positional]
+  primary: positional
+  positional:
+    display_name: Positional MAGMA
+    gene_id_type: entrez
+    context: protein-coding gene body with configured windows
+    source_name: NCBI gene locations distributed by MAGMA
+    source_version: NCBI37.3
+    source_url: https://cncr.nl/research/magma/
+    result_statistic_type: calibrated_gene_p_value
+    result_statistic_interpretation: MAGMA gene association p-value
+  annotation_groups:
+    - name_prefix: emagma
+      method: emagma
+      glob: emagma/annotations/*.genes.annot
+      display_prefix: eMAGMA
+      gene_id_type: entrez
+      context_from_filename: true
+      context_aliases: {}
+      source_name: GTEx v8 eQTL-informed eMAGMA annotation
+      source_version: GTEx v8; repository 87746c3c
+      source_url: https://github.com/eskederks/eMAGMA-tutorial
+      result_statistic_type: calibrated_gene_p_value
+      result_statistic_interpretation: MAGMA gene p-value using GTEx v8 eQTL SNP-to-gene assignments
+      gene_settings: [adap-permp=10000]
+      gene_set_directory: emagma/networks_entrez
+      gene_set_suffix: .txt
+      gene_set_format: membership
+      minimum_gene_id_overlap_fraction: 0.01
+    - name_prefix: h_magma
+      method: h_magma
+      glob: h_magma/core/Input_Files/*.genes.annot*
+      display_prefix: H-MAGMA
+      gene_id_type: ensembl
+      context_from_filename: true
+      context_aliases: {}
+      source_name: H-MAGMA chromatin-interaction annotation
+      source_version: repository ffe05419
+      source_url: https://github.com/thewonlab/H-MAGMA
+      result_statistic_type: calibrated_gene_p_value
+      result_statistic_interpretation: MAGMA gene p-value using chromatin-interaction SNP-to-gene assignments
+      gene_settings: []
+      gene_set_directory: null
+      gene_set_suffix: null
+      gene_set_format: auto
+      exclude_globs: ['*MAGMAdefault*']
+    - name_prefix: h_magma_protocol
+      method: h_magma
+      glob: h_magma/protocol_v1_02/Annotation_Files/*.annot
+      display_prefix: H-MAGMA protocol
+      gene_id_type: ensembl
+      context_from_filename: true
+      context_aliases:
+        AD2.transcript: Adrenal gland
+        AO.transcript: Aorta
+        BL1.transcript: Bladder
+        CM.transcript: Cardiomyocytes
+        EG2.transcript: Esophagus
+        FT2.transcript: Adipose tissue
+        GA.transcript: Gastric tissue
+        GM.transcript: GM12878 and GM19240 lymphoblastoid cell lines
+        H1.transcript: H1 embryonic stem cells
+        HCmerge.transcript: Hippocampus
+        IMR90.transcript: Fibroblast cells
+        LG.transcript: Lung
+        LI11.transcript: Liver
+        LV.transcript: Left ventricle
+        ME.transcript: H1-derived mesendoderm cells
+        MSC.transcript: H1-derived mesenchymal stem cells
+        NPC.transcript: H1-derived neuronal progenitor cells
+        OV2.transcript: Ovary
+        PA.transcript: Pancreas
+        PO3.transcript: Psoas muscle
+        RA3.transcript: Right atrium
+        RV.transcript: Right ventricle
+        SB.transcript: Small bowel
+        SG1.transcript: Sigmoid colon
+        SX.transcript: Spleen
+        TB.transcript: Trophoblast
+        TH1.transcript: Thymus
+        X5628FC.transcript: Dorsolateral prefrontal cortex
+      source_name: H-MAGMA protocol chromatin-interaction annotation
+      source_version: '1.02'
+      source_url: https://doi.org/10.5281/zenodo.6382668
+      result_statistic_type: calibrated_gene_p_value
+      result_statistic_interpretation: MAGMA gene p-value using chromatin-interaction SNP-to-gene assignments
+      gene_settings: []
+      gene_set_directory: null
+      gene_set_suffix: null
+      gene_set_format: auto
+  n_magma:
+    display_prefix: nMAGMA
+    gene_id_type: symbol
+    source_name: nMAGMA positional, Hi-C, eQTL and co-expression annotations
+    source_version: repository cb75ff67
+    source_url: https://github.com/sldrcyang/nMAGMA
+    result_statistic_type: calibrated_gene_p_value
+    result_statistic_interpretation: MAGMA gene p-value using the union of positional, Hi-C, eQTL, and co-expression assignments
+    gene_location_file: n_magma/source/Codes/protein_coding_gene.loc
+    annotation_window_upstream_kb: 0
+    annotation_window_downstream_kb: 0
+    tissues:
+      cortex:
+        components: [n_magma/source/Hi-C_annot/DLPFC_assig_throu_re_dataset1.genes.annot, n_magma/source/Hi-C_annot/DLPFC_assig_throu_re_dataset2.genes.annot, n_magma/source/eqtl_annot/Cortex_eqtl.genes.annot, n_magma/components/tom/Cortex_TOM_genes.annot]
+      hippocampus:
+        components: [n_magma/source/Hi-C_annot/Hippocampus_assig_throu_re_dataset1.genes.annot, n_magma/source/Hi-C_annot/Hippocampus_assig_throu_re_dataset2.genes.annot, n_magma/source/eqtl_annot/Hippocampus_eqtl.genes.annot, n_magma/components/tom/Hippocampus_TOM.genes.annot]
+      liver:
+        components: [n_magma/source/Hi-C_annot/Liver_assig_throu_re_dataset1.genes.annot, n_magma/source/Hi-C_annot/Liver_assig_throu_re_dataset2.genes.annot, n_magma/source/eqtl_annot/Liver_eqtl.genes.annot, n_magma/components/tom/Liver_TOM.genes.annot]
+      small_bowel:
+        components: [n_magma/source/Hi-C_annot/Small_Bowel_assig_throu_re_dataset1.genes.annot, n_magma/source/Hi-C_annot/Small_Bowel_assig_throu_re_dataset2.genes.annot, n_magma/source/eqtl_annot/Small_Bowel_eqtl.genes.annot, n_magma/components/tom/Small_Bowel_TOM.genes.annot]
+  chrom_magma:
+    name: chrom_magma_ovarian_h3k27ac
+    display_name: chromMAGMA ovarian H3K27ac enhancers
+    gene_id_type: mixed
+    context: active ovarian H3K27ac enhancer peaks linked through GeneHancer v4.7
+    source_name: chromMAGMA ovarian cancer reference
+    source_version: GeneHancer 4.7; repository dbbd9524
+    source_url: https://github.com/lawrenson-lab/chromMAGMA-public
+    result_statistic_type: minimum_regulatory_element_p_value
+    result_statistic_interpretation: Minimum MAGMA regulatory-element p-value linked to each gene; used for ranking, not calibrated gene-level significance
+    regulatory_element_location_file: chrom_magma/source/Processing/Data/genehancer.subsetted_ovca.enhancer.loc
+    element_to_gene_file: chrom_magma/source/Processing/Data/munged_genehancer_enhancer_list.txt
+    annotation_window_upstream_kb: 0
+    annotation_window_downstream_kb: 0
+  expected_mapping_definition_counts:
+    positional: 1
+    emagma: 47
+    h_magma: 35
+    n_magma: 4
+    chrom_magma: 1
+identifier_harmonisation:
+  emagma_networks:
+    comment_prefix: '#'
+    source_gene_id_type: ensembl
+    target_gene_id_type: entrez
+    rscript_executable: Rscript
+    r_export_script: export_rdata_columns.R
+    rdata_file: h_magma/protocol_v1_02/geneAnno_allgenes.rda
+    rdata_object: geneAnno1
+    rdata_source_gene_column: ensembl_gene_id
+    rdata_bridge_column: hgnc_symbol
+    r_export_file: emagma_network_gene_identifiers.tsv
+    gene_location_file: base/gene_locations/NCBI37.3/NCBI37.3.gene.loc
+    gene_location_delimiter_pattern: '\s+'
+    gene_location_target_column: 0
+    gene_location_bridge_column: 5
+    source_directory: emagma/networks
+    source_pattern: '*.txt'
+    destination_directory: emagma/networks_entrez
+    annotation_directory: emagma/annotations
+    annotation_suffix: .genes.annot
+    annotation_delimiter_pattern: '\s+'
+    membership_delimiter_pattern: '\s+'
+    membership_set_column: 0
+    membership_gene_column: 1
+    annotation_gene_column: 0
+    output_delimiter: "\t"
+    source_gene_version_pattern: '\.[0-9]+$'
+    minimum_unique_gene_mapping_fraction: 0.85
+    minimum_annotation_overlap_fraction: 0.01
+    expected_network_files: 12
+    crosswalk_file: base/gene_identifiers/gencode26_ensembl_symbol_ncbi37_entrez.tsv
+    summary_file: emagma/networks_entrez/identifier_harmonisation_summary.tsv
+    crosswalk_columns:
+      source_gene: ensembl_gene_id
+      bridge_gene: hgnc_symbol
+      target_gene: entrez_gene_id
+    summary_columns:
+      network: network
+      source_memberships: source_memberships
+      retained_memberships: retained_memberships
+      source_unique_genes: source_unique_genes
+      mapped_unique_genes: mapped_unique_genes
+      unique_gene_mapping_fraction: unique_gene_mapping_fraction
+      annotation_unique_genes: annotation_unique_genes
+      overlapping_annotation_genes: overlapping_annotation_genes
+      annotation_overlap_fraction: annotation_overlap_fraction

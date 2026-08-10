@@ -1,0 +1,55 @@
+enabled: false
+genome_build: null
+script_path: k-pops.py
+gene_annotation_file: null
+kernel_matrix_prefix: null
+magma_association_prefix: null
+minimum_gene_count: 10
+kernel_validation_chunk_rows: 512
+kernel_symmetry_relative_tolerance: 1.0e-5
+kernel_symmetry_absolute_tolerance: 1.0e-6
+use_magma_covariates: true
+covariate_projection_chromosomes: null
+remove_hla_during_covariate_projection: true
+training_chromosomes: [loco]
+remove_hla_during_training: true
+remove_hla_during_testing: true
+device: cpu
+top_contributor_gene_count: 5
+anchor_genes: []
+anchor_gene_type: ENSGID
+save_attribution_files: false
+verbose: false
+reporting:
+  top_gene_count: 10
+  score_decimal_places: 4
+input_schema:
+  table_delimiter_pattern: '\s+'
+  predictions_table_delimiter: "\t"
+  published_table_delimiter: "\t"
+  gene_id_column: ENSGID
+  gene_name_column: NAME
+  chromosome_column: CHR
+  tss_column: TSS
+  magma_gene_id_column: GENE
+  magma_score_column: ZSTAT
+  predictions_gene_id_column: 'Unnamed: 0'
+  predictions_score_column: PoPS_Score
+  published_gene_id_column: ENSGID
+  predictions_gene_id_from_index: true
+  kernel_genes_suffix: .genes
+  kernel_matrix_suffix: .bin
+  magma_genes_out_suffix: .genes.out
+  magma_genes_raw_suffix: .genes.raw
+  kernel_float_bytes: 4
+output_layout:
+  output_prefix: '{dataset_id}_kpops'
+  staging_directory: '.partial/{dataset_id}_kpops'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  completion_manifest: 'run_metadata/{dataset_id}_kpops_completion.yaml'
+  service_log_file: 'logs/{dataset_id}_kpops.log'
+  predictions_suffix: .preds
+  coefficients_suffix: .coefs
+  attribution_suffix: .attr
+  attribution_rows_suffix: .genes.row
+  attribution_columns_suffix: .genes.col

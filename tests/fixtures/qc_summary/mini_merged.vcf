@@ -1,0 +1,11 @@
+##fileformat=VCFv4.2
+##contig=<ID=1,length=1000000>
+##INFO=<ID=AF,Number=A,Type=Float,Description="Study alternate allele frequency">
+##INFO=<ID=EUR,Number=A,Type=Float,Description="Reference EUR alternate allele frequency">
+##FORMAT=<ID=AF,Number=A,Type=Float,Description="Study alternate allele frequency">
+##FORMAT=<ID=SI,Number=A,Type=Float,Description="Imputation quality">
+##FORMAT=<ID=LP,Number=A,Type=Float,Description="Minus log10 p-value">
+##FORMAT=<ID=NEF,Number=A,Type=Integer,Description="Effective sample size">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	study
+1	100	.	A	G	.	PASS	AF=0.2;EUR=0.21	AF:SI:LP:NEF	0.2:0.9:8:1000
+1	101	.	A	T	.	PASS	AF=0.5	AF:SI:LP:NEF	0.5:0.9:8:1000

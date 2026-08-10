@@ -1,0 +1,86 @@
+enabled: false
+genome_build: GRCh37
+locus_window_bp: 750000
+minimum_credible_set_coverage: 0.95
+probability_tolerance: 1.0e-8
+credible_sets_directory: null
+magma_gene_results_file: null
+magma_covariate_results_file: null
+pops_scores_file: null
+annotation_resource_directory: null
+model_directory: null
+vep_mode: api
+vep_command: null
+vep_cache: null
+cadd_mode: api
+cadd_file: null
+input_schema:
+  table_delimiter: "\t"
+  whitespace_delimiter_pattern: '\s+'
+  index_file: indexfile.txt
+  index_filename_column: Filename
+  index_locus_column: GenomicLocus
+  index_annotation_column: Annotfiles
+  credible_set_index_column: index
+  credible_set_variant_column: cred1
+  credible_set_probability_column: prob1
+  variant_identifier_pattern: '^(?:chr)?(\d+):(\d+):([ACGT]+)(?::|_)([ACGT]+)$'
+  chromosome_minimum: 1
+  chromosome_maximum: 23
+  position_maximum: 2147483647
+  magma_gene_column: GENE
+  magma_z_column: ZSTAT
+  magma_covariate_column: VARIABLE
+  magma_covariate_p_column: P
+  pops_gene_column: ENSGID
+  pops_score_column: PoPS_Score
+  ensembl_gene_pattern: '^ENSG[0-9]+(?:\.[0-9]+)?$'
+upstream:
+  script_relative_path: FLAMES.py
+  model_directory_relative_path: resources/model
+  model_file: FLAMES_XGB_model.sav
+  feature_file: features.txt
+  cadd_index_suffix: .tbi
+  required_annotation_directories:
+    - ENSG
+    - eQTLGen
+    - GTEx_v8_finemapping_CAVIAR
+    - eQTL_catalog
+    - HACER
+    - Cicero_whole_blood
+    - Jung_PCHiC
+    - Javierre_PCHiC
+    - ABC_EP
+    - ABC_CRISPR
+    - EP_correlation_F5
+    - GeneHancer
+    - RoadMapEpi
+    - EpiMap
+    - Promoter_regions
+  required_annotation_file_patterns:
+    - ENSG/ENSG.v102.genes.txt
+    - 'Promoter_regions/Proms_per_transcript_{genome_build}.parquet'
+  runtime_imports: [pandas, numpy, pyliftover, requests, pyarrow, fastparquet, sklearn, xgboost]
+  annotation_bundle_id: zenodo:12635505
+result_schema:
+  filename_column: filename
+  locus_column: locus
+  symbol_column: symbol
+  gene_column: ensg
+  xgboost_score_column: XGB_score
+  pops_score_column: PoPS_Score
+  raw_score_column: FLAMES_raw
+  scaled_score_column: FLAMES_scaled
+  precision_column: estimated_cumulative_precision
+  highest_column: FLAMES_highest
+  causal_column: FLAMES_causal
+output_layout:
+  score_basename: 'results/{dataset_id}_FLAMES_scores'
+  raw_score_suffix: .raw
+  prediction_suffix: .pred
+  annotation_file: 'annotations/{dataset_id}/{dataset_id}_locus_{row_number}_annotated.tsv'
+  index_file: 'inputs/{dataset_id}_flames_index.tsv'
+  staging_directory: '.partial/{dataset_id}_flames'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  completion_manifest: 'run_metadata/{dataset_id}_flames_completion.yaml'
+  service_log_file: 'logs/{dataset_id}_flames.log'

@@ -1,0 +1,123 @@
+enabled: false
+method: fastbat_gene
+input_file: null
+genome_build: null
+reference:
+  prefix: null
+  population: null
+  required_extensions: [.bed, .bim, .fam]
+  bim_columns: [chromosome, variant_id, genetic_distance, position, allele1, allele2]
+  table_delimiter_pattern: '\s+'
+variant_harmonisation:
+  coordinate_fallback: true
+  chromosome_label_policy: strip_chr_prefix
+  minimum_overlap_fraction: 0.50
+  allow_strand_complement: false
+gene_annotation:
+  file: null
+  columns: [chromosome, start, end, gene]
+  resource_output_names:
+    manifest: resource_manifest.yaml
+    readme: README.md
+    checksums: SHA256SUMS
+set_annotation:
+  file: null
+  gmt_file: null
+  oversized_set_policy: omit
+  conversion:
+    allowed_chromosomes: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', X, Y]
+    chromosome_label_policy: exact
+    duplicate_gene_policy: deduplicate
+    unmapped_gene_policy: report
+    empty_pathway_policy: omit
+    output_names:
+      set_list: pathways.fastbat.set
+      pathway_mapping: pathway_mapping.tsv
+      gene_variant_mapping: gene_variant_mapping.tsv
+      unmapped_genes: unmapped_genes.tsv
+      manifest: resource_manifest.yaml
+      readme: README.md
+      checksums: SHA256SUMS
+gene_window_kb: 50
+segment_size_kb: 100
+reference_maf_min: 0.01
+fastbat_ld_cutoff: 0.9
+mbat_svd_gamma: 0.9
+frequency_difference_max: 0.2
+print_component_p_values: true
+write_snpset: false
+reporting:
+  top_result_count: 10
+  p_value_significant_digits: 4
+  nominal_alpha: 0.05
+  familywise_alpha: 0.05
+  fdr_alpha: 0.05
+  correction_columns:
+    nominal_significant: significant_nominal
+    bonferroni_adjusted_p: P_bonferroni
+    bonferroni_significant: significant_bonferroni
+    fdr_bh_adjusted_p: P_fdr_bh
+    fdr_bh_significant: significant_fdr_bh
+  chromosome_columns:
+    fastbat_gene: Chr
+    fastbat_segment: Chr
+    fastbat_set: null
+    mbat_combo: Chr
+minimum_gcta_version: 1.94.1
+version_arguments: [--version]
+version_pattern: '(?i)(?:gcta[^0-9]*)?v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+version_probe_output_argument: --out
+version_probe_output_name: probe
+version_probe_temporary_prefix: .gcta_gene_version_probe_
+output_layout:
+  log_file: 'logs/{dataset_id}_{method}_gcta_gene.log'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  completion_manifest: 'run_metadata/{dataset_id}_{method}_gcta_completion.yaml'
+  output_prefix: 'raw/{dataset_id}'
+  staging_directory: '.partial/{dataset_id}_{method}'
+  prepared_set_directory: 'prepared_sets/{dataset_id}'
+  analysis_set_list: 'prepared_sets/{dataset_id}/analysis.fastbat.set'
+  harmonised_input: 'prepared_inputs/{dataset_id}_{method}_gcta_reference_ids.tsv'
+  primary_results:
+    fastbat_gene: 'raw/{dataset_id}.gene.fastbat'
+    fastbat_segment: 'raw/{dataset_id}.seg.fastbat'
+    fastbat_set: 'raw/{dataset_id}.fastbat'
+    mbat_combo: 'raw/{dataset_id}.gene.assoc.mbat'
+  normalized_result: 'results/{dataset_id}_{method}_results.tsv'
+  frequency_qc_result: 'raw/{dataset_id}.freq.badsnps'
+  mbat_snpset_result: 'raw/{dataset_id}.gene.snpset.mbat'
+results:
+  normalized_schema_version: gcta_gene.v2
+  delimiter: auto
+  delimiter_candidates: [tab, whitespace]
+  sample_lines: 25
+  infer_schema_length: 1000
+  maximum_columns: 64
+  null_values: [NA, NaN, nan, .]
+  normalized_delimiter: "\t"
+  normalized_null_value: NA
+  schemas:
+    fastbat_gene:
+      required_columns: [Gene, Chr, Start, End, No.SNPs, Pvalue]
+      p_value_column: Pvalue
+      identifier_columns: [Gene]
+      component_p_value_columns: []
+      unit_label: genes
+    fastbat_segment:
+      required_columns: [Chr, Start, End, No.SNPs, Pvalue]
+      p_value_column: Pvalue
+      identifier_columns: [Chr, Start, End]
+      component_p_value_columns: []
+      unit_label: segments
+    fastbat_set:
+      required_columns: [Set, No.SNPs, Pvalue]
+      p_value_column: Pvalue
+      identifier_columns: [Set]
+      component_p_value_columns: []
+      unit_label: sets
+    mbat_combo:
+      required_columns: [Gene, Chr, Start, End, No.SNPs, P_mBATcombo]
+      p_value_column: P_mBATcombo
+      identifier_columns: [Gene]
+      component_p_value_columns: [P_mBAT, P_fastBAT]
+      unit_label: genes

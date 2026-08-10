@@ -1,0 +1,21 @@
+enabled: false
+inputs:
+  vcf: null
+  dataset_id: null
+output_directory: null
+maf_min: 0.01
+info_min: 0.7
+info_max: null
+missing_info_action: remove
+minimum_neglog10_p: null
+reference_population_tag: EUR
+frequency_difference_max: 0.2
+include_indels: false
+remove_palindromic: true
+palindromic_lower: 0.4
+palindromic_upper: 0.6
+remove_mhc: true
+mhc:
+  chromosome: "6"
+  start: 25000000
+  end: 34000000

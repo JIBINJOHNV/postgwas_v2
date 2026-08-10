@@ -1,0 +1,25 @@
+# Direct SuSiE example. Input and reference paths remain explicit CLI inputs.
+config_version: 1
+
+run:
+  output_directory: results/direct_susie
+  dataset_id: STUDY
+  overwrite: false
+  resume: true
+
+execution:
+  threads: 4
+  memory_gb: 32
+
+pipeline:
+  modules: []
+
+modules:
+  fine_mapping:
+    enabled: true
+    engine: susie
+    genome_build: GRCh37
+    locus_type: range
+    # The example locus file already contains the intended model boundaries.
+    locus_window_kb: 0
+

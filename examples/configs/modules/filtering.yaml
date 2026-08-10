@@ -1,0 +1,9 @@
+# A module-only configuration. All omitted values come from filtering.yaml.
+enabled: true
+inputs:
+  vcf: /path/to/harmonised.vcf.gz
+  dataset_id: example_trait
+output_directory: results/filtering
+maf_min: 0.01
+info_min: 0.8
+remove_mhc: true

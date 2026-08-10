@@ -1,0 +1,80 @@
+enabled: false
+analysis: univariate
+execution_backend: auto
+genome_build: GRCh37
+bim_file_pattern: null
+ld_file_pattern: null
+chromosomes: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22']
+fit_arguments: []
+test_arguments: []
+gsa:
+  annotation_file_pattern: null
+  loadlib_file_pattern: null
+  baseline_go_file: null
+  model_go_file: null
+  test_go_file: null
+  use_complete_tag_indices: true
+  exclude_ranges: [MHC]
+  hardprune_maf: 0.05
+  hardprune_r2: 0.6
+  z_max: null
+  go_extend_bp: 10000
+  go_all_genes_label: coding_genes
+  loglike_difference_method: fast
+  standard_error_samples: 100
+  adam_epoch: null
+  adam_step: null
+  go_file_delimiter: "\t"
+  go_file_required_columns: [GO, GENE, CHR, FROM, TO]
+  go_identifier_column: GO
+  result_delimiter: "\t"
+  result_columns:
+    identifier: GO
+    gene_count: NGENES
+    heritability: h2
+    heritability_standard_error: se_h2
+    baseline_heritability: h2_base
+    enrichment: enrich
+    enrichment_standard_error: se_enrich
+    snp_count: snps
+    log_likelihood_difference: loglike_diff
+    degrees_of_freedom: loglike_df
+    model_aic: loglike_aic
+  evidence_aic_threshold: 0.0
+  top_results: 50
+workflow:
+  fit_command: fit1
+  test_command: test1
+  split_sumstats_command: split_sumstats
+  gsa_command: plsa
+  figure_command: one
+  chromosome_placeholder: '@'
+  run_id_format: '%Y%m%dT%H%M%S%fZ'
+output_layout:
+  log_file: 'logs/{run_id}/{dataset_id}_mixer.log'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  fit_prefix: 'results/raw/univariate/{dataset_id}.fit'
+  test_prefix: 'results/raw/univariate/{dataset_id}.test'
+  summary_yaml: 'results/{dataset_id}_mixer_summary.yaml'
+  summary_tsv: 'results/{dataset_id}_mixer_summary.tsv'
+  figure_prefix: 'plots/{dataset_id}'
+  gsa_split_pattern: 'results/raw/gsa/input/{dataset_id}.chr@.sumstats.gz'
+  gsa_baseline_prefix: 'results/raw/gsa/{dataset_id}.baseline'
+  gsa_full_prefix: 'results/raw/gsa/{dataset_id}.full'
+  gsa_summary_yaml: 'results/{dataset_id}_gsa_mixer_summary.yaml'
+  gsa_top_results_tsv: 'results/{dataset_id}_gsa_mixer_top_results.tsv'
+reporting:
+  enabled: true
+  generate_figures: true
+  figure_extensions: [png]
+  figure_statistics: [point_estimate]
+  table_delimiter: "\t"
+  null_value: NA
+  quality:
+    missing_chromosome_action: error
+    unexpected_chromosome_action: error
+    seed_mismatch_action: error
+    nonfinite_qq_action: warning
+    missing_log_metrics_action: warning
+    missing_uncertainty_action: warning
+    insufficient_model_power_action: warning

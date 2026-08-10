@@ -1,0 +1,90 @@
+enabled: false
+model: []
+model_use_cases:
+  marginal:
+    label: "Marginal tests / original FLAMES"
+    question: "Does each property associate with GWAS signal on its own?"
+    model: []
+    direction: two-sided
+  tissue_specificity:
+    label: "Tissue specificity / FUMA-style"
+    question: "Is a tissue positively associated after adjusting for Average?"
+    model:
+      - "condition-hide=Average"
+    direction: greater
+model_placeholders:
+  PROPERTY: "Exact, case-sensitive column header after the leading gene-ID column; separate multiple properties with commas."
+  INTERNAL: "One of size/genesize, density, mac, or sampsize/N; these are MAGMA technical variables, not covariate-table columns."
+  PATH: "Path to a whitespace-separated property list, or to a file with one joint model per line when used with joint."
+model_modifiers:
+  analyse:
+    syntax:
+      - "analyse={all|cov|covar|covariates}"
+      - "analyse=list,<PROPERTY>,..."
+      - "analyse=file,<PATH>"
+    requires_value: true
+    description: "Choose which gene properties MAGMA tests."
+    published_example: "Duncan et al. (2025) screened 461 cell-type properties, then restricted conditional follow-up to the significant cell types."
+    example: "--covariate-model analyse=list,CellType_A,CellType_B"
+  correct:
+    syntax:
+      - "correct={all|none}"
+      - "correct={include|exclude},<INTERNAL>,..."
+    requires_value: true
+    description: "Choose which MAGMA technical variables are adjusted for."
+    published_example: "Published MAGMA GWAS gene-property analyses adjust for gene size, density, inverse minor-allele count, and variable sample size (de Leeuw et al., 2015; Duncan et al., 2025)."
+    example: "--covariate-model correct=all"
+  condition:
+    syntax:
+      - "condition=<PROPERTY>,..."
+      - "condition=file,<PATH>"
+    requires_value: true
+    description: "Adjust for properties and report their coefficients."
+    published_example: "Duncan et al. (2025) conditioned significant cell-type specificity properties on one another to identify relatively independent GWAS associations."
+    example: "--covariate-model analyse=list,CellType_A condition=CellType_B"
+  condition-hide:
+    syntax:
+      - "condition-hide=<PROPERTY>,..."
+      - "condition-hide=file,<PATH>"
+    requires_value: true
+    description: "Adjust for properties without reporting their coefficients."
+    published_example: "Watanabe et al. (2019) tested tissue or cell-type expression while adjusting for cross-property Average expression."
+    example: "--covariate-model condition-hide=Average --covariate-direction greater"
+  condition-residualize:
+    syntax:
+      - "condition-residualize=<PROPERTY>,..."
+      - "condition-residualize=file,<PATH>"
+    requires_value: true
+    description: "Remove property effects from the outcome before testing."
+    published_example: "The published MAGMA conditional framework uses residualization to remove prespecified technical-artifact effects before testing biological properties (de Leeuw et al., 2018)."
+    example: "--covariate-model analyse=list,BiologicalScore condition-residualize=TechnicalScore"
+  joint:
+    syntax:
+      - "joint=<PATH>"
+    requires_value: true
+    description: "Read one multivariable model per line from a file."
+    published_example: "The blood-pressure MAGMA workflow jointly modeled correlated significant and confounding gene properties to assess independent effects (de Leeuw et al., 2018)."
+    example: "--covariate-model joint=property_models.txt"
+  joint-pairs:
+    syntax:
+      - "joint-pairs"
+    requires_value: false
+    description: "Test every pair of selected properties together."
+    published_example: "Duncan et al. (2025) used pairwise conditional models among significant brain-cell-type properties for schizophrenia and other GWAS phenotypes."
+    example: "--covariate-model analyse=list,CellType_A,CellType_B joint-pairs"
+direction: two-sided
+minimum_genes: 10
+input:
+  gene_results_file: null
+  covariates_file: null
+  missing_values: median
+  maximum_missing_fraction: 0.05
+  missing_genes: drop
+output_layout:
+  output_prefix: "{dataset_id}"
+  results_file: "{dataset_id}.gsa.out"
+  native_log_file: "{dataset_id}.log"
+  service_log_file: "logs/{dataset_id}_magmacovar.log"
+  resolved_config_file: "logs/{dataset_id}_magmacovar_resolved_config.yaml"
+  completion_manifest: "logs/{dataset_id}_magmacovar_completion.yaml"
+  staging_directory: ".magmacovar_staging/{dataset_id}"

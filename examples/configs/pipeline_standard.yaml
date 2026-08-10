@@ -1,0 +1,39 @@
+# Values omitted here are loaded from packaged module defaults.
+config_version: 1
+
+run:
+  output_directory: results/example_run
+  dataset_id: example_trait
+
+execution:
+  threads: 8
+  memory_gb: 32
+
+resources:
+  root: /path/to/postgwas_resources
+  executables:
+    bcftools: bcftools
+    plink: plink
+    plink2: plink2
+    magma: magma
+    finemap: finemap
+    rscript: Rscript
+    python: python
+
+pipeline:
+  modules: [filtering, ld_annotation, ld_clumping, fine_mapping, qc_summary]
+
+modules:
+  filtering:
+    enabled: true
+    maf_min: 0.01
+    info_min: 0.8
+  ld_annotation:
+    enabled: true
+  ld_clumping:
+    enabled: true
+  fine_mapping:
+    enabled: true
+    engine: susie
+  qc_summary:
+    enabled: true

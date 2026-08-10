@@ -1,0 +1,29 @@
+pipeline:
+  modules:
+    - filtering
+    - ld_annotation
+    - formatting
+    - imputation
+    - ld_clumping
+    - fine_mapping
+    - magma
+    - magmacovar
+    - pops
+    - flames
+    - ldsc
+    - manhattan
+    - qc_summary
+modules:
+  filtering: {enabled: true}
+  ld_annotation: {enabled: true}
+  formatting: {enabled: true}
+  imputation: {enabled: true}
+  ld_clumping: {enabled: true}
+  fine_mapping: {enabled: true}
+  magma: {enabled: true}
+  magmacovar: {enabled: true}
+  pops: {enabled: true}
+  flames: {enabled: true}
+  ldsc: {enabled: true}
+  manhattan: {enabled: true}
+  qc_summary: {enabled: true}

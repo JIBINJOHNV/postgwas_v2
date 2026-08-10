@@ -1,0 +1,24 @@
+config_version: 1
+run:
+  output_directory: results
+  dataset_id: postgwas
+  overwrite: false
+  resume: true
+execution:
+  threads: auto
+  memory_gb: auto
+  reserve_threads: 1
+  usable_memory_fraction: 0.90
+  random_seed: 10
+  temporary_directory: null
+  retries: 0
+  timeout_seconds: null
+  fail_fast: true
+logging:
+  console_level: INFO
+  file_level: DEBUG
+  show_progress: true
+  terminal_label_width: 42
+  filename: postgwas.log
+  capture_external_tools: true
+  include_timestamps: true

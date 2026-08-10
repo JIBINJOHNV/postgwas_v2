@@ -1,0 +1,6 @@
+enabled: false
+population: EUR
+intercept: null
+minimum_info: 0.9
+minimum_maf: 0.01
+chromosomes: 22

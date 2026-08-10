@@ -1,0 +1,6 @@
+enabled: false
+population: EUR
+frequency_tolerance: 0.2
+palindromic_lower: 0.4
+palindromic_upper: 0.6
+unresolved_action: reject

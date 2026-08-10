@@ -1,4 +1,4 @@
-name: postgwas1
+name: postgwas
 channels:
   - conda-forge
   - bioconda
@@ -11,7 +11,6 @@ dependencies:
   - bioconda::gseapy
   - conda-forge::py2cytoscape
   - networkx
-  - r-susier
   - r-base=4.3.*
   - r-argparse
   - r-susier
@@ -62,6 +61,7 @@ dependencies:
   - backports=1.0
   - backports.zoneinfo=0.2.1
   - bedtools=2.31.1
+  - bioconda::bcftools=1.23.1
   - bitarray=2.9.2
   - brotli-python=1.0.9
   - bzip2=1.0.8
@@ -136,16 +136,17 @@ dependencies:
   - platformdirs=4.3.6
   - pooch=1.8.2
   - py-xgboost=2.1.1
+  - pytorch>=2.1,<3
   - pyarrow=17.0.0
   - pyarrow-core=17.0.0
   - pybedtools=0.10.0
   - pycparser=2.22
   - pyliftover=0.4.1
   - pysocks=1.7.1
-  - python=3.8.20
+  - python=3.10
   - python-dateutil=2.9.0
   - python-tzdata=2024.2
-  - python_abi=3.8
+  - python_abi=3.10
   - pytz=2024.2
   - re2=2025.11.05
   - readline=8.2
@@ -155,7 +156,6 @@ dependencies:
   - scipy=1.10.1
   - six=1.16.0
   - snappy=1.2.2
-  - statsmodels=0.14.1
   - threadpoolctl=3.5.0
   - tk=8.6.13
   - typing_extensions=4.12.2
@@ -173,6 +173,7 @@ dependencies:
   - bgenix
   - pip:
       - attrs==25.3.0
+      - anndata==0.8.0
       - biopython==1.81
       - click==8.1.8
       - cloudpickle==3.1.2
@@ -181,7 +182,9 @@ dependencies:
       - importlib-metadata==8.5.0
       - locket==1.0.0
       - marshmallow==2.18.1
+      - matplotlib>=3.7,<3.8
       - more-itertools==10.5.0
+      - numba==0.57.1
       - partd==1.4.1
       - pip==25.0.1
       - pluggy==0.13.1
@@ -189,12 +192,15 @@ dependencies:
       - py==1.11.0
       - pygments==2.19.2
       - pysam==0.23.3
-      - pytest==5.3.5
+      - pytest>=8,<9
       - pyyaml==6.0.3
       - rich==14.2.0
-      - setuptools==59.8.0
+      - scanpy==1.9.3
+      - scikit-misc==0.3.1
+      - scdrs @ git+https://github.com/martinjzhang/scDRS.git@1518b56c73eb23c6ca20999d439aaa31a6b7624b
+      - setuptools>=68
       - toolz==1.0.0
+      - umap-learn==0.5.5
       - wcwidth==0.2.14
       - zipp==3.20.2
       - polars-lts-cpu==0.20.31
-      - git+https://github.com/bioinformed/vgraph.git

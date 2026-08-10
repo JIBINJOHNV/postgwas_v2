@@ -1,114 +1,101 @@
 #!/usr/bin/env python3
-"""
-postgwas — unified top-level CLI for all PostGWAS modules.
+"""Lazy top-level command dispatcher for PostGWAS."""
 
-Example usage:
-  postgwas finemap --help
-  postgwas harmonisation pipeline ...
-  postgwas heritability direct --help
-"""
-from postgwas._mp_fix import *
 import sys
+
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
-# Import module entrypoints
-from postgwas.harmonisation.cli import main as harmonisation_main
-from postgwas.finemap.cli import main as finemap_main
-from postgwas.flames.cli import main as flames_main
-from postgwas.pops.cli import main as pops_main
-from postgwas.qc_summary.cli import main as qc_main
-from postgwas.gene_assoc.cli import main as magma_main
-from postgwas.magmacovar.cli import main as magmacovar_main
-from postgwas.annot_ldblock.cli import main as annot_ldblock_main
-from postgwas.ld_clump.cli import main as ld_clump_main
-from postgwas.formatter.cli import main as formatter_main
-from postgwas.sumstat_filter.cli import main as sumstat_filter_main
-from postgwas.manhattan.cli import main as manhattan_main
-from postgwas.h2_rg.cli import main as heritability_main
-from postgwas.imputation.cli import main as imputation_main
-from postgwas.pipeline.cli import main as pipeline_main
-from postgwas.enrichment.main import main as enrichment_main
-# -------------------------------------------------------------------
-# MODULE REGISTRY (alphabetical by key)
-# -------------------------------------------------------------------
-MODULES = {
-    "annot_ldblock": (annot_ldblock_main, "Run LD-block annotation module"),
-    "finemap":       (finemap_main,       "Run fine-mapping pipeline (SuSiE/FINEMAP)"),
-    "flames":        (flames_main,        "Run FLAMES effector-gene pipeline"),
-    "formatter":     (formatter_main,     "Format sumstats → MAGMA/PoPS inputs"),
-    "harmonisation": (harmonisation_main, "Run harmonisation pipeline"),
-    "heritability":  (heritability_main,  "Run heritability estimation (LDSC)"),
-    "imputation":    (imputation_main,    "Run summary-statistic imputation module"),
-    "ld_clump":      (ld_clump_main,      "Run LD clumping and pruning module"),
-    "magma":         (magma_main,         "Run MAGMA gene/pathway analysis"),
-    "magmacovar":    (magmacovar_main,    "Run MAGMA gene-property (covariate) model"),
-    "manhattan":     (manhattan_main,     "Generate Manhattan/QQ plots"),
-    "pops":          (pops_main,          "Run PoPS gene-prioritisation module"),
-    "qc":            (qc_main,            "Run QC summary module"),
-    "pathway_enrichmnet":(enrichment_main,"Run pathway enrichment module"),
-    "sumstat_filter":(sumstat_filter_main,"Summary-statistics filtering module"),
-    "pipeline":(pipeline_main,"Summary-statistics pipeline module"),
-}
+from postgwas._mp_fix import *  # noqa: F401,F403 - multiprocessing bootstrap
+from postgwas.core.ui import format_cli_examples
+from postgwas.pipeline.registry import REGISTRY, resolve_reference
 
-# Sort alphabetically
-MODULES = dict(sorted(MODULES.items(), key=lambda x: x[0].lower()))
 
 console = Console()
 
-# -------------------------------------------------------------------
-# Rich Global Help
-# -------------------------------------------------------------------
-def print_global_help(prog: str = "postgwas") -> None:
-    """Render Rich-formatted top-level help."""
+# Keep the historical misspelling as a compatibility alias without advertising it.
+COMMAND_ALIASES = {"pathway_enrichmnet": "pathway_enrichment"}
 
-    # Header banner
+
+def print_global_help(prog: str = "postgwas") -> None:
     header = Text("PostGWAS — Unified Toolkit for Post-GWAS Analyses", style="bold cyan")
     console.print(Panel(header, expand=False))
 
-    # Module table
-    table = Table(title="Available Modules", title_style="bold magenta", padding=(0,1))
+    table = Table(title="Available Modules", title_style="bold magenta", padding=(0, 1))
     table.add_column("Command", style="cyan", no_wrap=True)
     table.add_column("Description", style="green")
-
-    for name, (_, desc) in MODULES.items():
-        table.add_row(name, desc)
-
+    for command, spec in sorted(REGISTRY.commands().items()):
+        table.add_row(command, spec.description)
     console.print(table)
+    console.print(
+        "\n" + format_cli_examples(
+            (
+                "Prepare raw GWAS summary statistics:",
+                "postgwas harmonisation",
+                ("--help",),
+            ),
+            (
+                "Validate a harmonised GWAS-VCF:",
+                "postgwas --validate",
+                ("--help",),
+            ),
+            (
+                "Choose and inspect a multi-module workflow:",
+                "postgwas pipeline",
+                ("--help",),
+            ),
+            (
+                "Export a complete fine-mapping pipeline configuration:",
+                "postgwas config export",
+                (
+                    "--pipeline finemap",
+                    "--style full",
+                    "--output finemap_pipeline.yaml",
+                ),
+            ),
+            title="Examples — start here",
+        ) + "\n"
+    )
 
-    console.print("\n[bold yellow]Usage:[/bold yellow]  postgwas <module> --help")
-    console.print("Example: [green]postgwas finemap --help[/green]\n")
 
-
-# -------------------------------------------------------------------
-# Dispatcher
-# -------------------------------------------------------------------
 def main():
     argv = sys.argv
     prog = argv[0]
-
-    # If no command or help requested
     if len(argv) == 1 or argv[1] in ("-h", "--help"):
         print_global_help(prog)
-        sys.exit(0)
+        return 0
 
-    cmd = argv[1]
+    if argv[1] == "--validate":
+        from postgwas.modules.harmonisation.concordance.cli import main as validation_main
 
-    # Invalid module name
-    if cmd not in MODULES:
-        console.print(f"[red]{prog}: error: unknown module '{cmd}'[/red]\n")
+        sys.argv = [f"{prog} --validate"] + argv[2:]
+        return validation_main()
+
+    shorthand_export = argv[1] == "--config"
+    command = "config" if shorthand_export else COMMAND_ALIASES.get(argv[1], argv[1])
+    commands = REGISTRY.commands()
+    if command not in commands:
+        console.print(f"[red]{prog}: error: unknown module '{argv[1]}'[/red]\n")
         print_global_help(prog)
-        sys.exit(1)
+        return 2
 
-    module_main, _ = MODULES[cmd]
-
-    # Replace argv so the submodule sees correct prog name
-    sys.argv = [f"{prog}-{cmd}"] + argv[2:]
-
-    return module_main()
+    spec = commands[command]
+    arguments = argv[2:]
+    command_prog = f"{prog} --config" if shorthand_export else f"{prog}-{command}"
+    sys.argv = [command_prog] + arguments
+    try:
+        entrypoint = resolve_reference(spec.cli_entrypoint)
+    except (ImportError, AttributeError) as exc:
+        console.print(
+            f"[red]{prog}: module '{command}' could not be loaded: "
+            f"{type(exc).__name__}: {exc}[/red]"
+        )
+        return 1
+    result = entrypoint()
+    return 0 if result is None else result
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

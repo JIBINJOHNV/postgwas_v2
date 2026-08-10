@@ -12,16 +12,20 @@ chaining multiple steps together.
 ┃ Command               ┃ Description                               ┃
 ┡━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
 │ annot_ldblock         │ LD-block annotation                       │
+│ caldera               │ CALDERA causal-gene prioritisation        │
 │ finemap               │ Fine-mapping (SuSiE / FINEMAP)            │
 │ flames                │ FLAMES integrative scoring                │
 │ formatter             │ Convert VCF to tool-specific formats      │
+│ gcta_gene             │ GCTA fastBAT / mBAT-combo set analysis   │
 │ harmonisation         │ Harmonisation of input summary statistics │
 │ heritability          │ LDSC-based heritability estimation        │
 │ imputation            │ Summary-statistic imputation              │
+│ kpops                 │ Kernel-based K-POPS gene prioritisation   │
 │ ld_clump              │ LD clumping                               │
 │ magma                 │ MAGMA gene/pathway analysis               │
 │ magmacovar            │ MAGMA gene-property model                 │
 │ manhattan             │ Manhattan/QQ plot generation              │
+│ mixer                 │ Single-trait MiXeR and GSA-MiXeR           │
 │ pipeline              │ Multi-step summary-statistic pipeline     │
 │ pops                  │ PoPS gene-prioritisation                  │
 │ qc                    │ QC summary reporting                      │
@@ -246,16 +250,18 @@ docker run --rm  --platform=linux/amd64 \
     -u $(id -u):$(id -g) \
     -v /Users/JJOHN41/:/Users/JJOHN41/ \
     -it jibinjv/postgwas:1.3 postgwas harmonisation \
-    --nthreads 10 \
-    --max-mem 50G \
-    --config /Users/JJOHN41/Downloads/postgwas/tests/harmonisatio_example_input_file.csv \
-    --defaults /Users/JJOHN41/Downloads/postgwas/tests/harmonisation.yaml
+    --threads 10 \
+    --memory-gb 50 \
+    --sample-sheet /path/to/sample_sheet.csv \
+    --run-config /path/to/run_config.yaml \
+    --resource-directory /path/to/postgwas_resources \
+    --output-directory /path/to/results
 
 
-# --nthreads Number of threads to use
-# --max-mem Maximum memory to use
-# --config Full path to the input config file generated in Step 1
-# --defaults Full path to a YAML file containing default parameters for the harmonisation module , example available in the tests folder. https://github.com/JIBINJOHNV/postgwas/tree/main/tests
+# --threads Number of worker threads
+# --memory-gb Maximum memory in GB
+# --sample-sheet Dataset and column mappings
+# --run-config Run, resource, logging, execution, and module parameters
 ```
 
 #### <span style="color: #5fa8ff; font-weight: bold;">Step 3: Run PostGWAS Downstream modules individually</span>
@@ -290,9 +296,12 @@ Modules marked as **(opt)** are optional and can be skipped depending on your an
 | **ld_clump**        | harmonisation → imputation(opt) → annot_ldblock → sumstat_filter(opt) → ld_clump |
 | **heritability**    | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → heritability |
 | **magma**            | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → formatter → magma |
+| **gcta_gene**        | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → formatter → gcta_gene |
 | **magmacovar**       | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → formatter → magma → magmacovar|
 | **pops**             | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → formatter → magma → pops |
+| **kpops**            | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → formatter → magma → kpops |
 | **finemap**          | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → annot_ldblock → ld_clump → formatter → finemap |
+| **caldera**          | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → annot_ldblock → ld_clump → formatter → magma → pops → finemap → caldera |
 | **flames**           | harmonisation → sumstat_filter(opt) → imputation(opt) → sumstat_filter(opt) → annot_ldblock → ld_clump → formatter → magma → magmacovar→ pops → finemap → flames |
 | **pathway_enrichment** | Not depend on any other postgwas module, it require a file that contain gene symbol in the first column |
 
@@ -318,48 +327,44 @@ After completing Step 3, you can chain modules programmatically or execute them 
         -it jibinjv/postgwas:1.3 postgwas --help   
 ```
 
+Create formatter inputs and run MAGMA as separate modules:
+
 ```sh
-base_dir="/Users/JJOHN41/Downloads/postgwas/tests/"
-resourse_folder="/Users/JJOHN41/Documents/software_resources/resourses/postgwas/"
-genome_version="GRCh37"
-sample_id="ADHD2022_iPSYCH_deCODE_PGC"
+postgwas formatter \
+  --vcf study_GRCh37.vcf.gz \
+  --format magma \
+  --dataset-id STUDY \
+  --output-directory formatted
 
-## Please ensure that the genome build of the input summary-statistics VCF file matches the genome build of all reference files.
-## Please ensure that the gene locus file and the gene set file use the same gene identifiers or gene symbols.
-
-docker run --rm  --platform=linux/amd64 \
-    -u $(id -u):$(id -g) \
-    -v /Users/JJOHN41/:/Users/JJOHN41/ \
-    -it jibinjv/postgwas:1.3 postgwas formatter \
-    --nthreads 2 \
-    --max-mem 16G \
-    --vcf ${base_dir}/${sample_id}/00_harmonised_sumstat/${sample_id}_GRCh37_merged.vcf.gz \
-    --format magma \
-    --sample_id ${sample_id} \
-    --outdir ${base_dir}/${sample_id}/magma_inputs/
-
-
-docker run --rm  --platform=linux/amd64 \
-    -u $(id -u):$(id -g) \
-    -v /Users/JJOHN41/:/Users/JJOHN41/ \
-    -it jibinjv/postgwas:1.3 postgwas magma \
-    --nthreads 2 \
-    --max-mem 16G \
-    --sample_id ${sample_id} \
-    --outdir ${base_dir}/${sample_id}/magma_analysis/ \
-    --snp_loc_file ${base_dir}/${sample_id}/${sample_id}_magma_snp_loc.tsv \
-    --pval_file ${base_dir}/${sample_id}/${sample_id}_magma_P_val.tsv \
-    --ld_ref ${resourse_folder}/onekg_plinkfiles/GRCh37/EUR.chr1_22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes_multiallele_uniqid_Grch37_maf0001 \
-    --gene_loc_file ${resourse_folder}/magma/gene_loc/NCBI37.3/NCBI37.3.gene_withGeneSymbol.loc \
-    --geneset_file ${resourse_folder}/msigdb_v2025.1.Hs_GMTs/msigdb.v2025.1.Hs.symbols.gmt \
-    --window_upstream 35 \
-    --window_downstream 10 \
-    --gene_model snp-wise=mean \
-    --n_sample_col N_COL
-
-
-
+postgwas magma \
+  --snp-location-file formatted/STUDY_magma_snp_loc.tsv \
+  --p-value-file formatted/STUDY_magma_p_values.tsv \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --gene-set-file reference/pathways.gmt \
+  --dataset-id STUDY \
+  --output-directory magma_results
 ```
+
+Or run formatter and MAGMA in one pipeline. Export the complete configuration
+first when paths and analysis settings should be stored in YAML:
+
+```sh
+postgwas config export \
+  --pipeline magma \
+  --style full \
+  --output magma_pipeline.yaml
+
+postgwas pipeline \
+  --modules magma \
+  --vcf study_GRCh37.vcf.gz \
+  --dataset-id STUDY \
+  --output-directory results \
+  --run-config magma_pipeline.yaml
+```
+
+See [MAGMA module documentation](docs/modules/magma.md) for reference compatibility,
+variant matching, output provenance, and container licensing requirements.
 
 #### <span style="color: #5fa8ff; font-weight: bold;">Step 4: Run PostGWAS pipeline module </span>
 
@@ -375,8 +380,8 @@ docker run --rm --platform=linux/amd64 \
   -it jibinjv/postgwas:1.3 \
   postgwas pipeline \
         --modules flames \
-        --nthreads 10 \
-        --max-mem 60G \
+        --threads 10 \
+        --memory-gb 60 \
         --seed 10 \
         --apply-manhattan \
         --apply-filter \
@@ -410,8 +415,7 @@ docker run --rm --platform=linux/amd64 \
         --population EUR \
         --corr_method pearson \
         --r2threshold 0.8 \
-        --gwas2vcf_resource ${resourse_folder}/gwas2vcf/ \
-        --gwas2vcf_default_config ${base_dir}/harmonisation.yaml \
+        --resource-directory ${resourse_folder}/gwas2vcf/ \
         --imputation_tool pred_ld \
         --ref_ld ${resourse_folder}/imputation/pred-ld/ref/ 
 ```

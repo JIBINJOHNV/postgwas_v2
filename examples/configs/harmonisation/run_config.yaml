@@ -1,0 +1,41 @@
+config_version: 1
+
+run:
+  output_directory: /path/to/results
+  dataset_id: postgwas
+  overwrite: false
+  resume: false
+
+resources:
+  root: /path/to/postgwas_resources
+
+execution:
+  # Omit these two keys to use packaged automatic rules.
+  # threads: 8
+  # memory_gb: 32
+  retries: 0
+
+logging:
+  console_level: INFO
+  file_level: DEBUG
+
+modules:
+  harmonisation:
+    enabled: true
+    comparison_af:
+      source: 1000G
+      column: EUR
+    concordance_validation:
+      enabled: false
+      allow_strand_complement: true
+      palindromic_action: exclude
+      indel_representation_action: warn
+      write_all_matches: false
+      effect: {absolute: 1.0e-6, relative: 1.0e-5}
+      allele_frequency: {absolute: 1.0e-6, relative: 1.0e-5}
+      z_score: {absolute: 1.0e-5, relative: 1.0e-5}
+      failure:
+        maximum_value_mismatch_fraction: 0.0
+        maximum_vcf_only_variants: 0
+        maximum_vcf_duplicate_records: 0
+        minimum_retained_fraction: null

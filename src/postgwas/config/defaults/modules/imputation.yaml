@@ -1,0 +1,14 @@
+enabled: false
+engine: pred_ld
+population: EUR
+engines:
+  pred_ld:
+    minimum_r2: 0.8
+    minimum_maf: 0.001
+    mode: TOP_LD
+  raiss:
+    minimum_r2: 0.8
+  ssimp:
+    minimum_r2: 0.8
+  summary_gwas_imputation:
+    minimum_r2: 0.8
