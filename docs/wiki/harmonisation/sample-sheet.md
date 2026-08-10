@@ -37,15 +37,18 @@ standard error from valid statistics under configured policies.
 
 ## EAF and INFO mappings
 
-Choose exactly one source for each concept:
+Choose exactly one source for study EAF. INFO uses the explicit priority shown
+below:
 
-| Concept | Internal source | External source |
-|---|---|---|
-| Study effect-allele frequency | `effect_allele_frequency_column` | `external_eaf_file` plus `external_eaf_column` |
-| Study imputation quality | `imputation_info_column` | `external_info_file` plus `external_info_column` |
+| Concept | Internal source | External source | Resolution rule |
+|---|---|---|---|
+| Study effect-allele frequency | `effect_allele_frequency_column` | `external_eaf_file` plus `external_eaf_column` | Exactly one source is required. |
+| Study imputation quality | `imputation_info_column` | `external_info_file` plus `external_info_column` | Internal INFO takes priority when both are listed; otherwise use external INFO. With neither, explicitly supply `--fixed-info VALUE` or preflight fails. |
 
 An external path without its column name is incomplete. The comparison AF
 panel configured for harmonisation is not a substitute for either study source.
+An ignored external INFO source is reported rather than silently combined with
+the internal values.
 
 ## Sample-size mappings
 

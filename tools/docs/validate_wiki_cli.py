@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate commands in published Wiki console blocks against the live CLI."""
+"""Validate commands in the README and published Wiki against the live CLI."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = REPOSITORY_ROOT / "docs" / "wiki.yml"
+ROOT_README = REPOSITORY_ROOT / "README.md"
 FENCE_PATTERN = re.compile(r"```(?:console|bash|shell)\n(.*?)```", re.DOTALL)
 INLINE_COMMAND_PATTERN = re.compile(r"`(postgwas(?:\s+[^`\n]+)?)`")
 LONG_OPTION_PATTERN = re.compile(r"(?<![A-Za-z0-9-])(--[A-Za-z][A-Za-z0-9-]*)")
@@ -60,7 +61,7 @@ def _logical_commands(block: str) -> Iterable[str]:
 
 def documented_commands(manifest: Path = DEFAULT_MANIFEST) -> tuple[tuple[Path, str], ...]:
     commands = []
-    for source in _published_sources(manifest):
+    for source in (ROOT_README, *_published_sources(manifest)):
         text = source.read_text(encoding="utf-8")
         for block in FENCE_PATTERN.findall(text):
             for command in _logical_commands(block):
@@ -280,7 +281,7 @@ def validate_documented_commands(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Validate commands in published Wiki console blocks against PostGWAS help."
+        description="Validate commands in README and published Wiki blocks against PostGWAS help."
     )
     parser.add_argument("--executable", default="postgwas")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)

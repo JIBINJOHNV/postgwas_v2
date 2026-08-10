@@ -1,13 +1,15 @@
-# Wiki maintenance
+# Documentation maintenance
 
-The public GitHub Wiki is a generated view of canonical Markdown maintained in
-the main PostGWAS repository. Do not maintain an independent copy of the same
-documentation in the Wiki repository.
+The PostGWAS user guide is maintained as canonical Markdown in the main
+repository. The root [`README.md`](../../README.md) links every published page,
+so the complete guide can be browsed directly in a private repository without
+GitHub Wiki access.
 
 ## Source contract
 
-[`docs/wiki.yml`](../wiki.yml) is the publication manifest. Its page order is
-the sidebar order, and each entry defines:
+[`docs/wiki.yml`](../wiki.yml) is the documentation manifest. Its page order is
+the order used by the root README and optional generated navigation, and each
+entry defines:
 
 - the user-facing page title;
 - a unique, stable Wiki slug;
@@ -34,7 +36,7 @@ local assets that do not yet have a defined publication rule.
 Pull requests and pushes to the default branch run the same contract through
 `.github/workflows/wiki-docs.yml`.
 
-## Build the Wiki tree
+## Build an optional Wiki-compatible tree
 
 Generate the publishable files locally:
 
@@ -43,9 +45,11 @@ python tools/docs/build_wiki.py
 ```
 
 Output is written to the ignored `build/wiki/` directory. The builder records
-the Markdown files it owns in `.postgwas-wiki-files`; a later build removes only
-stale files listed in that inventory and preserves unrelated files. Publish only
-the generated Markdown files, not the inventory.
+the files it owns in `.postgwas-wiki-files`; a later build removes only stale
+files listed in that inventory and preserves unrelated files. The inventory is
+part of the generated publication tree and must be retained in the Wiki Git
+repository so automated rebuilds can distinguish managed files from unrelated
+content. GitHub does not render it as a Wiki page.
 
 An alternative output directory can be selected explicitly:
 
@@ -57,20 +61,16 @@ The builder refuses to use an existing non-empty directory unless that
 directory contains its managed-file inventory. This prevents accidental
 replacement of a Wiki clone or another user-owned directory.
 
-## Publish
+## Publication
 
-Wiki publication is deliberately separate from validation. After the repository
-Wiki is enabled and its initial Home page exists:
+GitHub Wiki publication is not configured for this private repository. Users
+browse the canonical pages through the complete documentation index in the
+root README. The workflow validates the Markdown, generated navigation, links,
+and documented commands, but does not attempt to push a `.wiki.git` repository.
 
-1. Build the Wiki tree.
-2. Clone the repository's `.wiki.git` repository into a separate directory.
-3. Copy the generated Markdown files into that clone.
-4. Review the Wiki repository diff.
-5. Commit and push the Wiki repository.
-
-Automated publication should run only after changes reach the default branch.
-Use a repository-scoped write credential selected for the Wiki; do not add a
-broad personal token to the workflow.
+If Wiki access is enabled in the future, the optional generated tree can be
+reviewed and published as a separate change. The canonical Markdown and the
+root README index must remain the source of truth.
 
 ## Add a page
 
@@ -78,8 +78,9 @@ broad personal token to the workflow.
 2. Start the page with one level-one heading.
 3. Add the page to `docs/wiki.yml` with a stable, unique slug.
 4. Use relative links between canonical Markdown sources.
-5. Run the Wiki validation tests.
-6. Inspect the generated page and navigation before publication.
+5. Add its canonical source link to the root README in manifest order.
+6. Run the documentation validation tests.
+7. Inspect the source page and optional generated navigation.
 
 For module documentation, begin with
 [`docs/templates/module-page.md`](../templates/module-page.md). Configuration and

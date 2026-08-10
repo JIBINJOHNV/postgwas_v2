@@ -126,7 +126,10 @@ the manifest and QC evidence with every downstream result.
 ## Common problems
 
 - Incorrect column names or delimiters.
-- Supplying both internal and external EAF/INFO, or neither.
+- Supplying both internal and external EAF, or supplying neither EAF source.
+- Supplying no INFO source without explicitly choosing `--fixed-info`; when
+  both internal and external INFO are listed, internal INFO takes priority and
+  the ignored external source is reported.
 - Case-control rows missing cases or controls.
 - Build-check or chromosome resource files missing.
 - Low build-match evidence or excessive liftover loss.

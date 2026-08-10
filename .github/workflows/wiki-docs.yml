@@ -1,8 +1,9 @@
-name: Validate Wiki documentation
+name: Validate user documentation
 
 on:
   pull_request:
     paths:
+      - "README.md"
       - "docs/**"
       - "tools/docs/**"
       - "tests/test_wiki_docs.py"
@@ -11,6 +12,7 @@ on:
     branches:
       - main
     paths:
+      - "README.md"
       - "docs/**"
       - "tools/docs/**"
       - "tests/test_wiki_docs.py"
@@ -25,10 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
