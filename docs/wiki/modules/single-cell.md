@@ -296,7 +296,7 @@ MAGMA text results do not encode enough metadata to prove genome-build,
 ancestry, or gene-identifier compatibility in direct mode. Retain the upstream
 MAGMA configuration and reference manifest.
 
-## Reference inputs and downloads
+### Reference inputs and downloads
 
 PostGWAS deliberately does not select or silently download a biological atlas
 or an identifier mapping. Pin the exact files used by the study:

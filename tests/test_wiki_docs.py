@@ -11,6 +11,7 @@ import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
+ROOT_README = REPOSITORY_ROOT / "README.md"
 BUILDER = REPOSITORY_ROOT / "tools" / "docs" / "build_wiki.py"
 CLI_VALIDATOR = REPOSITORY_ROOT / "tools" / "docs" / "validate_wiki_cli.py"
 MODULE_TEMPLATE = REPOSITORY_ROOT / "docs" / "templates" / "module-page.md"
@@ -25,6 +26,13 @@ HARMONISATION_ORDER_ASSET = HARMONISATION_ORDER_SOURCE.with_name(
 CONFIGURATION_DEFAULTS_SOURCE = (
     REPOSITORY_ROOT / "docs" / "wiki" / "reference" / "configuration-defaults.md"
 )
+HARMONISATION_CONFIGURATION_SOURCE = (
+    REPOSITORY_ROOT / "docs" / "modules" / "harmonisation" / "configuration.md"
+)
+HARMONISATION_SAMPLE_SHEET_SOURCE = (
+    REPOSITORY_ROOT / "docs" / "wiki" / "harmonisation" / "sample-sheet.md"
+)
+WIKI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "wiki-docs.yml"
 MODULE_HEADINGS = [
     "## Purpose",
     "## What the analysis does",
@@ -119,6 +127,40 @@ def test_harmonisation_wiki_preserves_the_runtime_processing_order():
     for sequence in (dataset_steps, chromosome_steps, post_merge_steps):
         positions = [text.index(heading) for heading in sequence]
         assert positions == sorted(positions)
+
+
+def test_harmonisation_cross_page_step_and_info_contracts_match_runtime():
+    configuration = HARMONISATION_CONFIGURATION_SOURCE.read_text(encoding="utf-8")
+    sample_sheet = HARMONISATION_SAMPLE_SHEET_SOURCE.read_text(encoding="utf-8")
+
+    assert "At chromosome step 04, the supplied raw frequency reference" in configuration
+    assert "At\nchromosome step 03, an odds ratio is normalized" in configuration
+    assert "reciprocates an odds ratio before its\nlater log conversion" not in configuration
+    assert "Internal INFO takes priority when both are listed" in sample_sheet
+    assert "Exactly one source is required" in sample_sheet
+
+
+def test_readme_uses_current_repository_and_version_two_interfaces():
+    text = ROOT_README.read_text(encoding="utf-8")
+
+    assert "JIBINJOHNV/postgwas_v2/wiki" in text
+    assert "JIBINJOHNV/postgwas.git" not in text
+    assert "jibinjv/postgwas:1.3" not in text
+    assert "sumstat_file" not in text
+    assert "--sample-sheet studies.csv" in text
+
+
+def test_wiki_workflow_publishes_only_after_main_validation():
+    workflow = WIKI_WORKFLOW.read_text(encoding="utf-8")
+
+    assert workflow.count('- "README.md"') == 2
+    assert "needs: validate" in workflow
+    assert "github.event_name == 'push'" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "python tools/docs/build_wiki.py --output wiki-repository" in workflow
+    assert "printf '%s\\n' Home.md > wiki-repository/.postgwas-wiki-files" in workflow
+    assert "${{ github.token }}" in workflow
+    assert "git push origin HEAD" in workflow
 
 
 def test_harmonisation_wiki_visualises_execution_scope_and_variant_outcomes():

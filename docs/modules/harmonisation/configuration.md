@@ -54,7 +54,7 @@ by default before joining. An explicit `build.mode` remains authoritative and
 bypasses the automatic evidence thresholds while still collecting strand
 evidence from the declared build reference.
 
-At chromosome step 03, the supplied raw frequency reference remains an
+At chromosome step 04, the supplied raw frequency reference remains an
 ordinary `CHROM`, `POS`, `REF`, `ALT`, population-AF table. PostGWAS joins it
 once to the study on chromosome and position, then uses vectorised Polars
 expressions to classify the four orientations. It does not create or require a
@@ -62,13 +62,14 @@ four-times-expanded reference file. The selected result is recorded in
 `strand_action`, with aligned reference ALT frequency in
 `strand_reference_af`.
 
-Complementing both alleles preserves beta, odds ratio, Z and true EAF. Changing
-the effect allele negates beta and Z, reciprocates an odds ratio before its
-later log conversion, and replaces true EAF with `1-EAF`; SE, p-value, INFO and
-sample size remain unchanged. A confirmed MAF is never inverted because it is
-not tied to the listed effect allele. If the second-level reference comparison
-instead proves that a MAF-like column is true EAF, swapped rows are inverted at
-that point. After chromosome processing, PostGWAS consolidates every completed
+Chromosome step 03 has already converted an odds ratio and any declared raw
+OR-scale SE to canonical log-odds BETA and SE. Complementing both alleles then
+preserves BETA, Z and true EAF. Changing the effect allele negates BETA and Z
+and replaces true EAF with `1-EAF`; log-scale SE, p-value, INFO and sample size
+remain unchanged. A confirmed MAF is never inverted because it is not tied to
+the listed effect allele. If the second-level reference comparison instead
+proves that a MAF-like column is true EAF, swapped rows are inverted at that
+point. After chromosome processing, PostGWAS consolidates every completed
 chromosome's `maf_reference_decision`. Only unanimous conclusive evidence
 changes the final dataset frequency type. The manifest preserves the initial
 MAF suspicion separately and records the final type, its source, and the
@@ -95,7 +96,7 @@ row under `info.deduplicate_reference: true` or fails before row multiplication.
 ### Effect scale before Z-based recovery
 
 The study-wide effect decision is passed unchanged to every chromosome. At
-chromosome step 05, an odds ratio is normalized through the existing
+chromosome step 03, an odds ratio is normalized through the existing
 `harmonise_effect_estimates()` implementation, producing the canonical
 log-odds beta and applying the configured non-positive-OR and SE-scale rules.
 Only then does step 06 derive a missing standard error from `SE = beta / Z`.

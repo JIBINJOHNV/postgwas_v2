@@ -43,9 +43,11 @@ python tools/docs/build_wiki.py
 ```
 
 Output is written to the ignored `build/wiki/` directory. The builder records
-the Markdown files it owns in `.postgwas-wiki-files`; a later build removes only
-stale files listed in that inventory and preserves unrelated files. Publish only
-the generated Markdown files, not the inventory.
+the files it owns in `.postgwas-wiki-files`; a later build removes only stale
+files listed in that inventory and preserves unrelated files. The inventory is
+part of the generated publication tree and must be retained in the Wiki Git
+repository so automated rebuilds can distinguish managed files from unrelated
+content. GitHub does not render it as a Wiki page.
 
 An alternative output directory can be selected explicitly:
 
@@ -59,18 +61,20 @@ replacement of a Wiki clone or another user-owned directory.
 
 ## Publish
 
-Wiki publication is deliberately separate from validation. After the repository
-Wiki is enabled and its initial Home page exists:
+Wiki publication runs automatically after validation succeeds on a push to the
+default branch. The first publication still requires the repository Wiki to be
+enabled and initialized with a Home page:
 
-1. Build the Wiki tree.
-2. Clone the repository's `.wiki.git` repository into a separate directory.
-3. Copy the generated Markdown files into that clone.
-4. Review the Wiki repository diff.
-5. Commit and push the Wiki repository.
+1. Enable the repository Wiki under **Settings → Features**.
+2. Create and save its initial Home page.
+3. Run the validation workflow again or push a documentation change to the
+   default branch.
 
-Automated publication should run only after changes reach the default branch.
-Use a repository-scoped write credential selected for the Wiki; do not add a
-broad personal token to the workflow.
+The publication job clones the repository's `.wiki.git` repository, writes the
+generated tree through the same managed-file builder, reviews the Git diff, and
+adopts only the initial `Home.md` as managed on the first run, and pushes only
+when content changed. It uses the workflow's ephemeral,
+repository-scoped token; do not add a broad personal token.
 
 ## Add a page
 
