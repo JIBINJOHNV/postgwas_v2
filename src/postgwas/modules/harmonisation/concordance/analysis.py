@@ -22,13 +22,59 @@ INPUT_SOURCE_ROW_COLUMN = "__concordance_input_source_row"
 VCF_SOURCE_ROW_COLUMN = "__concordance_vcf_source_row"
 PARTITION_COLUMN = "__concordance_chromosome_partition"
 
+VARIANT_TYPES = (
+    ("snps", "snp"),
+    ("indels", "indel"),
+    ("other_variants", "other"),
+)
+MATCH_TYPE_FIELDS = {
+    "direct": "direct_matches",
+    "allele_swapped": "swapped_matches",
+    "strand_complement": "complement_matches",
+    "strand_complement_swapped": "complement_swapped_matches",
+    "palindromic_as_listed": "palindromic_as_listed_matches",
+    "palindromic_swapped": "palindromic_swapped_matches",
+    "palindromic_forward": "palindromic_forward_matches",
+    "palindromic_forward_swapped": "palindromic_forward_swapped_matches",
+    "palindromic_reverse_complement": "palindromic_reverse_complement_matches",
+    "palindromic_reverse_complement_swapped": (
+        "palindromic_reverse_complement_swapped_matches"
+    ),
+}
+POSITION_COUNT_FIELDS = (
+    "input_unmatched_positions",
+    "vcf_unmatched_positions",
+    "unmatched_position_union",
+    "shared_unmatched_positions",
+    "unambiguous_position_pairs",
+    "ambiguous_shared_positions",
+    "same_position_input_variants",
+    "same_position_vcf_variants",
+    "input_specific_variants",
+    "vcf_specific_variants",
+    "input_specific_positions",
+    "vcf_specific_positions",
+    "position_value_checked_pairs",
+    "position_value_concordant_pairs",
+    "position_value_mismatch_pairs",
+)
+METRIC_OBSERVED_COLUMNS = {
+    "effect": "vcf_effect",
+    "standard_error": "vcf_se",
+    "allele_frequency": "observed_frequency",
+    "z_score": "vcf_z",
+}
+
 
 @dataclass
 class ConcordanceAnalysis:
     status: str
     summary: dict[str, Any]
     metric_summary: dict[str, dict[str, Any]]
+    metric_summary_by_variant_type: dict[str, dict[str, dict[str, Any]]]
+    position_metric_summary_by_variant_type: dict[str, dict[str, dict[str, Any]]]
     matched: pl.DataFrame | pl.LazyFrame
+    position_matches: pl.DataFrame | pl.LazyFrame
     mismatches: pl.DataFrame | pl.LazyFrame
     input_only: pl.DataFrame | pl.LazyFrame
     vcf_only: pl.DataFrame | pl.LazyFrame
@@ -124,6 +170,7 @@ def prepare_input_table(
     row,
     *,
     effect_type: str,
+    se_scale: str | None = None,
     p_value_type: str,
     eaf_is_maf: bool | None,
     settings,
@@ -139,7 +186,23 @@ def prepare_input_table(
         if effect_type == "odds_ratio" else effect
     )
     supplied_z = _numeric(frame, row.z_score_column)
-    standard_error = _numeric(frame, row.standard_error_column)
+    supplied_standard_error = _numeric(frame, row.standard_error_column)
+    if (
+        effect_type == "odds_ratio"
+        and row.standard_error_column
+        and se_scale not in ("log_odds", "as_given")
+    ):
+        raise ValueError(
+            "Odds-ratio concordance requires the study-level SE-scale decision "
+            "('log_odds' or 'as_given')."
+        )
+    standard_error = (
+        pl.when(effect > 0)
+        .then(supplied_standard_error / effect)
+        .otherwise(None)
+        if effect_type == "odds_ratio" and se_scale == "as_given"
+        else supplied_standard_error
+    )
     input_af = _numeric(frame, row.effect_allele_frequency_column)
     p_value = _numeric(frame, row.p_value_column)
     duplicate_action = (
@@ -224,6 +287,28 @@ def prepare_input_table(
         .otherwise(pl.col("input_z_source"))
         .alias("input_z_source"),
     ).drop("_z_from_p")
+    result = result.with_columns(
+        pl.when(pl.col("input_se").is_not_null())
+        .then(pl.col("input_se"))
+        .when(
+            pl.col("input_beta").is_not_null()
+            & pl.col("input_z").is_not_null()
+            & (pl.col("input_z") != 0)
+        )
+        .then((pl.col("input_beta") / pl.col("input_z")).abs())
+        .otherwise(None)
+        .alias("input_se"),
+        pl.when(pl.col("input_se").is_not_null())
+        .then(pl.lit("supplied_canonical_scale"))
+        .when(
+            pl.col("input_beta").is_not_null()
+            & pl.col("input_z").is_not_null()
+            & (pl.col("input_z") != 0)
+        )
+        .then(pl.lit("calculated_abs_beta_div_z"))
+        .otherwise(pl.lit("unavailable"))
+        .alias("input_se_source"),
+    )
 
     result = result.with_columns(
         (
@@ -541,13 +626,8 @@ def _safe_number(value):
     return number if math.isfinite(number) else None
 
 
-def _metric_summary(
-    frame: pl.DataFrame | pl.LazyFrame,
-    name: str,
-    observed: str,
-) -> dict[str, Any]:
-    """Calculate identical global metrics for eager or partition-backed matches."""
-    lazy = frame.lazy() if isinstance(frame, pl.DataFrame) else frame
+def _metric_aggregate_expressions(name: str, observed: str) -> list[pl.Expr]:
+    """Build one metric's expressions for a shared single-pass aggregation."""
     expected = "expected_%s" % name
     difference = "%s_absolute_difference" % name
     orientation_column = "%s_orientation_eligible" % name
@@ -558,33 +638,40 @@ def _metric_summary(
     expected_present = pl.when(present).then(pl.col(expected)).otherwise(None)
     observed_present = pl.when(present).then(pl.col(observed)).otherwise(None)
     difference_present = pl.when(present).then(pl.col(difference)).otherwise(None)
+    prefix = "%s__" % name
     expressions = [
-        pl.len().alias("rows"),
-        pl.col(orientation_column).sum().alias("orientation_eligible"),
-        pl.col(checked_column).sum().alias("checked"),
-        pl.col(observed_column).sum().alias("observed"),
-        pl.col(concordant_column).sum().alias("concordant"),
-        difference_present.mean().alias("mean"),
-        difference_present.median().alias("median"),
-        difference_present.max().alias("maximum"),
-        difference_present.pow(2).mean().sqrt().alias("rmse"),
-        pl.corr(expected_present, observed_present, method="pearson").alias("pearson"),
-        pl.corr(expected_present, observed_present, method="spearman").alias("spearman"),
+        pl.len().alias(prefix + "rows"),
+        pl.col(orientation_column).sum().alias(prefix + "orientation_eligible"),
+        pl.col(checked_column).sum().alias(prefix + "checked"),
+        pl.col(observed_column).sum().alias(prefix + "observed"),
+        pl.col(concordant_column).sum().alias(prefix + "concordant"),
+        difference_present.mean().alias(prefix + "mean"),
+        difference_present.median().alias(prefix + "median"),
+        difference_present.max().alias(prefix + "maximum"),
+        difference_present.pow(2).mean().sqrt().alias(prefix + "rmse"),
+        pl.corr(expected_present, observed_present, method="pearson")
+        .alias(prefix + "pearson"),
+        pl.corr(expected_present, observed_present, method="spearman")
+        .alias(prefix + "spearman"),
     ]
-    if name != "allele_frequency":
+    if name in ("effect", "z_score"):
         expressions.append(
             pl.when(present)
             .then(pl.col(expected).sign() == pl.col(observed).sign())
             .otherwise(None)
             .mean()
-            .alias("sign")
+            .alias(prefix + "sign")
         )
-    stats = lazy.select(expressions).collect().to_dicts()[0]
-    rows = int(stats["rows"] or 0)
-    orientation_eligible = int(stats["orientation_eligible"] or 0)
-    checked = int(stats["checked"] or 0)
-    observed_count = int(stats["observed"] or 0)
-    concordant = int(stats["concordant"] or 0)
+    return expressions
+
+
+def _metric_summary_from_stats(stats: dict[str, Any], name: str) -> dict[str, Any]:
+    prefix = "%s__" % name
+    rows = int(stats.get(prefix + "rows") or 0)
+    orientation_eligible = int(stats.get(prefix + "orientation_eligible") or 0)
+    checked = int(stats.get(prefix + "checked") or 0)
+    observed_count = int(stats.get(prefix + "observed") or 0)
+    concordant = int(stats.get(prefix + "concordant") or 0)
     return {
         "orientation_eligible": orientation_eligible,
         "unavailable_in_input": orientation_eligible - checked,
@@ -595,14 +682,71 @@ def _metric_summary(
         "concordant": concordant,
         "mismatches": checked - concordant,
         "concordance_fraction": concordant / checked if checked else None,
-        "pearson": _safe_number(stats["pearson"]) if observed_count >= 2 else None,
-        "spearman": _safe_number(stats["spearman"]) if observed_count >= 2 else None,
-        "sign_concordance": _safe_number(stats.get("sign")),
-        "mean_absolute_difference": _safe_number(stats["mean"]),
-        "median_absolute_difference": _safe_number(stats["median"]),
-        "maximum_absolute_difference": _safe_number(stats["maximum"]),
-        "rmse": _safe_number(stats["rmse"]),
+        "pearson": (
+            _safe_number(stats.get(prefix + "pearson"))
+            if observed_count >= 2 else None
+        ),
+        "spearman": (
+            _safe_number(stats.get(prefix + "spearman"))
+            if observed_count >= 2 else None
+        ),
+        "sign_concordance": _safe_number(stats.get(prefix + "sign")),
+        "mean_absolute_difference": _safe_number(stats.get(prefix + "mean")),
+        "median_absolute_difference": _safe_number(stats.get(prefix + "median")),
+        "maximum_absolute_difference": _safe_number(stats.get(prefix + "maximum")),
+        "rmse": _safe_number(stats.get(prefix + "rmse")),
     }
+
+
+def _metric_summaries(
+    frame: pl.DataFrame | pl.LazyFrame,
+    *,
+    eaf_is_maf: bool | None,
+    group_column: str | None = None,
+) -> dict[str, dict[str, Any]] | dict[str, dict[str, dict[str, Any]]]:
+    """Aggregate every configured value metric in one eager or lazy scan."""
+    lazy = frame.lazy() if isinstance(frame, pl.DataFrame) else frame
+    expressions = [
+        expression
+        for name, observed in METRIC_OBSERVED_COLUMNS.items()
+        for expression in _metric_aggregate_expressions(name, observed)
+    ]
+    if group_column is None:
+        records = lazy.select(expressions).collect().to_dicts()
+        stats = records[0] if records else {}
+        summaries = {
+            name: _metric_summary_from_stats(stats, name)
+            for name in METRIC_OBSERVED_COLUMNS
+        }
+        summaries["allele_frequency"]["frequency_type"] = (
+            "minor_allele_frequency"
+            if eaf_is_maf is True
+            else "effect_allele_frequency"
+            if eaf_is_maf is False
+            else "unresolved"
+        )
+        return summaries
+
+    records = {
+        str(record[group_column]): record
+        for record in lazy.group_by(group_column).agg(expressions).collect().to_dicts()
+    }
+    by_type: dict[str, dict[str, dict[str, Any]]] = {}
+    for label, variant_type in VARIANT_TYPES:
+        stats = records.get(variant_type, {})
+        summaries = {
+            name: _metric_summary_from_stats(stats, name)
+            for name in METRIC_OBSERVED_COLUMNS
+        }
+        summaries["allele_frequency"]["frequency_type"] = (
+            "minor_allele_frequency"
+            if eaf_is_maf is True
+            else "effect_allele_frequency"
+            if eaf_is_maf is False
+            else "unresolved"
+        )
+        by_type[label] = summaries
+    return by_type
 
 
 def _counts_by_type(frame: pl.DataFrame, type_column: str) -> dict[str, int]:
@@ -620,49 +764,273 @@ def _counts_by_type(frame: pl.DataFrame, type_column: str) -> dict[str, int]:
     }
 
 
-def _maximum_possible_indel_pairs(
+def _position_diagnostics(
     unmatched_input: pl.DataFrame,
     unmatched_vcf: pl.DataFrame,
-) -> int:
-    """Return a conservative count-only upper bound for representation changes."""
-    input_groups = (
-        unmatched_input.filter(pl.col("input_variant_type") == "indel")
-        .with_columns(
-            (
-                pl.col("input_effect_allele").str.len_chars().cast(pl.Int64)
-                - pl.col("input_other_allele").str.len_chars().cast(pl.Int64)
-            ).abs().alias("_length_change")
-        )
-        .group_by("input_chrom", "_length_change")
-        .len(name="_input_count")
+    *,
+    settings,
+) -> tuple[
+    pl.DataFrame,
+    pl.DataFrame,
+    pl.DataFrame,
+    dict[str, dict[str, int]],
+]:
+    """Compare unmatched one-to-one records at the same position diagnostically.
+
+    Allele correspondence is unknown once exact allele matching has failed.
+    Position-level effect and Z comparisons therefore use magnitudes, and AF is
+    folded to minor frequency. These diagnostics never establish orientation
+    and never determine pass/fail status.
+    """
+    input_keys = ["input_chrom", "input_pos"]
+    vcf_keys = ["vcf_chrom", "vcf_pos"]
+    input_positions = unmatched_input.group_by(input_keys).agg(
+        pl.len().alias("input_records_at_position"),
+        pl.col("input_variant_type").first().alias("input_position_variant_type"),
     )
-    vcf_groups = (
-        unmatched_vcf.filter(pl.col("vcf_variant_type") == "indel")
-        .with_columns(
-            (
-                pl.col("vcf_ref").str.len_chars().cast(pl.Int64)
-                - pl.col("vcf_alt").str.len_chars().cast(pl.Int64)
-            ).abs().alias("_length_change")
-        )
-        .group_by("vcf_chrom", "_length_change")
-        .len(name="_vcf_count")
+    vcf_positions = unmatched_vcf.group_by(vcf_keys).agg(
+        pl.len().alias("vcf_records_at_position"),
+        pl.col("vcf_variant_type").first().alias("vcf_position_variant_type"),
     )
-    if not input_groups.height or not vcf_groups.height:
-        return 0
-    paired = input_groups.join(
-        vcf_groups,
-        left_on=["input_chrom", "_length_change"],
-        right_on=["vcf_chrom", "_length_change"],
+    shared_positions = input_positions.join(
+        vcf_positions,
+        left_on=input_keys,
+        right_on=vcf_keys,
         how="inner",
     )
-    if not paired.height:
-        return 0
-    return int(
-        paired.select(
-            pl.min_horizontal("_input_count", "_vcf_count").sum()
-        ).item()
-        or 0
+
+    annotated_input = (
+        unmatched_input.join(input_positions, on=input_keys, how="left")
+        .join(vcf_positions, left_on=input_keys, right_on=vcf_keys, how="left")
+        .with_columns(pl.col("vcf_records_at_position").fill_null(0))
+        .with_columns(
+            pl.when(pl.col("vcf_records_at_position") == 0)
+            .then(pl.lit("input_position_only"))
+            .when(
+                (pl.col("input_records_at_position") == 1)
+                & (pl.col("vcf_records_at_position") == 1)
+                & (
+                    pl.col("input_variant_type")
+                    == pl.col("vcf_position_variant_type")
+                )
+            )
+            .then(pl.lit("one_to_one_same_position"))
+            .when(
+                (pl.col("input_records_at_position") == 1)
+                & (pl.col("vcf_records_at_position") == 1)
+            )
+            .then(pl.lit("variant_type_mismatch"))
+            .otherwise(pl.lit("multiallelic_position_ambiguous"))
+            .alias("position_comparison")
+        )
     )
+    annotated_vcf = (
+        unmatched_vcf.join(vcf_positions, on=vcf_keys, how="left")
+        .join(input_positions, left_on=vcf_keys, right_on=input_keys, how="left")
+        .with_columns(pl.col("input_records_at_position").fill_null(0))
+        .with_columns(
+            pl.when(pl.col("input_records_at_position") == 0)
+            .then(pl.lit("vcf_position_only"))
+            .when(
+                (pl.col("input_records_at_position") == 1)
+                & (pl.col("vcf_records_at_position") == 1)
+                & (
+                    pl.col("vcf_variant_type")
+                    == pl.col("input_position_variant_type")
+                )
+            )
+            .then(pl.lit("one_to_one_same_position"))
+            .when(
+                (pl.col("input_records_at_position") == 1)
+                & (pl.col("vcf_records_at_position") == 1)
+            )
+            .then(pl.lit("variant_type_mismatch"))
+            .otherwise(pl.lit("multiallelic_position_ambiguous"))
+            .alias("position_comparison")
+        )
+    )
+
+    position_pairs = annotated_input.filter(
+        pl.col("position_comparison") == "one_to_one_same_position"
+    ).join(
+        annotated_vcf.filter(
+            pl.col("position_comparison") == "one_to_one_same_position"
+        ).select(unmatched_vcf.columns),
+        left_on=input_keys,
+        right_on=vcf_keys,
+        how="inner",
+    )
+    orientation_unknown = pl.lit(True)
+    position_pairs = _metric_columns(
+        position_pairs,
+        "effect",
+        pl.col("input_beta").abs(),
+        pl.col("vcf_effect").abs(),
+        orientation_unknown,
+        settings.effect,
+    )
+    position_pairs = _metric_columns(
+        position_pairs,
+        "standard_error",
+        pl.col("input_se"),
+        pl.col("vcf_se"),
+        orientation_unknown,
+        settings.standard_error,
+    )
+    position_pairs = position_pairs.with_columns(
+        pl.min_horizontal(pl.col("input_af"), 1.0 - pl.col("input_af"))
+        .alias("_position_expected_af"),
+        pl.min_horizontal(pl.col("vcf_af"), 1.0 - pl.col("vcf_af"))
+        .alias("observed_frequency"),
+    )
+    position_pairs = _metric_columns(
+        position_pairs,
+        "allele_frequency",
+        pl.col("_position_expected_af"),
+        pl.col("observed_frequency"),
+        orientation_unknown,
+        settings.allele_frequency,
+    ).drop("_position_expected_af")
+    position_pairs = _metric_columns(
+        position_pairs,
+        "z_score",
+        pl.col("input_z").abs(),
+        pl.col("vcf_z").abs(),
+        orientation_unknown,
+        settings.z_score,
+    )
+    position_pairs = position_pairs.with_columns(
+        pl.concat_str([
+            pl.when(pl.col("effect_checked") & ~pl.col("effect_concordant"))
+            .then(pl.lit("effect_mismatch")).otherwise(pl.lit("")),
+            pl.when(
+                pl.col("standard_error_checked")
+                & ~pl.col("standard_error_concordant")
+            ).then(pl.lit("standard_error_mismatch")).otherwise(pl.lit("")),
+            pl.when(
+                pl.col("allele_frequency_checked")
+                & ~pl.col("allele_frequency_concordant")
+            ).then(pl.lit("allele_frequency_mismatch")).otherwise(pl.lit("")),
+            pl.when(pl.col("z_score_checked") & ~pl.col("z_score_concordant"))
+            .then(pl.lit("z_score_mismatch")).otherwise(pl.lit("")),
+        ], separator=";")
+        .str.replace_all(r";+", ";")
+        .str.strip_chars(";")
+        .alias("position_value_reasons")
+    )
+
+    counts: dict[str, dict[str, int]] = {}
+    checked_any = (
+        pl.col("effect_checked")
+        | pl.col("standard_error_checked")
+        | pl.col("allele_frequency_checked")
+        | pl.col("z_score_checked")
+    )
+    checked_pairs = position_pairs.filter(checked_any)
+    mismatch_pairs = checked_pairs.filter(pl.col("position_value_reasons") != "")
+    global_pair_positions = position_pairs.select(input_keys).unique().height
+    global_input_specific_positions = annotated_input.filter(
+        pl.col("vcf_records_at_position") == 0
+    ).select(input_keys).unique().height
+    global_vcf_specific_positions = annotated_vcf.filter(
+        pl.col("input_records_at_position") == 0
+    ).select(vcf_keys).unique().height
+    counts["all_variants"] = {
+        "input_unmatched_positions": input_positions.height,
+        "vcf_unmatched_positions": vcf_positions.height,
+        "unmatched_position_union": (
+            input_positions.height + vcf_positions.height - shared_positions.height
+        ),
+        "shared_unmatched_positions": shared_positions.height,
+        "unambiguous_position_pairs": global_pair_positions,
+        "ambiguous_shared_positions": shared_positions.height - global_pair_positions,
+        "variant_type_mismatch_positions": shared_positions.filter(
+            (pl.col("input_records_at_position") == 1)
+            & (pl.col("vcf_records_at_position") == 1)
+            & (
+                pl.col("input_position_variant_type")
+                != pl.col("vcf_position_variant_type")
+            )
+        ).height,
+        "multiallelic_ambiguous_positions": shared_positions.filter(
+            (pl.col("input_records_at_position") != 1)
+            | (pl.col("vcf_records_at_position") != 1)
+        ).height,
+        "same_position_input_variants": annotated_input.filter(
+            pl.col("vcf_records_at_position") > 0
+        ).height,
+        "same_position_vcf_variants": annotated_vcf.filter(
+            pl.col("input_records_at_position") > 0
+        ).height,
+        "input_specific_variants": annotated_input.filter(
+            pl.col("vcf_records_at_position") == 0
+        ).height,
+        "vcf_specific_variants": annotated_vcf.filter(
+            pl.col("input_records_at_position") == 0
+        ).height,
+        "input_specific_positions": global_input_specific_positions,
+        "vcf_specific_positions": global_vcf_specific_positions,
+        "position_value_checked_pairs": checked_pairs.height,
+        "position_value_concordant_pairs": (
+            checked_pairs.height - mismatch_pairs.height
+        ),
+        "position_value_mismatch_pairs": mismatch_pairs.height,
+    }
+
+    for label, variant_type in VARIANT_TYPES:
+        input_type = annotated_input.filter(
+            pl.col("input_variant_type") == variant_type
+        )
+        vcf_type = annotated_vcf.filter(pl.col("vcf_variant_type") == variant_type)
+        input_type_positions = input_type.select(input_keys).unique()
+        vcf_type_positions = vcf_type.select(vcf_keys).unique()
+        shared_type = input_type_positions.join(
+            vcf_type_positions,
+            left_on=input_keys,
+            right_on=vcf_keys,
+            how="inner",
+        )
+        pairs_type = position_pairs.filter(
+            pl.col("input_variant_type") == variant_type
+        )
+        checked_pairs = pairs_type.filter(checked_any)
+        mismatch_pairs = checked_pairs.filter(pl.col("position_value_reasons") != "")
+        counts[label] = {
+            "input_unmatched_positions": input_type_positions.height,
+            "vcf_unmatched_positions": vcf_type_positions.height,
+            "unmatched_position_union": (
+                input_type_positions.height
+                + vcf_type_positions.height
+                - shared_type.height
+            ),
+            "shared_unmatched_positions": shared_type.height,
+            "unambiguous_position_pairs": pairs_type.height,
+            "ambiguous_shared_positions": shared_type.height - pairs_type.height,
+            "same_position_input_variants": input_type.filter(
+                pl.col("vcf_records_at_position") > 0
+            ).height,
+            "same_position_vcf_variants": vcf_type.filter(
+                pl.col("input_records_at_position") > 0
+            ).height,
+            "input_specific_variants": input_type.filter(
+                pl.col("vcf_records_at_position") == 0
+            ).height,
+            "vcf_specific_variants": vcf_type.filter(
+                pl.col("input_records_at_position") == 0
+            ).height,
+            "input_specific_positions": input_type.filter(
+                pl.col("vcf_records_at_position") == 0
+            ).select("input_chrom", "input_pos").unique().height,
+            "vcf_specific_positions": vcf_type.filter(
+                pl.col("input_records_at_position") == 0
+            ).select("vcf_chrom", "vcf_pos").unique().height,
+            "position_value_checked_pairs": checked_pairs.height,
+            "position_value_concordant_pairs": (
+                checked_pairs.height - mismatch_pairs.height
+            ),
+            "position_value_mismatch_pairs": mismatch_pairs.height,
+        }
+    return annotated_input, annotated_vcf, position_pairs, counts
 
 
 def _variant_type_summary(
@@ -675,9 +1043,11 @@ def _variant_type_summary(
     duplicate_count: int,
     checked_count: int,
     mismatch_count: int,
-    possible_pairs: int,
+    match_type_counts: dict[str, int] | None = None,
+    position_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    return {
+    union_count = input_count + vcf_count - matched_count
+    summary = {
         "input_unique_variants": input_count,
         "vcf_unique_variants": vcf_count,
         "exact_matched_variants": matched_count,
@@ -685,20 +1055,25 @@ def _variant_type_summary(
         "vcf_only_variants": vcf_only_count,
         "vcf_duplicate_records": duplicate_count,
         "exact_match_fraction": matched_count / input_count if input_count else None,
+        "variant_union": union_count,
+        "common_union_fraction": matched_count / union_count if union_count else None,
         "value_checked_variants": checked_count,
         "value_mismatch_variants": mismatch_count,
         "value_mismatch_fraction": (
             mismatch_count / checked_count if checked_count else 0.0
         ),
-        # Counts alone cannot pair records. This is deliberately an upper
-        # bound, never a claim that a particular indel was retained.
-        "maximum_possible_representation_pairs": possible_pairs,
-        "unpaired_input_only_variants": input_only_count - possible_pairs,
-        "unpaired_vcf_only_variants": vcf_only_count - possible_pairs,
-        "representation_adjusted_match_fraction_upper_bound": (
-            (matched_count + possible_pairs) / input_count if input_count else None
-        ),
     }
+    supplied_matches = match_type_counts or {}
+    summary.update({
+        field: int(supplied_matches.get(match_type, 0))
+        for match_type, field in MATCH_TYPE_FIELDS.items()
+    })
+    supplied_positions = position_counts or {}
+    summary.update({
+        field: int(supplied_positions.get(field, 0))
+        for field in POSITION_COUNT_FIELDS
+    })
+    return summary
 
 
 def _variant_type_counts(
@@ -708,6 +1083,7 @@ def _variant_type_counts(
     vcf_only: pl.DataFrame,
     vcf_duplicates: pl.DataFrame,
     matched: pl.DataFrame,
+    position_counts: dict[str, dict[str, int]],
 ) -> dict[str, dict[str, Any]]:
     """Build exact-match statistics independently for SNPs and indels."""
     input_counts = _counts_by_type(input_unique, "input_variant_type")
@@ -717,14 +1093,13 @@ def _variant_type_counts(
     vcf_only_counts = _counts_by_type(valid_vcf_only, "vcf_variant_type")
     duplicate_counts = _counts_by_type(vcf_duplicates, "vcf_variant_type")
     matched_counts = _counts_by_type(matched, "input_variant_type")
-    possible_indel_pairs = _maximum_possible_indel_pairs(
-        unmatched_input, valid_vcf_only,
-    )
     checked_counts: dict[str, int] = {}
     mismatch_counts: dict[str, int] = {}
+    match_counts: dict[str, dict[str, int]] = {}
     if matched.height and "effect_checked" in matched.columns:
         checked = matched.filter(
             pl.col("effect_checked")
+            | pl.col("standard_error_checked")
             | pl.col("allele_frequency_checked")
             | pl.col("z_score_checked")
         )
@@ -732,22 +1107,19 @@ def _variant_type_counts(
         mismatch_counts = _counts_by_type(
             matched.filter(pl.col("failure_reasons") != ""), "input_variant_type"
         )
+        for variant_type, match_type, count in matched.group_by(
+            "input_variant_type", "match_type"
+        ).len().iter_rows():
+            match_counts.setdefault(str(variant_type), {})[str(match_type)] = int(count)
 
     summaries: dict[str, dict[str, Any]] = {}
-    for label, variant_type in (
-        ("snps", "snp"),
-        ("indels", "indel"),
-        ("other_variants", "other"),
-    ):
+    for label, variant_type in VARIANT_TYPES:
         input_count = input_counts.get(variant_type, 0)
         matched_count = matched_counts.get(variant_type, 0)
         input_only_count = input_only_counts.get(variant_type, 0)
         vcf_only_count = vcf_only_counts.get(variant_type, 0)
         checked_count = checked_counts.get(variant_type, 0)
         mismatch_count = mismatch_counts.get(variant_type, 0)
-        possible_pairs = (
-            possible_indel_pairs if variant_type == "indel" else 0
-        )
         summaries[label] = _variant_type_summary(
             input_count=input_count,
             vcf_count=vcf_counts.get(variant_type, 0),
@@ -757,7 +1129,8 @@ def _variant_type_counts(
             duplicate_count=duplicate_counts.get(variant_type, 0),
             checked_count=checked_count,
             mismatch_count=mismatch_count,
-            possible_pairs=possible_pairs,
+            match_type_counts=match_counts.get(variant_type),
+            position_counts=position_counts.get(label),
         )
     return summaries
 
@@ -766,30 +1139,13 @@ def _evaluate_variant_type(
     label: str,
     summary: dict[str, Any],
     settings,
-    *,
-    allow_possible_representation_pairs: bool = False,
 ) -> tuple[str, list[str]]:
-    """Apply matching and value thresholds to one variant-type stratum."""
+    """Apply value-integrity thresholds; unmatched variants are report-only."""
     if not summary["input_unique_variants"] and not summary["vcf_unique_variants"]:
         return "NOT_APPLICABLE", ["no %s were available for comparison" % label]
 
     failure_reasons: list[str] = []
     warning_reasons: list[str] = []
-    vcf_only_for_failure = summary["vcf_only_variants"]
-    retained_for_failure = summary["exact_match_fraction"]
-    if allow_possible_representation_pairs and summary["maximum_possible_representation_pairs"]:
-        vcf_only_for_failure = summary["unpaired_vcf_only_variants"]
-        retained_for_failure = summary[
-            "representation_adjusted_match_fraction_upper_bound"
-        ]
-        warning_reasons.append(
-            "up to %s balanced unmatched indel pair(s) may reflect normalization; "
-            "individual retention is not proven"
-            % f"{summary['maximum_possible_representation_pairs']:,}"
-        )
-
-    if vcf_only_for_failure > int(settings.failure.maximum_vcf_only_variants):
-        failure_reasons.append("VCF-only %s exceed the configured maximum" % label)
     if summary["vcf_duplicate_records"] > int(
         settings.failure.maximum_vcf_duplicate_records
     ):
@@ -802,18 +1158,19 @@ def _evaluate_variant_type(
         failure_reasons.append(
             "%s value mismatches exceed the configured maximum fraction" % label
         )
-    if (
-        settings.failure.minimum_retained_fraction is not None
-        and retained_for_failure is not None
-        and retained_for_failure < float(settings.failure.minimum_retained_fraction)
-    ):
-        failure_reasons.append(
-            "%s retained fraction is below the configured minimum" % label
-        )
     if summary["input_only_variants"]:
-        warning_reasons.append("some valid input %s have no exact VCF match" % label)
+        warning_reasons.append(
+            "some valid input %s have no allele-aware VCF match (report-only)" % label
+        )
     if summary["vcf_only_variants"]:
-        warning_reasons.append("some VCF %s have no exact input match" % label)
+        warning_reasons.append(
+            "some VCF %s have no allele-aware input match (report-only)" % label
+        )
+    if summary["position_value_mismatch_pairs"]:
+        warning_reasons.append(
+            "same-position unmatched %s contain diagnostic value differences"
+            % label
+        )
 
     if failure_reasons:
         return "FAIL", failure_reasons
@@ -829,27 +1186,16 @@ def _finalise_variant_types(
     snp_status, snp_reasons = _evaluate_variant_type(
         "SNPs", variant_types["snps"], settings,
     )
-    permit_indel_representation_pairs = (
-        settings.indel_representation_action == "warn"
-        and snp_status == "PASS"
-        and bool(variant_types["indels"]["maximum_possible_representation_pairs"])
-    )
     indel_status, indel_reasons = _evaluate_variant_type(
         "indels",
         variant_types["indels"],
         settings,
-        allow_possible_representation_pairs=permit_indel_representation_pairs,
     )
     other_status, other_reasons = _evaluate_variant_type(
         "other variants", variant_types["other_variants"], settings,
     )
     variant_types["snps"].update(status=snp_status, status_reasons=snp_reasons)
-    variant_types["indels"].update(
-        status=indel_status,
-        status_reasons=indel_reasons,
-        representation_action=settings.indel_representation_action,
-        representation_adjustment_applied=permit_indel_representation_pairs,
-    )
+    variant_types["indels"].update(status=indel_status, status_reasons=indel_reasons)
     variant_types["other_variants"].update(
         status=other_status,
         status_reasons=other_reasons,
@@ -883,9 +1229,11 @@ def _finalise_summary_status(
         if status == "FAIL"
         for reason in reasons
     ]
-    if summary["vcf_invalid_rows"] > int(settings.failure.maximum_vcf_only_variants):
+    if summary["vcf_invalid_rows"] > int(
+        settings.failure.maximum_invalid_vcf_records
+    ):
         failure_reasons.append(
-            "invalid VCF variants exceed the configured maximum VCF-only count"
+            "invalid VCF records exceed the configured maximum"
         )
     warning_reasons = [
         "%s: %s" % (label, reason)
@@ -903,6 +1251,11 @@ def _finalise_summary_status(
         warning_reasons.append("the input contains duplicate variants")
     if unavailable_values:
         warning_reasons.append("some requested value comparisons lack an input value")
+    if summary["palindromic_variants_excluded_from_orientation"]:
+        warning_reasons.append(
+            "some palindromic variants lacked a safely resolved orientation for "
+            "effect, EAF, and Z comparison"
+        )
     if eaf_is_maf is None:
         warning_reasons.append(
             "allele-frequency concordance was skipped because the final frequency "
@@ -928,8 +1281,10 @@ def compare_input_to_vcf(
     row,
     *,
     effect_type: str,
+    se_scale: str | None = None,
     p_value_type: str,
     eaf_is_maf: bool | None,
+    strand_consensus: str | None = None,
     settings,
     policies,
     external_eaf_frame: pl.DataFrame | None = None,
@@ -937,7 +1292,8 @@ def compare_input_to_vcf(
     duplicate_report_frame: pl.DataFrame | None = None,
 ) -> ConcordanceAnalysis:
     input_table = prepare_input_table(
-        input_frame, row, effect_type=effect_type, p_value_type=p_value_type,
+        input_frame, row, effect_type=effect_type, se_scale=se_scale,
+        p_value_type=p_value_type,
         eaf_is_maf=eaf_is_maf, settings=settings, policies=policies,
         external_eaf_frame=external_eaf_frame,
         external_eaf_mapping=external_eaf_mapping,
@@ -953,7 +1309,8 @@ def compare_input_to_vcf(
     if duplicate_report_frame is not None:
         prepared_report = prepare_input_table(
             duplicate_report_frame, row,
-            effect_type=effect_type, p_value_type=p_value_type,
+            effect_type=effect_type, se_scale=se_scale,
+            p_value_type=p_value_type,
             eaf_is_maf=eaf_is_maf, settings=settings, policies=policies,
             external_eaf_frame=external_eaf_frame,
             external_eaf_mapping=external_eaf_mapping,
@@ -995,24 +1352,41 @@ def compare_input_to_vcf(
     matched, unmatched_unique = _join_matches(
         input_unique, vcf_unique, bool(settings.allow_strand_complement)
     )
-    unmatched_unique = unmatched_unique.with_columns(
-        pl.lit("no_coordinate_and_allele_match").alias("not_retained_reason")
-    )
-    input_only = pl.concat(
-        [input_invalid, duplicate_input, unmatched_unique], how="diagonal_relaxed"
-    ).sort("input_row")
-
-    matched = matched.with_columns(
+    listed_effect_is_alt = (
         pl.when(pl.col("_match_basis") == "listed")
         .then(pl.col("input_effect_allele") == pl.col("vcf_alt"))
         .otherwise(pl.col("input_effect_complement") == pl.col("vcf_alt"))
-        .alias("_effect_is_alt")
-    ).with_columns(
+    )
+    if (
+        settings.palindromic_action == "compare_resolved"
+        and strand_consensus == "reverse"
+    ):
+        effect_is_alt = pl.when(pl.col("input_is_palindromic")).then(
+            pl.col("input_effect_complement") == pl.col("vcf_alt")
+        ).otherwise(listed_effect_is_alt)
+    else:
+        effect_is_alt = listed_effect_is_alt
+    matched = matched.with_columns(effect_is_alt.alias("_effect_is_alt"))
+
+    palindromic_resolved = (
+        settings.palindromic_action == "compare_resolved"
+        and strand_consensus in ("forward", "reverse")
+    )
+    if palindromic_resolved:
+        palindromic_aligned = "palindromic_%s" % (
+            "forward" if strand_consensus == "forward" else "reverse_complement"
+        )
+        palindromic_swapped = palindromic_aligned + "_swapped"
+    else:
+        palindromic_aligned = "palindromic_as_listed"
+        palindromic_swapped = "palindromic_swapped"
+
+    matched = matched.with_columns(
         pl.when(pl.col("input_is_palindromic"))
         .then(
             pl.when(pl.col("_effect_is_alt"))
-            .then(pl.lit("palindromic_as_listed"))
-            .otherwise(pl.lit("palindromic_swapped"))
+            .then(pl.lit(palindromic_aligned))
+            .otherwise(pl.lit(palindromic_swapped))
         )
         .when(pl.col("_match_basis") == "complement")
         .then(
@@ -1031,16 +1405,23 @@ def compare_input_to_vcf(
         .otherwise(pl.lit(-1.0))
         .alias("orientation_factor"),
     )
+    include_palindromic = (
+        settings.palindromic_action == "compare_as_listed"
+        or palindromic_resolved
+    )
     orientation = (
-        pl.lit(True)
-        if settings.palindromic_action == "compare_as_listed"
-        else ~pl.col("input_is_palindromic")
+        pl.lit(True) if include_palindromic else ~pl.col("input_is_palindromic")
     )
     matched = matched.with_columns(orientation.alias("orientation_comparable"))
     matched = _metric_columns(
         matched, "effect",
         pl.col("input_beta") * pl.col("orientation_factor"),
         pl.col("vcf_effect"), pl.col("orientation_comparable"), settings.effect,
+    )
+    matched = _metric_columns(
+        matched, "standard_error",
+        pl.col("input_se"), pl.col("vcf_se"), pl.lit(True),
+        settings.standard_error,
     )
     if eaf_is_maf is True:
         expected_af = pl.min_horizontal(pl.col("input_af"), 1.0 - pl.col("input_af"))
@@ -1070,6 +1451,10 @@ def compare_input_to_vcf(
         pl.concat_str([
             pl.when(pl.col("effect_checked") & ~pl.col("effect_concordant"))
             .then(pl.lit("effect_mismatch")).otherwise(pl.lit("")),
+            pl.when(
+                pl.col("standard_error_checked")
+                & ~pl.col("standard_error_concordant")
+            ).then(pl.lit("standard_error_mismatch")).otherwise(pl.lit("")),
             pl.when(pl.col("allele_frequency_checked") & ~pl.col("allele_frequency_concordant"))
             .then(pl.lit("allele_frequency_mismatch")).otherwise(pl.lit("")),
             pl.when(pl.col("z_score_checked") & ~pl.col("z_score_concordant"))
@@ -1081,30 +1466,51 @@ def compare_input_to_vcf(
     )
 
     matched_vcf = matched.select("matched_vcf_key")
-    vcf_only = vcf_unique.join(
+    valid_vcf_only = vcf_unique.join(
         matched_vcf, left_on="vcf_key", right_on="matched_vcf_key", how="anti"
     ).with_columns(pl.lit("no_input_coordinate_and_allele_match").alias("vcf_only_reason"))
+    (
+        unmatched_unique,
+        valid_vcf_only,
+        position_matches,
+        position_counts,
+    ) = _position_diagnostics(
+        unmatched_unique,
+        valid_vcf_only,
+        settings=settings,
+    )
+    unmatched_unique = unmatched_unique.with_columns(
+        pl.lit("no_coordinate_and_allele_match").alias("not_retained_reason")
+    )
+    input_only = pl.concat(
+        [input_invalid, duplicate_input, unmatched_unique], how="diagonal_relaxed"
+    ).sort("input_row")
+    vcf_only = valid_vcf_only
     if vcf_invalid.height:
         vcf_only = pl.concat([vcf_only, vcf_invalid], how="diagonal_relaxed")
 
     mismatches = matched.filter(pl.col("failure_reasons") != "")
-    metric_summary = {
-        "effect": _metric_summary(matched, "effect", "vcf_effect"),
-        "allele_frequency": _metric_summary(matched, "allele_frequency", "observed_frequency"),
-        "z_score": _metric_summary(matched, "z_score", "vcf_z"),
-    }
-    metric_summary["allele_frequency"]["frequency_type"] = (
-        "minor_allele_frequency"
-        if eaf_is_maf is True
-        else "effect_allele_frequency"
-        if eaf_is_maf is False
-        else "unresolved"
+    metric_summary = _metric_summaries(matched, eaf_is_maf=eaf_is_maf)
+    metric_summary_by_variant_type = _metric_summaries(
+        matched,
+        eaf_is_maf=eaf_is_maf,
+        group_column="input_variant_type",
+    )
+    position_metric_summary_by_variant_type = _metric_summaries(
+        position_matches,
+        eaf_is_maf=eaf_is_maf,
+        group_column="input_variant_type",
     )
 
     checked_any = 0
     if matched.height:
         checked_any = int(matched.select(
-            (pl.col("effect_checked") | pl.col("allele_frequency_checked") | pl.col("z_score_checked")).sum()
+            (
+                pl.col("effect_checked")
+                | pl.col("standard_error_checked")
+                | pl.col("allele_frequency_checked")
+                | pl.col("z_score_checked")
+            ).sum()
         ).item() or 0)
     mismatch_fraction = mismatches.height / checked_any if checked_any else 0.0
     retained_fraction = matched.height / input_unique.height if input_unique.height else 0.0
@@ -1115,10 +1521,27 @@ def compare_input_to_vcf(
         input_unique,
         unmatched_unique,
         vcf_unique,
-        vcf_only,
+        valid_vcf_only,
         vcf_duplicates,
         matched,
+        position_counts,
     )
+    palindromic_total = sum(
+        int(count)
+        for match_type, count in match_counts.items()
+        if str(match_type).startswith("palindromic_")
+    )
+    palindromic_compared = palindromic_total if include_palindromic else 0
+    palindromic_excluded = palindromic_total - palindromic_compared
+    if palindromic_resolved:
+        palindromic_basis = "study_wide_%s_strand_consensus" % strand_consensus
+    elif settings.palindromic_action == "compare_as_listed":
+        palindromic_basis = "listed_allele_order"
+    elif settings.palindromic_action == "exclude":
+        palindromic_basis = "excluded_by_policy"
+    else:
+        palindromic_basis = "strand_consensus_unavailable"
+
     summary = {
         "input_rows": input_table.height,
         "input_valid_rows": input_eligible.height,
@@ -1130,17 +1553,23 @@ def compare_input_to_vcf(
         "vcf_duplicate_records": vcf_duplicates.height,
         "vcf_invalid_rows": vcf_invalid.height,
         "matched_variants": matched.height,
+        "variant_union": input_unique.height + vcf_unique.height - matched.height,
         "input_only_variants": unmatched_unique.height,
-        "vcf_only_variants": vcf_only.height,
+        "vcf_only_variants": valid_vcf_only.height,
         "retained_fraction": retained_fraction,
         "value_mismatch_variants": mismatches.height,
         "value_mismatch_fraction": mismatch_fraction,
-        "palindromic_variants_excluded_from_orientation": int(
-            matched.get_column("input_is_palindromic").sum() or 0
-        ) if matched.height and settings.palindromic_action == "exclude" else 0,
+        "palindromic_variants_compared": palindromic_compared,
+        "palindromic_variants_excluded_from_orientation": palindromic_excluded,
+        "palindromic_comparison_basis": palindromic_basis,
         "match_types": match_counts,
         "variant_types": variant_types,
+        "position_diagnostics": position_counts["all_variants"],
     }
+    summary["common_union_fraction"] = (
+        summary["matched_variants"] / summary["variant_union"]
+        if summary["variant_union"] else None
+    )
     status = _finalise_summary_status(
         summary,
         metric_summary,
@@ -1151,7 +1580,12 @@ def compare_input_to_vcf(
         status=status,
         summary=summary,
         metric_summary=metric_summary,
+        metric_summary_by_variant_type=metric_summary_by_variant_type,
+        position_metric_summary_by_variant_type=(
+            position_metric_summary_by_variant_type
+        ),
         matched=matched,
+        position_matches=position_matches,
         mismatches=mismatches,
         input_only=input_only,
         vcf_only=vcf_only,
@@ -1163,6 +1597,7 @@ def combine_concordance_partitions(
     partition_summaries: list[dict[str, Any]],
     *,
     matched: pl.LazyFrame,
+    position_matches: pl.LazyFrame,
     input_only: pl.LazyFrame,
     vcf_only: pl.LazyFrame,
     vcf_duplicates: pl.LazyFrame,
@@ -1184,6 +1619,7 @@ def combine_concordance_partitions(
         "input_only_variants",
         "vcf_only_variants",
         "value_mismatch_variants",
+        "palindromic_variants_compared",
         "palindromic_variants_excluded_from_orientation",
     )
     summary = {
@@ -1194,10 +1630,20 @@ def combine_concordance_partitions(
         summary["matched_variants"] / summary["input_unique_variants"]
         if summary["input_unique_variants"] else 0.0
     )
+    summary["variant_union"] = (
+        summary["input_unique_variants"]
+        + summary["vcf_unique_variants"]
+        - summary["matched_variants"]
+    )
+    summary["common_union_fraction"] = (
+        summary["matched_variants"] / summary["variant_union"]
+        if summary["variant_union"] else None
+    )
     checked_any = int(
         matched.select(
             (
                 pl.col("effect_checked")
+                | pl.col("standard_error_checked")
                 | pl.col("allele_frequency_checked")
                 | pl.col("z_score_checked")
             ).sum().alias("checked_any")
@@ -1212,10 +1658,25 @@ def combine_concordance_partitions(
         for match_type, count in partition["match_types"].items():
             match_types[match_type] = match_types.get(match_type, 0) + int(count)
     summary["match_types"] = match_types
+    bases = {
+        str(partition["palindromic_comparison_basis"])
+        for partition in partition_summaries
+    }
+    summary["palindromic_comparison_basis"] = (
+        bases.pop() if len(bases) == 1 else "mixed"
+    )
 
     variant_types: dict[str, dict[str, Any]] = {}
-    for label in ("snps", "indels", "other_variants"):
+    for label, _variant_type in VARIANT_TYPES:
         values = [partition["variant_types"][label] for partition in partition_summaries]
+        combined_match_counts = {
+            match_type: sum(int(value[field]) for value in values)
+            for match_type, field in MATCH_TYPE_FIELDS.items()
+        }
+        combined_position_counts = {
+            field: sum(int(value[field]) for value in values)
+            for field in POSITION_COUNT_FIELDS
+        }
         variant_types[label] = _variant_type_summary(
             input_count=sum(int(value["input_unique_variants"]) for value in values),
             vcf_count=sum(int(value["vcf_unique_variants"]) for value in values),
@@ -1225,26 +1686,29 @@ def combine_concordance_partitions(
             duplicate_count=sum(int(value["vcf_duplicate_records"]) for value in values),
             checked_count=sum(int(value["value_checked_variants"]) for value in values),
             mismatch_count=sum(int(value["value_mismatch_variants"]) for value in values),
-            possible_pairs=sum(
-                int(value["maximum_possible_representation_pairs"])
-                for value in values
-            ),
+            match_type_counts=combined_match_counts,
+            position_counts=combined_position_counts,
         )
     summary["variant_types"] = variant_types
-
-    metric_summary = {
-        "effect": _metric_summary(matched, "effect", "vcf_effect"),
-        "allele_frequency": _metric_summary(
-            matched, "allele_frequency", "observed_frequency",
-        ),
-        "z_score": _metric_summary(matched, "z_score", "vcf_z"),
+    position_fields = partition_summaries[0]["position_diagnostics"].keys()
+    summary["position_diagnostics"] = {
+        field: sum(
+            int(partition["position_diagnostics"][field])
+            for partition in partition_summaries
+        )
+        for field in position_fields
     }
-    metric_summary["allele_frequency"]["frequency_type"] = (
-        "minor_allele_frequency"
-        if eaf_is_maf is True
-        else "effect_allele_frequency"
-        if eaf_is_maf is False
-        else "unresolved"
+
+    metric_summary = _metric_summaries(matched, eaf_is_maf=eaf_is_maf)
+    metric_summary_by_variant_type = _metric_summaries(
+        matched,
+        eaf_is_maf=eaf_is_maf,
+        group_column="input_variant_type",
+    )
+    position_metric_summary_by_variant_type = _metric_summaries(
+        position_matches,
+        eaf_is_maf=eaf_is_maf,
+        group_column="input_variant_type",
     )
     status = _finalise_summary_status(
         summary,
@@ -1257,7 +1721,12 @@ def combine_concordance_partitions(
         status=status,
         summary=summary,
         metric_summary=metric_summary,
+        metric_summary_by_variant_type=metric_summary_by_variant_type,
+        position_metric_summary_by_variant_type=(
+            position_metric_summary_by_variant_type
+        ),
         matched=ordered_matches,
+        position_matches=position_matches.sort(["input_chrom", "input_pos"]),
         mismatches=ordered_matches.filter(pl.col("failure_reasons") != ""),
         input_only=input_only.sort("input_row"),
         vcf_only=vcf_only.sort(

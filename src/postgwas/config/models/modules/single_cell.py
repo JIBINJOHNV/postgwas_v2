@@ -2,17 +2,47 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import get_args, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from postgwas.config.models.common import ModuleConfig, StrictModel
+from postgwas.config.models.common import (
+    GenomeBuild,
+    ModuleConfig,
+    Population,
+    StrictModel,
+)
 
 
-SingleCellTool = Literal["magma_celltype", "scdrs"]
+SingleCellTool = Literal["magma_celltype", "scdrs", "ldsc_celltype"]
 SINGLE_CELL_TOOLS = get_args(SingleCellTool)
+SINGLE_CELL_TOOL_PIPELINE_DEPENDENCIES = {
+    "magma_celltype": ("magma",),
+    "scdrs": ("magma",),
+    "ldsc_celltype": ("formatter",),
+}
+SINGLE_CELL_TOOL_FORMATS = {
+    "magma_celltype": ("magma",),
+    "scdrs": ("magma",),
+    "ldsc_celltype": ("ldsc",),
+}
+SINGLE_CELL_TOOL_SUPPORTING_CONFIGS = {
+    "magma_celltype": ("magma", "magmacovar"),
+    "scdrs": ("magma",),
+    "ldsc_celltype": ("ldsc",),
+}
+for _tool_mapping in (
+    SINGLE_CELL_TOOL_PIPELINE_DEPENDENCIES,
+    SINGLE_CELL_TOOL_FORMATS,
+    SINGLE_CELL_TOOL_SUPPORTING_CONFIGS,
+):
+    if tuple(_tool_mapping) != SINGLE_CELL_TOOLS:
+        raise RuntimeError(
+            "Every SingleCellTool must define dependencies, formats, and "
+            "supporting configuration in canonical tool order"
+        )
 SingleCellCorrectionMethod = Literal["bonferroni", "sidak", "holm", "fdr_bh"]
 ScdrsSpecies = Literal["human", "hsapiens", "mouse", "mmusculus"]
 ScdrsMatrixState = Literal["raw_counts", "normalized_log1p"]
@@ -26,6 +56,39 @@ def _safe_relative_pattern(value: str) -> str:
     if path.is_absolute() or ".." in path.parts:
         raise ValueError("must be a relative path below the output directory")
     return cleaned
+
+
+def single_cell_pipeline_dependencies(
+    tools: list[SingleCellTool] | tuple[SingleCellTool, ...],
+) -> tuple[str, ...]:
+    """Return the unique upstream modules required by selected methods."""
+    return tuple(dict.fromkeys(
+        dependency
+        for tool in tools
+        for dependency in SINGLE_CELL_TOOL_PIPELINE_DEPENDENCIES[tool]
+    ))
+
+
+def single_cell_formatter_targets(
+    tools: list[SingleCellTool] | tuple[SingleCellTool, ...],
+) -> tuple[str, ...]:
+    """Return the formatter contracts consumed by selected methods."""
+    return tuple(dict.fromkeys(
+        target
+        for tool in tools
+        for target in SINGLE_CELL_TOOL_FORMATS[tool]
+    ))
+
+
+def single_cell_supporting_configurations(
+    tools: list[SingleCellTool] | tuple[SingleCellTool, ...],
+) -> tuple[str, ...]:
+    """Return non-executable module settings consumed by selected methods."""
+    return tuple(dict.fromkeys(
+        module
+        for tool in tools
+        for module in SINGLE_CELL_TOOL_SUPPORTING_CONFIGS[tool]
+    ))
 
 
 class MagmaCelltypeInputConfig(StrictModel):
@@ -48,6 +111,145 @@ class MagmaCelltypeConfig(StrictModel):
         if any(character.isspace() for character in cleaned):
             raise ValueError("must not contain whitespace")
         return cleaned
+
+
+class LdscCelltypeInputConfig(StrictModel):
+    source: Literal["munged", "formatter"]
+    sumstats_file: Path | None = None
+    ldcts_file: Path | None = None
+    baseline_ld_prefixes: list[str]
+    weights_ld_prefix: str | None = None
+    merge_alleles_file: Path | None = None
+
+    @field_validator("baseline_ld_prefixes")
+    @classmethod
+    def unique_reference_prefixes(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("reference prefixes must not be empty")
+        if any("," in value for value in cleaned):
+            raise ValueError(
+                "individual reference prefixes must not contain commas"
+            )
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("reference prefixes must be unique")
+        return cleaned
+
+    @field_validator("weights_ld_prefix")
+    @classmethod
+    def optional_reference_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("must not be empty")
+        if "," in cleaned:
+            raise ValueError("must identify exactly one LD-score prefix")
+        return cleaned
+
+
+class LdscCelltypeReferenceFormatConfig(StrictModel):
+    chromosomes: Literal[22]
+    chromosome_placeholder: Literal["@"]
+    prefix_separator: Literal[","]
+    ldscore_suffix: str
+    m_suffix: str
+    minimum_prefixes_per_cell_type: int = Field(ge=2)
+
+    @field_validator("ldscore_suffix", "m_suffix")
+    @classmethod
+    def nonempty_suffix(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned or not cleaned.startswith("."):
+            raise ValueError("must be non-empty and start with '.'")
+        return cleaned
+
+
+class LdscCelltypeResultFormatConfig(StrictModel):
+    delimiter: Literal["\t"]
+    name_column: str
+    coefficient_column: str
+    standard_error_column: str
+    p_value_column: str
+    sumstats_required_columns: list[str] = Field(min_length=1)
+    native_results_suffix: str
+    native_log_suffix: str
+    munged_sumstats_suffix: str
+    munge_log_suffix: str
+
+    @field_validator(
+        "name_column", "coefficient_column", "standard_error_column",
+        "p_value_column",
+    )
+    @classmethod
+    def nonempty_result_column(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("must not be empty")
+        return cleaned
+
+    @field_validator("sumstats_required_columns")
+    @classmethod
+    def unique_sumstats_columns(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("sumstats column names must not be empty")
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("sumstats column names must be unique")
+        return cleaned
+
+    @field_validator(
+        "native_results_suffix", "native_log_suffix", "munged_sumstats_suffix",
+        "munge_log_suffix",
+    )
+    @classmethod
+    def nonempty_output_suffix(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned or not cleaned.startswith("."):
+            raise ValueError("must be non-empty and start with '.'")
+        return cleaned
+
+    @model_validator(mode="after")
+    def distinct_result_columns(self):
+        columns = [
+            self.name_column,
+            self.coefficient_column,
+            self.standard_error_column,
+            self.p_value_column,
+        ]
+        if len(columns) != len(set(columns)):
+            raise ValueError("native result column names must be unique")
+        return self
+
+
+class LdscCelltypeConfig(StrictModel):
+    workflow: Literal["h2_cts"]
+    genome_build: GenomeBuild
+    population: Population
+    input: LdscCelltypeInputConfig
+    reference_format: LdscCelltypeReferenceFormatConfig
+    result_format: LdscCelltypeResultFormatConfig
+    version_probe_arguments: list[str]
+    version_pattern: str
+
+    @field_validator("version_probe_arguments")
+    @classmethod
+    def nonempty_probe_arguments(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("version probe arguments must not be empty")
+        return cleaned
+
+    @field_validator("version_pattern")
+    @classmethod
+    def valid_version_pattern(cls, value: str) -> str:
+        try:
+            compiled = re.compile(value)
+        except re.error as exc:
+            raise ValueError("must be a valid regular expression") from exc
+        if compiled.groups != 1:
+            raise ValueError("must contain exactly one capture group")
+        return value
 
 
 class ScdrsInputConfig(StrictModel):
@@ -209,6 +411,11 @@ class ScdrsDownstreamConfig(StrictModel):
         cleaned = [value.strip() for value in values]
         if any(not value for value in cleaned):
             raise ValueError("annotation names must not be empty")
+        if any("," in value for value in cleaned):
+            raise ValueError(
+                "annotation names must not contain commas used by the native "
+                "scDRS CLI list syntax"
+            )
         if len(cleaned) != len(set(cleaned)):
             raise ValueError("annotation names must be unique")
         return cleaned
@@ -257,19 +464,11 @@ class ScdrsConfig(StrictModel):
 
     @model_validator(mode="after")
     def supported_native_contract(self):
-        species_family = {
-            "human": "human",
-            "hsapiens": "human",
-            "mouse": "mouse",
-            "mmusculus": "mouse",
-        }
-        if (
-            species_family[self.h5ad_species]
-            != species_family[self.gene_set_species]
-        ):
+        if self.h5ad_species != self.gene_set_species:
             raise ValueError(
-                "cross-species scDRS gene-set conversion is not supported by "
-                "the current PostGWAS preflight; use matching species"
+                "the current PostGWAS scDRS preflight requires identical H5AD "
+                "and gene-set species values; this also avoids the supported "
+                "upstream version treating aliases as cross-species input"
             )
         if not (
             self.return_control_raw_score
@@ -396,6 +595,14 @@ class SingleCellOutputLayout(StrictModel):
     scdrs_generated_gene_statistics: str
     scdrs_generated_gene_set: str
     scdrs_gene_mapping_report: str
+    ldsc_celltype_engine_directory: str
+    ldsc_celltype_results_file: str
+    ldsc_celltype_qc_report: str
+    ldsc_celltype_completion_manifest: str
+    ldsc_celltype_staging_directory: str
+    ldsc_celltype_native_output_prefix: str
+    ldsc_celltype_normalized_ldcts: str
+    ldsc_celltype_munge_output_prefix: str
 
     @field_validator("*")
     @classmethod
@@ -428,6 +635,7 @@ class SingleCellConfig(ModuleConfig):
     tools: list[SingleCellTool] = Field(min_length=1)
     magma_celltype: MagmaCelltypeConfig
     scdrs: ScdrsConfig
+    ldsc_celltype: LdscCelltypeConfig
     multiple_testing: SingleCellMultipleTestingConfig
     result_schema: SingleCellResultSchema
     output_layout: SingleCellOutputLayout
@@ -466,6 +674,10 @@ class SingleCellConfig(ModuleConfig):
 
 
 __all__ = [
-    "SINGLE_CELL_TOOLS", "SingleCellConfig", "SingleCellCorrectionMethod",
-    "SingleCellTool",
+    "SINGLE_CELL_TOOLS", "SINGLE_CELL_TOOL_FORMATS",
+    "SINGLE_CELL_TOOL_PIPELINE_DEPENDENCIES",
+    "SINGLE_CELL_TOOL_SUPPORTING_CONFIGS", "SingleCellConfig",
+    "SingleCellCorrectionMethod", "SingleCellTool",
+    "single_cell_formatter_targets", "single_cell_pipeline_dependencies",
+    "single_cell_supporting_configurations",
 ]

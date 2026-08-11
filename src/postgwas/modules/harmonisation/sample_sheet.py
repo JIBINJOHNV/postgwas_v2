@@ -13,14 +13,26 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    PrivateAttr,
+    ValidationInfo,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.paths import configured_output_path
 from postgwas.core.values import MISSING_TEXT
+from postgwas.modules.harmonisation.resource_paths import (
+    validate_external_resource_spec,
+)
 
 
 INFERABLE_FIELDS = ("trait_type", "effect_type", "p_value_type", "delimiter")
+SAMPLE_SHEET_VERSION = 2
 
 ENUM_ALIASES = {
     "trait_type": {
@@ -128,6 +140,16 @@ def _require_nonempty_file(path: Path, field: str, row_number: int) -> None:
         raise ConfigurationError("Row %d: %s is empty: %s" % (row_number, field, path))
 
 
+def _require_external_resource(path: Path, field: str, row_number: int) -> None:
+    """Accept one non-empty file or an explicit chromosome/build template."""
+    try:
+        validate_external_resource_spec(path)
+    except ValueError as exc:
+        raise ConfigurationError(
+            "Row %d: %s is invalid. %s" % (row_number, field, exc)
+        ) from exc
+
+
 class HarmonisationSampleSheetRow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -175,9 +197,9 @@ class HarmonisationSampleSheetRow(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def validate_alternatives(self):
-        if self.config_version != 2:
-            raise ValueError("config_version must be 2")
+    def validate_alternatives(self, info: ValidationInfo):
+        if self.config_version != SAMPLE_SHEET_VERSION:
+            raise ValueError("config_version must be %d" % SAMPLE_SHEET_VERSION)
         if not ((self.chromosome_column and self.position_column) or self.chromosome_position_column):
             raise ValueError(
                 "provide chromosome_column plus position_column, or chromosome_position_column"
@@ -188,9 +210,36 @@ class HarmonisationSampleSheetRow(BaseModel):
         internal_eaf = self.effect_allele_frequency_column is not None
         external_eaf = self.external_eaf_file is not None or self.external_eaf_column is not None
         if external_eaf and not (self.external_eaf_file and self.external_eaf_column):
-            raise ValueError("external EAF requires both external_eaf_file and external_eaf_column")
-        if internal_eaf == external_eaf:
-            raise ValueError("provide exactly one EAF source: internal column XOR external file+column")
+            missing = (
+                "external_eaf_file"
+                if self.external_eaf_file is None
+                else "external_eaf_column"
+            )
+            raise ValueError(
+                "Dataset %r has an incomplete external EAF source: %s is missing. "
+                "Set both external_eaf_file and external_eaf_column, or set both "
+                "to NA and provide effect_allele_frequency_column instead."
+                % (self.dataset_id, missing)
+            )
+        draft_allows_missing_eaf = bool(
+            info.context and info.context.get("allow_missing_eaf")
+        )
+        if internal_eaf and external_eaf:
+            raise ValueError(
+                "Dataset %r provides two allele-frequency sources: internal "
+                "effect_allele_frequency_column=%r and external_eaf_file plus "
+                "external_eaf_column. Keep exactly one source and set the other "
+                "alternative to NA."
+                % (self.dataset_id, self.effect_allele_frequency_column)
+            )
+        if not internal_eaf and not external_eaf and not draft_allows_missing_eaf:
+            raise ValueError(
+                "Dataset %r has no allele-frequency source. Complete the sample "
+                "sheet by setting either effect_allele_frequency_column to the "
+                "exact study EAF/MAF column name, or both external_eaf_file and "
+                "external_eaf_column. All three fields are currently NA."
+                % self.dataset_id
+            )
 
         internal_info = self.imputation_info_column is not None
         external_info = self.external_info_file is not None or self.external_info_column is not None
@@ -199,17 +248,42 @@ class HarmonisationSampleSheetRow(BaseModel):
             and external_info
             and not (self.external_info_file and self.external_info_column)
         ):
-            raise ValueError("external INFO requires both external_info_file and external_info_column")
+            missing = (
+                "external_info_file"
+                if self.external_info_file is None
+                else "external_info_column"
+            )
+            raise ValueError(
+                "Dataset %r has an incomplete external INFO source: %s is "
+                "missing. Set both external_info_file and external_info_column, "
+                "or set both to NA and provide imputation_info_column or the "
+                "--fixed-info option instead."
+                % (self.dataset_id, missing)
+            )
 
         has_controls = self.control_count_column is not None or self.control_count is not None
         has_cases = self.case_count_column is not None or self.case_count is not None
-        if not has_controls:
+        draft_allows_missing_sample_size = bool(
+            info.context and info.context.get("allow_missing_sample_size")
+        )
+        if not has_controls and not draft_allows_missing_sample_size:
             raise ValueError("provide control_count_column or control_count")
         if self.trait_type == "case_control" and not has_cases:
             raise ValueError("case-control traits require case_count_column or case_count")
         if self.trait_type == "quantitative" and has_cases:
             raise ValueError("quantitative traits must not provide case-count fields")
         return self
+
+    @classmethod
+    def validate_generated_draft(cls, value: Any) -> "HarmonisationSampleSheetRow":
+        """Validate a generator draft while leaving user-completable fields unresolved."""
+        return cls.model_validate(
+            value,
+            context={
+                "allow_missing_sample_size": True,
+                "allow_missing_eaf": True,
+            },
+        )
 
     @property
     def normalisation_warnings(self) -> tuple[str, ...]:
@@ -246,6 +320,24 @@ def _read_records(sample_sheet: Path) -> tuple[list[str], list[dict[str, str]]]:
     return raw_header, records
 
 
+def _validation_error_text(exc: ValidationError) -> str:
+    """Render Pydantic row errors without implementation details or help URLs."""
+    messages: list[str] = []
+    for error in exc.errors(
+        include_url=False,
+        include_context=False,
+        include_input=False,
+    ):
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        message = str(error.get("msg") or "invalid value")
+        if message.startswith("Value error, "):
+            message = message[len("Value error, "):]
+        detail = "%s: %s" % (location, message) if location else message
+        if detail not in messages:
+            messages.append(detail)
+    return "; ".join(messages) or str(exc)
+
+
 def load_harmonisation_sample_sheet(path: str | Path) -> list[HarmonisationSampleSheetRow]:
     """Normalize and validate rows without opening any referenced data file."""
     sample_sheet = Path(path).expanduser().resolve()
@@ -270,9 +362,19 @@ def load_harmonisation_sample_sheet(path: str | Path) -> list[HarmonisationSampl
             record[field] = _normalise_path(record.get(field), sample_sheet)
         try:
             row = HarmonisationSampleSheetRow.model_validate(record)
-        except Exception as exc:
+        except ValidationError as exc:
+            dataset = record.get("dataset_id")
+            dataset_context = (
+                " for dataset %r" % dataset if not _missing(dataset) else ""
+            )
             raise ConfigurationError(
-                "Invalid sample-sheet row %d in %s: %s" % (row_number, sample_sheet, exc)
+                "Invalid sample-sheet row %d%s in %s: %s"
+                % (
+                    row_number,
+                    dataset_context,
+                    sample_sheet,
+                    _validation_error_text(exc),
+                )
             ) from exc
         row._normalisation_warnings.extend(warnings)
         if row.imputation_info_column and (
@@ -286,9 +388,13 @@ def load_harmonisation_sample_sheet(path: str | Path) -> list[HarmonisationSampl
 
         _require_nonempty_file(row.input_file, "input_file", row_number)
         if row.external_eaf_file:
-            _require_nonempty_file(row.external_eaf_file, "external_eaf_file", row_number)
+            _require_external_resource(
+                row.external_eaf_file, "external_eaf_file", row_number,
+            )
         if row.external_info_file and row.imputation_info_column is None:
-            _require_nonempty_file(row.external_info_file, "external_info_file", row_number)
+            _require_external_resource(
+                row.external_info_file, "external_info_file", row_number,
+            )
 
         normalized_id = row.dataset_id.casefold()
         if normalized_id in seen_ids:

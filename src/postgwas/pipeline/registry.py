@@ -101,7 +101,7 @@ MODULES = (
         "Filter summary statistics using explicit QC policies.",
         cli_entrypoint="postgwas.modules.filtering.cli:main",
         parser_factories=COMMON + (
-            "postgwas.cli.common:get_genome_build_parser",
+            "postgwas.modules.filtering.cli:get_filtering_genome_build_parser",
             "postgwas.cli.common:get_common_sumstat_filter_parser",
             "postgwas.cli.common:get_bcftools_binary_parser",
         ),
@@ -113,7 +113,7 @@ MODULES = (
         "Apply the configured QC policy after imputation.",
         dependencies=("imputation",),
         parser_factories=COMMON + (
-            "postgwas.cli.common:get_genome_build_parser",
+            "postgwas.modules.filtering.cli:get_filtering_genome_build_parser",
             "postgwas.cli.common:get_common_sumstat_filter_parser",
             "postgwas.cli.common:get_bcftools_binary_parser",
         ),
@@ -266,6 +266,7 @@ MODULES = (
         ),
         pipeline_supplied_options=(
             "magma_gene_results_file", "scdrs_magma_gene_results_file",
+            "ldsc_celltype_sumstats_file", "ldsc_celltype_sumstats_source",
         ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
         preflight=(

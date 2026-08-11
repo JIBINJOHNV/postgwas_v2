@@ -487,7 +487,7 @@ def validate_harmonisation_resource_maps(
             elif key in ("default_eaf_file", "user_eaf_file", "user_info_file"):
                 if key == "default_eaf_file":
                     mapping = default_eaf_colmap
-                    value_column = resources.get("default_comparison_af_column")
+                    value_column = resources.get("default_eaf_reference_column")
                 elif key == "user_eaf_file":
                     mapping = external_eaf_colmap
                     value_column = resources.get("user_eaf_column")

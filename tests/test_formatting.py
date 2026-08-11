@@ -8,12 +8,16 @@ import pytest
 import yaml
 
 from postgwas.config import load_configuration, load_module_configuration
-from postgwas.config.models.modules.formatting import FormattingVcfFields
+from postgwas.config.models.modules.formatting import (
+    FormattingStudyDesign,
+    FormattingVcfFields,
+)
 from postgwas.core.variant_identifiers import inspect_bim_identifier_type
-from postgwas.modules.formatting.cli import build_parser
+from postgwas.modules.formatting.cli import build_parser, main as formatter_main
 from postgwas.modules.formatting.contracts import required_formats
 from postgwas.modules.formatting.exporters.ldsc import export_ldsc
 from postgwas.modules.formatting.exporters.mixer import export_mixer
+from postgwas.modules.formatting.exporters.pred_ld import export_pred_ld
 from postgwas.modules.formatting.service import run_formatter_direct
 from postgwas.modules.formatting.table import (
     FormattingError,
@@ -36,6 +40,112 @@ def test_pipeline_format_dependencies_come_from_formatter_configuration():
         update={"module_formats": {"custom_analysis": ["mixer"]}}
     )
     assert required_formats(config, ["custom_analysis"], ["ldsc"]) == ["ldsc", "mixer"]
+
+
+def test_study_design_requirement_is_a_validated_formatter_contract():
+    study_design = load_configuration().modules.formatting.study_design
+
+    assert study_design.required_formats == ["ldsc", "mixer"]
+    with pytest.raises(ValueError, match="ldsc and mixer exactly once"):
+        FormattingStudyDesign.model_validate({
+            "case_count_column": "N_CASE",
+            "control_count_column": "N_CONTROL",
+            "required_formats": ["ldsc"],
+        })
+
+
+def test_magma_susie_and_finemap_do_not_require_study_design_counts(
+    tmp_path, monkeypatch, capsys,
+):
+    config = tmp_path / "formatting.yaml"
+    config.write_text(
+        "formats: [magma, susie, finemap]\n",
+        encoding="utf-8",
+    )
+    frame = pl.DataFrame({
+        "CHROM": ["1"],
+        "POS": [100],
+        "ID": ["rs1"],
+        "REF": ["A"],
+        "ALT": ["G"],
+        "BETA": [0.2],
+        "SE": [0.1],
+        "Z": [2.0],
+        "LP": [8.0],
+        "EAF": [0.2],
+        "N": [1000.0],
+        "NEFF": [900.0],
+    })
+    monkeypatch.setattr(
+        "postgwas.modules.formatting.service.load_harmonised_vcf",
+        lambda *args, **kwargs: frame,
+    )
+
+    output_directory = tmp_path / "results"
+    results = run_formatter_direct(Namespace(
+        vcf=str(FIXTURE),
+        dataset_id="QUANT",
+        output_directory=str(output_directory),
+        run_config=str(config),
+        bcftools=sys.executable,
+        overwrite=True,
+    ))
+
+    assert list(results) == ["magma", "susie", "finemap"]
+    assert all(result["rows_out"] == 1 for result in results.values())
+    assert pl.read_csv(
+        results["magma"]["pval_file"], separator="\t",
+    )["N_COL"].item() == 1000
+    assert pl.read_csv(
+        results["susie"]["susie_input"], separator="\t",
+    )["NEF"].item() == 900
+    assert pl.read_csv(
+        results["finemap"]["finemap_input"], separator="\t",
+    )["NEF"].item() == 900
+
+    log_text = Path(results["magma"]["log_file"]).read_text(encoding="utf-8")
+    assert "study_design" in log_text
+    assert "reason=not_required_for_selected_formats" in log_text
+    assert "Cannot infer the study type" not in log_text
+    screen_text = capsys.readouterr().out
+    assert "Study-design inference" in screen_text
+    assert "not required for the selected formats" in screen_text
+    resolved = yaml.safe_load(
+        (output_directory / "run_metadata" / "resolved_config.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "study_design" not in resolved["modules"]["formatting"]
+
+
+@pytest.mark.parametrize("target", ["ldsc", "mixer"])
+def test_ldsc_and_mixer_still_require_study_design_counts(
+    tmp_path, monkeypatch, target,
+):
+    config = tmp_path / (target + ".yaml")
+    config.write_text("formats: [%s]\n" % target, encoding="utf-8")
+    frame = pl.DataFrame({
+        "CHROM": ["1"], "POS": [100], "ID": ["rs1"],
+        "REF": ["A"], "ALT": ["G"], "Z": [2.0], "LP": [8.0],
+        "EAF": [0.2], "INFO": [0.95], "NEFF": [900.0],
+    })
+    monkeypatch.setattr(
+        "postgwas.modules.formatting.service.load_harmonised_vcf",
+        lambda *args, **kwargs: frame,
+    )
+
+    with pytest.raises(
+        FormattingError,
+        match=r"canonical sample-count fields are missing: N_CASE, N_CONTROL",
+    ):
+        run_formatter_direct(Namespace(
+            vcf=str(FIXTURE),
+            dataset_id="STUDY",
+            output_directory=str(tmp_path / (target + "_results")),
+            run_config=str(config),
+            bcftools=sys.executable,
+            overwrite=True,
+        ))
 
 
 @pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")
@@ -189,6 +299,210 @@ def test_completed_formatter_outputs_resume_without_reextracting_vcf(
 
 
 @pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")
+def test_formatter_resume_rebases_copied_run_to_current_output_directory(
+    tmp_path, monkeypatch,
+):
+    original = tmp_path / "original"
+    copied = tmp_path / "copied"
+    common = dict(
+        vcf=str(FIXTURE),
+        dataset_id="STUDY",
+        format=TARGETS,
+        bcftools=shutil.which("bcftools"),
+        resume=True,
+    )
+    first = run_formatter_direct(Namespace(
+        **common, output_directory=str(original), overwrite=True,
+    ))
+    original_artifact = Path(
+        first["gcta_gene"]["summary_statistics_input_file"]
+    )
+    shutil.copytree(original, copied)
+
+    from postgwas.modules.formatting import service
+
+    monkeypatch.setattr(
+        service,
+        "load_harmonised_vcf",
+        lambda *args, **kwargs: pytest.fail("copied resume re-read the GWAS-VCF"),
+    )
+    resumed = run_formatter_direct(Namespace(
+        **common, output_directory=str(copied),
+    ))
+
+    current_artifact = (copied / "STUDY_gcta.ma").resolve()
+    current_log = (copied / "logs" / "STUDY_formatter.log").resolve()
+    result = resumed["gcta_gene"]
+    assert Path(result["summary_statistics_input_file"]) == current_artifact
+    assert Path(result["outputs"]["summary_statistics"]["path"]) == current_artifact
+    assert Path(result["log_file"]) == current_log
+    assert Path(result["summary_statistics_input_file"]) != original_artifact
+    assert result["resumed"] is True
+    assert Path(resumed["pred_ld"]["pred_ld_folder"]) == (
+        copied / "pred_ld"
+    ).resolve()
+    returned_paths = {
+        Path(value).resolve()
+        for target_result in resumed.values()
+        for value in _absolute_paths(target_result)
+    }
+    assert returned_paths
+    assert all(
+        path == copied.resolve() or copied.resolve() in path.parents
+        for path in returned_paths
+    )
+
+    copied_manifest = yaml.safe_load(
+        (copied / "run_metadata" / "formatter_completion.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert copied_manifest["results"]["gcta_gene"][
+        "summary_statistics_input_file"
+    ] == str(current_artifact)
+    assert copied_manifest["results"]["gcta_gene"]["log_file"] == str(current_log)
+    assert all(
+        copied.resolve() in Path(record["path"]).parents
+        for record in copied_manifest["outputs"]
+    )
+
+
+@pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")
+def test_custom_output_resume_rebases_copied_artifact(tmp_path, monkeypatch):
+    original = tmp_path / "original"
+    copied = tmp_path / "copied"
+    common = dict(
+        vcf=str(FIXTURE),
+        dataset_id="STUDY",
+        bcftools=shutil.which("bcftools"),
+        custom_output_file="study_custom.tsv",
+        custom_columns={
+            "id": str((tmp_path / "absolute-looking header").resolve()),
+            "chr": "CHR",
+        },
+        resume=True,
+    )
+    first = run_formatter_direct(Namespace(
+        **common, output_directory=str(original), overwrite=True,
+    ))
+    original_artifact = Path(first["custom"]["custom_output_file"])
+    shutil.copytree(original, copied)
+
+    from postgwas.modules.formatting import service
+
+    monkeypatch.setattr(
+        service,
+        "load_harmonised_vcf",
+        lambda *args, **kwargs: pytest.fail("custom resume re-read the GWAS-VCF"),
+    )
+    resumed = run_formatter_direct(Namespace(
+        **common, output_directory=str(copied),
+    ))
+
+    current_artifact = (copied / "study_custom.tsv").resolve()
+    assert Path(resumed["custom"]["custom_output_file"]) == current_artifact
+    assert current_artifact != original_artifact
+    assert resumed["custom"]["resumed"] is True
+    assert resumed["custom"]["field_roles"] == common["custom_columns"]
+    manifest = yaml.safe_load(
+        (copied / "run_metadata" / "formatter_completion.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["formats"] == []
+    assert manifest["selected_targets"] == ["custom"]
+    assert manifest["results"]["custom"]["custom_output_file"] == str(
+        current_artifact
+    )
+    assert manifest["outputs"][0]["path"] == str(current_artifact)
+
+
+def _absolute_paths(value):
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _absolute_paths(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _absolute_paths(child)
+    elif isinstance(value, (str, Path)) and Path(value).is_absolute():
+        yield value
+
+
+@pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")
+def test_formatter_resume_rejects_manifest_filename_mismatch(tmp_path):
+    original = tmp_path / "original"
+    copied = tmp_path / "copied"
+    common = dict(
+        vcf=str(FIXTURE),
+        dataset_id="STUDY",
+        format=["gcta_gene"],
+        bcftools=shutil.which("bcftools"),
+        resume=True,
+    )
+    run_formatter_direct(Namespace(
+        **common, output_directory=str(original), overwrite=True,
+    ))
+    shutil.copytree(original, copied)
+    manifest_path = copied / "run_metadata" / "formatter_completion.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    wrong_artifact = str((original / "STUDY_wrong.ma").resolve())
+    manifest["results"]["gcta_gene"][
+        "summary_statistics_input_file"
+    ] = wrong_artifact
+    manifest["results"]["gcta_gene"]["outputs"]["summary_statistics"][
+        "path"
+    ] = wrong_artifact
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8",
+    )
+
+    with pytest.raises(
+        FormattingError,
+        match=r"artifact gcta_gene\.summary_statistics does not match.*STUDY_gcta\.ma",
+    ):
+        run_formatter_direct(Namespace(
+            **common, output_directory=str(copied),
+        ))
+
+    log_text = (copied / "logs" / "STUDY_formatter.log").read_text(
+        encoding="utf-8"
+    )
+    assert "FAILED" in log_text
+
+
+@pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")
+def test_formatter_resume_does_not_fall_back_to_original_artifact(tmp_path):
+    original = tmp_path / "original"
+    copied = tmp_path / "copied"
+    common = dict(
+        vcf=str(FIXTURE),
+        dataset_id="STUDY",
+        format=["gcta_gene"],
+        bcftools=shutil.which("bcftools"),
+        resume=True,
+    )
+    first = run_formatter_direct(Namespace(
+        **common, output_directory=str(original), overwrite=True,
+    ))
+    original_artifact = Path(
+        first["gcta_gene"]["summary_statistics_input_file"]
+    )
+    shutil.copytree(original, copied)
+    copied_artifact = copied / "STUDY_gcta.ma"
+    copied_artifact.unlink()
+
+    with pytest.raises(
+        FormattingError,
+        match=r"Resume file is missing or empty: .*copied/STUDY_gcta\.ma",
+    ):
+        run_formatter_direct(Namespace(
+            **common, output_directory=str(copied),
+        ))
+
+    assert original_artifact.is_file()
+
+
+@pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")
 def test_formatter_resolved_metadata_contains_only_selected_target(tmp_path):
     args = Namespace(
         vcf=str(FIXTURE), dataset_id="STUDY", output_directory=str(tmp_path),
@@ -205,6 +519,7 @@ def test_formatter_resolved_metadata_contains_only_selected_target(tmp_path):
     assert "module_formats" not in formatting
     assert "format_order" not in formatting
     assert "chromosomes" not in formatting
+    assert "study_design" not in formatting
     assert "mixer" not in formatting
     reloaded = load_configuration(path)
     assert reloaded.run.dataset_id == "STUDY"
@@ -349,6 +664,210 @@ def test_formatter_overwrite_takes_precedence_over_default_resume(
     assert rerun["magma"].get("resumed") is not True
 
 
+def test_formatter_rejects_colliding_outputs_before_vcf_extraction(
+    tmp_path, monkeypatch,
+):
+    config = tmp_path / "formatting.yaml"
+    config.write_text(
+        "formats: [susie, finemap]\n"
+        "exports:\n"
+        "  susie:\n"
+        "    output_file: '{dataset_id}_shared.tsv'\n"
+        "  finemap:\n"
+        "    output_file: '{dataset_id}_shared.tsv'\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "results"
+    monkeypatch.setattr(
+        "postgwas.modules.formatting.service.load_harmonised_vcf",
+        lambda *args, **kwargs: pytest.fail("collision preflight read the VCF"),
+    )
+
+    with pytest.raises(FormattingError) as caught:
+        run_formatter_direct(Namespace(
+            vcf=str(FIXTURE),
+            dataset_id="STUDY",
+            output_directory=str(output),
+            run_config=str(config),
+            bcftools=sys.executable,
+            overwrite=True,
+        ))
+
+    message = str(caught.value)
+    assert "Formatter output collision" in message
+    assert "susie and finemap" in message
+    assert str((output / "STUDY_shared.tsv").resolve()) in message
+    assert not (output / "STUDY_shared.tsv").exists()
+    assert not (output / "run_metadata" / "resolved_config.yaml").exists()
+    log = output / "logs" / "STUDY_formatter.log"
+    assert log.is_file()
+    assert "FAILED" in log.read_text(encoding="utf-8")
+
+
+def test_formatter_rejects_colliding_partition_paths(tmp_path):
+    from postgwas.modules.formatting.service import _validate_output_destinations
+
+    module = load_configuration().modules.formatting
+    pred_ld = module.exports["pred_ld"].model_copy(update={
+        "partition_file": "{dataset_id}_pred_ld.tsv",
+    })
+    exports = dict(module.exports)
+    exports["pred_ld"] = pred_ld
+    module = module.model_copy(update={
+        "chromosomes": ["1", "2"],
+        "exports": exports,
+    })
+
+    with pytest.raises(
+        FormattingError,
+        match=(
+            r"pred_ld\[partition=1\] and pred_ld\[partition=2\].*"
+            r"Configure a unique"
+        ),
+    ):
+        _validate_output_destinations(
+            tmp_path,
+            "STUDY",
+            ["pred_ld"],
+            module,
+        )
+
+
+@pytest.mark.parametrize(
+    ("custom_output", "expected_label"),
+    [
+        ("STUDY_susie.tsv", "susie and custom"),
+        ("logs/STUDY_formatter.log", "custom and formatter log"),
+    ],
+)
+def test_custom_output_collision_fails_before_vcf_extraction(
+    tmp_path, monkeypatch, custom_output, expected_label,
+):
+    monkeypatch.setattr(
+        "postgwas.modules.formatting.service.load_harmonised_vcf",
+        lambda *args, **kwargs: pytest.fail("custom collision preflight read the VCF"),
+    )
+
+    with pytest.raises(FormattingError) as caught:
+        run_formatter_direct(Namespace(
+            vcf=str(FIXTURE),
+            dataset_id="STUDY",
+            output_directory=str(tmp_path),
+            format=["susie"],
+            bcftools=sys.executable,
+            custom_output_file=custom_output,
+            custom_columns={"id": "SNP"},
+            overwrite=True,
+        ))
+
+    assert "Formatter output collision" in str(caught.value)
+    assert expected_label in str(caught.value)
+    assert not (tmp_path / "STUDY_susie.tsv").exists()
+
+
+def test_formatter_canonical_output_destinations_are_unique(tmp_path):
+    from postgwas.modules.formatting.service import _validate_output_destinations
+
+    module = load_configuration().modules.formatting
+
+    destinations = _validate_output_destinations(
+        tmp_path,
+        "STUDY",
+        TARGETS,
+        module,
+    )
+
+    expected = sum(
+        bool(module.exports[target].output_file)
+        + len(module.exports[target].outputs)
+        + (
+            len(module.chromosomes)
+            if module.exports[target].partition_file is not None
+            else 0
+        )
+        for target in TARGETS
+    )
+    assert len(destinations) == expected
+    assert len(set(destinations.values())) == expected
+
+
+def test_pred_ld_reports_only_rows_written_for_configured_chromosomes(
+    tmp_path, monkeypatch, capsys,
+):
+    config = tmp_path / "formatting.yaml"
+    config.write_text(
+        "formats: [pred_ld]\nchromosomes: ['1']\n",
+        encoding="utf-8",
+    )
+    frame = pl.DataFrame({
+        "CHROM": ["1", "X"],
+        "POS": [100, 200],
+        "ID": ["rs1", "rs2"],
+        "REF": ["A", "C"],
+        "ALT": ["G", "T"],
+        "BETA": [0.2, -0.1],
+        "SE": [0.1, 0.2],
+        "EAF": [0.2, 0.3],
+        "INFO": [0.95, 0.90],
+        "LP": [8.0, 6.0],
+        "N": [1000.0, 1000.0],
+        "N_CASE": [400.0, 400.0],
+        "N_CONTROL": [600.0, 600.0],
+    })
+    monkeypatch.setattr(
+        "postgwas.modules.formatting.service.load_harmonised_vcf",
+        lambda *args, **kwargs: frame,
+    )
+
+    result = run_formatter_direct(Namespace(
+        vcf=str(FIXTURE),
+        dataset_id="STUDY",
+        output_directory=str(tmp_path / "results"),
+        run_config=str(config),
+        bcftools=sys.executable,
+        overwrite=True,
+    ))["pred_ld"]
+
+    assert result["rows_in"] == 2
+    assert result["rows_out"] == 1
+    assert result["rows_excluded_unconfigured_chromosome"] == 1
+    assert result["excluded_chromosomes"] == {"X": 1}
+    assert result["schema_rows_excluded"] == 0
+    assert result["rows_excluded"] == 1
+    output = pl.read_csv(result["files"][0], separator="\t")
+    assert output["snp"].to_list() == ["rs1"]
+
+    log_text = Path(result["log_file"]).read_text(encoding="utf-8")
+    assert "excluded_unconfigured_chromosomes" in log_text
+    assert "chromosomes='{X -> 1}'" in log_text
+    assert "reason=unconfigured_chromosome" in log_text
+    screen_text = capsys.readouterr().out
+    assert "1 outside configured" in screen_text
+    assert "chromosomes" in screen_text
+
+
+def test_pred_ld_fails_before_writing_when_no_configured_chromosomes_remain(
+    tmp_path,
+):
+    frame = pl.DataFrame({
+        "SNP": ["rsX"], "CHROM": ["X"], "POS": [100],
+        "ALT": ["G"], "REF": ["A"], "BETA": [0.2], "SE": [0.1],
+        "N_CONTROL": [600.0], "N": [1000.0], "EAF": [0.2],
+        "LP": [8.0], "INFO": [0.95],
+    })
+    config = load_configuration().modules.formatting.model_copy(
+        update={"chromosomes": ["1"]}
+    )
+
+    with pytest.raises(FormattingError) as caught:
+        export_pred_ld(frame, tmp_path, "STUDY", config, overwrite=False)
+
+    message = str(caught.value)
+    assert "No PRED-LD variants remain on the configured chromosomes: 1" in message
+    assert "Excluded unconfigured chromosome counts: X=1" in message
+    assert not (tmp_path / "pred_ld").exists()
+
+
 def test_formatter_help_explains_formats_and_configuration():
     help_text = build_parser().format_help()
     assert "The VCF is read once" in help_text
@@ -358,6 +877,30 @@ def test_formatter_help_explains_formats_and_configuration():
     assert "--variant-id-type {rsid,unique}" in help_text
     assert "Per-target YAML settings" in help_text
     assert "--run-config PATH" in help_text
+    assert "--custom-output FILE" in help_text
+    assert "--id NAME" in help_text
+    assert "--n-case NAME" in help_text
+    assert "without editing YAML" in help_text
+
+
+def test_bare_formatter_command_displays_the_same_help_as_help_flag(capsys):
+    assert formatter_main([]) == 0
+    bare_help = capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as caught:
+        formatter_main(["--help"])
+    explicit_help = capsys.readouterr().out
+
+    assert caught.value.code == 0
+    assert bare_help == explicit_help
+    assert "custom output" in bare_help.lower()
+
+
+def test_formatter_options_without_vcf_still_fail_validation():
+    with pytest.raises(SystemExit) as caught:
+        formatter_main(["--format", "magma"])
+
+    assert caught.value.code == 2
 
 
 def test_formatter_configurable_cli_actions_do_not_own_defaults():
@@ -365,9 +908,189 @@ def test_formatter_configurable_cli_actions_do_not_own_defaults():
     for destination in (
         "format", "run_config", "resume", "overwrite", "bcftools", "dataset_id",
         "output_directory", "threads", "memory_gb", "seed", "variant_id_type",
+        "custom_output_file", "custom_columns",
     ):
         action = next(item for item in parser._actions if item.dest == destination)
         assert action.default == argparse.SUPPRESS
+
+
+def test_custom_cli_preserves_requested_column_order():
+    args = build_parser().parse_args([
+        "--vcf", str(FIXTURE),
+        "--custom-output", "study.tsv",
+        "--p", "PVALUE",
+        "--id", "MARKER",
+        "--alt", "EFFECT",
+        "--ref", "OTHER",
+        "--lp", "LOGP",
+        "--maf", "MAF",
+    ])
+
+    assert args.custom_columns == {
+        "p": "PVALUE",
+        "id": "MARKER",
+        "alt": "EFFECT",
+        "ref": "OTHER",
+        "lp": "LOGP",
+        "maf": "MAF",
+    }
+
+
+@pytest.mark.parametrize(
+    ("attributes", "message"),
+    [
+        (
+            {"custom_output_file": "study.tsv", "custom_columns": {"chr": "CHR"}},
+            r"custom output requires --id NAME",
+        ),
+        (
+            {"custom_columns": {"id": "SNP"}},
+            r"custom output requires --custom-output",
+        ),
+        (
+            {
+                "custom_output_file": "study.tsv",
+                "custom_columns": {"id": "SAME", "chr": "SAME"},
+            },
+            r"column names must be unique",
+        ),
+    ],
+)
+def test_custom_cli_rejects_incomplete_or_ambiguous_schema(attributes, message):
+    from postgwas.modules.formatting.service import _resolved_configuration
+
+    with pytest.raises(Exception, match=message):
+        _resolved_configuration(Namespace(**attributes))
+
+
+@pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")
+def test_custom_output_is_additive_and_uses_requested_scientific_semantics(tmp_path):
+    args = build_parser().parse_args([
+        "--vcf", str(FIXTURE),
+        "--dataset-id", "STUDY",
+        "--output-directory", str(tmp_path),
+        "--bcftools", shutil.which("bcftools"),
+        "--format", "magma",
+        "--custom-output", "study_custom.tsv",
+        "--p", "PVALUE",
+        "--id", "MARKER",
+        "--maf", "MAF",
+        "--eaf", "EAF",
+        "--alt", "EFFECT",
+        "--ref", "OTHER",
+        "--lp", "LOGP",
+        "--variant-id-type", "unique",
+        "--overwrite",
+    ])
+
+    result = run_formatter_direct(args)
+
+    assert list(result) == ["magma", "custom"]
+    assert Path(result["magma"]["pval_file"]).is_file()
+    custom = pl.read_csv(result["custom"]["custom_output_file"], separator="\t")
+    assert custom.columns == [
+        "PVALUE", "MARKER", "MAF", "EAF", "EFFECT", "OTHER", "LOGP",
+    ]
+    assert custom.height == 4
+    rs1 = custom.filter(pl.col("MARKER") == "1_100_A_G").row(0, named=True)
+    assert rs1 == {
+        "PVALUE": pytest.approx(1e-8),
+        "MARKER": "1_100_A_G",
+        "MAF": pytest.approx(0.2),
+        "EAF": pytest.approx(0.8),
+        "EFFECT": "G",
+        "OTHER": "A",
+        "LOGP": pytest.approx(8.0),
+    }
+    bounded = custom.filter(pl.col("MARKER") == "2_300_G_A")["PVALUE"].item()
+    assert bounded == pytest.approx(1e-300)
+    assert result["custom"]["p_values_bounded"] == 1
+    assert result["custom"]["variant_id_type"] == "unique"
+    log_text = Path(result["custom"]["log_file"]).read_text(encoding="utf-8")
+    assert "target=custom" in log_text
+    assert "study_design reason=not_required_for_selected_formats" in log_text
+
+    resolved = yaml.safe_load(
+        (tmp_path / "run_metadata" / "resolved_config.yaml").read_text(
+            encoding="utf-8"
+        )
+    )["modules"]["formatting"]
+    assert list(resolved["exports"]) == ["magma"]
+    assert resolved["custom_output"]["columns"] == args.custom_columns
+
+
+@pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")
+def test_custom_id_supports_rsid_and_counts_unusable_identifiers(tmp_path):
+    args = build_parser().parse_args([
+        "--vcf", str(FIXTURE),
+        "--dataset-id", "STUDY",
+        "--output-directory", str(tmp_path),
+        "--bcftools", shutil.which("bcftools"),
+        "--custom-output", "rsids.tsv",
+        "--id", "src",
+        "--chr", "CHR",
+    ])
+
+    result = run_formatter_direct(args)["custom"]
+    output = pl.read_csv(result["custom_output_file"], separator="\t")
+
+    assert output.columns == ["src", "CHR"]
+    assert output["src"].to_list() == ["rs1", "rs3", "rs4"]
+    assert result["rows_in"] == 4
+    assert result["rows_out"] == 3
+    assert result["identifier_rows_excluded"] == 1
+    assert result["rows_excluded"] == 1
+    manifest = yaml.safe_load(
+        (tmp_path / "run_metadata" / "formatter_completion.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [record["path"] for record in manifest["outputs"]] == [
+        result["custom_output_file"]
+    ]
+
+
+def test_custom_output_excludes_and_reports_missing_requested_values(
+    tmp_path, monkeypatch,
+):
+    frame = pl.DataFrame({
+        "CHROM": ["1", "1", "1", "1"],
+        "POS": [100, 200, 300, 400],
+        "ID": ["rs1", "rs2", "rs3", "rs4"],
+        "REF": ["A", "C", "G", "T"],
+        "ALT": ["G", "T", "A", "C"],
+        "BETA": [0.2, None, 0.3, 0.4],
+        "SE": [0.1, 0.2, 0.0, 0.3],
+        "EAF": [0.8, 0.2, 0.3, 1.2],
+    })
+    monkeypatch.setattr(
+        "postgwas.modules.formatting.service.load_harmonised_vcf",
+        lambda *args, **kwargs: frame,
+    )
+
+    result = run_formatter_direct(Namespace(
+        vcf=str(FIXTURE),
+        dataset_id="STUDY",
+        output_directory=str(tmp_path),
+        bcftools=sys.executable,
+        custom_output_file="study.tsv",
+        custom_columns={
+            "id": "SNP", "beta": "BETA", "se": "SE", "maf": "MAF",
+        },
+        overwrite=True,
+    ))["custom"]
+
+    output = pl.read_csv(result["custom_output_file"], separator="\t")
+    assert output.to_dicts() == [{
+        "SNP": "rs1", "BETA": 0.2, "SE": 0.1, "MAF": pytest.approx(0.2),
+    }]
+    assert result["rows_in"] == 4
+    assert result["rows_out"] == 1
+    assert result["schema_rows_excluded"] == 3
+    assert result["rows_excluded"] == 3
+    assert "missing_or_invalid_required_value" in Path(
+        result["log_file"]
+    ).read_text(encoding="utf-8")
 
 
 def test_identifier_selection_is_general_and_configuration_driven():

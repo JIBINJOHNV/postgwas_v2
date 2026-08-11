@@ -38,6 +38,7 @@ polars - so it is importable and testable on its own.
 Python 3.8 compatible.
 """
 
+import csv
 import gzip
 import os
 from types import MappingProxyType
@@ -66,7 +67,8 @@ __all__ = [
 _REASONS = {
     # -- step 01, reading -----------------------------------------------------
     "missing_required_columns":
-        "A column the variant needs was empty, so the variant could not be used.",
+        "A column the variant needs was empty or could not be parsed as its "
+        "configured numeric type, so the variant could not be used.",
 
     # -- step 02, coordinates and alleles -------------------------------------
     "invalid_chromosome":
@@ -633,17 +635,66 @@ def _read_table(path, delimiter):
     )
 
 
-def concat_reject_files(paths, out_path, delimiter, logger=None, compress=None):
+def _validate_reject_output(path, delimiter, expected_rows, compressed):
+    """Validate one written reject table without loading it back into memory."""
+    opener = gzip.open if compressed else open
+    try:
+        with opener(
+            path, "rt", encoding="utf-8", newline="",
+        ) as handle:
+            reader = csv.reader(handle, delimiter=delimiter)
+            try:
+                header = next(reader)
+            except StopIteration as exc:
+                raise RejectOutputError(
+                    "Combined rejected-variants output is empty and has no header: %s"
+                    % path
+                ) from exc
+            missing = [column for column in REJECT_COLUMNS if column not in header]
+            if missing:
+                raise RejectOutputError(
+                    "Combined rejected-variants output %s is missing required "
+                    "column(s): %s." % (path, ", ".join(missing))
+                )
+            observed_rows = sum(1 for _row in reader)
+    except RejectOutputError:
+        raise
+    except Exception as exc:
+        raise RejectOutputError(
+            "Combined rejected-variants output could not be validated at %s "
+            "(%s: %s)." % (path, type(exc).__name__, exc)
+        ) from exc
+    if observed_rows != int(expected_rows):
+        raise RejectOutputError(
+            "Combined rejected-variants output %s contains %d row(s), but %d "
+            "were written from the source rejection files. Source files were "
+            "not removed."
+            % (path, observed_rows, int(expected_rows))
+        )
+    return observed_rows
+
+
+def concat_reject_files(
+    paths, out_path, delimiter, logger=None, compress=None, remove_sources=False,
+):
     """Merge the per-chromosome reject files into the one dataset file.
 
     Missing or unreadable inputs fail finalisation: an absent file means that
-    an expected stage left no auditable record.  Header-only files contribute
-    nothing but confirm that the stage ran and rejected no variants.
+    an expected stage left no auditable record. Header-only files contribute
+    nothing but confirm that the stage ran and rejected no variants. When
+    ``remove_sources`` is true, source shards are removed only after an atomic
+    write has passed required-column and exact-row-count validation.
     """
+    delimiter = str(delimiter)
+    if len(delimiter) != 1:
+        raise RejectOutputError(
+            "Reject-file delimiter must be exactly one character."
+        )
     if compress is None:
         compress = str(out_path).endswith(".gz")
     if compress and not str(out_path).endswith(".gz"):
         out_path = str(out_path) + ".gz"
+    out_path = str(out_path)
 
     frames = []      # type: List[pl.DataFrame]
     used = []        # type: List[str]
@@ -692,11 +743,26 @@ def concat_reject_files(paths, out_path, delimiter, logger=None, compress=None):
     merged = merged.select(ordered)
 
     directory = os.path.dirname(os.path.abspath(out_path))
+    temporary = out_path + ".part%d" % os.getpid()
     try:
         if directory:
             os.makedirs(directory, exist_ok=True)
-        _write_table(merged, out_path, compress, delimiter)
+        _write_table(merged, temporary, compress, delimiter)
+        _validate_reject_output(
+            temporary, delimiter, merged.height, compressed=compress,
+        )
+        os.replace(temporary, out_path)
+    except RejectOutputError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
     except Exception as exc:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
         if logger is not None:
             logger.error(
                 "The combined rejected-variants file could not be written to %s "
@@ -707,11 +773,34 @@ def concat_reject_files(paths, out_path, delimiter, logger=None, compress=None):
             "(%s: %s)." % (out_path, type(exc).__name__, exc)
         ) from exc
 
+    removed_sources = []
+    retained_sources = []
+    if remove_sources:
+        destination = os.path.abspath(out_path)
+        for path in used:
+            if os.path.abspath(path) == destination:
+                continue
+            try:
+                os.unlink(path)
+                removed_sources.append(path)
+            except OSError as exc:
+                retained_sources.append(path)
+                if logger is not None:
+                    warning = (
+                        "The consolidated rejected-variants file is valid, but "
+                        "source shard %s could not be removed (%s: %s)."
+                        % (path, type(exc).__name__, exc)
+                    )
+                    method = getattr(logger, "warn", None) or logger.error
+                    method(warning)
+
     result = {
         "path": out_path,
         "rows": merged.height,
         "files_used": used,
         "files_missing": missing,
+        "source_files_removed": removed_sources,
+        "source_files_retained": retained_sources,
     }
     if logger is not None:
         logger.info(
@@ -719,6 +808,15 @@ def concat_reject_files(paths, out_path, delimiter, logger=None, compress=None):
             % (len(used), "" if len(used) == 1 else "s", out_path,
                "{:,}".format(merged.height))
         )
+        if remove_sources:
+            logger.info(
+                "Removed %d validated source rejection file%s; %d remain."
+                % (
+                    len(removed_sources),
+                    "" if len(removed_sources) == 1 else "s",
+                    len(retained_sources),
+                )
+            )
     return result
 
 

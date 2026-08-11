@@ -11,10 +11,15 @@ import os
 import shutil
 
 from postgwas.config import load_module_configuration
+from postgwas.config.models.modules.single_cell import (
+    SINGLE_CELL_TOOL_PIPELINE_DEPENDENCIES,
+    single_cell_formatter_targets,
+)
 from postgwas.modules.formatting.contracts import required_formats
 from postgwas.modules.formatting.reference_identifiers import (
     BimIdentifierRequirement,
     configure_reference_variant_identifiers,
+    configure_required_variant_identifier_type,
 )
 
 # ============================================================
@@ -201,10 +206,22 @@ def run_formatter_runner(args, ctx):
     formatting_config = load_module_configuration(
         "formatting", getattr(args, "run_config", None),
     )
+    requested_formats = list(getattr(args, "format", None) or ())
+    if "single_cell" in active_modules:
+        single_cell = load_module_configuration(
+            "single_cell",
+            getattr(args, "run_config", None),
+            cli_overrides=(
+                {"tools": args.tools} if hasattr(args, "tools") else None
+            ),
+        )
+        requested_formats.extend(
+            single_cell_formatter_targets(single_cell.tools)
+        )
     args.format = required_formats(
         formatting_config,
         active_modules,
-        getattr(args, "format", None) or (),
+        requested_formats,
     )
     requirements = []
     if any(
@@ -273,6 +290,14 @@ def run_formatter_runner(args, ctx):
     if requirements:
         configure_reference_variant_identifiers(
             args, formatting_config, requirements,
+        )
+    if "ldsc" in requested_formats:
+        configure_required_variant_identifier_type(
+            args,
+            formatting_config,
+            consumer="LDSC HapMap3 summary-statistic munging",
+            formatter_target="ldsc",
+            required_type="rsid",
         )
 
     # 2. Resolve Binaries
@@ -407,11 +432,17 @@ def run_single_cell_runner(args, ctx):
 
     root = setup_subdir(args, "single_cell")
     try:
-        magma = _validated_magma_gene_result(ctx, "single-cell analysis")
         module = resolve_single_cell_configuration(args).modules.single_cell
-        if "magma_celltype" in module.tools:
+        magma_tools = {
+            tool for tool in module.tools
+            if "magma" in SINGLE_CELL_TOOL_PIPELINE_DEPENDENCIES[tool]
+        }
+        magma = None
+        if magma_tools:
+            magma = _validated_magma_gene_result(ctx, "single-cell analysis")
+        if "magma_celltype" in module.tools and magma is not None:
             args.magma_gene_results_file = magma["magma_genes_raw"]
-        if "scdrs" in module.tools:
+        if "scdrs" in module.tools and magma is not None:
             primary = magma["primary_mapping"]
             actual_gene_id_type = magma["mapping_analyses"][primary].get(
                 "gene_id_type"
@@ -428,6 +459,21 @@ def run_single_cell_runner(args, ctx):
                 )
             args.scdrs_gene_set_source = "magma"
             args.scdrs_magma_gene_results_file = magma["magma_genes_out"]
+        if "ldsc_celltype" in module.tools:
+            formatter = ctx.get("formatter")
+            ldsc = (
+                formatter.get("ldsc") if isinstance(formatter, dict) else None
+            )
+            sumstats_file = (
+                ldsc.get("ldsc_file") if isinstance(ldsc, dict) else None
+            )
+            if not sumstats_file:
+                raise ValueError(
+                    "LDSC cell-type analysis requires the formatter's validated "
+                    "LDSC output"
+                )
+            args.ldsc_celltype_sumstats_source = "formatter"
+            args.ldsc_celltype_sumstats_file = sumstats_file
         return run_single_cell_direct(args, ctx)
     finally:
         args.output_directory = root

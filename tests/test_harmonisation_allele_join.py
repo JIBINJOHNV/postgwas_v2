@@ -15,6 +15,10 @@ from postgwas.modules.harmonisation.shared.allele_join import (
 
 STUDY_COLUMNS = {"chr": "CHR", "pos": "POS", "ea": "EA", "oa": "OA"}
 REFERENCE_COLUMNS = {"chr": "CHROM", "pos": "BP", "ea": "A1", "oa": "A2"}
+DUPLICATE_ACTIONS = {
+    "duplicate_exact_action": "keep_one",
+    "duplicate_non_identical_action": "discard_all",
+}
 
 
 def test_shared_join_preserves_order_and_applies_only_requested_swap_transform():
@@ -40,6 +44,7 @@ def test_shared_join_preserves_order_and_applies_only_requested_swap_transform()
         reference_columns=REFERENCE_COLUMNS,
         value_column="AF",
         output_column="EAF",
+        **DUPLICATE_ACTIONS,
         swapped_value="one_minus",
         study_columns_canonical=True,
     )
@@ -71,6 +76,7 @@ def test_shared_join_prefers_direct_and_can_fall_back_from_an_empty_value():
         reference_columns=REFERENCE_COLUMNS,
         value_column="VALUE",
         output_column="VALUE",
+        **DUPLICATE_ACTIONS,
         swapped_value="same",
         prefer_non_null_value=False,
     )
@@ -81,6 +87,7 @@ def test_shared_join_prefers_direct_and_can_fall_back_from_an_empty_value():
         reference_columns=REFERENCE_COLUMNS,
         value_column="VALUE",
         output_column="VALUE",
+        **DUPLICATE_ACTIONS,
         swapped_value="same",
         prefer_non_null_value=True,
     )
@@ -91,7 +98,7 @@ def test_shared_join_prefers_direct_and_can_fall_back_from_an_empty_value():
     assert fallback[fallback_orientation].to_list() == [1]
 
 
-def test_shared_join_prefers_finite_value_within_exact_reference_duplicates():
+def test_shared_join_discards_missing_and_finite_non_identical_duplicates():
     study = pl.DataFrame({
         "CHR": ["1"], "POS": [10], "EA": ["A"], "OA": ["G"],
     })
@@ -110,16 +117,44 @@ def test_shared_join_prefers_finite_value_within_exact_reference_duplicates():
         reference_columns=REFERENCE_COLUMNS,
         value_column="VALUE",
         output_column="VALUE",
-        deduplicate_reference=True,
+        **DUPLICATE_ACTIONS,
     )
 
-    assert result["VALUE"].to_list() == pytest.approx([0.9])
-    assert stats["reference_duplicate_rows_removed"] == 2
+    assert result["VALUE"].to_list() == [None]
+    assert stats["reference_duplicate_rows_removed"] == 3
     assert stats["reference_duplicate_groups"] == 1
-    assert stats["reference_duplicate_groups_preferred_usable_value"] == 1
+    assert stats["reference_exact_duplicate_groups"] == 0
+    assert stats["reference_non_identical_duplicate_groups"] == 1
+    assert stats["reference_duplicate_groups_discarded"] == 1
 
 
-def test_shared_join_rejects_conflicting_finite_reference_duplicates():
+def test_shared_join_discards_conflicting_finite_reference_duplicates():
+    study = pl.DataFrame({
+        "CHR": ["1"], "POS": [10], "EA": ["A"], "OA": ["G"],
+    })
+    reference = pl.DataFrame({
+        "CHROM": ["1", "1"], "BP": [10, 10],
+        "A1": ["A", "A"], "A2": ["G", "G"],
+        "VALUE": [0.7, 0.9],
+    })
+
+    result, orientation, stats = allele_oriented_left_join(
+        study,
+        reference,
+        study_columns=STUDY_COLUMNS,
+        reference_columns=REFERENCE_COLUMNS,
+        value_column="VALUE",
+        output_column="VALUE",
+        **DUPLICATE_ACTIONS,
+    )
+
+    assert result["VALUE"].to_list() == [None]
+    assert result[orientation].to_list() == [None]
+    assert stats["reference_non_identical_duplicate_groups"] == 1
+    assert stats["reference_duplicate_rows_removed"] == 2
+
+
+def test_shared_join_can_fail_on_non_identical_reference_duplicates():
     study = pl.DataFrame({
         "CHR": ["1"], "POS": [10], "EA": ["A"], "OA": ["G"],
     })
@@ -131,7 +166,7 @@ def test_shared_join_rejects_conflicting_finite_reference_duplicates():
 
     with pytest.raises(
         RuntimeError,
-        match=r"conflicting finite values.*CHR='1'.*POS=10.*\[0.7, 0.9\]",
+        match=r"non-identical duplicate values.*CHR='1'.*POS=10.*\[0.7, 0.9\]",
     ):
         allele_oriented_left_join(
             study,
@@ -140,7 +175,8 @@ def test_shared_join_rejects_conflicting_finite_reference_duplicates():
             reference_columns=REFERENCE_COLUMNS,
             value_column="VALUE",
             output_column="VALUE",
-            deduplicate_reference=True,
+            duplicate_exact_action="keep_one",
+            duplicate_non_identical_action="fail",
         )
 
 
@@ -161,12 +197,40 @@ def test_shared_join_collapses_equivalent_finite_reference_duplicates():
         reference_columns=REFERENCE_COLUMNS,
         value_column="VALUE",
         output_column="VALUE",
-        deduplicate_reference=True,
+        **DUPLICATE_ACTIONS,
     )
 
     assert result["VALUE"].to_list() == pytest.approx([0.9])
     assert stats["reference_duplicate_rows_removed"] == 1
-    assert stats["reference_duplicate_groups_preferred_usable_value"] == 0
+    assert stats["reference_exact_duplicate_groups"] == 1
+    assert stats["reference_non_identical_duplicate_groups"] == 0
+
+
+def test_shared_join_can_discard_all_exact_reference_duplicates():
+    study = pl.DataFrame({
+        "CHR": ["1"], "POS": [10], "EA": ["A"], "OA": ["G"],
+    })
+    reference = pl.DataFrame({
+        "CHROM": ["1", "1"], "BP": [10, 10],
+        "A1": ["A", "A"], "A2": ["G", "G"],
+        "VALUE": [0.9, 0.9],
+    })
+
+    result, orientation, stats = allele_oriented_left_join(
+        study,
+        reference,
+        study_columns=STUDY_COLUMNS,
+        reference_columns=REFERENCE_COLUMNS,
+        value_column="VALUE",
+        output_column="VALUE",
+        duplicate_exact_action="discard_all",
+        duplicate_non_identical_action="discard_all",
+    )
+
+    assert result["VALUE"].to_list() == [None]
+    assert result[orientation].to_list() == [None]
+    assert stats["reference_duplicate_groups_discarded"] == 1
+    assert stats["reference_duplicate_rows_removed"] == 2
 
 
 def _info_inputs(tmp_path, duplicate=False):
@@ -198,12 +262,10 @@ def _info_inputs(tmp_path, duplicate=False):
     return reference, study, columns, mapping
 
 
-def _info_policies(deduplicate):
+def _info_policies(**duplicate_overrides):
     return default_policies().with_overrides({
-        "info": {
-            "source": "reference",
-            "deduplicate_reference": deduplicate,
-        }
+        "info": {"source": "reference"},
+        "external_reference": duplicate_overrides,
     })
 
 
@@ -227,7 +289,7 @@ def test_external_info_uses_one_join_for_direct_swapped_and_unmatched(
         info_file=str(reference),
         info_column="INFO",
         external_info_colmap=mapping,
-        policies=_info_policies(True),
+        policies=_info_policies(),
     )
 
     assert joins == 1
@@ -239,11 +301,33 @@ def test_external_info_uses_one_join_for_direct_swapped_and_unmatched(
     assert qc["missing_info"] == 1
 
 
-def test_external_info_duplicate_policy_fails_without_row_multiplication(tmp_path):
+def test_external_info_non_identical_duplicates_are_all_discarded(tmp_path):
+    reference, study, columns, mapping = _info_inputs(tmp_path, duplicate=True)
+
+    result, qc, resolved = harmonise_imputation_quality(
+        "1",
+        study,
+        columns,
+        info_file=str(reference),
+        info_column="INFO",
+        external_info_colmap=mapping,
+        policies=_info_policies(),
+    )
+
+    assert result[resolved["imp_info_col"]].to_list() == pytest.approx(
+        [None, 0.8, None]
+    )
+    assert qc["matched_direct"] == 0
+    assert qc["matched_flipped"] == 1
+    assert qc["missing_info"] == 2
+
+
+def test_external_info_non_identical_duplicate_policy_can_fail(tmp_path):
     reference, study, columns, mapping = _info_inputs(tmp_path, duplicate=True)
 
     with pytest.raises(
-        ImputationQualityError, match="info.deduplicate_reference",
+        ImputationQualityError,
+        match="external_reference.non_identical_duplicate_action",
     ):
         harmonise_imputation_quality(
             "1",
@@ -252,26 +336,11 @@ def test_external_info_duplicate_policy_fails_without_row_multiplication(tmp_pat
             info_file=str(reference),
             info_column="INFO",
             external_info_colmap=mapping,
-            policies=_info_policies(False),
+            policies=_info_policies(non_identical_duplicate_action="fail"),
         )
 
 
-def test_external_info_duplicate_policy_rejects_conflicting_scores(tmp_path):
-    reference, study, columns, mapping = _info_inputs(tmp_path, duplicate=True)
-
-    with pytest.raises(ImputationQualityError, match="conflicting finite values"):
-        harmonise_imputation_quality(
-            "1",
-            study,
-            columns,
-            info_file=str(reference),
-            info_column="INFO",
-            external_info_colmap=mapping,
-            policies=_info_policies(True),
-        )
-
-
-def test_external_info_duplicate_prefers_valid_score_over_missing(tmp_path):
+def test_external_info_duplicate_missing_and_finite_values_discards_both(tmp_path):
     reference, study, columns, mapping = _info_inputs(tmp_path)
     reference.write_text(
         "CHROM\tPOS\tA1\tA2\tINFO\n"
@@ -288,19 +357,53 @@ def test_external_info_duplicate_prefers_valid_score_over_missing(tmp_path):
         info_file=str(reference),
         info_column="INFO",
         external_info_colmap=mapping,
-        policies=_info_policies(True),
+        policies=_info_policies(),
+    )
+
+    assert result[resolved["imp_info_col"]].to_list() == pytest.approx(
+        [None, 0.8, None]
+    )
+    assert qc["missing_info"] == 2
+    assert qc["matched_direct"] == 0
+    assert qc["matched_flipped"] == 1
+
+
+def test_external_info_exact_duplicates_keep_one(tmp_path):
+    reference, study, columns, mapping = _info_inputs(tmp_path)
+    reference.write_text(
+        "CHROM\tPOS\tA1\tA2\tINFO\n"
+        "1\t10\tA\tG\t0.9\n"
+        "1\t10\tA\tG\t0.9\n"
+        "1\t20\tT\tC\t0.8\n",
+        encoding="utf-8",
+    )
+
+    result, qc, resolved = harmonise_imputation_quality(
+        "1",
+        study,
+        columns,
+        info_file=str(reference),
+        info_column="INFO",
+        external_info_colmap=mapping,
+        policies=_info_policies(),
     )
 
     assert result[resolved["imp_info_col"]].to_list() == pytest.approx(
         [0.9, 0.8, None]
     )
-    assert qc["missing_info"] == 1
     assert qc["matched_direct"] == 1
     assert qc["matched_flipped"] == 1
 
 
-def test_eaf_and_info_duplicate_resolution_defaults_are_enabled():
+def test_eaf_and_info_share_one_external_reference_duplicate_policy():
     policies = default_policies()
 
-    assert policies.get("eaf.deduplicate_reference") is True
-    assert policies.get("info.deduplicate_reference") is True
+    assert policies.get("external_reference.exact_duplicate_action") == "keep_one"
+    assert (
+        policies.get("external_reference.non_identical_duplicate_action")
+        == "discard_all"
+    )
+    with pytest.raises(KeyError):
+        policies.get("eaf.deduplicate_reference")
+    with pytest.raises(KeyError):
+        policies.get("info.deduplicate_reference")

@@ -1,113 +1,32 @@
-"""
-Filter a harmonised GWAS-VCF with bcftools.
-
-Every threshold that used to be hardcoded at the call site is now a policy key
-(see ``harmonisation/policies.py``).  Passing ``policies=None`` - which is what
-every existing call site does - reproduces the previous behaviour exactly,
-because each historical default below is the value the parameter had before.
-
-Policy keys read by this module::
-
-    filter.lp_cutoff              null   (-log10 p threshold; see `pval_cutoff` below)
-    filter.maf_cutoff             0.01
-    filter.af_diff_cutoff         0.2
-    filter.af_missing             remove | keep
-    filter.info_cutoff            0.7
-    filter.info_max               1.05
-    filter.info_missing           remove | keep
-    filter.include_indels         false
-    filter.exclude_palindromic    true
-    filter.palindromic_af_lower   0.4
-    filter.palindromic_af_upper   0.6
-    filter.remove_mhc             true
-    filter.mhc_chrom              '6'
-    filter.mhc_start              25000000
-    filter.mhc_end                34000000
-    filter.empty_expression       match_all | match_none
-    execution.threads_per_chromosome  5
-    execution.max_mem_per_job         '12G'
-"""
+"""Filter a harmonised GWAS-VCF with a validated bcftools configuration."""
 
 import csv
 import io
-import math
+import json
 import os
 import re
 import shlex
+import tempfile
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import polars as pl
 
-from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.core.execution.runtime import run_cmd
+from postgwas.core.paths import configured_output_path, validate_filename_component
+from postgwas.core.ui.screen import screen_field, screen_line
+from postgwas.core.vcf import VCF_TAG
 
-try:  # pandas is a hard dependency of the pipeline, but this module can live without it
-    import pandas as pd
-except ImportError:  # pragma: no cover - defensive
-    pd = None
-
-
-# ``_UNSET`` distinguishes "the caller said nothing" from "the caller explicitly
-# asked for None/False".  Only then can a policy value fill a parameter in
-# without ever overriding something the caller actually passed.
-_UNSET = object()
-
-#: Historical hardcoded defaults, kept so that a call with policies=None and no
-#: explicit argument behaves exactly as it did before the policy registry existed.
-HISTORICAL_DEFAULTS = {
-    "pval_cutoff": None,
-    "maf_cutoff": None,
-    "allelefreq_diff_cutoff": None,
-    "info_cutoff": None,
-    "info_max": None,
-    "info_missing": "keep",
-    "include_indels": True,
-    "exclude_palindromic": False,
-    "palindromic_af_lower": 0.4,
-    "palindromic_af_upper": 0.6,
-    "remove_mhc": False,
-    "mhc_chrom": "6",
-    "mhc_start": 25000000,
-    "mhc_end": 34000000,
-    "threads": 5,
-    "max_mem": "5G",
-    "af_missing": "remove",
-    "lp_missing": "remove",
-    "empty_expression": "match_all",
-}
 
 MISSING_CHOICES = ("keep", "remove")
 EMPTY_EXPRESSION_CHOICES = ("match_all", "match_none")
 
 
-def _resolve(value, policies, key: Optional[str], historical):
-    """Explicit argument wins, then the policy, then the historical hardcoded value."""
-    if value is not _UNSET:
-        return value
-    if policies is None or key is None:
-        return historical
-    return policies.get(key)
-
-
 def _is_missing(value) -> bool:
-    """True for None, NaN and pandas' NA.
-
-    ``main.py`` puts ``pd.NA`` *inside* ``extra_options``, so ``dict.get(k, 0)``
-    never falls back and ``pd.NA < 5`` raises "boolean value of NA is ambiguous"
-    - after the filtered VCF has already been written.
-    """
+    """Return whether a diagnostic count is unavailable or NaN-like."""
     if value is None:
         return True
-    if pd is not None:
-        try:
-            result = pd.isna(value)
-        except (TypeError, ValueError):
-            return False
-        try:
-            return bool(result)
-        except (TypeError, ValueError):  # array-like
-            return False
     try:
         return value != value
     except Exception:
@@ -329,6 +248,9 @@ def _collect_filter_reason_statistics(
     output_folder: str,
     output_prefix: str,
     log_warn,
+    *,
+    bcftools_bin: str,
+    bash_bin: str,
 ) -> Optional[Dict[str, Any]]:
     """Tag all filter reasons in one bcftools stream, then aggregate with Polars."""
     if not checks:
@@ -340,21 +262,31 @@ def _collect_filter_reason_statistics(
     for index, check in enumerate(checks, 1):
         check["tag"] = "PGWAS_FILTER_%02d" % index
 
-    tag_file = Path(output_folder) / (
-        ".%s_filter_reason_tags_%d.tsv" % (output_prefix, os.getpid())
+    handle = tempfile.NamedTemporaryFile(
+        prefix=".%s_filter_reason_tags_" % output_prefix,
+        suffix=".tsv",
+        dir=output_folder,
+        delete=False,
     )
-    stages = ["bcftools view -Ou %s" % shlex.quote(str(vcf_path))]
+    tag_file = Path(handle.name)
+    handle.close()
+    quoted_bcftools = shlex.quote(bcftools_bin)
+    stages = [
+        "%s view -Ou %s" % (quoted_bcftools, shlex.quote(str(vcf_path)))
+    ]
     for check in checks:
         stages.append(
-            "bcftools filter -Ou -m + -s %s -e %s"
-            % (check["tag"], shlex.quote(check["expr"]))
+            "%s filter -Ou -m + -s %s -e %s"
+            % (quoted_bcftools, check["tag"], shlex.quote(check["expr"]))
         )
-    stages.append("bcftools query -f '%FILTER\\n'")
+    stages.append("%s query -f '%%FILTER\\n'" % quoted_bcftools)
     inner = "set -euo pipefail; %s > %s" % (
         " | ".join(stages), shlex.quote(str(tag_file)),
     )
     try:
-        result = run_cmd("bash -c %s" % shlex.quote(inner))
+        result = run_cmd(
+            "%s -c %s" % (shlex.quote(bash_bin), shlex.quote(inner))
+        )
         if result.returncode != 0:
             log_warn(
                 "Filter-reason tagging failed (exit %s): %s"
@@ -376,17 +308,24 @@ def _collect_filter_reason_statistics(
 
 def _write_filter_reason_report(
     statistics: Optional[Dict[str, Any]],
-    output_folder: str,
-    output_prefix: str,
+    report_path: str | Path,
 ) -> Optional[str]:
     """Persist the exact reason accounting as a reloadable TSV."""
     if statistics is None:
         return None
-    path = Path(output_folder) / "qc_summary" / (
-        "%s_filter_reason_summary.tsv" % output_prefix
-    )
+    path = Path(report_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        newline="",
+        encoding="utf-8",
+        prefix=".%s." % path.name,
+        suffix=".tmp",
+        dir=path.parent,
+        delete=False,
+    )
+    temporary_path = Path(handle.name)
+    try:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
@@ -427,103 +366,121 @@ def _write_filter_reason_report(
                 "variants_removed_for_this_reason": primary,
                 "status": status,
             })
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        os.replace(temporary_path, path)
+    except BaseException:
+        handle.close()
+        temporary_path.unlink(missing_ok=True)
+        raise
     return str(path)
+
+
+def _read_vcf_header(vcf_path: Path, bcftools_bin: str) -> str:
+    """Read a VCF header with the configured bcftools executable."""
+    result = run_cmd(
+        [bcftools_bin, "view", "--header-only", str(vcf_path)],
+        shell=False,
+    )
+    header = result.stdout or ""
+    if not header.strip():
+        raise ValueError("bcftools returned an empty VCF header for %s" % vcf_path)
+    return header
+
+
+def _declared_vcf_tags(header: str, category: str) -> set[str]:
+    return set(re.findall(r"^##%s=<ID=([^,>]+)" % category, header, re.MULTILINE))
+
+
+def _validate_vcf_contract(
+    *,
+    header: str,
+    genome_build: str,
+    genome_build_header_tokens: Mapping[str, List[str]],
+    required_fields: List[str],
+) -> List[str]:
+    """Validate genome build and active INFO/FORMAT fields before filtering."""
+    tokens = list(genome_build_header_tokens.get(genome_build) or ())
+    if not tokens:
+        raise ValueError(
+            "No VCF header tokens are configured for genome build %s" % genome_build
+        )
+    build_declarations = []
+    for line in header.splitlines():
+        lower_line = line.lower()
+        if re.match(r"^##(?:reference|assembly|genome_build)\s*=", line, re.I):
+            build_declarations.append(lower_line)
+        elif lower_line.startswith("##contig=<") and re.search(
+            r"(?:^|[,\s])assembly\s*=", line, re.I,
+        ):
+            build_declarations.append(lower_line)
+    declared_build_text = "\n".join(build_declarations)
+    if not any(token.lower() in declared_build_text for token in tokens):
+        raise ValueError(
+            "Input VCF header does not declare configured genome build %s. "
+            "Expected one of these configured header tokens: %s"
+            % (genome_build, ", ".join(tokens))
+        )
+
+    declared = {
+        "FORMAT": _declared_vcf_tags(header, "FORMAT"),
+        "INFO": _declared_vcf_tags(header, "INFO"),
+    }
+    missing = []
+    for field in dict.fromkeys(required_fields):
+        category, tag = field.split("/", 1)
+        if tag not in declared[category]:
+            missing.append(field)
+    if missing:
+        raise ValueError(
+            "Input VCF header is missing fields required by active filters: %s"
+            % ", ".join(missing)
+        )
+    return re.findall(r"^##contig=<ID=([^,>]+)", header, re.MULTILINE)
 
 
 def filter_gwas_vcf_bcftools(
     vcf_path: str,
     output_folder: str,
     output_prefix: str,
-    # Every parameter defaulted to `_UNSET` below keeps its historical default
-    # value - see HISTORICAL_DEFAULTS - and only takes its value from `policies`
-    # when the caller passed nothing at all. An explicitly passed value, even
-    # None or False, always wins.
-    pval_cutoff: Optional[float] = _UNSET,
-    maf_cutoff: Optional[float] = _UNSET,
-    allelefreq_diff_cutoff: Optional[float] = _UNSET,
-    info_cutoff: Optional[float] = _UNSET,
-    info_min: Optional[float] = None,
-    info_max: Optional[float] = _UNSET,
-    info_missing: str = _UNSET,
-    external_af_name: str = "EUR",
-    include_indels: bool = _UNSET,
-    exclude_palindromic: bool = _UNSET,
-    palindromic_af_lower: float = _UNSET,
-    palindromic_af_upper: float = _UNSET,
-    remove_mhc: bool = _UNSET,
-    mhc_chrom: str = _UNSET,
-    mhc_start: int = _UNSET,
-    mhc_end: int = _UNSET,
-    threads: int = _UNSET,
-    max_mem: str = _UNSET,
-    extra_options: Optional[Dict[str, Any]] = None,
-    policies=None,
-    logger=None,
-    lp_cutoff: Optional[float] = None,
-    max_pvalue: Optional[float] = None,
-    lp_missing: Optional[str] = None,
-    af_missing: Optional[str] = None,
-    empty_expression: Optional[str] = None,
-    report_missing_counts: bool = True,
-) -> Dict[str, str]:
+    *,
+    genome_build: str,
+    genome_build_header_tokens: Mapping[str, List[str]],
+    pval_cutoff: Optional[float],
+    maf_cutoff: Optional[float],
+    allelefreq_diff_cutoff: Optional[float],
+    info_min: Optional[float],
+    info_max: Optional[float],
+    info_missing: str,
+    external_af_name: str,
+    include_indels: bool,
+    exclude_palindromic: bool,
+    palindromic_af_lower: float,
+    palindromic_af_upper: float,
+    remove_mhc: bool,
+    mhc_chrom: str,
+    mhc_start: int,
+    mhc_end: int,
+    threads: int,
+    max_mem: str,
+    lp_missing: str,
+    af_missing: str,
+    empty_expression: str,
+    sort_output: bool,
+    vcf_fields: Mapping[str, str],
+    output_layout: Mapping[str, str],
+    bcftools_bin: str,
+    tabix_bin: str,
+    bash_bin: str,
+    resolved_configuration: Mapping[str, Any],
+    report_missing_counts: bool,
+) -> Dict[str, Any]:
     """Filter a GWAS-VCF and report, honestly, how many variants each rule cost.
 
-    New keyword arguments (all optional, all defaulting to the previous behaviour):
-
-    ``policies``        a ``harmonisation.policies.Policies`` object; fills in any
-                        threshold the caller did not pass.
-    ``logger``          a ``core.pipeline_logging.PipelineLogger``; every
-                        line that goes to the log file also goes to it, and the
-                        filtering itself is recorded as one QC action with a
-                        before and an after count.
-    ``lp_cutoff``       threshold on ``FORMAT/LP``, which is -log10(p).
-    ``max_pvalue``      a *raw* p-value, converted to ``lp_cutoff`` with -log10.
-    ``lp_missing``      ``keep``/``remove`` for variants whose LP is missing.
-    ``af_missing``      ``keep``/``remove`` for variants whose AF is missing.
-    ``empty_expression````match_all``/``match_none`` when no include filter is active.
-
-    ``pval_cutoff`` is kept for compatibility and still means "minimum
-    ``FORMAT/LP``", i.e. a -log10 p value, NOT a raw p-value.  Passing 5e-8
-    therefore filters nothing; a warning now says so.  Use ``max_pvalue=5e-8``.
+    All scientific policies, VCF fields, output paths, and executable paths are
+    supplied from the schema-validated canonical filtering configuration.
     """
-    # ------------------------------------------------------------------
-    # Policy resolution (explicit argument > policy > historical default)
-    # ------------------------------------------------------------------
-    pval_cutoff = _resolve(pval_cutoff, policies, None, HISTORICAL_DEFAULTS["pval_cutoff"])
-    maf_cutoff = _resolve(maf_cutoff, policies, "filter.maf_cutoff", HISTORICAL_DEFAULTS["maf_cutoff"])
-    allelefreq_diff_cutoff = _resolve(
-        allelefreq_diff_cutoff, policies, "filter.af_diff_cutoff",
-        HISTORICAL_DEFAULTS["allelefreq_diff_cutoff"])
-    info_cutoff = _resolve(info_cutoff, policies, "filter.info_cutoff", HISTORICAL_DEFAULTS["info_cutoff"])
-    info_max = _resolve(info_max, policies, "filter.info_max", HISTORICAL_DEFAULTS["info_max"])
-    info_missing = _resolve(info_missing, policies, "filter.info_missing", HISTORICAL_DEFAULTS["info_missing"])
-    include_indels = _resolve(include_indels, policies, "filter.include_indels",
-                              HISTORICAL_DEFAULTS["include_indels"])
-    exclude_palindromic = _resolve(exclude_palindromic, policies, "filter.exclude_palindromic",
-                                   HISTORICAL_DEFAULTS["exclude_palindromic"])
-    palindromic_af_lower = _resolve(palindromic_af_lower, policies, "filter.palindromic_af_lower",
-                                    HISTORICAL_DEFAULTS["palindromic_af_lower"])
-    palindromic_af_upper = _resolve(palindromic_af_upper, policies, "filter.palindromic_af_upper",
-                                    HISTORICAL_DEFAULTS["palindromic_af_upper"])
-    remove_mhc = _resolve(remove_mhc, policies, "filter.remove_mhc", HISTORICAL_DEFAULTS["remove_mhc"])
-    mhc_chrom = _resolve(mhc_chrom, policies, "filter.mhc_chrom", HISTORICAL_DEFAULTS["mhc_chrom"])
-    mhc_start = _resolve(mhc_start, policies, "filter.mhc_start", HISTORICAL_DEFAULTS["mhc_start"])
-    mhc_end = _resolve(mhc_end, policies, "filter.mhc_end", HISTORICAL_DEFAULTS["mhc_end"])
-    threads = _resolve(threads, policies, "execution.threads_per_chromosome",
-                       HISTORICAL_DEFAULTS["threads"])
-    max_mem = _resolve(max_mem, policies, "execution.max_mem_per_job", HISTORICAL_DEFAULTS["max_mem"])
-
-    af_missing = _resolve(
-        _UNSET if af_missing is None else af_missing,
-        policies, "filter.af_missing", HISTORICAL_DEFAULTS["af_missing"])
-    empty_expression = _resolve(
-        _UNSET if empty_expression is None else empty_expression,
-        policies, "filter.empty_expression", HISTORICAL_DEFAULTS["empty_expression"])
-    # NOTE: there is no `filter.lp_missing` key in the frozen policy registry, so
-    # this one is a plain keyword argument.  Its default matches today's silent
-    # behaviour (bcftools drops a record whose LP is missing).
-    lp_missing = HISTORICAL_DEFAULTS["lp_missing"] if lp_missing is None else lp_missing
-
     if info_missing not in MISSING_CHOICES:
         raise ValueError("❌ info_missing must be either 'keep' or 'remove'")
     if af_missing not in MISSING_CHOICES:
@@ -532,49 +489,153 @@ def filter_gwas_vcf_bcftools(
         raise ValueError("❌ lp_missing must be either 'keep' or 'remove'")
     if empty_expression not in EMPTY_EXPRESSION_CHOICES:
         raise ValueError("❌ empty_expression must be either 'match_all' or 'match_none'")
+    if threads < 1:
+        raise ValueError("❌ threads must be at least 1")
+    output_prefix = validate_filename_component(output_prefix, "dataset_id")
+    if not VCF_TAG.fullmatch(external_af_name):
+        raise ValueError("❌ external_af_name must be a valid VCF tag")
 
-    vcf_name = os.path.basename(vcf_path)
-    genomeversion = "GRCh38" if "GRCh38" in vcf_name else "GRCh37" if "GRCh37" in vcf_name else None
-    output_prefix = f"{output_prefix}_{genomeversion}" if genomeversion else output_prefix
-    step_dir = Path(output_folder)
+    started_at = time.monotonic()
+    fixed_pattern = re.compile(r"^[A-Z][A-Z0-9_]*$")
+    format_pattern = re.compile(r"^FORMAT/[A-Za-z][A-Za-z0-9_.-]*$")
+    info_pattern = re.compile(r"^INFO/[A-Za-z][A-Za-z0-9_.-]*$")
+    chromosome_field = str(vcf_fields["chromosome"])
+    position_field = str(vcf_fields["position"])
+    reference_field = str(vcf_fields["reference_allele"])
+    alternate_field = str(vcf_fields["alternate_allele"])
+    variant_type_field = str(vcf_fields["variant_type"])
+    study_af_format = str(vcf_fields["study_af_format"])
+    imputation_quality_format = str(vcf_fields["imputation_quality_format"])
+    log_pvalue_format = str(vcf_fields["log_pvalue_format"])
+    study_af_info = str(vcf_fields["study_af_info"])
+    external_af_info = str(vcf_fields["external_af_info"]).format(
+        reference_population_tag=external_af_name
+    )
+    if any(
+        not fixed_pattern.fullmatch(field)
+        for field in (
+            chromosome_field,
+            position_field,
+            reference_field,
+            alternate_field,
+            variant_type_field,
+        )
+    ) or any(
+        not format_pattern.fullmatch(field)
+        for field in (study_af_format, imputation_quality_format, log_pvalue_format)
+    ) or any(
+        not info_pattern.fullmatch(field)
+        for field in (study_af_info, external_af_info)
+    ):
+        raise ValueError("❌ Configured filtering VCF fields are invalid")
+
+    step_dir = Path(output_folder).expanduser().resolve()
     step_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = step_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"{output_prefix}_filter_gwas_vcf_bcftools.log"
+    path_values = {"dataset_id": output_prefix, "genome_build": genome_build}
+    output_vcf = configured_output_path(
+        step_dir, output_layout["filtered_vcf"], **path_values
+    )
+    log_file = configured_output_path(
+        step_dir, output_layout["log_file"], **path_values
+    )
+    reason_report_path = configured_output_path(
+        step_dir, output_layout["reason_summary"], **path_values
+    )
+    mhc_bed = configured_output_path(
+        step_dir, output_layout["mhc_exclusion_bed"], **path_values
+    )
+    for path in (output_vcf, log_file, reason_report_path, mhc_bed):
+        path.parent.mkdir(parents=True, exist_ok=True)
     log_buffer = io.StringIO()
 
     def log_print(*args):
         text = " ".join(str(a) for a in args)
         log_buffer.write(text + "\n")
-        if logger is not None:
-            for line in text.splitlines():
-                if line.strip():
-                    logger.info(line.strip())
 
     def log_warn(*args):
         text = " ".join(str(a) for a in args)
         log_buffer.write(text + "\n")
-        if logger is not None:
-            for line in text.splitlines():
-                if line.strip():
-                    logger.warn(line.strip())
 
     def write_log():
-        with open(log_file, "w") as f:
-            f.write(log_buffer.getvalue())
+        handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".%s." % log_file.name,
+            suffix=".tmp",
+            dir=log_file.parent,
+            delete=False,
+        )
+        temporary_log = Path(handle.name)
+        try:
+            handle.write(log_buffer.getvalue())
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            os.replace(temporary_log, log_file)
+        except BaseException:
+            handle.close()
+            temporary_log.unlink(missing_ok=True)
+            raise
 
     # ============================================================
     # VALIDATION
     # ============================================================
-    if not os.path.exists(vcf_path):
+    log_print(
+        "Resolved configuration:\n%s"
+        % json.dumps(resolved_configuration, indent=2, sort_keys=True)
+    )
+    input_vcf = Path(vcf_path).expanduser().resolve()
+    if not input_vcf.is_file() or input_vcf.stat().st_size <= 0:
         msg = f"❌ ERROR: Input VCF not found: {vcf_path}"
         log_print(msg)
+        log_print("❌ STATUS: FAILED")
         write_log()
         raise FileNotFoundError(msg)
-    os.makedirs(output_folder, exist_ok=True)
-    output_vcf = os.path.join(output_folder, f"{output_prefix}_filtered.vcf.gz")
-
-    quoted_input = shlex.quote(str(vcf_path))
+    try:
+        header = _read_vcf_header(input_vcf, bcftools_bin)
+        required_fields = []
+        if pval_cutoff is not None:
+            required_fields.append(log_pvalue_format)
+        if maf_cutoff is not None or exclude_palindromic:
+            required_fields.append(study_af_format)
+        if info_min is not None or info_max is not None:
+            required_fields.append(imputation_quality_format)
+        if allelefreq_diff_cutoff is not None:
+            required_fields.extend((study_af_info, external_af_info))
+        contigs = _validate_vcf_contract(
+            header=header,
+            genome_build=genome_build,
+            genome_build_header_tokens=genome_build_header_tokens,
+            required_fields=required_fields,
+        )
+        if remove_mhc:
+            mhc_chrom = _match_contig_naming(
+                str(mhc_chrom), contigs, log_warn,
+            )
+    except BaseException as exc:
+        log_print("❌ VCF validation failed: %s: %s" % (type(exc).__name__, exc))
+        log_print("❌ STATUS: FAILED")
+        write_log()
+        raise
+    log_print(
+        "✅ VCF contract validated: genome_build=%s; active_fields=%s"
+        % (genome_build, ", ".join(required_fields) or "none")
+    )
+    for label, executable in (
+        ("bcftools", bcftools_bin),
+        ("tabix", tabix_bin),
+        ("bash", bash_bin),
+    ):
+        version = run_cmd([executable, "--version"], check=False, shell=False)
+        version_text = (version.stdout or version.stderr or "").splitlines()
+        log_print(
+            "🔧 %s version: %s"
+            % (label, version_text[0].strip() if version_text else "unavailable")
+        )
+    quoted_input = shlex.quote(str(input_vcf))
+    quoted_bcftools = shlex.quote(bcftools_bin)
+    quoted_bash = shlex.quote(bash_bin)
+    quoted_tabix = shlex.quote(tabix_bin)
 
     # ============================================================
     # FAST COUNT
@@ -584,16 +645,24 @@ def filter_gwas_vcf_bcftools(
         quoted = shlex.quote(str(vcf))
         problems = []
         try:
-            res = run_cmd(f"bcftools index -n {quoted}")
+            res = run_cmd(
+                f"{quoted_bcftools} index -n {quoted}", check=False
+            )
             if res.returncode == 0:
                 return int(res.stdout.strip())
             problems.append(f"`bcftools index -n` exit {res.returncode}: {res.stderr.strip()}")
         except Exception as exc:  # run_cmd itself blew up
             problems.append(f"`bcftools index -n` raised {type(exc).__name__}: {exc}")
 
-        fallback = "set -o pipefail; bcftools view --threads %d -H %s | wc -l" % (threads, quoted)
+        fallback = (
+            "set -o pipefail; %s view --threads %d -H %s | wc -l"
+            % (quoted_bcftools, threads, quoted)
+        )
         try:
-            res = run_cmd("bash -c %s" % shlex.quote(fallback))
+            res = run_cmd(
+                "%s -c %s" % (quoted_bash, shlex.quote(fallback)),
+                check=False,
+            )
             if res.returncode == 0:
                 return int(res.stdout.strip())
             problems.append(f"`bcftools view -H | wc -l` exit {res.returncode}: {res.stderr.strip()}")
@@ -614,10 +683,13 @@ def filter_gwas_vcf_bcftools(
         """
         # `query -f '.\n'` counts one line per record without formatting the
         # record itself, which is markedly cheaper than `view -H` on a big file.
-        inner = "set -o pipefail; bcftools query -i %s -f '.\\n' %s | wc -l" % (
-            shlex.quote(expr), shlex.quote(str(vcf)))
+        inner = "set -o pipefail; %s query -i %s -f '.\\n' %s | wc -l" % (
+            quoted_bcftools, shlex.quote(expr), shlex.quote(str(vcf)))
         try:
-            res = run_cmd("bash -c %s" % shlex.quote(inner))
+            res = run_cmd(
+                "%s -c %s" % (quoted_bash, shlex.quote(inner)),
+                check=False,
+            )
         except Exception as exc:
             log_warn(f"⚠️ Could not count `{expr}`: {type(exc).__name__}: {exc}")
             return None
@@ -633,43 +705,12 @@ def filter_gwas_vcf_bcftools(
             log_warn(f"⚠️ Unexpected output counting `{expr}`: {res.stdout!r}")
             return None
 
-    pre_variants = fast_count(vcf_path)
-    if extra_options is not None:
-        log_print(f"\n\t\t\t📊 Variants in the input file                        : {_fmt_count(extra_options.get('total_variant_infile'), 'N/A')}")
-        log_print(f"\n\t\t\t📊 Variants successfully read by harmonisation module: {_fmt_count(extra_options.get('total_variant_read'), 'N/A')}")
-        log_print(f"\n\t\t\t📊 Variants USED for VCF creation                    : {_fmt_count(extra_options.get('total_variant_in_vcf_input'), 'N/A')}")
-        log_print(f"\n\t\t\t📊 Variants BEFORE filtering                         : {_fmt_count(pre_variants)}")
-        log_print("")
-
+    pre_variants = fast_count(str(input_vcf))
     # ============================================================
     # P-VALUE / LP THRESHOLD
-    # `FORMAT/LP` is -log10(p): bigger means MORE significant.
+    # The configured log-P field is -log10(p): bigger means more significant.
     # ============================================================
-    resolved_lp = None
-    lp_source = None
-    if lp_cutoff is not None:
-        resolved_lp, lp_source = float(lp_cutoff), "lp_cutoff"
-    elif max_pvalue is not None:
-        if not (0 < float(max_pvalue) <= 1):
-            raise ValueError("❌ max_pvalue must be a raw p-value in (0, 1], got %r" % (max_pvalue,))
-        resolved_lp, lp_source = -math.log10(float(max_pvalue)), "max_pvalue"
-        log_print(
-            "🔧 max_pvalue %g converted to a -log10 threshold: FORMAT/LP >= %.6f"
-            % (float(max_pvalue), resolved_lp)
-        )
-    elif pval_cutoff is not None:
-        resolved_lp, lp_source = float(pval_cutoff), "pval_cutoff"
-        if 0 < resolved_lp < 1:
-            log_warn(
-                "⚠️ pval_cutoff=%r is compared against FORMAT/LP, which is -log10(p), "
-                "so this keeps every variant with p <= %g - i.e. it filters nothing. "
-                "Use max_pvalue=%r (or lp_cutoff=%.4f) if you meant a raw p-value."
-                % (pval_cutoff, 10 ** (-resolved_lp), pval_cutoff, -math.log10(resolved_lp))
-            )
-    elif policies is not None:
-        policy_lp = policies.get("filter.lp_cutoff")
-        if policy_lp is not None:
-            resolved_lp, lp_source = float(policy_lp), "filter.lp_cutoff"
+    resolved_lp = float(pval_cutoff) if pval_cutoff is not None else None
 
     # ============================================================
     # INCLUDE LOGIC
@@ -682,26 +723,34 @@ def filter_gwas_vcf_bcftools(
     condition_checks: List[Dict[str, Any]] = []
 
     if resolved_lp is not None:
-        lp_expr = f"(FORMAT/LP >= {resolved_lp})"
+        lp_expr = f"({log_pvalue_format} >= {resolved_lp})"
         if lp_missing == "keep":
-            lp_expr = f"({lp_expr} | (FORMAT/LP == '.'))"
+            lp_expr = f"({lp_expr} | ({log_pvalue_format} == '.'))"
         missing_checks.append({
-            "field": "FORMAT/LP", "expr": "FORMAT/LP == '.'",
+            "field": log_pvalue_format,
+            "expr": f"{log_pvalue_format} == '.'",
             "action": lp_missing, "key": "lp_missing", "priority": 10,
         })
         include_parts.append(lp_expr)
         condition_checks.append({
             "label": "P-value evidence below LP %.6g" % resolved_lp,
-            "expr": f"(FORMAT/LP != '.' & FORMAT/LP < {resolved_lp})",
+            "expr": (
+                f"({log_pvalue_format} != '.' & "
+                f"{log_pvalue_format} < {resolved_lp})"
+            ),
             "priority": 11,
         })
 
     if maf_cutoff is not None:
-        maf_expr = f"(FORMAT/AF >= {maf_cutoff} & FORMAT/AF <= {1 - maf_cutoff})"
+        maf_expr = (
+            f"({study_af_format} >= {maf_cutoff} & "
+            f"{study_af_format} <= {1 - maf_cutoff})"
+        )
         if af_missing == "keep":
-            maf_expr = f"({maf_expr} | (FORMAT/AF == '.'))"
+            maf_expr = f"({maf_expr} | ({study_af_format} == '.'))"
         missing_checks.append({
-            "field": "FORMAT/AF", "expr": "FORMAT/AF == '.'",
+            "field": study_af_format,
+            "expr": f"{study_af_format} == '.'",
             "action": af_missing, "key": "af_missing", "priority": 20,
         })
         include_parts.append(maf_expr)
@@ -709,8 +758,9 @@ def filter_gwas_vcf_bcftools(
             "label": "Minor allele frequency outside %.6g ≤ AF ≤ %.6g"
             % (maf_cutoff, 1 - maf_cutoff),
             "expr": (
-                f"(FORMAT/AF != '.' & "
-                f"(FORMAT/AF < {maf_cutoff} | FORMAT/AF > {1 - maf_cutoff}))"
+                f"({study_af_format} != '.' & "
+                f"({study_af_format} < {maf_cutoff} | "
+                f"{study_af_format} > {1 - maf_cutoff}))"
             ),
             "priority": 21,
         })
@@ -718,59 +768,47 @@ def filter_gwas_vcf_bcftools(
     info_expr = None
     base_expr = None
     info_failure_expr = None
-    if info_cutoff is not None:
-        if info_max is not None:
-            if info_cutoff > info_max:
-                log_print("⚠️ info_cutoff > info_max → ignoring info_max")
-                base_expr = f"(FORMAT/SI >= {info_cutoff})"
-                info_failure_expr = f"(FORMAT/SI != '.' & FORMAT/SI < {info_cutoff})"
-            else:
-                base_expr = f"(FORMAT/SI >= {info_cutoff} & FORMAT/SI <= {info_max})"
-                info_failure_expr = (
-                    f"(FORMAT/SI != '.' & "
-                    f"(FORMAT/SI < {info_cutoff} | FORMAT/SI > {info_max}))"
-                )
-        else:
-            base_expr = f"(FORMAT/SI >= {info_cutoff})"
-            info_failure_expr = f"(FORMAT/SI != '.' & FORMAT/SI < {info_cutoff})"
-        if info_min is not None:
-            log_print("⚠️ info_cutoff provided → info_min ignored")
-    elif info_min is not None or info_max is not None:
+    if info_min is not None or info_max is not None:
         if info_min is not None and info_max is not None:
             if info_min > info_max:
                 raise ValueError("❌ Invalid INFO range: info_min > info_max")
-            base_expr = f"(FORMAT/SI >= {info_min} & FORMAT/SI <= {info_max})"
+            base_expr = (
+                f"({imputation_quality_format} >= {info_min} & "
+                f"{imputation_quality_format} <= {info_max})"
+            )
             info_failure_expr = (
-                f"(FORMAT/SI != '.' & "
-                f"(FORMAT/SI < {info_min} | FORMAT/SI > {info_max}))"
+                f"({imputation_quality_format} != '.' & "
+                f"({imputation_quality_format} < {info_min} | "
+                f"{imputation_quality_format} > {info_max}))"
             )
         elif info_min is not None:
-            base_expr = f"(FORMAT/SI >= {info_min})"
-            info_failure_expr = f"(FORMAT/SI != '.' & FORMAT/SI < {info_min})"
+            base_expr = f"({imputation_quality_format} >= {info_min})"
+            info_failure_expr = (
+                f"({imputation_quality_format} != '.' & "
+                f"{imputation_quality_format} < {info_min})"
+            )
         else:
-            base_expr = f"(FORMAT/SI <= {info_max})"
-            info_failure_expr = f"(FORMAT/SI != '.' & FORMAT/SI > {info_max})"
+            base_expr = f"({imputation_quality_format} <= {info_max})"
+            info_failure_expr = (
+                f"({imputation_quality_format} != '.' & "
+                f"{imputation_quality_format} > {info_max})"
+            )
 
     if base_expr is not None:
         if info_missing == "keep":
             # Inside the filter, '.' must be in single quotes
-            info_expr = f"({base_expr} | (FORMAT/SI == '.'))"
+            info_expr = f"({base_expr} | ({imputation_quality_format} == '.'))"
         else:
-            info_expr = f"({base_expr} & (FORMAT/SI != '.'))"
+            info_expr = f"({base_expr} & ({imputation_quality_format} != '.'))"
         missing_checks.append({
-            "field": "FORMAT/SI", "expr": "FORMAT/SI == '.'",
+            "field": imputation_quality_format,
+            "expr": f"{imputation_quality_format} == '.'",
             "action": info_missing, "key": "info_missing", "priority": 30,
         })
 
     if info_expr is not None:
         include_parts.append(info_expr)
-        if info_cutoff is not None and info_max is not None and info_cutoff <= info_max:
-            info_label = "Imputation quality outside %.6g ≤ INFO (SI) ≤ %.6g" % (
-                info_cutoff, info_max,
-            )
-        elif info_cutoff is not None:
-            info_label = "Imputation quality below INFO (SI) %.6g" % info_cutoff
-        elif info_min is not None and info_max is not None:
+        if info_min is not None and info_max is not None:
             info_label = "Imputation quality outside %.6g ≤ INFO (SI) ≤ %.6g" % (
                 info_min, info_max,
             )
@@ -783,20 +821,24 @@ def filter_gwas_vcf_bcftools(
         })
 
     if allelefreq_diff_cutoff is not None:
-        af_diff_expr = f"(abs(INFO/AF - INFO/{external_af_name}) <= {allelefreq_diff_cutoff})"
+        af_diff_expr = (
+            f"(abs({study_af_info} - {external_af_info}) "
+            f"<= {allelefreq_diff_cutoff})"
+        )
         if af_missing == "keep":
             af_diff_expr = (
-                f"({af_diff_expr} | (INFO/AF == '.') | (INFO/{external_af_name} == '.'))"
+                f"({af_diff_expr} | ({study_af_info} == '.') | "
+                f"({external_af_info} == '.'))"
             )
         missing_checks.extend([{
-            "field": "INFO/AF",
-            "expr": "INFO/AF == '.'",
+            "field": study_af_info,
+            "expr": f"{study_af_info} == '.'",
             "action": af_missing,
             "key": "af_missing",
             "priority": 40,
         }, {
-            "field": f"INFO/{external_af_name}",
-            "expr": f"INFO/{external_af_name} == '.'",
+            "field": external_af_info,
+            "expr": f"{external_af_info} == '.'",
             "action": af_missing,
             "key": "af_missing",
             "priority": 41,
@@ -806,8 +848,9 @@ def filter_gwas_vcf_bcftools(
             "label": "External AF absolute difference |AF − %s| > %.6g"
             % (external_af_name, allelefreq_diff_cutoff),
             "expr": (
-                f"(INFO/AF != '.' & INFO/{external_af_name} != '.' & "
-                f"abs(INFO/AF - INFO/{external_af_name}) > {allelefreq_diff_cutoff})"
+                f"({study_af_info} != '.' & {external_af_info} != '.' & "
+                f"abs({study_af_info} - {external_af_info}) "
+                f"> {allelefreq_diff_cutoff})"
             ),
             "priority": 42,
         })
@@ -836,40 +879,48 @@ def filter_gwas_vcf_bcftools(
     # EXCLUDE LOGIC
     # ============================================================
     palindromic_logic = (
-    "((REF=='A' & ALT=='T') | (REF=='T' & ALT=='A') | "
-    "(REF=='C' & ALT=='G') | (REF=='G' & ALT=='C'))"
+        f"(({reference_field}=='A' & {alternate_field}=='T') | "
+        f"({reference_field}=='T' & {alternate_field}=='A') | "
+        f"({reference_field}=='C' & {alternate_field}=='G') | "
+        f"({reference_field}=='G' & {alternate_field}=='C'))"
     )
     exclude_expr = None
     if exclude_palindromic:
         exclude_expr = (
             f"({palindromic_logic} & "
-            f"(FORMAT/AF >= {palindromic_af_lower} & FORMAT/AF <= {palindromic_af_upper}))"
+            f"({study_af_format} >= {palindromic_af_lower} & "
+            f"{study_af_format} <= {palindromic_af_upper}))"
         )
         condition_checks.append({
             "label": "Palindromic SNPs with ambiguous frequency (%.6g ≤ AF ≤ %.6g)"
             % (palindromic_af_lower, palindromic_af_upper),
             "expr": (
-                "(%s & FORMAT/AF != '.' & FORMAT/AF >= %s & FORMAT/AF <= %s)"
-                % (palindromic_logic, palindromic_af_lower, palindromic_af_upper)
+                "(%s & %s != '.' & %s >= %s & %s <= %s)"
+                % (
+                    palindromic_logic,
+                    study_af_format,
+                    study_af_format,
+                    palindromic_af_lower,
+                    study_af_format,
+                    palindromic_af_upper,
+                )
             ),
             "priority": 60,
         })
     if not include_indels:
         condition_checks.append({
             "label": "Indels and other non-SNP variants",
-            "expr": "(TYPE != 'snp')",
+            "expr": f"({variant_type_field} != 'snp')",
             "priority": 50,
         })
     if remove_mhc:
-        mhc_chrom = _match_contig_naming(
-            str(mhc_chrom), vcf_path, threads, log_print, log_warn,
-        )
         condition_checks.append({
             "label": "Variants in the MHC region (%s:%s-%s)"
             % (mhc_chrom, f"{int(mhc_start):,}", f"{int(mhc_end):,}"),
             "expr": (
-                f"(CHROM == '{mhc_chrom}' & "
-                f"POS >= {int(mhc_start)} & POS <= {int(mhc_end)})"
+                f"({chromosome_field} == '{mhc_chrom}' & "
+                f"{position_field} >= {int(mhc_start)} & "
+                f"{position_field} <= {int(mhc_end)})"
             ),
             "priority": 70,
         })
@@ -895,11 +946,13 @@ def filter_gwas_vcf_bcftools(
     reason_checks.sort(key=lambda item: item.get("priority", 999))
 
     reason_statistics = _collect_filter_reason_statistics(
-        vcf_path=vcf_path,
+        vcf_path=str(input_vcf),
         checks=reason_checks,
-        output_folder=output_folder,
+        output_folder=str(step_dir),
         output_prefix=output_prefix,
         log_warn=log_warn,
+        bcftools_bin=bcftools_bin,
+        bash_bin=bash_bin,
     )
     if reason_statistics is None:
         # The exact single-pass audit failed, but retain the previous independent
@@ -930,10 +983,11 @@ def filter_gwas_vcf_bcftools(
     # PIPELINE
     # ============================================================
     cmd_parts = []
+    temporary_bed = None
     # speed edit: no --threads on intermediate uncompressed stream step
-    cmd1 = "bcftools view -Ou"
+    cmd1 = "%s view -Ou" % quoted_bcftools
     if include_expr is not None:
-        cmd1 += f' -i "{include_expr}"'
+        cmd1 += " -i %s" % shlex.quote(include_expr)
     if not include_indels:
         cmd1 += " --types snps"
     cmd1 += f" {quoted_input}"
@@ -941,69 +995,106 @@ def filter_gwas_vcf_bcftools(
     # keep -e separate from -i
     if exclude_expr:
         # speed edit: no --threads on intermediate uncompressed stream step
-        cmd_parts.append(f'bcftools view -Ou -e "{exclude_expr}"')
+        cmd_parts.append(
+            "%s view -Ou -e %s"
+            % (quoted_bcftools, shlex.quote(exclude_expr))
+        )
     if remove_mhc:
-        mhc_bed = os.path.join(output_folder, f"{output_prefix}_mhc_exclude.bed")
         # BED is 0-based half-open; mhc_start is a 1-based inclusive coordinate,
         # so the start field must be one less or the first base of the region
         # survives the exclusion.
         bed_start = max(0, int(mhc_start) - 1)
-        with open(mhc_bed, "w") as f:
-            f.write(f"{mhc_chrom}\t{bed_start}\t{int(mhc_end)}\n")
+        bed_handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".%s." % mhc_bed.name,
+            suffix=".bed",
+            dir=mhc_bed.parent,
+            delete=False,
+        )
+        temporary_bed = Path(bed_handle.name)
+        try:
+            bed_handle.write(f"{mhc_chrom}\t{bed_start}\t{int(mhc_end)}\n")
+            bed_handle.flush()
+            os.fsync(bed_handle.fileno())
+            bed_handle.close()
+        except BaseException:
+            bed_handle.close()
+            temporary_bed.unlink(missing_ok=True)
+            raise
         # speed edit: no --threads on intermediate uncompressed stream step
-        cmd_parts.append(f"bcftools view -Ou -T ^{shlex.quote(mhc_bed)}")
+        cmd_parts.append(
+            "%s view -Ou -T %s"
+            % (quoted_bcftools, shlex.quote("^" + str(temporary_bed)))
+        )
     # ============================================================
     # SPEED OPTIMIZATION
     # - keep -i and -e separate
-    # - skip expensive sort unless explicitly requested
-    #   use extra_options={"force_sort": True} if needed
+    # - skip expensive sort unless configured
     # ============================================================
-    need_sort = extra_options.get("force_sort", False) if extra_options else False
-    if need_sort:
+    if sort_output:
         cmd_parts.append(
-            f"bcftools sort --temp-dir {shlex.quote(str(output_folder))} --max-mem {shlex.quote(str(max_mem))}"
+            "%s sort --temp-dir %s --max-mem %s"
+            % (
+                quoted_bcftools,
+                shlex.quote(str(step_dir)),
+                shlex.quote(str(max_mem)),
+            )
         )
     # keep threads here where they help most: final bgzip compression
-    cmd_parts.append(f"bcftools view -Oz --threads {threads}")
+    cmd_parts.append("%s view -Oz --threads %d" % (quoted_bcftools, threads))
     pipeline_core = " | ".join(cmd_parts)
+
+    temporary_handle = tempfile.NamedTemporaryFile(
+        prefix=".%s." % output_vcf.name,
+        suffix=".vcf.gz",
+        dir=output_vcf.parent,
+        delete=False,
+    )
+    temporary_vcf = Path(temporary_handle.name)
+    temporary_handle.close()
+    temporary_index = Path(str(temporary_vcf) + ".tbi")
 
     # Without pipefail only the exit status of the LAST stage is seen, so an
     # abort in the middle of the pipe produced a silently TRUNCATED VCF whose
     # reduced count was then reported as "variants removed by filtering".
     inner = (
-        f"set -euo pipefail; {pipeline_core} > {shlex.quote(output_vcf)} "
-        f"&& tabix -f -p vcf {shlex.quote(output_vcf)}"
+        f"set -euo pipefail; {pipeline_core} > {shlex.quote(str(temporary_vcf))} "
+        f"&& {quoted_tabix} -f -p vcf {shlex.quote(str(temporary_vcf))}"
     )
-    pipeline = "bash -c %s" % shlex.quote(inner)
+    pipeline = "%s -c %s" % (quoted_bash, shlex.quote(inner))
     log_print("🚀 Full bcftools pipeline:")
     log_print(inner)
     log_print("")
-    result = run_cmd(pipeline)
-    if result.returncode != 0:
-        log_print("❌ Error during bcftools pipeline execution.")
-        log_print("STDERR:")
-        log_print(result.stderr)
+    try:
+        run_cmd(pipeline)
+        if (
+            not temporary_vcf.is_file()
+            or temporary_vcf.stat().st_size <= 0
+            or not temporary_index.is_file()
+            or temporary_index.stat().st_size <= 0
+        ):
+            raise RuntimeError(
+                "bcftools/tabix completed without a non-empty temporary VCF and index"
+            )
+    except BaseException as exc:
+        log_print(
+            "❌ Error during bcftools pipeline execution: %s: %s"
+            % (type(exc).__name__, exc)
+        )
+        log_print("❌ STATUS: FAILED")
         write_log()
-        raise RuntimeError("bcftools pipeline failed")
+        temporary_vcf.unlink(missing_ok=True)
+        temporary_index.unlink(missing_ok=True)
+        if temporary_bed is not None:
+            temporary_bed.unlink(missing_ok=True)
+        raise RuntimeError("bcftools filtering pipeline failed") from exc
     # ============================================================
     # Count variants after filtering
     # ============================================================
-    post_variants = fast_count(output_vcf)
+    post_variants = fast_count(str(temporary_vcf))
     log_print("📊 Variants counted with: bcftools index -n (fallback: bcftools view -H | wc -l)")
     log_print(f"✅ Variants AFTER filtering                          : {_fmt_count(post_variants)}")
-    log_print(f"💾 Filtered VCF saved to                             : {output_vcf}")
-    log_print("\n🎉 bcftools filtering completed.")
-
-    # Rule 5: a QC action is never recorded without a before and an after count.
-    if logger is not None and pre_variants is not None and post_variants is not None:
-        logger.qc(
-            "vcf filtering",
-            "bcftools removed the variants that failed the active quality filters.",
-            pre_variants,
-            post_variants,
-            step="04 filter_vcf",
-            warn=post_variants == 0 and pre_variants > 0,
-        )
 
     if pre_variants and post_variants == 0:
         log_warn(
@@ -1030,86 +1121,77 @@ def filter_gwas_vcf_bcftools(
                     _fmt_count(reason_statistics.get("primary_removed_total")),
                 )
             )
-    reason_report = _write_filter_reason_report(
-        reason_statistics, output_folder, output_prefix,
+    report_statistics = reason_statistics or {
+        "checks": reason_checks,
+        "primary_removed_total": None,
+        "overlap_variants": None,
+        "extra_rule_matches": None,
+        "actual_removed": actual_removed,
+        "reconciled": False,
+    }
+    report_handle = tempfile.NamedTemporaryFile(
+        prefix=".%s." % reason_report_path.name,
+        suffix=".tsv",
+        dir=reason_report_path.parent,
+        delete=False,
     )
-    if reason_report:
-        log_print("Detailed filter reason report path: %s" % reason_report)
-
-    # The terminal shows observed consequences, not a second copy of the
-    # configuration. The same lines are retained in the filtering log.
-    for line in _filtering_summary_lines(
+    temporary_report = Path(report_handle.name)
+    report_handle.close()
+    temporary_report.unlink()
+    summary_lines = _filtering_summary_lines(
         missing_checks if report_missing_counts else [],
         condition_checks,
         pre_variants,
         post_variants,
         reason_statistics=reason_statistics,
-        reason_report=reason_report,
-        data_flow=extra_options,
-    ):
-        print(line)
+        reason_report=str(reason_report_path),
+    )
+    try:
+        _write_filter_reason_report(
+            report_statistics, temporary_report,
+        )
+        output_index = Path(str(output_vcf) + ".tbi")
+        os.replace(temporary_vcf, output_vcf)
+        os.replace(temporary_index, output_index)
+        if temporary_bed is not None:
+            os.replace(temporary_bed, mhc_bed)
+        os.replace(temporary_report, reason_report_path)
+        reason_report = str(reason_report_path)
+    except BaseException as exc:
+        temporary_vcf.unlink(missing_ok=True)
+        temporary_index.unlink(missing_ok=True)
+        temporary_report.unlink(missing_ok=True)
+        if temporary_bed is not None:
+            temporary_bed.unlink(missing_ok=True)
+        log_print(
+            "❌ Filtering output finalisation failed: %s: %s"
+            % (type(exc).__name__, exc)
+        )
+        log_print("❌ STATUS: FAILED")
+        write_log()
+        raise
+    if reason_report:
+        log_print("Detailed filter reason report path: %s" % reason_report)
+    log_print(f"💾 Filtered VCF saved to                             : {output_vcf}")
+    for line in summary_lines:
         log_print(line)
-    print("")
-    # --- Safe access for extra_options: main.py stores pd.NA IN the dict, so
-    # --- dict.get(key, 0) never falls back and every comparison below has to be
-    # --- guarded, or `pd.NA < 5` raises after the filtered VCF was written.
-    if extra_options is not None:
-        infile = extra_options.get("total_variant_infile")
-        read = extra_options.get("total_variant_read")
-        vcf_input = extra_options.get("total_variant_in_vcf_input")
-        # 1️⃣ Input → Read
-        if not _is_missing(read) and not _is_missing(infile) and read < infile:
-            diff = infile - read
-            pct = (diff / infile * 100) if infile else 0
-            msg = "Harmonisation did not read all variants: %s missing (%.2f%%)." % (
-                _fmt_count(diff), pct,
-            )
-            log_print(msg)
-            print(screen_field(
-                "warning", "Input loss", msg,
-                indent=4, label_width=18,
-            ))
-        # 2️⃣ Read → VCF input
-        if not _is_missing(vcf_input) and not _is_missing(read) and vcf_input < read:
-            diff = read - vcf_input
-            pct = (diff / read * 100) if read else 0
-            message = "Fewer variants were used for VCF creation: %s removed after harmonisation (%.2f%%)." % (
-                _fmt_count(diff), pct,
-            )
-            log_print(message)
-            print("\n" + "\n".join([
-                screen_line("warning", "Variant loss during harmonisation", indent=4),
-                screen_field(
-                    "count", "Summary-stat rows", _fmt_count(read),
-                    indent=6, label_width=24,
-                ),
-                screen_field(
-                    "count", "Used for VCF", _fmt_count(vcf_input),
-                    indent=6, label_width=24,
-                ),
-                screen_field(
-                    "loss", "Removed", "%s (%.2f%%)" % (_fmt_count(diff), pct),
-                    indent=6, label_width=24,
-                ),
-                screen_field(
-                    "info", "Detailed reasons",
-                    "see the harmonisation reject-reason report and chromosome logs",
-                    indent=6, label_width=24,
-                ),
-            ]))
-        # 3️⃣ VCF input → Pre-filter
-        if (pre_variants is not None and not _is_missing(vcf_input)
-                and pre_variants < vcf_input):
-            diff = vcf_input - pre_variants
-            pct = (diff / vcf_input * 100) if vcf_input else 0
-            log_print(
-                "Not all variants reached the VCF: %s dropped during VCF generation (%.2f%%)."
-                % (_fmt_count(diff), pct)
-            )
-    print("")
+    log_print("⏱️ Filtering runtime seconds                         : %.3f" % (
+        time.monotonic() - started_at
+    ))
+    log_print("✅ STATUS: COMPLETED")
+    log_print("\n🎉 bcftools filtering completed.")
     write_log()
+
+    # The terminal shows observed consequences, not a second copy of the
+    # configuration. The same lines are retained in the filtering log.
+    for line in summary_lines:
+        print(line)
+    print("")
     return {
-        "filtered_vcf": output_vcf,
+        "filtered_vcf": str(output_vcf),
+        "filtered_vcf_index": str(Path(str(output_vcf) + ".tbi")),
+        "filter_log": str(log_file),
+        "mhc_exclusion_bed": str(mhc_bed) if remove_mhc else None,
         "variants_before": pre_variants,
         "variants_after": post_variants,
         "missing_value_drops": missing_value_drops,
@@ -1133,20 +1215,22 @@ def filter_gwas_vcf_bcftools(
     }
 
 
-def _match_contig_naming(mhc_chrom: str, vcf_path: str, threads: int, log_print, log_warn) -> str:
+def _match_contig_naming(
+    mhc_chrom: str,
+    contigs: List[str],
+    log_warn,
+) -> str:
     """Return the MHC contig name as the VCF actually spells it.
 
     ``bcftools view -T ^bed`` silently excludes nothing when the BED names a
     contig the VCF does not contain, so `6` against a `chr6` VCF (or the
     reverse) turns MHC removal into a no-op with no error anywhere.
     """
-    contigs = _vcf_contigs(vcf_path, threads)
     if not contigs:
-        log_warn(
-            "⚠️ Could not read the contig names from %s, so the MHC contig name "
-            "'%s' could not be checked against the VCF." % (vcf_path, mhc_chrom)
+        raise ValueError(
+            "MHC removal requires ##contig declarations in the input VCF header; "
+            "none were found"
         )
-        return mhc_chrom
     if mhc_chrom in contigs:
         return mhc_chrom
 
@@ -1160,34 +1244,12 @@ def _match_contig_naming(mhc_chrom: str, vcf_path: str, threads: int, log_print,
         )
         return alternative
 
-    log_warn(
-        "⚠️ MHC contig '%s' is not present in %s (contigs seen: %s%s). The MHC "
-        "exclusion will remove NOTHING. Set filter.mhc_chrom to match the VCF."
-        % (mhc_chrom, vcf_path, ", ".join(contigs[:10]),
-           ", ..." if len(contigs) > 10 else "")
+    raise ValueError(
+        "MHC contig %r is absent from the input VCF header (contigs seen: %s%s). "
+        "Set modules.filtering.mhc.chromosome to a matching contig."
+        % (
+            mhc_chrom,
+            ", ".join(contigs[:10]),
+            ", ..." if len(contigs) > 10 else "",
+        )
     )
-    return mhc_chrom
-
-
-def _vcf_contigs(vcf_path: str, threads: int = 1) -> List[str]:
-    """Contig names in a VCF: the ones with data if indexed, else the header's."""
-    quoted = shlex.quote(str(vcf_path))
-    names: List[str] = []
-    try:
-        res = run_cmd(f"bcftools index -s {quoted}")
-        if res.returncode == 0 and (res.stdout or "").strip():
-            for line in res.stdout.splitlines():
-                parts = line.split("\t")
-                if parts and parts[0].strip():
-                    names.append(parts[0].strip())
-    except Exception:
-        names = []
-    if names:
-        return names
-    try:
-        res = run_cmd(f"bcftools view -h {quoted}")
-        if res.returncode == 0:
-            names = re.findall(r"##contig=<ID=([^,>]+)", res.stdout or "")
-    except Exception:
-        names = []
-    return names

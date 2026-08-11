@@ -6,6 +6,11 @@ allele-aligned, build-resolved GWAS-VCFs with QC and rejection evidence.
 This page follows the real processing order. It first gives a visual map, then
 explains every logged step in plain English.
 
+The command first prints a run-level preparation block with the sample sheet,
+number of selected datasets, resource directory, output directory, and current
+preflight stage. Per-dataset resolved settings follow it; the analysis-start
+message is printed only when harmonisation is ready to read that dataset.
+
 ## Visual workflow
 
 Read this diagram from top to bottom. The three large boxes show which work is
@@ -42,8 +47,10 @@ every allele unchanged. It still checks every variant against the reference.
 | Neff | Effective sample size, especially for an unbalanced case-control study. |
 | REF/ALT | The reference and alternate alleles in a genome-build reference or VCF. |
 
-The configured population-frequency panel helps with allele orientation and
-frequency QC. It does not silently replace a missing study EAF.
+The tabular `default_eaf` panel supports allele orientation and MAF/EAF
+confirmation. The separate indexed `comparison_af` VCF supplies final VCF
+population annotations and frequency QC. Neither silently replaces a missing
+study EAF.
 
 ## Where each part happens
 
@@ -71,11 +78,17 @@ PostGWAS performs these checks first:
    configured bcftools liftover plugin. Exact chromosome files cannot yet be
    selected because the study's build and observed chromosomes are not known.
 5. Save the resolved configuration, command, normalized sample-sheet row, and
-   initial logs.
+   initial logs. Initialize one screen report per selected dataset and the
+   run-level summary CSV with one `NOT_RUN` row for every selected dataset.
 6. Process sample-sheet datasets one at a time. A failed dataset does not erase
-   another dataset that completed successfully.
+   another dataset that completed successfully. Before each dataset begins,
+   its summary row changes to `RUNNING`.
 
 If one of these checks fails, chromosome analysis has not started.
+
+The screen report is an output-routing step, not a second analysis. PostGWAS
+copies each emitted stdout message to the active dataset report and optionally
+to the terminal. It performs no additional GWAS scan or scientific calculation.
 
 ## Stage B — Prepare the complete dataset
 
@@ -98,7 +111,9 @@ These eight steps run once on the complete study.
    - normalizes chromosome labels, positions, and alleles;
    - rejects invalid coordinates and unusable alleles;
    - converts configured scientific columns to numeric types while keeping
-     identifiers as strings;
+     identifiers as strings; configured missing tokens such as `.` become null,
+     and an unparseable scalar numeric cell becomes null without forcing the
+     complete column to remain text;
    - identifies duplicate groups and deterministically retains or rejects rows
      according to the configured ranking; and
    - normalizes an internal INFO column when present.
@@ -116,9 +131,11 @@ These eight steps run once on the complete study.
    build setting resolves it.
 
 6. **Dataset step 6 — Determine strand consensus.** Informative,
-   non-palindromic matches are counted as forward or reverse-complement.
-   Palindromic and ambiguous matches do not vote. The result is a study-level
-   guide for the later per-variant orientation step.
+   non-palindromic SNV matches across the complete study are counted as forward
+   or reverse-complement. Palindromic and ambiguous matches do not vote. At
+   least 1,000 informative variants and a 99% dominant direction are required
+   by default. The result is used only where allele letters cannot decide the
+   strand; it never overrides a clear non-palindromic row-level match.
 
 7. **Dataset step 7 — Determine statistic types.** PostGWAS decides or verifies:
 
@@ -189,13 +206,30 @@ in this order inside each chromosome.
 4. **Chromosome step 4 — Orient alleles and obtain EAF.** Every variant is
    matched to the supplied chromosome reference using chromosome, position,
    and alleles. A multiallelic position is not accepted by position alone.
-   PostGWAS selects one safe orientation, updates allele-specific statistics,
-   and rejects or fails unresolved variants according to policy.
+   SNVs test forward, forward-swapped, reverse-complement, and
+   reverse-complement-swapped forms. Indels test direct/swapped allele order
+   only; bcftools performs their normalization later. An ordinary
+   non-palindromic variant follows its unique row-level match. A palindromic
+   A/T or C/G SNP follows the strong whole-study consensus; mixed, unresolved,
+   or insufficient consensus rejects it. PostGWAS then updates allele-specific
+   statistics and records the result in `strand_action`.
 
    It then validates the internal EAF or allele-matches the configured external
    EAF. If the whole-study screen marked an internal column as MAF-like, the
-   reference performs the second check here. A column confirmed as true MAF is
-   not silently called EAF; PostGWAS stops with an actionable message.
+   reference performs the second check here using non-palindromic matches. The
+   reference must contain enough matched variants, must not be dominated by
+   effect alleles whose reference frequency is already at or below 0.5, and the
+   mean error as EAF versus folded MAF must differ by the configured minimum
+   margin. Clear EAF evidence triggers the deferred `1-EAF` correction on
+   allele-swapped rows. A true MAF result, too little overlap, an uninformative
+   reference comparison, or errors that are too close stop with an actionable
+   message. PostGWAS never guesses that an unresolved MAF-like column is EAF.
+
+   Finally, the aligned study EAF is compared with the selected population AF
+   as QC only. This comparison never chooses or changes strand. A large
+   difference warns for a non-palindromic row by default, but rejects a
+   palindromic row by default because its allele letters cannot independently
+   verify the consensus orientation.
 
 5. **Chromosome step 5 — Calculate sample size.** Case-control studies use
    cases and controls to calculate
@@ -248,7 +282,11 @@ rows read − rows rejected = rows ready for export
 An imbalance stops the chromosome because a row was lost or counted twice.
 
 14. **Chromosome step 14 — Export adapter input.** Write the harmonised table,
-    JSON column mapping, counts, and summaries required by GWAS-to-VCF.
+    JSON column mapping, counts, and summaries required by GWAS-to-VCF. The
+    final TSV column, `strand_action`, records the reference-orientation action
+    for each retained variant. It is intentionally omitted from the positional
+    JSON mapping, so the same TSV is passed directly to GWAS-to-VCF while the
+    adapter ignores this audit-only column.
 
 15. **Chromosome step 15 — Create the first VCF.** Run the bundled GWAS-to-VCF
     adapter in the inferred input build. Exact commands, exit status, and
@@ -304,8 +342,8 @@ association did not change.
 | Forward swapped | Swap alleles; negate BETA/Z; use `1 − EAF`. |
 | Reverse complement | Complement alleles; keep the effect direction. |
 | Reverse complement swapped | Complement and swap; negate BETA/Z; use `1 − EAF`. |
-| Palindromic resolved | Use strand consensus and informative EAF to select one orientation. |
-| Palindromic ambiguous | Reject or fail because A/T or C/G cannot be oriented safely. |
+| Palindromic resolved | Use strong full-study non-palindromic strand consensus; reference AF is checked only afterward. |
+| Palindromic ambiguous | Reject or fail because consensus is mixed, unresolved, insufficient, or leaves more than one reference match. |
 | Reference ambiguous | Reject or fail because more than one reference orientation remains. |
 | Reference unmatched | Reject or fail because no reference allele pair matches. |
 
@@ -333,8 +371,9 @@ After each chromosome round:
 3. Stop retrying when the limit is reached or a retry round makes no progress.
 4. Fail the dataset by default if a chromosome still fails. If partial output
    was explicitly allowed, label the result `PARTIAL`, never `OK`.
-5. Combine input-stage and chromosome-stage rejected rows into one rejection
-   file and one reason-by-chromosome report.
+5. Write the reason-by-chromosome report, then combine input-stage and
+   chromosome-stage rejected rows into one rejection file. Validate its
+   required columns and exact row count before deleting the source shards.
 6. Fail finalization if required rejection provenance cannot be written.
 7. Reconcile total rows across completed chromosomes.
 8. Finalize the EAF/MAF decision using chromosome reference evidence. This final
@@ -386,20 +425,52 @@ itself mean the complete dataset failed.
 This stage runs only with `--validate`, after required VCFs and QC are complete.
 
 1. Select the merged VCF in the inferred input build.
-2. Stage the original input, duplicate evidence, optional external EAF, and VCF
-   values.
+2. Stage the original input, duplicate evidence, and VCF values.
 3. Confirm that the VCF header build agrees with the inferred input build.
-4. Compare one chromosome partition at a time to limit memory.
-5. Report SNP, indel, and other-variant matching separately. SNP orientation can
+4. Prepare an optional external EAF source. A single all-chromosome file is
+   staged once. A path containing `{chromosome}` is resolved with the confirmed
+   build and read only for the chromosome currently being compared.
+5. Compare one chromosome partition at a time to limit memory.
+6. Report SNP, indel, and other-variant matching separately. SNP orientation can
    consider direct, swapped, complement, and complement-swapped alleles. Indels
    require exact representation; possible normalization-related differences are
    reported but not claimed as proven matches.
-6. Compare oriented effect, final EAF, and Z values using configured tolerances.
-7. Write summary, mismatch, input-only, VCF-only, duplicate-VCF, and optional
+7. Compare oriented effect, final EAF, and Z values using configured tolerances.
+8. Write summary, mismatch, input-only, VCF-only, duplicate-VCF, and optional
    all-match reports, then add the result to the run manifest.
 
 A validation failure does not erase harmonised files, but the dataset is not
 reported as successfully validated.
+
+## Stage G — Finalize the multi-dataset run summary
+
+After each dataset finishes, fails, or is interrupted, PostGWAS updates that
+dataset's row in
+`<output>/run_metadata/harmonisation_run_summary.csv`. Its columns follow the
+analysis order: dataset identity/status, initial input and ready-row SNP versus
+indel/other counts, build inference, study-wide decisions, chromosome evidence,
+population comparison, final VCF/QC, and output provenance. A successful row
+records the resolved and detected genome build, effect type, P-value type, final
+frequency type, population result, key variant counts, and the final manifest.
+Failed rows retain the evidence that was available before failure and include
+an actionable failure reason; datasets not reached after an interruption remain
+`NOT_RUN`.
+
+For strand orientation, PostGWAS sums the already-recorded chromosome counters
+for completed chromosomes only. It also writes expected, completed, and
+summarized chromosome counts and checks:
+
+```text
+evaluated variants = retained variants + strand-stage removals
+retained variants = forward + forward-swapped
+                    + reverse-complement + reverse-complement-swapped
+```
+
+The CSV is marked `partial`, `mixed`, or `inconsistent` when chromosome
+coverage, status, or arithmetic does not support a complete result. No summary
+statistics or VCF is rescanned. After all selected datasets have been handled,
+the terminal shows the CSV location and the numbers that are OK, partial,
+failed, or not finished.
 
 ## What can happen to one input row?
 

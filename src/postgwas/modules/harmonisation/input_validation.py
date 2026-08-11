@@ -42,6 +42,10 @@ from postgwas.modules.harmonisation.policies import (
     default_policies,
     load_policies,
 )
+from postgwas.modules.harmonisation.resource_paths import (
+    matching_external_resource_files,
+    validate_external_resource_spec,
+)
 from postgwas.modules.harmonisation.shared.runtime import (
     emit_high_visibility_warning,
     emit_message,
@@ -316,8 +320,6 @@ def read_summary_statistics_header(path: str, policies=None) -> Tuple[List[str],
         maximum_columns=int(policies.get("input.delimiter_max_columns")),
         sample_lines=int(policies.get("input.delimiter_sample_rows")),
     ).value
-    if line.startswith("#") and not line.startswith("##"):
-        line = line[1:]
     header = next(csv.reader([line], delimiter=separator))
     return [name.strip() for name in header], separator
 
@@ -350,6 +352,24 @@ def _check_file(
     problems: List[Problem],
     required: bool,
 ) -> None:
+    if key in ("eaffile", "infofile"):
+        try:
+            validate_external_resource_spec(value)
+        except ValueError as exc:
+            problems.append(
+                Problem(
+                    config_key=key,
+                    configured_value=value,
+                    issue=str(exc),
+                    suggestion=(
+                        "Use one existing file for all chromosomes or an explicit "
+                        "path template containing {chromosome}."
+                    ),
+                    category="file_missing",
+                    stage="config",
+                )
+            )
+        return
     if not os.path.exists(value):
         problems.append(
             Problem(
@@ -483,15 +503,22 @@ def _check_external_column(
     column = _clean(cfg.get(column_key))
     if not path or not column:
         return
-    if not _looks_like_path(path) or not os.path.exists(path):
+    if not _looks_like_path(path):
         return
     try:
-        header, _sep = read_summary_statistics_header(path, policies)
+        matches = matching_external_resource_files(path)
+    except ValueError:
+        return
+    if not matches:
+        return
+    inspected_path = str(matches[0])
+    try:
+        header, _sep = read_summary_statistics_header(inspected_path, policies)
     except Exception as exc:
         problems.append(
             Problem(
                 config_key=file_key,
-                configured_value=path,
+                configured_value=inspected_path,
                 issue="header could not be read (%s)" % exc,
                 suggestion="The file may be corrupt or use an unexpected format.",
                 category="file_missing",

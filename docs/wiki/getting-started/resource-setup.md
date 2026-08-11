@@ -19,15 +19,22 @@ chain_files/<source_build>_to_<target_build>.chain
 GRCh37_38_check_files/<build>_check_file.tsv
 ```
 
-The packaged build transition is GRCh37 ↔ GRCh38. The default comparison
-sources exposed by the CLI are `1000G` and `ALFA`; the selected population
-column is configurable. dbSNP source is a configuration value, not a filename
-to guess.
+The packaged build transition is GRCh37 ↔ GRCh38. The indexed VCF comparison
+sources exposed by the CLI are `1000G` and `ALFA`; ALFA EUR is the packaged
+default for VCF population-frequency annotation and post-merge QC. The
+separate tabular strand/MAF–EAF reference supports `ALFA`, `wgs_ukb`, `panukb`,
+`1000G`, and `fingen`, and defaults to ALFA EUR. Select one source per run under
+`modules.harmonisation.default_eaf`; the source name must match the filename
+exactly. All five panels provide GRCh37 and GRCh38 autosomes; sex-chromosome
+coverage differs by panel and build and is checked against the chromosomes in
+each dataset during preflight. dbSNP source is a configuration value, not a
+filename to guess.
 
-Default AF tables use configured CHROM, POS, ALT-as-effect, REF-as-other
-mapping. Comparison VCFs expose population INFO fields. Build-check tables use
-the separately configured column mapping. Validate headers against the exported
-YAML before processing a full dataset.
+Default AF tables use the `default_eaf` source/population and configured CHROM,
+POS, ALT-as-effect, REF-as-other mapping. Comparison VCFs use `comparison_af`
+and expose population INFO fields. Build-check tables use the separately
+configured column mapping. Validate headers against the exported YAML before
+processing a full dataset.
 
 ## Module resources
 

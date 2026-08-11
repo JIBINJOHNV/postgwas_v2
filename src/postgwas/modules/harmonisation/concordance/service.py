@@ -18,6 +18,10 @@ from postgwas.core.pipeline_logging import PipelineLogger
 from postgwas.core.processes import run_checked_command
 from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.core.vcf import extract_vcf_table
+from postgwas.modules.harmonisation.resource_paths import (
+    external_resource_template_fields,
+    resolve_resource_file,
+)
 from postgwas.modules.harmonisation.study_properties import (
     finalise_eaf_decision_from_chromosomes,
 )
@@ -55,6 +59,19 @@ def _validation_logger(
     )
 
 
+def _dataset_harmonisation_directory(
+    output_root: str | Path,
+    dataset_id: str,
+    output_layout,
+) -> Path:
+    """Resolve the canonical result root shared with harmonisation."""
+    return configured_output_path(
+        output_root,
+        output_layout["dataset_directory"],
+        dataset_id=dataset_id,
+    )
+
+
 def write_validation_preflight_failure(
     output_root: str | Path,
     dataset_id: str,
@@ -65,11 +82,8 @@ def write_validation_preflight_failure(
     screen_level: str,
 ) -> str:
     """Write an actionable log even when failure happens before data loading."""
-    dataset_root = configured_output_path(
-        output_root, output_layout["dataset_directory"], dataset_id=dataset_id,
-    )
-    base = configured_output_path(
-        dataset_root, output_layout["analysis_directory"], dataset_id=dataset_id,
+    base = _dataset_harmonisation_directory(
+        output_root, dataset_id, output_layout,
     )
     path = configured_output_path(
         base, output_layout["concordance_log"], dataset_id=dataset_id,
@@ -201,20 +215,16 @@ def _stage_csv(
     log: PipelineLogger,
 ) -> int:
     """Stream selected columns to a partition-addressable Parquet table."""
-    selected = ([row_index_name] if row_index_name else []) + columns
     try:
-        lazy = pl.scan_csv(
+        lazy = _partitioned_csv_scan(
             source,
             separator=separator,
-            comment_prefix=comment_prefix,
+            columns=columns,
+            partition_expression=partition_expression,
             null_values=null_values,
-            infer_schema_length=int(schema_inference_rows),
-            ignore_errors=False,
-            low_memory=True,
+            schema_inference_rows=schema_inference_rows,
             row_index_name=row_index_name,
-            row_index_offset=1 if row_index_name else 0,
-        ).select(selected).with_columns(
-            partition_expression.alias(PARTITION_COLUMN)
+            comment_prefix=comment_prefix,
         )
         lazy.sink_parquet(destination, maintain_order=True)
         rows = int(
@@ -234,6 +244,36 @@ def _stage_csv(
         % (description.capitalize(), f"{rows:,}", len(columns))
     )
     return rows
+
+
+def _partitioned_csv_scan(
+    source: str | Path,
+    *,
+    separator: str,
+    columns: list[str],
+    partition_expression: pl.Expr,
+    null_values: list[str],
+    schema_inference_rows: int,
+    row_index_name: str | None,
+    comment_prefix: str | None,
+) -> pl.LazyFrame:
+    """Scan selected CSV fields with the canonical chromosome partition."""
+    selected = ([row_index_name] if row_index_name else []) + columns
+    return (
+        pl.scan_csv(
+            source,
+            separator=separator,
+            comment_prefix=comment_prefix,
+            null_values=null_values,
+            infer_schema_length=int(schema_inference_rows),
+            ignore_errors=False,
+            low_memory=True,
+            row_index_name=row_index_name,
+            row_index_offset=1 if row_index_name else 0,
+        )
+        .select(selected)
+        .with_columns(partition_expression.alias(PARTITION_COLUMN))
+    )
 
 
 def _stage_input(
@@ -301,6 +341,7 @@ def _stage_external_eaf(
     destination: Path,
     policies,
     log: PipelineLogger,
+    reference_build: str,
 ) -> Path | None:
     if row.effect_allele_frequency_column:
         return None
@@ -308,20 +349,38 @@ def _stage_external_eaf(
         raise ConcordanceValidationError(
             "The sample sheet does not provide a complete internal or external EAF source."
         )
-    columns = list(dict.fromkeys([
-        mapping.chromosome,
-        mapping.position,
-        mapping.effect_allele,
-        mapping.other_allele,
-        row.external_eaf_column,
-    ]))
-    separator = _separator(row.external_eaf_file, "auto", policies)
+    columns = _external_eaf_columns(row, mapping)
+    try:
+        template_fields = external_resource_template_fields(row.external_eaf_file)
+    except ValueError as exc:
+        raise ConcordanceValidationError(
+            "Invalid external EAF path template %r: %s"
+            % (row.external_eaf_file, exc)
+        ) from exc
+    if "chromosome" in template_fields:
+        log.info(
+            "External effect-allele frequencies will be resolved and read once "
+            "per concordance chromosome from template %s."
+            % row.external_eaf_file
+        )
+        return None
+    try:
+        source = resolve_resource_file(
+            row.external_eaf_file,
+            reference_build,
+            "all",
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise ConcordanceValidationError(
+            "Cannot resolve the external EAF file for concordance: %s" % exc
+        ) from exc
+    separator = _separator(source, mapping.delimiter, policies)
     log.info(
         "Streaming external effect-allele frequencies [%s] from %s with separator %r."
-        % (", ".join(columns), row.external_eaf_file, separator)
+        % (", ".join(columns), source, separator)
     )
     _stage_csv(
-        row.external_eaf_file,
+        source,
         destination,
         separator=separator,
         columns=columns,
@@ -334,6 +393,76 @@ def _stage_external_eaf(
         log=log,
     )
     return destination
+
+
+def _external_eaf_columns(row, mapping) -> list[str]:
+    return list(dict.fromkeys([
+        mapping.chromosome,
+        mapping.position,
+        mapping.effect_allele,
+        mapping.other_allele,
+        row.external_eaf_column,
+    ]))
+
+
+def _read_external_eaf_partition(
+    row,
+    mapping,
+    partition: str,
+    reference_build: str,
+    policies,
+    log: PipelineLogger,
+) -> pl.DataFrame:
+    """Read one resolved external-EAF chromosome without staging the full panel."""
+    try:
+        source = resolve_resource_file(
+            row.external_eaf_file,
+            reference_build,
+            partition,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise ConcordanceValidationError(
+            "Cannot resolve the external EAF file for concordance chromosome %s "
+            "from template %s: %s"
+            % (partition, row.external_eaf_file, exc)
+        ) from exc
+    columns = _external_eaf_columns(row, mapping)
+    separator = _separator(source, mapping.delimiter, policies)
+    log.info(
+        "Concordance chromosome %s: reading external effect-allele frequencies "
+        "[%s] from %s with separator %r."
+        % (partition, ", ".join(columns), source, separator)
+    )
+    try:
+        frame = (
+            _partitioned_csv_scan(
+                source,
+                separator=separator,
+                columns=columns,
+                partition_expression=reference_chromosome_expression(
+                    mapping.chromosome
+                ),
+                null_values=list(policies.get("input.null_values")),
+                schema_inference_rows=int(
+                    policies.get("input.schema_inference_rows")
+                ),
+                row_index_name=None,
+                comment_prefix="##",
+            )
+            .filter(pl.col(PARTITION_COLUMN) == partition)
+            .drop(PARTITION_COLUMN)
+            .collect()
+        )
+    except (OSError, pl.exceptions.PolarsError) as exc:
+        raise ConcordanceValidationError(
+            "Cannot read the external EAF file for concordance chromosome %s "
+            "(%s): %s" % (partition, source, exc)
+        ) from exc
+    log.info(
+        "Concordance chromosome %s: external EAF rows read=%s."
+        % (partition, f"{frame.height:,}")
+    )
+    return frame
 
 
 def _extract_vcf(
@@ -454,11 +583,14 @@ def _compare_staged_partitions(
     workspace: Path,
     row,
     effect_type: str,
+    se_scale: str | None = None,
     p_value_type: str,
     eaf_is_maf: bool | None,
+    strand_consensus: str | None = None,
     settings,
     policies,
     external_eaf_mapping,
+    external_eaf_build: str,
     log: PipelineLogger,
 ) -> ConcordanceAnalysis:
     partitions = _partition_values(input_path, vcf_path)
@@ -473,6 +605,7 @@ def _compare_staged_partitions(
     partition_summaries: list[dict[str, Any]] = []
     report_paths: dict[str, list[Path]] = {
         "matched": [],
+        "position_matches": [],
         "input_only": [],
         "vcf_only": [],
         "vcf_duplicates": [],
@@ -485,17 +618,33 @@ def _compare_staged_partitions(
             _read_partition(duplicate_path, partition)
             if duplicate_path is not None else None
         )
-        external_eaf_frame = (
-            _read_partition(external_eaf_path, partition)
-            if external_eaf_path is not None else None
-        )
+        if external_eaf_path is not None:
+            external_eaf_frame = _read_partition(external_eaf_path, partition)
+        elif (
+            not row.effect_allele_frequency_column
+            and row.external_eaf_file
+            and input_frame.height
+            and partition is not None
+        ):
+            external_eaf_frame = _read_external_eaf_partition(
+                row,
+                external_eaf_mapping,
+                partition,
+                external_eaf_build,
+                policies,
+                log,
+            )
+        else:
+            external_eaf_frame = None
         analysis = compare_input_to_vcf(
             input_frame,
             vcf_frame,
             row,
             effect_type=effect_type,
+            se_scale=se_scale,
             p_value_type=p_value_type,
             eaf_is_maf=eaf_is_maf,
+            strand_consensus=strand_consensus,
             settings=settings,
             policies=policies,
             external_eaf_frame=external_eaf_frame,
@@ -522,6 +671,9 @@ def _compare_staged_partitions(
     return combine_concordance_partitions(
         partition_summaries,
         matched=_spooled_lazy(report_paths["matched"], empty_reports["matched"]),
+        position_matches=_spooled_lazy(
+            report_paths["position_matches"], empty_reports["position_matches"],
+        ),
         input_only=_spooled_lazy(
             report_paths["input_only"], empty_reports["input_only"],
         ),
@@ -582,11 +734,36 @@ def _summary_rows(analysis: ConcordanceAnalysis, context: dict[str, Any]) -> lis
                         "metric": metric,
                         "value": metric_value,
                     })
+        elif key == "position_diagnostics":
+            for metric, metric_value in value.items():
+                rows.append({
+                    "section": "position_diagnostics",
+                    "metric": metric,
+                    "value": metric_value,
+                })
         else:
             rows.append({"section": "retention", "metric": key, "value": value})
     for metric, values in analysis.metric_summary.items():
         for key, value in values.items():
             rows.append({"section": metric, "metric": key, "value": value})
+    for variant_type, metrics in analysis.metric_summary_by_variant_type.items():
+        for metric, values in metrics.items():
+            for key, value in values.items():
+                rows.append({
+                    "section": "values_%s_%s" % (variant_type, metric),
+                    "metric": key,
+                    "value": value,
+                })
+    for variant_type, metrics in (
+        analysis.position_metric_summary_by_variant_type.items()
+    ):
+        for metric, values in metrics.items():
+            for key, value in values.items():
+                rows.append({
+                    "section": "position_%s_%s" % (variant_type, metric),
+                    "metric": key,
+                    "value": value,
+                })
     return rows
 
 
@@ -648,40 +825,60 @@ def _update_run_manifest(path: Path | None, result: dict[str, Any], log: Pipelin
 
 def _screen_summary(dataset_id: str, analysis: ConcordanceAnalysis, reports: dict[str, str]) -> None:
     summary = analysis.summary
-    effect = analysis.metric_summary["effect"]
-    frequency = analysis.metric_summary["allele_frequency"]
-    z_score = analysis.metric_summary["z_score"]
     snps = summary["variant_types"]["snps"]
     indels = summary["variant_types"]["indels"]
     other_variants = summary["variant_types"]["other_variants"]
+    position = summary["position_diagnostics"]
+    width = 36
 
-    def concordance_text(metric):
+    def fraction_text(numerator: int, denominator: int, unit: str = "") -> str:
+        unit_text = " %s" % unit if unit else ""
+        if denominator <= 0:
+            return "%s / %s%s (not applicable)" % (
+                f"{numerator:,}", f"{denominator:,}", unit_text,
+            )
+        return "%s / %s%s (%0.2f%%)" % (
+            f"{numerator:,}", f"{denominator:,}", unit_text,
+            100.0 * numerator / denominator,
+        )
+
+    def metric_text(metric):
         if metric.get("frequency_type") == "unresolved":
             return "not compared; final frequency type unresolved"
         if not metric["checked"]:
-            return "not comparable; input value unavailable"
-        text = "%s/%s concordant" % (
-            f"{metric['concordant']:,}", f"{metric['checked']:,}",
-        )
+            return "0 / 0 (not applicable)"
+        text = fraction_text(metric["concordant"], metric["checked"])
         if metric["unavailable_in_input"]:
             text += "; %s input values unavailable" % f"{metric['unavailable_in_input']:,}"
         return text
 
-    def matching_text(values):
-        input_count = values["input_unique_variants"]
-        fraction = values["exact_match_fraction"]
-        exact = "%s/%s exact" % (
-            f"{values['exact_matched_variants']:,}", f"{input_count:,}",
-        )
-        if fraction is not None:
-            exact += " (%0.2f%%)" % (100.0 * fraction)
-        return "%s; input-only %s; VCF-only %s" % (
-            exact,
-            f"{values['input_only_variants']:,}",
-            f"{values['vcf_only_variants']:,}",
-        )
-
-    print("\n" + "\n".join([
+    variant_groups = (
+        ("SNPs", "snps", snps),
+        ("Indels", "indels", indels),
+        ("Other variants", "other_variants", other_variants),
+    )
+    position_labels = {
+        "snps": "SNP",
+        "indels": "Indel",
+        "other_variants": "Other",
+    }
+    common_labels = {
+        "snps": "SNPs",
+        "indels": "indels",
+        "other_variants": "other variants",
+    }
+    statistic_labels = {
+        "snps": "SNP",
+        "indels": "Indel",
+        "other_variants": "Other-variant",
+    }
+    metric_groups = (
+        ("Effect", "effect", "analysis"),
+        ("Standard error", "standard_error", "analysis"),
+        ("Allele frequency", "allele_frequency", "genetic"),
+        ("Z score", "z_score", "analysis"),
+    )
+    lines = [
         screen_line("analysis", "Harmonisation concordance validation", indent=4),
         screen_field("info", "Dataset", dataset_id, indent=6, label_width=24),
         screen_field(
@@ -693,77 +890,353 @@ def _screen_summary(dataset_id: str, analysis: ConcordanceAnalysis, reports: dic
             indent=6, label_width=24,
         ),
         "",
-        screen_line("genetic", "Variant matching", indent=6),
+        screen_line("genetic", "1. Input composition", indent=6),
         screen_field(
-            "count", "Input unique variants",
-            f"{summary['input_unique_variants']:,}", indent=8, label_width=28,
+            "count", "Total unique variants",
+            f"{summary['input_unique_variants']:,}", indent=8, label_width=width,
+        ),
+    ]
+    for label, _key, values in variant_groups:
+        lines.append(screen_field(
+            "count", label,
+            fraction_text(
+                values["input_unique_variants"], summary["input_unique_variants"],
+            ), indent=10, label_width=width,
+        ))
+    lines.extend([
+        screen_field(
+            "warning" if summary["input_invalid_rows"] else "info",
+            "Invalid variants",
+            fraction_text(summary["input_invalid_rows"], summary["input_rows"]),
+            indent=8, label_width=width,
         ),
         screen_field(
-            "warning"
-            if summary["input_invalid_rows"] or summary["input_duplicate_rows"]
-            else "info",
-            "Invalid / duplicate input",
-            "%s / %s" % (
-                f"{summary['input_invalid_rows']:,}",
-                f"{summary['input_duplicate_rows']:,}",
-            ),
-            indent=8, label_width=28,
-        ),
-        screen_field(
-            "success", "Matched variants",
-            f"{summary['matched_variants']:,} ({summary['retained_fraction']:.2%})",
-            indent=8, label_width=28,
-        ),
-        screen_field("loss" if summary["input_only_variants"] else "info", "Unmatched input variants", f"{summary['input_only_variants']:,}", indent=8, label_width=28),
-        screen_field("loss" if summary["vcf_only_variants"] else "info", "Unmatched VCF variants", f"{summary['vcf_only_variants']:,}", indent=8, label_width=28),
-        screen_field("warning" if summary["vcf_duplicate_records"] else "info", "Duplicate VCF records", f"{summary['vcf_duplicate_records']:,}", indent=8, label_width=28),
-        screen_field(
-            "success" if snps["status"] == "PASS" else "warning" if snps["status"] in ("WARNING", "NOT_APPLICABLE") else "error",
-            "SNP concordance",
-            "%s — %s" % (snps["status"], matching_text(snps)),
-            indent=8,
-            label_width=28,
-        ),
-        screen_field(
-            "success" if indels["status"] == "PASS" else "warning" if indels["status"] in ("WARNING", "NOT_APPLICABLE") else "error",
-            "Indel concordance",
-            "%s — %s" % (indels["status"], matching_text(indels)),
-            indent=8,
-            label_width=28,
-        ),
-        screen_field(
-            "warning" if indels["maximum_possible_representation_pairs"] else "info",
-            "Possible normalized indels",
-            "%s maximum; not individually proven"
-            % f"{indels['maximum_possible_representation_pairs']:,}",
-            indent=8,
-            label_width=28,
-        ),
-        screen_field(
-            "success"
-            if other_variants["status"] == "PASS"
-            else "warning"
-            if other_variants["status"] in ("WARNING", "NOT_APPLICABLE")
-            else "error",
-            "Other-variant concordance",
-            "%s — %s" % (other_variants["status"], matching_text(other_variants)),
-            indent=8,
-            label_width=28,
-        ),
-        screen_field(
-            "warning" if summary["palindromic_variants_excluded_from_orientation"] else "info",
-            "Palindromic effect/Z",
-            "%s excluded by policy"
-            % f"{summary['palindromic_variants_excluded_from_orientation']:,}",
-            indent=8, label_width=28,
+            "warning" if summary["input_duplicate_rows"] else "info",
+            "Duplicate variants",
+            fraction_text(summary["input_duplicate_rows"], summary["input_rows"]),
+            indent=8, label_width=width,
         ),
         "",
-        screen_line("analysis", "Value concordance", indent=6),
-        screen_field("warning" if effect["unavailable_in_input"] else "analysis", "Effect", concordance_text(effect), indent=8, label_width=28),
-        screen_field("warning" if frequency["unavailable_in_input"] else "genetic", "Allele frequency", concordance_text(frequency), indent=8, label_width=28),
-        screen_field("warning" if z_score["unavailable_in_input"] else "analysis", "Z score", concordance_text(z_score), indent=8, label_width=28),
-        screen_field("info", "Detailed summary", Path(reports["summary"]).name, indent=8, label_width=28),
-    ]) + "\n")
+        screen_line("genetic", "2. Final VCF composition", indent=6),
+        screen_field(
+            "count", "Total unique variants",
+            f"{summary['vcf_unique_variants']:,}", indent=8, label_width=width,
+        ),
+    ])
+    for label, _key, values in variant_groups:
+        lines.append(screen_field(
+            "count", label,
+            fraction_text(
+                values["vcf_unique_variants"], summary["vcf_unique_variants"],
+            ), indent=10, label_width=width,
+        ))
+    lines.extend([
+        screen_field(
+            "error" if summary["vcf_invalid_rows"] else "info",
+            "Invalid VCF records",
+            fraction_text(summary["vcf_invalid_rows"], summary["vcf_records"]),
+            indent=8, label_width=width,
+        ),
+        screen_field(
+            "error" if summary["vcf_duplicate_records"] else "info",
+            "Duplicate VCF records",
+            fraction_text(summary["vcf_duplicate_records"], summary["vcf_records"]),
+            indent=8, label_width=width,
+        ),
+        "",
+        screen_line("genetic", "3. Allele-aware comparison", indent=6),
+        screen_field(
+            "info", "Match key",
+            "chromosome, position and unordered allele pair",
+            indent=8, label_width=width,
+        ),
+        screen_line("genetic", "3.1 Common allele-aware variants", indent=8),
+        screen_field(
+            "success", "Total common variants",
+            fraction_text(
+                summary["matched_variants"], summary["variant_union"],
+                "union variants",
+            ), indent=10, label_width=width,
+        ),
+    ])
+    for label, _key, values in variant_groups:
+        lines.append(screen_field(
+            "success" if values["exact_matched_variants"] else "info",
+            "Common %s" % common_labels[_key],
+            fraction_text(
+                values["exact_matched_variants"], values["variant_union"],
+                "union %s" % common_labels[_key],
+            ), indent=12, label_width=width,
+        ))
+
+    match_types = summary["match_types"]
+    palindromic = sum(
+        int(count)
+        for match_type, count in match_types.items()
+        if str(match_type).startswith("palindromic_")
+    )
+    palindromic_compared = int(summary["palindromic_variants_compared"])
+    palindromic_excluded = int(
+        summary["palindromic_variants_excluded_from_orientation"]
+    )
+    if not palindromic:
+        palindromic_message = fraction_text(0, summary["matched_variants"])
+    elif palindromic_excluded:
+        palindromic_message = (
+            "%s; %s compared and %s excluded because a safe strand orientation "
+            "was unavailable or disabled by policy; SE remains comparable"
+            % (
+                fraction_text(palindromic, summary["matched_variants"]),
+                f"{palindromic_compared:,}",
+                f"{palindromic_excluded:,}",
+            )
+        )
+    elif summary["palindromic_comparison_basis"] == "listed_allele_order":
+        palindromic_message = (
+            fraction_text(palindromic, summary["matched_variants"])
+            + "; included from listed allele order by explicit policy"
+        )
+    else:
+        palindromic_message = (
+            fraction_text(palindromic, summary["matched_variants"])
+            + "; included in effect, EAF and Z using the study-wide strand consensus"
+        )
+    lines.extend([
+        screen_line("genetic", "3.2 Orientation of common variants", indent=8),
+        screen_field("info", "Direct", fraction_text(
+            int(match_types.get("direct", 0)), summary["matched_variants"],
+        ), indent=10, label_width=width),
+        screen_field("info", "Allele-swapped", fraction_text(
+            int(match_types.get("allele_swapped", 0)), summary["matched_variants"],
+        ), indent=10, label_width=width),
+        screen_field("info", "Strand-complement", fraction_text(
+            int(match_types.get("strand_complement", 0)), summary["matched_variants"],
+        ), indent=10, label_width=width),
+        screen_field("info", "Complement-swapped", fraction_text(
+            int(match_types.get("strand_complement_swapped", 0)),
+            summary["matched_variants"],
+        ), indent=10, label_width=width),
+        screen_field(
+            "warning" if palindromic_excluded else "info", "Palindromic",
+            palindromic_message,
+            indent=10, label_width=width,
+        ),
+        screen_line("analysis", "3.3 Statistical concordance", indent=8),
+    ])
+    for label, key, kind in metric_groups:
+        metric = analysis.metric_summary[key]
+        lines.append(screen_field(
+            "warning" if metric["mismatches"] else kind,
+            label, metric_text(metric), indent=10, label_width=width,
+        ))
+    for _variant_label, variant_key, _values in variant_groups:
+        lines.append(screen_line(
+            "analysis", "%s statistics" % statistic_labels[variant_key],
+            indent=10,
+        ))
+        for label, key, kind in metric_groups:
+            metric = analysis.metric_summary_by_variant_type[variant_key][key]
+            lines.append(screen_field(
+                "warning" if metric["mismatches"] else kind,
+                label, metric_text(metric), indent=12, label_width=width,
+            ))
+
+    lines.append(screen_line(
+        "loss", "3.4 Variants failing allele-aware matching", indent=8,
+    ))
+    for source, total_key, count_key in (
+        ("Input unmatched", "input_unique_variants", "input_only_variants"),
+        ("VCF unmatched", "vcf_unique_variants", "vcf_only_variants"),
+    ):
+        lines.append(screen_line("loss", source, indent=10))
+        lines.append(screen_field(
+            "loss" if summary[count_key] else "success", "Total",
+            fraction_text(summary[count_key], summary[total_key]),
+            indent=12, label_width=width,
+        ))
+        type_count_key = (
+            "input_only_variants" if source.startswith("Input")
+            else "vcf_only_variants"
+        )
+        type_total_key = (
+            "input_unique_variants" if source.startswith("Input")
+            else "vcf_unique_variants"
+        )
+        for label, _key, values in variant_groups:
+            lines.append(screen_field(
+                "loss" if values[type_count_key] else "info", label,
+                fraction_text(values[type_count_key], values[type_total_key]),
+                indent=14, label_width=width,
+            ))
+
+    lines.extend([
+        "",
+        screen_line(
+            "analysis",
+            "4. Position diagnostics for allele-unmatched variants only",
+            indent=6,
+        ),
+        screen_field(
+            "info", "Method",
+            "runs only after allele-aware matching fails; position matches do not establish variant identity",
+            indent=8, label_width=width,
+        ),
+        screen_field(
+            "info", "Variant-type strata",
+            "position counts can overlap when a mixed or multiallelic position contains more than one variant type",
+            indent=8, label_width=width,
+        ),
+        screen_field(
+            "count", "Unmatched input positions",
+            f"{position['input_unmatched_positions']:,}",
+            indent=8, label_width=width,
+        ),
+    ])
+    for label, _key, values in variant_groups:
+        lines.append(screen_field(
+            "count", "%s positions" % position_labels[_key],
+            fraction_text(
+                values["input_unmatched_positions"],
+                position["input_unmatched_positions"],
+            ), indent=10, label_width=width,
+        ))
+    lines.append(screen_field(
+        "count", "Unmatched VCF positions",
+        f"{position['vcf_unmatched_positions']:,}",
+        indent=8, label_width=width,
+    ))
+    for label, _key, values in variant_groups:
+        lines.append(screen_field(
+            "count", "%s positions" % position_labels[_key],
+            fraction_text(
+                values["vcf_unmatched_positions"],
+                position["vcf_unmatched_positions"],
+            ), indent=10, label_width=width,
+        ))
+    lines.append(screen_field(
+        "genetic", "Shared unmatched positions",
+        fraction_text(
+            position["shared_unmatched_positions"],
+            position["unmatched_position_union"],
+            "union positions",
+        ), indent=8, label_width=width,
+    ))
+    for label, _key, values in variant_groups:
+        lines.append(screen_field(
+            "genetic", "%s positions" % position_labels[_key],
+            fraction_text(
+                values["shared_unmatched_positions"],
+                values["unmatched_position_union"],
+                "union %s positions" % position_labels[_key],
+            ), indent=10, label_width=width,
+        ))
+    lines.append(screen_field(
+        "loss", "Input-only unmatched positions",
+        fraction_text(
+            position["input_specific_positions"],
+            position["input_unmatched_positions"],
+        ), indent=8, label_width=width,
+    ))
+    for label, _key, values in variant_groups:
+        lines.append(screen_field(
+            "loss" if values["input_specific_positions"] else "info",
+            "%s positions" % position_labels[_key],
+            fraction_text(
+                values["input_specific_positions"],
+                values["input_unmatched_positions"],
+            ), indent=10, label_width=width,
+        ))
+    lines.append(screen_field(
+        "loss", "VCF-only unmatched positions",
+        fraction_text(
+            position["vcf_specific_positions"],
+            position["vcf_unmatched_positions"],
+        ), indent=8, label_width=width,
+    ))
+    for label, _key, values in variant_groups:
+        lines.append(screen_field(
+            "loss" if values["vcf_specific_positions"] else "info",
+            "%s positions" % position_labels[_key],
+            fraction_text(
+                values["vcf_specific_positions"],
+                values["vcf_unmatched_positions"],
+            ), indent=10, label_width=width,
+        ))
+    lines.extend([
+        screen_field(
+            "analysis", "One-to-one diagnostic pairs",
+            fraction_text(
+                position["unambiguous_position_pairs"],
+                position["shared_unmatched_positions"],
+                "shared positions",
+            ), indent=8, label_width=width,
+        ),
+        screen_field(
+            "warning" if position["ambiguous_shared_positions"] else "info",
+            "Ambiguous shared positions",
+            fraction_text(
+                position["ambiguous_shared_positions"],
+                position["shared_unmatched_positions"],
+            ), indent=8, label_width=width,
+        ),
+        screen_field(
+            "warning" if position["variant_type_mismatch_positions"] else "info",
+            "Variant-type mismatches",
+            fraction_text(
+                position["variant_type_mismatch_positions"],
+                position["shared_unmatched_positions"],
+            ), indent=10, label_width=width,
+        ),
+        screen_field(
+            "warning" if position["multiallelic_ambiguous_positions"] else "info",
+            "Multiallelic positions",
+            fraction_text(
+                position["multiallelic_ambiguous_positions"],
+                position["shared_unmatched_positions"],
+            ), indent=10, label_width=width,
+        ),
+    ])
+    for _variant_label, variant_key, values in variant_groups:
+        lines.append(screen_line(
+            "analysis", "%s diagnostic statistics" % statistic_labels[variant_key],
+            indent=8,
+        ))
+        lines.append(screen_field(
+            "analysis", "Eligible pairs",
+            fraction_text(
+                values["unambiguous_position_pairs"],
+                values["shared_unmatched_positions"],
+            ), indent=10, label_width=width,
+        ))
+        for label, key, kind in metric_groups:
+            diagnostic_label = {
+                "effect": "Effect magnitude",
+                "allele_frequency": "Folded allele frequency",
+                "z_score": "Absolute Z magnitude",
+            }.get(key, label)
+            metric = analysis.position_metric_summary_by_variant_type[variant_key][key]
+            lines.append(screen_field(
+                "warning" if metric["mismatches"] else kind,
+                diagnostic_label, metric_text(metric),
+                indent=10, label_width=width,
+            ))
+
+    lines.extend(["", screen_line("info", "5. Concordance reports", indent=6)])
+    for key, label in (
+        ("summary", "Detailed summary"),
+        ("input_only", "Input-unmatched variants"),
+        ("vcf_only", "VCF-unmatched variants"),
+        ("mismatches", "Statistical mismatches"),
+        ("same_position_matches", "Same-position diagnostics"),
+        ("vcf_duplicates", "Duplicate VCF records"),
+        ("all_matches", "All allele-aware matches"),
+    ):
+        if key in reports:
+            lines.append(screen_field(
+                "info", label, Path(reports[key]).name,
+                indent=8, label_width=width,
+            ))
+    print("\n" + "\n".join(lines) + "\n")
 
 
 def run_concordance_validation(
@@ -785,15 +1258,8 @@ def run_concordance_validation(
 ) -> dict[str, Any]:
     """Run one validation and always leave a complete log and status summary."""
     vcf = Path(vcf_path).expanduser().resolve()
-    dataset_root = configured_output_path(
-        output_root,
-        output_layout["dataset_directory"],
-        dataset_id=row.dataset_id,
-    )
-    base = configured_output_path(
-        dataset_root,
-        output_layout["analysis_directory"],
-        dataset_id=row.dataset_id,
+    base = _dataset_harmonisation_directory(
+        output_root, row.dataset_id, output_layout,
     )
     log_path = configured_output_path(
         base, output_layout["concordance_log"], dataset_id=row.dataset_id,
@@ -851,7 +1317,24 @@ def run_concordance_validation(
                 "P-value type is unresolved. Keep the harmonisation run manifest beside the VCF "
                 "or set p_value_type in the sample sheet."
             )
+        se_scale = decisions.get("se_scale")
+        if effect_type == "odds_ratio" and row.standard_error_column:
+            configured_se_scale = policies.get("effect.se_scale")
+            if se_scale not in ("log_odds", "as_given"):
+                se_scale = (
+                    configured_se_scale
+                    if configured_se_scale in ("log_odds", "as_given")
+                    else None
+                )
+            if se_scale is None:
+                raise ConcordanceValidationError(
+                    "Odds-ratio concordance cannot compare the supplied standard "
+                    "error because its study-level scale is unresolved. Keep the "
+                    "harmonisation run manifest beside the VCF, or explicitly set "
+                    "effect.se_scale to 'log_odds' or 'as_given'."
+                )
         eaf_is_maf = decisions.get("eaf_is_maf")
+        strand_consensus = decisions.get("strand")
         if eaf_is_maf is None:
             log.warning(
                 "The final frequency type is unresolved after chromosome reference "
@@ -884,13 +1367,6 @@ def run_concordance_validation(
             policies,
             log,
         )
-        external_eaf_path = _stage_external_eaf(
-            row,
-            external_eaf_mapping,
-            external_eaf_path,
-            policies,
-            log,
-        )
         _, header = _extract_vcf(
             vcf,
             row.dataset_id,
@@ -920,13 +1396,25 @@ def run_concordance_validation(
                 "the VCF header build %s is recorded but cannot be cross-checked." % observed_build
             )
 
+        external_eaf_path = _stage_external_eaf(
+            row,
+            external_eaf_mapping,
+            external_eaf_path,
+            policies,
+            log,
+            observed_build,
+        )
+
         log.info(
-            "Study decisions: build=%s, effect_type=%s, p_value_type=%s, frequency_type=%s."
+            "Study decisions: build=%s, effect_type=%s, se_scale=%s, "
+            "p_value_type=%s, frequency_type=%s, strand_consensus=%s."
             % (
                 observed_build,
                 effect_type,
+                se_scale or "not_applicable",
                 p_value_type,
                 "MAF" if eaf_is_maf is True else "EAF" if eaf_is_maf is False else "unresolved",
+                strand_consensus or "unavailable",
             )
         )
         analysis = _compare_staged_partitions(
@@ -936,11 +1424,14 @@ def run_concordance_validation(
             external_eaf_path=external_eaf_path,
             workspace=workspace,
             row=row,
-            effect_type=effect_type, p_value_type=p_value_type,
+            effect_type=effect_type, se_scale=se_scale,
+            p_value_type=p_value_type,
             eaf_is_maf=eaf_is_maf,
+            strand_consensus=strand_consensus,
             settings=settings,
             policies=policies,
             external_eaf_mapping=external_eaf_mapping,
+            external_eaf_build=observed_build,
             log=log,
         )
         reports = {
@@ -950,6 +1441,7 @@ def run_concordance_validation(
                 "vcf": str(vcf),
                 "genome_build": observed_build,
                 "effect_type": effect_type,
+                "se_scale": se_scale,
                 "p_value_type": p_value_type,
                 "frequency_type": (
                     "minor_allele_frequency"
@@ -988,6 +1480,13 @@ def run_concordance_validation(
                     dataset_id=row.dataset_id,
                 ), vcf_config["table_delimiter"], vcf_config["table_null_output"],
             ),
+            "same_position_matches": _write_frame(
+                analysis.position_matches,
+                configured_output_path(
+                    base, output_layout["concordance_position_matches"],
+                    dataset_id=row.dataset_id,
+                ), vcf_config["table_delimiter"], vcf_config["table_null_output"],
+            ),
             "log": str(log_path),
         }
         if settings.write_all_matches:
@@ -1002,6 +1501,10 @@ def run_concordance_validation(
             "status": analysis.status,
             "summary": analysis.summary,
             "metrics": analysis.metric_summary,
+            "metrics_by_variant_type": analysis.metric_summary_by_variant_type,
+            "position_metrics_by_variant_type": (
+                analysis.position_metric_summary_by_variant_type
+            ),
             "reports": reports,
         }
         log.info("Validation result: %s" % analysis.status)

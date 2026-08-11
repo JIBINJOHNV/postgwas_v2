@@ -4,6 +4,12 @@ inputs:
   vcf: /path/to/harmonised.vcf.gz
   dataset_id: example_trait
 output_directory: results/filtering
+genome_build: GRCh37
 maf_min: 0.01
 info_min: 0.8
 remove_mhc: true
+mhc:
+  genome_build: GRCh37
+  chromosome: "6"
+  start: 25000000
+  end: 34000000

@@ -15,14 +15,18 @@ from postgwas.modules.formatting.table import (
 )
 
 
-def export_ldsc(frame, output_directory, dataset_id, config, *, overwrite):
+def export_ldsc(
+    frame, output_directory, dataset_id, config, *, overwrite, study_design=None,
+):
     """Write the sample-size schema understood by CBIIT ``munge_sumstats``."""
     schema = config.exports["ldsc"]
-    design = infer_study_design(
-        frame,
-        config.study_design.case_count_column,
-        config.study_design.control_count_column,
-    )
+    design = study_design
+    if design is None:
+        design = infer_study_design(
+            frame,
+            config.study_design.case_count_column,
+            config.study_design.control_count_column,
+        )
     case_control = design.trait_type == "binary"
     sample_columns = schema.trait_required_columns[design.trait_type]
     required = [*schema.validation.required_columns, *sample_columns]

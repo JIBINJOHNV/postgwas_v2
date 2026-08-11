@@ -46,7 +46,8 @@ POLICY_KEYS = [
     "info.clip_tolerance",
     "info.low_quality_threshold",
     "info.on_missing",
-    "info.deduplicate_reference",
+    "external_reference.exact_duplicate_action",
+    "external_reference.non_identical_duplicate_action",
 ]
 
 _REASON_TEXT = {
@@ -103,7 +104,12 @@ def harmonise_imputation_quality(
     tolerance_limit = max(clip_tolerance, clip_max)
     low_quality = float(policies.get("info.low_quality_threshold"))
     on_missing = policies.get("info.on_missing")
-    dedupe_reference = bool(policies.get("info.deduplicate_reference"))
+    duplicate_exact_action = str(
+        policies.get("external_reference.exact_duplicate_action")
+    )
+    duplicate_non_identical_action = str(
+        policies.get("external_reference.non_identical_duplicate_action")
+    )
     source = policies.get("info.source")
 
     qc_info = {"initial_variants": df.height}
@@ -253,33 +259,36 @@ def harmonise_imputation_quality(
                 },
                 value_column=info_col_to_use,
                 output_column=info_col_to_use,
+                duplicate_exact_action=duplicate_exact_action,
+                duplicate_non_identical_action=duplicate_non_identical_action,
                 swapped_value="same",
-                deduplicate_reference=dedupe_reference,
                 prefer_non_null_value=True,
                 study_columns_canonical=True,
                 error_type=ImputationQualityError,
                 warn=step.warn,
                 reference_label="external imputation-quality table",
-                duplicate_policy_name="info.deduplicate_reference",
             )
             df = df.drop(orientation_col)
             reference_before = join_stats["reference_rows_before_deduplication"]
             reference_after = join_stats["reference_rows_after_deduplication"]
             step.info("Imputation quality reference rows: {:,}".format(reference_before))
-            if dedupe_reference:
+            if join_stats["reference_duplicate_groups"]:
                 step.info(
-                    "Reference deduplicated on chromosome, position and both "
-                    "alleles: {:,} rows before, {:,} after ({:,} repeats removed; "
-                    "{:,} keys preferred a later finite score over an earlier "
-                    "missing or non-finite value). Conflicting finite scores "
-                    "stop the chromosome."
+                    "External INFO reference duplicates: {:,} exact key/value "
+                    "groups (action {!r}); {:,} non-identical key groups covering "
+                    "{:,} rows (action {!r}); {:,} reference rows removed "
+                    "({:,} before, {:,} after)."
                     .format(
+                        join_stats["reference_exact_duplicate_groups"],
+                        duplicate_exact_action,
+                        join_stats[
+                            "reference_non_identical_duplicate_groups"
+                        ],
+                        join_stats["reference_non_identical_duplicate_rows"],
+                        duplicate_non_identical_action,
+                        join_stats["reference_duplicate_rows_removed"],
                         reference_before,
                         reference_after,
-                        join_stats["reference_duplicate_rows_removed"],
-                        join_stats[
-                            "reference_duplicate_groups_preferred_usable_value"
-                        ],
                     )
                 )
             matched_direct = join_stats["direct_value_matches"]
@@ -293,6 +302,7 @@ def harmonise_imputation_quality(
             )
             qc_info["matched_direct"] = matched_direct
             qc_info["matched_flipped"] = matched_flipped
+            qc_info.update(join_stats)
 
             info_col = info_col_to_use
             sample_column_dict["imp_info_col"] = info_col

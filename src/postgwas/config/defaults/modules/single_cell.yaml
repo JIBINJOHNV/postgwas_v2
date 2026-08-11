@@ -70,6 +70,37 @@ scdrs:
     minimum_effective_genes: 51
     maximum_effective_gene_fraction: 0.2
     allow_missing_annotation_values: false
+ldsc_celltype:
+  workflow: h2_cts
+  genome_build: GRCh37
+  population: EUR
+  input:
+    source: munged
+    sumstats_file: null
+    ldcts_file: null
+    baseline_ld_prefixes: []
+    weights_ld_prefix: null
+    merge_alleles_file: null
+  reference_format:
+    chromosomes: 22
+    chromosome_placeholder: '@'
+    prefix_separator: ','
+    ldscore_suffix: '.l2.ldscore.gz'
+    m_suffix: '.l2.M_5_50'
+    minimum_prefixes_per_cell_type: 2
+  result_format:
+    delimiter: "\t"
+    name_column: Name
+    coefficient_column: Coefficient
+    standard_error_column: Coefficient_std_error
+    p_value_column: Coefficient_P_value
+    sumstats_required_columns: [SNP, Z, N]
+    native_results_suffix: '.cell_type_results.txt'
+    native_log_suffix: '.log'
+    munged_sumstats_suffix: '.sumstats.gz'
+    munge_log_suffix: '.log'
+  version_probe_arguments: []
+  version_pattern: '(?im)^\* Version ([0-9][0-9A-Za-z.+-]*)$'
 multiple_testing:
   methods: [bonferroni, fdr_bh]
   primary_method: bonferroni
@@ -108,3 +139,11 @@ output_layout:
   scdrs_generated_gene_statistics: 'engines/{dataset_id}_scdrs/inputs/{dataset_id}_magma_gene_statistics.tsv'
   scdrs_generated_gene_set: 'engines/{dataset_id}_scdrs/inputs/{dataset_id}.gs'
   scdrs_gene_mapping_report: 'engines/{dataset_id}_scdrs/inputs/{dataset_id}_gene_mapping.yaml'
+  ldsc_celltype_engine_directory: 'engines/{dataset_id}_ldsc_celltype'
+  ldsc_celltype_results_file: 'results/{dataset_id}_ldsc_celltype.tsv'
+  ldsc_celltype_qc_report: 'engines/{dataset_id}_ldsc_celltype/{dataset_id}_qc.yaml'
+  ldsc_celltype_completion_manifest: 'run_metadata/{dataset_id}_ldsc_celltype_completion.yaml'
+  ldsc_celltype_staging_directory: '.partial/{dataset_id}_ldsc_celltype'
+  ldsc_celltype_native_output_prefix: 'engines/{dataset_id}_ldsc_celltype/{dataset_id}'
+  ldsc_celltype_normalized_ldcts: 'engines/{dataset_id}_ldsc_celltype/inputs/{dataset_id}.ldcts'
+  ldsc_celltype_munge_output_prefix: 'engines/{dataset_id}_ldsc_celltype/inputs/{dataset_id}'

@@ -29,6 +29,11 @@ checksum, resolved formatter-configuration checksum, output checksums, and
 reusable result contract. A repeated pipeline validates that completion manifest
 and continues with the remaining steps. Changed, missing, empty, or
 checksum-mismatched inputs and outputs are rejected rather than silently reused.
+When a completed formatter run directory is copied, resume resolves artifacts
+from the current output directory, requires their relative paths to match the
+current configured filenames, validates their checksums there, and rewrites the
+copied manifest with current absolute paths. It never returns an artifact from
+the manifest's former output directory.
 Use `--no-resume` or set `run.resume: false` to force collision-protecting
 non-resume behaviour. Set `run.overwrite: true` or pass `--overwrite` to rerun a
 step and replace its outputs; overwrite takes precedence over resume.
@@ -98,12 +103,22 @@ Formatter schemas follow the same rule. VCF query expressions and every
 downstream column mapping are stored only in
 `src/postgwas/config/defaults/modules/formatting.yaml`. A run configuration may
 override them under `modules.formatting`; the typed model rejects unknown
-canonical columns, incomplete target schemas, invalid transformations, and
-duplicate output names. Per-step formatter metadata retains only the selected
-target schemas—for example, a MAGMA pipeline records `exports.magma` but omits
-the GCTA, fine-mapping, imputation, LDSC, and MiXeR export definitions. The
-metadata field selection is itself validated from the same canonical formatter
-YAML rather than being duplicated in module code.
+canonical columns, incomplete target schemas, and invalid transformations.
+Before VCF extraction, formatter preflight renders every selected output path,
+including named and chromosome-partitioned outputs, and rejects any duplicate
+destination. Per-step formatter metadata retains only the selected target
+schemas—for example, a MAGMA pipeline records `exports.magma` but omits the
+GCTA, fine-mapping, imputation, LDSC, and MiXeR export definitions. The metadata
+field selection is itself validated from the same canonical formatter YAML
+rather than being duplicated in module code.
+
+The formatter's optional custom CLI table follows the same architecture without
+requiring users to edit YAML. `--custom-output` and field header options become
+explicit overrides of an otherwise inactive `custom_output` section. The
+packaged configuration owns each field's canonical source, transformation, and
+validity rule; the CLI supplies only the output filename, requested roles, and
+header names. Active custom settings are included in scoped resolved metadata
+and completion-manifest checks, while inactive runs omit that section.
 
 ## Export configuration templates
 
@@ -131,4 +146,7 @@ postgwas config export --pipeline finemap magma > analysis_pipeline.yaml
 Use `--output PATH` instead of shell redirection when preferred. Pipeline
 export can also resolve values from an existing run file with `--run-config PATH`.
 The dependency planner determines all preceding modules; no profile selection
-is required.
+is required. Method-dispatched modules also retain non-executable configuration
+they consume. For example, an LDSC cell-type pipeline exports `formatting`, the
+supporting `ldsc` munging settings, and `single_cell`, while only `formatting`
+and `single_cell` appear in the executable `pipeline.modules` list.

@@ -112,6 +112,30 @@ def require_nonempty_file(
     return path
 
 
+def remove_owned_directory(
+    value: str | Path,
+    owner_root: str | Path,
+    label: str,
+    *,
+    error_type: Type[Exception] = ValueError,
+) -> None:
+    """Remove one module-owned directory only when it is below its output root."""
+    path = Path(value).expanduser()
+    resolved = path.resolve()
+    root = Path(owner_root).expanduser().resolve()
+    if resolved == root or root not in resolved.parents:
+        raise error_type(
+            "Refusing to remove %s outside its configured output root: %s"
+            % (label, resolved)
+        )
+    if path.is_symlink():
+        raise error_type("Refusing to remove symlinked %s: %s" % (label, path))
+    if path.exists():
+        if not path.is_dir():
+            raise error_type("Expected %s to be a directory: %s" % (label, path))
+        shutil.rmtree(path)
+
+
 def remove_empty_directories(*values: str | Path) -> None:
     """Remove explicitly supplied directories only when they are empty."""
     for value in values:
@@ -127,6 +151,7 @@ __all__ = [
     "expand_token_path",
     "resolve_executable",
     "require_nonempty_file",
+    "remove_owned_directory",
     "remove_empty_directories",
     "validate_filename_component",
 ]

@@ -14,8 +14,17 @@ from postgwas.core.variant_identifiers import (
 FormattingTarget = Literal[
     "magma", "susie", "finemap", "pred_ld", "ldsc", "mixer", "gcta_gene",
 ]
+StudyDesignTarget = Literal["ldsc", "mixer"]
 FormattingTransform = Literal[
     "negative_log10_to_raw_p", "effect_frequency_to_minor_frequency",
+]
+FormattingCustomField = Literal[
+    "id", "chr", "pos", "ref", "alt", "beta", "se", "z", "lp", "p",
+    "eaf", "maf", "n", "neff", "n_case", "n_control", "info",
+]
+FormattingCustomConstraint = Literal[
+    "none", "positive", "nonnegative", "open_unit_interval",
+    "closed_unit_interval",
 ]
 
 
@@ -226,9 +235,101 @@ class FormattingVariantIdentifierConfig(StrictModel):
         return value
 
 
+class FormattingCustomFieldContract(StrictModel):
+    """Canonical source, transform, and validity rule for one CLI field role."""
+
+    source: str
+    transformation: FormattingTransform | None
+    constraint: FormattingCustomConstraint
+
+    @field_validator("source")
+    @classmethod
+    def nonempty_source(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("source must not be empty")
+        return value
+
+
+class FormattingCustomOutputConfig(StrictModel):
+    """Validated optional custom table assembled by direct CLI overrides."""
+
+    output_file: str | None
+    columns: dict[FormattingCustomField, str]
+    field_contracts: dict[FormattingCustomField, FormattingCustomFieldContract]
+
+    @property
+    def active(self) -> bool:
+        return self.output_file is not None
+
+    @field_validator("field_contracts")
+    @classmethod
+    def complete_field_contracts(
+        cls,
+        values: dict[FormattingCustomField, FormattingCustomFieldContract],
+    ) -> dict[FormattingCustomField, FormattingCustomFieldContract]:
+        expected = set(get_args(FormattingCustomField))
+        if set(values) != expected:
+            missing = sorted(expected - set(values))
+            extra = sorted(set(values) - expected)
+            details = []
+            if missing:
+                details.append("missing %s" % ", ".join(missing))
+            if extra:
+                details.append("unknown %s" % ", ".join(extra))
+            raise ValueError(
+                "field_contracts must define every custom CLI field exactly "
+                "once (%s)" % "; ".join(details)
+            )
+        return values
+
+    @model_validator(mode="after")
+    def validate_activation_and_headers(self):
+        has_output = self.output_file is not None
+        has_columns = bool(self.columns)
+        if has_output != has_columns:
+            raise ValueError(
+                "custom output requires --custom-output and at least one custom "
+                "column option"
+            )
+        if not has_output:
+            return self
+        if not self.output_file.strip():
+            raise ValueError("custom output filename must not be empty")
+        if "id" not in self.columns:
+            raise ValueError("custom output requires --id NAME")
+        invalid = [
+            role for role, name in self.columns.items()
+            if not name.strip()
+            or name != name.strip()
+            or any(character in name for character in "\t\r\n\0")
+        ]
+        if invalid:
+            raise ValueError(
+                "custom output column names must be non-empty, trimmed, and "
+                "contain no control characters: %s" % ", ".join(invalid)
+            )
+        if len(set(self.columns.values())) != len(self.columns):
+            raise ValueError("custom output column names must be unique")
+        return self
+
+
 class FormattingStudyDesign(StrictModel):
     case_count_column: str
     control_count_column: str
+    required_formats: list[StudyDesignTarget]
+
+    @field_validator("required_formats")
+    @classmethod
+    def complete_required_formats(
+        cls, values: list[StudyDesignTarget],
+    ) -> list[StudyDesignTarget]:
+        expected = set(get_args(StudyDesignTarget))
+        if len(values) != len(set(values)) or set(values) != expected:
+            raise ValueError(
+                "must contain ldsc and mixer exactly once because both formats "
+                "interpret sample size using the inferred study design"
+            )
+        return values
 
 
 class FormattingRuntimeConfig(StrictModel):
@@ -290,6 +391,7 @@ class FormattingResolvedConfig(StrictModel):
 
     common_fields: list[str]
     format_fields: dict[FormattingTarget, list[str]]
+    custom_fields: list[str]
 
     @field_validator("common_fields")
     @classmethod
@@ -319,6 +421,15 @@ class FormattingResolvedConfig(StrictModel):
                 )
         return values
 
+    @field_validator("custom_fields")
+    @classmethod
+    def unique_custom_fields(cls, values: list[str]) -> list[str]:
+        if not values or len(values) != len(set(values)):
+            raise ValueError("custom_fields must contain unique values")
+        if "custom_output" not in values:
+            raise ValueError("custom_fields must include custom_output")
+        return values
+
 
 class FormattingConfig(ModuleConfig):
     formats: list[FormattingTarget]
@@ -331,6 +442,7 @@ class FormattingConfig(ModuleConfig):
     canonical_columns: FormattingCanonicalColumns
     chromosome_labels: FormattingChromosomeLabels
     variant_identifiers: FormattingVariantIdentifierConfig
+    custom_output: FormattingCustomOutputConfig
     study_design: FormattingStudyDesign
     runtime: FormattingRuntimeConfig
     vcf_include_expression: str | None = None
@@ -354,8 +466,20 @@ class FormattingConfig(ModuleConfig):
         if set(self.format_order) != expected:
             raise ValueError("format_order must contain every formatter target exactly once")
         available = self.model_dump(mode="python", exclude={"resolved_config"})
+        custom_overlap = (
+            set(self.resolved_config.custom_fields)
+            & set(self.resolved_config.common_fields)
+        )
+        if custom_overlap:
+            raise ValueError(
+                "resolved_config custom paths repeat common paths: %s"
+                % ", ".join(sorted(custom_overlap))
+            )
         for target, paths in self.resolved_config.format_fields.items():
-            overlap = set(paths) & set(self.resolved_config.common_fields)
+            overlap = set(paths) & (
+                set(self.resolved_config.common_fields)
+                | set(self.resolved_config.custom_fields)
+            )
             if overlap:
                 raise ValueError(
                     "resolved_config paths are repeated for %s: %s"
@@ -363,6 +487,7 @@ class FormattingConfig(ModuleConfig):
                 )
         for path in [
             *self.resolved_config.common_fields,
+            *self.resolved_config.custom_fields,
             *(
                 path
                 for paths in self.resolved_config.format_fields.values()
@@ -386,7 +511,10 @@ class FormattingConfig(ModuleConfig):
         known = set(self.vcf_fields.root) | {self.canonical_columns.resolved_variant_id}
         references = set(self.numeric_columns)
         references.update(self.canonical_columns.model_dump().values())
-        references.update(self.study_design.model_dump().values())
+        references.update({
+            self.study_design.case_count_column,
+            self.study_design.control_count_column,
+        })
         references.update({
             self.mixer.chromosome_column,
             self.mixer.position_column,
@@ -395,6 +523,10 @@ class FormattingConfig(ModuleConfig):
             self.mixer.sample_size_column,
             self.mixer.info_column,
         })
+        references.update(
+            contract.source
+            for contract in self.custom_output.field_contracts.values()
+        )
         for schema in self.exports.values():
             references.update(schema.columns)
             references.update(schema.trailing_columns)

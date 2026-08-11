@@ -1214,7 +1214,6 @@ def _cross_check(values):
                 )
             )
 
-    pair("eaf.palindromic_ambiguous_lower", "eaf.palindromic_ambiguous_upper", "ambiguous")
     pair("filter.palindromic_af_lower", "filter.palindromic_af_upper", "ambiguous")
     pair("pvalue.clip_low", "pvalue.clip_high", "p-value")
     pair("info.clip_min", "info.clip_max", "imputation quality")

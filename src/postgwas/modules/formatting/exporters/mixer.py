@@ -13,15 +13,19 @@ from postgwas.modules.formatting.table import (
 )
 
 
-def export_mixer(frame, output_directory, dataset_id, config, *, overwrite):
+def export_mixer(
+    frame, output_directory, dataset_id, config, *, overwrite, study_design=None,
+):
     """Write the official MiXeR ``SNP CHR BP A1 A2 N Z`` schema."""
     settings = config.mixer
     schema = config.exports["mixer"]
-    design = infer_study_design(
-        frame,
-        config.study_design.case_count_column,
-        config.study_design.control_count_column,
-    )
+    design = study_design
+    if design is None:
+        design = infer_study_design(
+            frame,
+            config.study_design.case_count_column,
+            config.study_design.control_count_column,
+        )
     required = list(schema.validation.required_columns)
     if settings.minimum_info is not None:
         required.append(settings.info_column)

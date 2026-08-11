@@ -449,6 +449,96 @@ def test_only_configured_numeric_columns_are_retyped():
     assert frame.item(0, "SNP") == 9007199254740993
 
 
+def test_numeric_conversion_keeps_valid_cells_and_nulls_only_failures():
+    frame = normalise_summary_statistics_values(
+        pl.DataFrame({
+            "P": ["0.1", ".", "bad"],
+            "BETA": ["0.2", "bad", "0.4"],
+            "N": ["1,000", "bad", "100.9"],
+            "INFO": ["0.9", "bad", None],
+            "SNP": ["001", "002", "003"],
+        }),
+        "CHR",
+        policies=default_policies(),
+        numeric_columns=["P", "BETA", "N", "INFO"],
+        sample_count_columns=["N"],
+        compound_numeric_columns=["INFO"],
+    )
+
+    assert frame.schema == {
+        "P": pl.Float64,
+        "BETA": pl.Float64,
+        "N": pl.Int64,
+        "INFO": pl.Float64,
+        "SNP": pl.String,
+    }
+    assert frame["P"].to_list() == [0.1, None, None]
+    assert frame["BETA"].to_list() == [0.2, None, 0.4]
+    assert frame["N"].to_list() == [1000, None, 100]
+    assert frame["INFO"].to_list() == [0.9, None, None]
+    assert frame["SNP"].to_list() == ["001", "002", "003"]
+
+
+def test_compound_info_remains_text_for_its_field_specific_parser():
+    frame = normalise_summary_statistics_values(
+        pl.DataFrame({"INFO": ["0.9,0.8", "bad"]}),
+        "CHR",
+        policies=default_policies(),
+        numeric_columns=["INFO"],
+        compound_numeric_columns=["INFO"],
+    )
+
+    assert frame.schema["INFO"] == pl.String
+    assert frame["INFO"].to_list() == ["0.9,0.8", "bad"]
+
+
+def test_dot_is_a_default_missing_token_and_required_p_is_rejected(tmp_path):
+    source = tmp_path / "study.tsv"
+    source.write_text(
+        "SNP\tCHR\tPOS\tEA\tOA\tBETA\tP\n"
+        "missing_p\t1\t100\tA\tG\t0.1\t.\n"
+        "retained\t1\t101\tC\tT\t0.2\t1e-6\n",
+        encoding="utf-8",
+    )
+    policies = default_policies()
+    assert "." in policies.get("input.null_values")
+
+    result = read_summary_statistics(
+        sumstat_file=str(source),
+        output_dir=str(tmp_path),
+        sample_column_dict={
+            "gwas_outputname": "study",
+            "chr_col": "CHR",
+            "pos_col": "POS",
+            "snp_id_col": "SNP",
+            "ea_col": "EA",
+            "oa_col": "OA",
+            "beta_or_col": "BETA",
+            "pval_col": "P",
+        },
+        output_layout={
+            "rejected_directory": "rejected",
+            "input_reject": "rejected/{dataset_id}_input.tsv",
+            "duplicates": "{dataset_id}_duplicates.tsv",
+        },
+        table_delimiter="\t",
+        policies=policies,
+        input_line_count=2,
+    )
+    retained = result[0]
+    removed_missing = result[-1]
+    rejected = pl.read_csv(
+        tmp_path / "rejected" / "study_input.tsv.gz",
+        separator="\t",
+        infer_schema_length=0,
+    )
+
+    assert retained["SNP"].to_list() == ["retained"]
+    assert removed_missing == 1
+    assert rejected["SNP"].to_list() == ["missing_p"]
+    assert rejected["reject_reason"].to_list() == ["missing_required_columns"]
+
+
 @pytest.mark.parametrize(
     "combined",
     [

@@ -176,3 +176,67 @@ def test_combined_reject_write_failure_is_fatal(tmp_path, monkeypatch):
             tmp_path / "combined.tsv.gz",
             delimiter="\t",
         )
+
+
+def test_validated_combined_reject_removes_all_source_shards(tmp_path):
+    input_reject = tmp_path / "input.tsv"
+    chromosome_reject = tmp_path / "chromosome.tsv"
+    output = tmp_path / "rejected" / "study_rejected_variants.tsv.gz"
+    pl.DataFrame({
+        "variant": ["rs1"],
+        "reject_step": ["01"],
+        "reject_detail": ["missing P"],
+        "reject_reason": ["missing_required_columns"],
+    }).write_csv(input_reject, separator="\t")
+    pl.DataFrame({
+        "variant": ["rs2"],
+        "reject_step": ["04"],
+        "reject_detail": ["ambiguous alleles"],
+        "reject_reason": ["palindromic_ambiguous"],
+    }).write_csv(chromosome_reject, separator="\t")
+
+    result = concat_reject_files(
+        [input_reject, chromosome_reject],
+        output,
+        delimiter="\t",
+        remove_sources=True,
+    )
+
+    combined = pl.read_csv(output, separator="\t", infer_schema_length=0)
+    assert combined["variant"].to_list() == ["rs1", "rs2"]
+    assert result["rows"] == 2
+    assert set(result["source_files_removed"]) == {
+        str(input_reject), str(chromosome_reject),
+    }
+    assert result["source_files_retained"] == []
+    assert not input_reject.exists()
+    assert not chromosome_reject.exists()
+
+
+def test_failed_combined_reject_validation_preserves_source_shards(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "chromosome.tsv"
+    output = tmp_path / "rejected" / "study_rejected_variants.tsv.gz"
+    pl.DataFrame({
+        "variant": ["rs1"],
+        "reject_step": ["04"],
+        "reject_detail": [None],
+        "reject_reason": ["reference_unmatched"],
+    }).write_csv(source, separator="\t")
+
+    def fail_validation(*_args, **_kwargs):
+        raise RejectOutputError("row-count validation failed")
+
+    monkeypatch.setattr(
+        reject_module, "_validate_reject_output", fail_validation,
+    )
+
+    with pytest.raises(RejectOutputError, match="row-count validation failed"):
+        concat_reject_files(
+            [source], output, delimiter="\t", remove_sources=True,
+        )
+
+    assert source.is_file()
+    assert not output.exists()
+    assert not list(output.parent.glob("*.part*"))

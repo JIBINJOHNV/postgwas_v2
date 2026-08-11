@@ -509,9 +509,9 @@ def harmonisation_diagnosis_pipeline(input_df,index):
     input_dict=input_df.iloc[index,].to_dict()
     sample_name = input_dict['gwas_outputname']
     raw_tsv_file = input_dict['sumstat_file']
-    #vcf_file = f"{input_dict['output_folder']}/00_harmonised_sumstat/{sample_name}_gwas2vcf_GRCh38_merged.vcf.gz"
-    vcf_file = f"{input_dict['output_folder']}/00_harmonised_sumstat/{sample_name}_GRCh38_merged.vcf.gz"
-    out_dir = f"{input_dict['output_folder']}/00_harmonised_sumstat/harmonisation_diagnosis/"
+    harmonisation_root = Path(input_dict['output_folder']).expanduser()
+    vcf_file = str(harmonisation_root / f"{sample_name}_GRCh38_merged.vcf.gz")
+    out_dir = str(harmonisation_root / "harmonisation_diagnosis")
     os.makedirs(out_dir, exist_ok=True)
     tsv_map = {
         "CHROM":input_dict['chr_col'],

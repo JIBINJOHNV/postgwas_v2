@@ -32,6 +32,7 @@ from .shared.runtime import reject_rows, step_context
 
 __all__ = [
     "effective_sample_size_expression",
+    "sample_count_expression",
     "prepare_missing_sample_sizes",
     "harmonise_sample_sizes",
 ]
@@ -57,7 +58,7 @@ _clean_name = optional_text
 _parse_count = parse_integer
 
 
-def _count_expression(df, column):
+def sample_count_expression(df, column):
     """Read one sample-count column exactly as the chromosome step does."""
     expr = pl.col(column)
     if df.schema[column] == pl.String:
@@ -82,7 +83,7 @@ def _to_counts(df, column, ctx, what):
     """
     before_null = int(df.select(pl.col(column).null_count()).item() or 0)
     df = df.with_columns(
-        _count_expression(df, column).alias(column)
+        sample_count_expression(df, column).alias(column)
     )
     after_null = int(df.select(pl.col(column).null_count()).item() or 0)
     unreadable = after_null - before_null
@@ -156,7 +157,7 @@ def prepare_missing_sample_sizes(
     expressions = []
     missing_terms = []
     for index, column in enumerate(columns):
-        parsed = _count_expression(df, column)
+        parsed = sample_count_expression(df, column)
         missing = parsed.is_null()
         missing_terms.append(missing)
         expressions.extend([

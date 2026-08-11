@@ -7,6 +7,8 @@ executables:
   plink2: plink2
   magma: magma
   scdrs: scdrs
+  ldsc: ldsc.py
+  munge_sumstats: munge_sumstats.py
   finemap: finemap
   gcta: gcta64
   rscript: Rscript

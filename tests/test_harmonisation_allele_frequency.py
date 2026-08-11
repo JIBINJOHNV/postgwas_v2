@@ -54,7 +54,7 @@ def test_reference_check_confirms_unaligned_maf_after_direct_and_swapped_matches
     assert stats["mean_eaf_error"] == pytest.approx(0.6)
 
 
-def test_reference_check_accepts_frequency_aligned_to_minor_effect_allele(tmp_path):
+def test_reference_check_is_inconclusive_when_reference_effect_alleles_are_all_minor(tmp_path):
     study = pl.DataFrame({
         "CHR": ["1", "1"], "POS": [100, 200],
         "EA": ["G", "T"], "OA": ["A", "C"], "AF": [0.2, 0.2],
@@ -65,10 +65,55 @@ def test_reference_check_accepts_frequency_aligned_to_minor_effect_allele(tmp_pa
         policies=_policies(2),
     )
 
-    assert decision == "eaf"
+    assert decision == "inconclusive"
     assert stats["reference_effect_allele_minor_fraction"] == pytest.approx(1.0)
     assert stats["mean_eaf_error"] == pytest.approx(0.0)
     assert stats["mean_maf_error"] == pytest.approx(0.0)
+    assert stats["decision_reason"] == "reference_effect_allele_mostly_minor"
+
+
+def test_reference_check_confirms_eaf_only_with_informative_separation(tmp_path):
+    study = pl.DataFrame({
+        "CHR": ["1", "1"], "POS": [100, 200],
+        "EA": ["A", "C"], "OA": ["G", "T"], "AF": [0.8, 0.8],
+    })
+
+    decision, stats = confirm_eaf_with_reference(
+        study, "AF", _reference(tmp_path), "EUR", MAPPING, STANDARD,
+        policies=_policies(2),
+    )
+
+    assert decision == "eaf"
+    assert stats["reference_effect_allele_minor_fraction"] == pytest.approx(0.0)
+    assert stats["mean_eaf_error"] == pytest.approx(0.0)
+    assert stats["mean_maf_error"] == pytest.approx(0.6)
+    assert stats["decision_reason"] == "eaf_error_lower_by_required_margin"
+
+
+def test_reference_check_is_inconclusive_when_errors_are_too_close(tmp_path):
+    reference = tmp_path / "reference.tsv"
+    reference.write_text(
+        "CHROM\tPOS\tREF\tALT\tEUR\n"
+        "1\t100\tG\tA\t0.7\n"
+        "1\t200\tC\tT\t0.3\n",
+        encoding="utf-8",
+    )
+    study = pl.DataFrame({
+        "CHR": ["1", "1"], "POS": [100, 200],
+        "EA": ["A", "T"], "OA": ["G", "C"], "AF": [0.49, 0.3],
+    })
+
+    decision, stats = confirm_eaf_with_reference(
+        study, "AF", str(reference), "EUR", MAPPING, STANDARD,
+        policies=_policies(2),
+    )
+
+    assert decision == "inconclusive"
+    assert stats["mean_eaf_error"] == pytest.approx(0.105)
+    assert stats["mean_maf_error"] == pytest.approx(0.095)
+    assert stats["absolute_error_difference"] == pytest.approx(0.01)
+    assert stats["minimum_error_margin"] == pytest.approx(0.02)
+    assert stats["decision_reason"] == "error_difference_below_required_margin"
 
 
 def test_reference_check_is_inconclusive_below_configured_overlap(tmp_path):
@@ -121,11 +166,69 @@ def test_reference_check_rejects_invalid_reference_frequency(tmp_path):
         )
 
 
-def test_external_eaf_duplicate_prefers_valid_frequency_over_missing(tmp_path):
+def test_external_eaf_duplicate_missing_and_finite_values_discards_both(tmp_path):
     reference = tmp_path / "external_eaf.tsv"
     reference.write_text(
         "CHROM\tPOS\tREF\tALT\tEUR\n"
         "1\t100\tG\tA\tNA\n"
+        "1\t100\tG\tA\t0.25\n",
+        encoding="utf-8",
+    )
+    study = pl.DataFrame({
+        "CHR": ["1"], "POS": [100], "EA": ["A"], "OA": ["G"],
+    })
+
+    result, column, stats = merge_external_allele_frequencies(
+        study,
+        str(reference),
+        "EUR",
+        MAPPING,
+        STANDARD,
+        policies=default_policies().with_overrides({
+            "eaf.external_min_match_fraction": 0.0,
+        }),
+        study_columns_canonical=True,
+    )
+
+    assert result[column].to_list() == [None]
+    assert stats["reference_duplicate_rows_removed"] == 2
+    assert stats["reference_non_identical_duplicate_groups"] == 1
+
+
+def test_external_eaf_non_identical_duplicates_are_all_discarded(tmp_path):
+    reference = tmp_path / "external_eaf.tsv"
+    reference.write_text(
+        "CHROM\tPOS\tREF\tALT\tEUR\n"
+        "1\t100\tG\tA\t0.25\n"
+        "1\t100\tG\tA\t0.45\n",
+        encoding="utf-8",
+    )
+    study = pl.DataFrame({
+        "CHR": ["1"], "POS": [100], "EA": ["A"], "OA": ["G"],
+    })
+
+    result, column, stats = merge_external_allele_frequencies(
+        study,
+        str(reference),
+        "EUR",
+        MAPPING,
+        STANDARD,
+        policies=default_policies().with_overrides({
+            "eaf.external_min_match_fraction": 0.0,
+        }),
+        study_columns_canonical=True,
+    )
+
+    assert result[column].to_list() == [None]
+    assert stats["reference_duplicate_rows_removed"] == 2
+    assert stats["reference_non_identical_duplicate_groups"] == 1
+
+
+def test_external_eaf_exact_duplicates_keep_one(tmp_path):
+    reference = tmp_path / "external_eaf.tsv"
+    reference.write_text(
+        "CHROM\tPOS\tREF\tALT\tEUR\n"
+        "1\t100\tG\tA\t0.25\n"
         "1\t100\tG\tA\t0.25\n",
         encoding="utf-8",
     )
@@ -145,31 +248,7 @@ def test_external_eaf_duplicate_prefers_valid_frequency_over_missing(tmp_path):
 
     assert result[column].to_list() == pytest.approx([0.25])
     assert stats["reference_duplicate_rows_removed"] == 1
-    assert stats["reference_duplicate_groups_preferred_usable_value"] == 1
-
-
-def test_external_eaf_duplicate_rejects_conflicting_frequencies(tmp_path):
-    reference = tmp_path / "external_eaf.tsv"
-    reference.write_text(
-        "CHROM\tPOS\tREF\tALT\tEUR\n"
-        "1\t100\tG\tA\t0.25\n"
-        "1\t100\tG\tA\t0.45\n",
-        encoding="utf-8",
-    )
-    study = pl.DataFrame({
-        "CHR": ["1"], "POS": [100], "EA": ["A"], "OA": ["G"],
-    })
-
-    with pytest.raises(AlleleFrequencyError, match="conflicting finite values"):
-        merge_external_allele_frequencies(
-            study,
-            str(reference),
-            "EUR",
-            MAPPING,
-            STANDARD,
-            policies=default_policies(),
-            study_columns_canonical=True,
-        )
+    assert stats["reference_exact_duplicate_groups"] == 1
 
 
 def test_external_eaf_match_fraction_counts_only_usable_frequencies(tmp_path):
@@ -205,6 +284,7 @@ def test_external_eaf_match_fraction_counts_only_usable_frequencies(tmp_path):
     )
 
     assert result.height == study.height
+    assert result.get_column("POS").to_list() == study.get_column("POS").to_list()
     assert column == "EUR"
     assert stats["key_match_rows"] == 6
     assert stats["key_match_fraction"] == pytest.approx(6 / 7)
@@ -353,6 +433,53 @@ def test_main_raises_when_reference_confirms_unaligned_maf(tmp_path):
             df, {"status": "mocked"}, sample_column_dict,
         ),
     ), pytest.raises(AlleleFrequencyError, match="confirmed as minor allele frequency"):
+        harmonise_allele_frequency(
+            "1", frame, columns, layout, "\t",
+            external_eaf_colmap=MAPPING,
+            default_eaf_file="reference.tsv",
+            default_eaf_column="EUR",
+            default_eaf_colmap=MAPPING,
+            study_decision={"eaf_is_maf": True},
+        )
+
+
+def test_main_raises_when_maf_reference_comparison_is_inconclusive(tmp_path):
+    frame = pl.DataFrame({
+        "CHR": ["1"], "POS": [100], "EA": ["A"], "OA": ["G"], "AF": [0.2],
+    })
+    columns = {
+        "gwas_outputname": "study", "output_folder": str(tmp_path),
+        "chr_col": "CHR", "pos_col": "POS", "ea_col": "EA", "oa_col": "OA",
+        "eaf_col": "AF",
+    }
+    layout = {
+        "frequency_qc_directory": "eaf_qc",
+        "missing_eaf": "eaf_qc/{dataset_id}_missing_chr{chromosome}.tsv",
+        "out_of_range_eaf": "eaf_qc/{dataset_id}_range_chr{chromosome}.tsv",
+    }
+    evidence = {
+        "comparable_variants": 1,
+        "minimum_overlap": 1000,
+        "mean_eaf_error": None,
+        "mean_maf_error": None,
+        "minimum_error_margin": 0.02,
+        "reference_effect_allele_minor_fraction": None,
+        "reference_minor_fraction_cutoff": 0.95,
+        "decision_reason": "insufficient_overlap",
+    }
+
+    with patch(
+        "postgwas.modules.harmonisation.allele_frequency.confirm_eaf_with_reference",
+        return_value=("inconclusive", evidence),
+    ), patch(
+        "postgwas.modules.harmonisation.allele_frequency.harmonise_strand_orientation",
+        side_effect=lambda chromosome, df, sample_column_dict, **kwargs: (
+            df, {"status": "mocked"}, sample_column_dict,
+        ),
+    ), pytest.raises(
+        AlleleFrequencyError,
+        match=r"reference comparison was inconclusive.*PostGWAS will not guess",
+    ):
         harmonise_allele_frequency(
             "1", frame, columns, layout, "\t",
             external_eaf_colmap=MAPPING,

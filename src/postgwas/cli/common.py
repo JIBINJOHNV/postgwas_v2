@@ -664,15 +664,23 @@ def get_plink_binary_parser(add_help=False):
 
 def get_bcftools_binary_parser(add_help=False):
     """Return the shared bcftools executable option."""
+    from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
+    configured = load_configuration().resources.executables.bcftools
     parser = argparse.ArgumentParser(add_help=add_help)
     group = parser.add_argument_group("External software")
 
     # Required inputs (but NOT marked required here → handled by subparser)
     group.add_argument(
         "--bcftools",
-        default="bcftools",
+        default=argparse.SUPPRESS,
         metavar="PATH",
-        help="Location of bcftools. Omit this when bcftools is available from your terminal.",
+        help=help_with_default(
+            "Full path or command name for bcftools",
+            configured,
+            label="Packaged default",
+        ),
     )
     return parser
 
@@ -932,8 +940,16 @@ def get_common_pops_parser(add_help=False):
 
 from rich_argparse import RawTextRichHelpFormatter
 
+
 def get_common_sumstat_filter_parser(add_help=False):
-    parser = argparse.ArgumentParser(formatter_class=RawTextRichHelpFormatter,add_help=add_help)
+    from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
+    module = load_configuration().modules.filtering
+    parser = argparse.ArgumentParser(
+        formatter_class=RawTextRichHelpFormatter,
+        add_help=add_help,
+    )
 
     group = parser.add_argument_group("Quality-control filters")
 
@@ -945,12 +961,13 @@ def get_common_sumstat_filter_parser(add_help=False):
         dest="minimum_neglog10_p",
         type=float,
         metavar="VALUE",
-        default=None,
-        help=(
+        default=argparse.SUPPRESS,
+        help=help_with_default(
             "Keep variants with -log10(P) at or above this value. "
-            "For genome-wide significance (P <= 5e-8), use 7.3. "
-            "Omit to keep all P-values."
-        )
+            "For genome-wide significance (P <= 5e-8), use 7.30103",
+            module.minimum_neglog10_p,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
@@ -958,16 +975,24 @@ def get_common_sumstat_filter_parser(add_help=False):
         dest="minimum_maf",
         type=float,
         metavar="VALUE",
-        default=0.002,
-        help="Remove variants below this minor-allele frequency (default: 0.002)."
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Remove variants below this minor-allele frequency",
+            module.maf_min,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
         "--reference-af-column",
         dest="reference_af_column",
-        default="EUR",
+        default=argparse.SUPPRESS,
         metavar="TAG",
-        help="Reference-population frequency tag in the VCF, such as EUR, AFR, or EAS (default: EUR)."
+        help=help_with_default(
+            "Reference-population frequency INFO tag",
+            module.reference_population_tag,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
@@ -975,8 +1000,13 @@ def get_common_sumstat_filter_parser(add_help=False):
         dest="maximum_af_difference",
         type=float,
         metavar="VALUE",
-        default=0.2,
-        help="Remove variants whose study and reference allele frequencies differ by more than this value (default: 0.2)."
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Remove variants whose study and reference allele frequencies differ "
+            "by more than this value",
+            module.frequency_difference_max,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
@@ -984,8 +1014,12 @@ def get_common_sumstat_filter_parser(add_help=False):
         dest="minimum_info",
         type=float,
         metavar="VALUE",
-        default=0.3,
-        help="Minimum INFO score (default: 0.3)."
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum INFO score",
+            module.info_min,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
@@ -993,8 +1027,12 @@ def get_common_sumstat_filter_parser(add_help=False):
         dest="maximum_info",
         type=float,
         metavar="VALUE",
-        default=None,
-        help="Remove variants above this INFO score. Omit to set no maximum."
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Remove variants above this INFO score",
+            module.info_max,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
@@ -1002,49 +1040,64 @@ def get_common_sumstat_filter_parser(add_help=False):
         dest="missing_info_action",
         type=str,
         metavar="ACTION",
-        default="remove",
+        default=argparse.SUPPRESS,
         choices=["keep", "remove"],
-        help="What to do when INFO is missing: remove or keep (default: remove)."
+        help=help_with_default(
+            "What to do when INFO is missing: remove or keep",
+            module.missing_info_action,
+            label="Packaged default",
+        ),
     )
-
-
     # =====================================================
     # FLAGS
     # =====================================================
     group.add_argument(
         "--include-indels",
-        action="store_true",
-        help="Keep insertion/deletion variants. By default, only SNPs are kept."
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Keep insertion/deletion and other non-SNP variants",
+            module.include_indels,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
         "--remove-palindromic",
-        action="store_true",
-        help=(
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
             "Remove ambiguous A/T and C/G SNPs when their allele frequency falls "
-            "between the two palindromic AF bounds."
-        )
+            "between the two palindromic AF bounds",
+            module.remove_palindromic,
+            label="Packaged default",
+        ),
     )
-
-
-
     # =====================================================
     # PALINDROMIC AF BOUNDS
     # =====================================================
     group.add_argument(
         "--palindromic-af-lower",
         type=float,
-        default=0.4,
+        default=argparse.SUPPRESS,
         metavar="VALUE",
-        help="Lower ambiguity bound used with --remove-palindromic (default: 0.4)."
+        help=help_with_default(
+            "Lower ambiguity bound used with --remove-palindromic",
+            module.palindromic_lower,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
         "--palindromic-af-upper",
         type=float,
-        default=0.6,
+        default=argparse.SUPPRESS,
         metavar="VALUE",
-        help="Upper ambiguity bound used with --remove-palindromic (default: 0.6)."
+        help=help_with_default(
+            "Upper ambiguity bound used with --remove-palindromic",
+            module.palindromic_upper,
+            label="Packaged default",
+        ),
     )
 
     # =====================================================
@@ -1052,32 +1105,48 @@ def get_common_sumstat_filter_parser(add_help=False):
     # =====================================================
     group.add_argument(
         "--remove-mhc",
-        action="store_true",
-        default=False,
-        help="Remove variants in the MHC region. By default, the region is retained."
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Remove variants in the configured build-specific MHC region",
+            module.remove_mhc,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
         "--mhc-chrom",
-        default="6",
+        default=argparse.SUPPRESS,
         metavar="CHROM",
-        help="Chromosome containing the MHC region (default: 6)."
+        help=help_with_default(
+            "Chromosome containing the MHC region",
+            module.mhc.chromosome,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
         "--mhc-start",
         type=int,
-        default=25_000_000,
+        default=argparse.SUPPRESS,
         metavar="POSITION",
-        help="Start coordinate of the MHC region (default: 25,000,000)."
+        help=help_with_default(
+            "One-based inclusive start coordinate of the MHC region",
+            module.mhc.start,
+            label="Packaged default",
+        ),
     )
 
     group.add_argument(
         "--mhc-end",
         type=int,
-        default=34_000_000,
+        default=argparse.SUPPRESS,
         metavar="POSITION",
-        help="End coordinate of the MHC region (default: 34,000,000)."
+        help=help_with_default(
+            "One-based inclusive end coordinate of the MHC region",
+            module.mhc.end,
+            label="Packaged default",
+        ),
     )
 
     return parser

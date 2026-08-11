@@ -104,7 +104,8 @@ class ConfigurationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             config = load_module_configuration("harmonisation", exported)
-        self.assertEqual(config.comparison_af.source, "1000G")
+        self.assertEqual(config.comparison_af.source, "ALFA")
+        self.assertEqual(config.default_eaf.source, "ALFA")
         self.assertEqual(config.policies["filter"]["maf_cutoff"], 0.01)
 
     def test_formatting_export_styles_share_values_and_keep_chromosomes_on_one_line(self):
@@ -239,7 +240,9 @@ class ConfigurationTests(unittest.TestCase):
             ],
         ), redirect_stdout(output):
             self.assertEqual(main(), 0)
-        self.assertEqual(yaml.safe_load(output.getvalue())["comparison_af"]["source"], "1000G")
+        rendered = yaml.safe_load(output.getvalue())
+        self.assertEqual(rendered["comparison_af"]["source"], "ALFA")
+        self.assertEqual(rendered["default_eaf"]["source"], "ALFA")
 
     def test_pipeline_shorthand_expands_finemap_dependencies(self):
         from postgwas.__main__ import main

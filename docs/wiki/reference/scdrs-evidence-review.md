@@ -10,8 +10,9 @@ information:
   current official documentation, and upstream source code.
 - **Application evidence**: choices reported by studies that applied scDRS to
   real GWAS and single-cell data.
-- **PostGWAS policy**: proposed validation and provenance requirements. These
-  are design decisions, not behavior implemented by the current release.
+- **PostGWAS policy**: validation and provenance decisions. The implementation
+  status is stated explicitly because several atlas-preparation and reporting
+  extensions remain future work.
 
 Every paper listed in the evidence tables below was reviewed for the method
 details reported here. This is an implementation-focused review, not a claim to
@@ -50,17 +51,20 @@ and [upstream repository](https://github.com/martinjzhang/scDRS).
 | MAGMA mapping | The publication used a 10-kb window around gene bodies and a population-matched LD reference. | A MAGMA result may be reused only when its build, LD population, gene identifiers, gene window, and model match the selected scDRS profile. |
 | GWAS power | The authors recommend an LDSC heritability Z score above 5 or GWAS sample size above 100,000 to obtain a reasonable number of discoveries. | This is a power recommendation rather than a validity threshold. Report it prominently and warn when neither condition is met. |
 | Cell diversity | The authors recommend a diverse set of potentially relevant cells; they state that fewer cells should reduce power rather than create false positives. | Dataset relevance and composition must be reported. No universal tissue or disease-status filter can be inferred. |
-| Control gene sets | Default `n_ctrl` is 1,000. Runtime and memory scale linearly with cells and control sets. | `n_ctrl`, random seed, expected P-value resolution, runtime, and memory must be resolved before execution. |
+| Control gene sets | Default `n_ctrl` is 1,000. Runtime and memory scale linearly with cells and control sets. | The initial implementation resolves `n_ctrl` and records the fixed upstream seed. A resource estimator and pre-run P-value-resolution report remain required extensions. |
 | Cell-group proportions | `adj_prop` is recommended only for extremely unbalanced datasets. | Do not enable proportion adjustment automatically; validate the named annotation and record why it was selected. |
 | Covariates | Covariates are numerical, indexed by `adata.obs_names`, include a constant, and must have values for at least 75% of cells. | Covariate inclusion is a study-level decision. Missingness, rank, alignment, and transformations require preflight validation. |
 | Group analysis | The group-association statistic uses the upper 5% quantile; heterogeneity uses Geary's C. | The cell-group annotation must be present and cell counts must be reported before testing. |
 | P values | Cell and group result files report raw P values; the number of controls limits Monte Carlo resolution. | PostGWAS must preserve raw results and define an explicit multiple-testing family rather than relabel raw values as adjusted. |
-| Scale | The paper reports about 3 hours and 60 GB for one million cells; a later brain application reported approximately 40 hours and 600 GB for 3.3 million nuclei. | Backed inspection and a pre-run resource estimate are required for atlas-scale data. |
+| Scale | The paper reports about 3 hours and 60 GB for one million cells; a later brain application reported approximately 40 hours and 600 GB for 3.3 million nuclei. | Backed inspection is implemented. A pre-run resource estimate remains required before recommending whole-atlas execution. |
 
 The upstream README currently calls v1.0.3b the latest stable version and v1.0.4
 a development version. The online API documentation is labelled v1.0.4.
 PostGWAS therefore must pin and record a supported executable version instead
 of assuming that the documentation version and installed package are the same.
+The pinned loader compares species strings before canonicalizing aliases, so
+PostGWAS requires the same spelling for H5AD and gene-set species and does not
+yet expose native cross-species conversion.
 
 ## CELLxGENE input contract
 
@@ -158,11 +162,12 @@ The strongest repeated practices are:
 | Significance | Native Monte Carlo P values, Monte Carlo Z scores converted to analytical P values, and differing FDR families are reported. | Nominal and adjusted evidence can be confused, especially when control-set resolution is coarse. |
 | Atlas scale | Published runs range from tens of thousands to millions of cells. | Unbounded execution can exhaust memory or lead users to down-sample without recording the changed estimand. |
 
-## Proposed PostGWAS scientific policy
+## PostGWAS scientific policy and implementation status
 
-The following policy is the recommended starting point for implementation. It
-must remain visibly marked as proposed until code, schema, tests, and user
-documentation implement the same behavior.
+The initial implementation enforces the exact-H5AD, effective-gene-set,
+one-to-one-mapping, native-output, and provenance requirements described below.
+Paragraphs using “should” describe remaining extensions rather than current
+runtime behavior.
 
 ### 1. Reuse MAGMA conditionally
 
@@ -187,11 +192,15 @@ incompatible file.
 
 ### 2. Prepare H5AD without changing the source
 
-Direct mode should accept an exact H5AD plus either an exact `.gs` file or an
-exact gene-statistics table. Pipeline mode should obtain the gene statistics
-from the compatible MAGMA stage. In both modes, configuration must declare:
+Direct mode accepts an exact H5AD plus either an exact `.gs` file or an exact
+MAGMA gene-statistics table. Pipeline mode obtains the gene statistics from the
+compatible MAGMA stage. The current implementation supports `adata.X` only and
+requires its state and species to be declared. Future matrix preparation should
+also support `raw.X` or an exact layer by writing a new derived H5AD. The full
+preparation contract is:
 
-- matrix source: `X`, `raw.X`, or an exact layer;
+- matrix source: `X` now; `raw.X` or an exact layer only after derived-H5AD
+  preparation is implemented;
 - matrix state: raw counts or size-factor-normalized `log1p` values;
 - species and assay;
 - gene-identifier source;
@@ -209,11 +218,13 @@ HVG-only, or imputed expression as the standard profile.
 ### 3. Make identifier conversion auditable
 
 The conversion from MAGMA Entrez identifiers and CELLxGENE Ensembl identifiers
-to the identifiers used by scDRS must use a pinned, build- and species-specific
-crosswalk. The report must contain input, mapped, unmapped, ambiguous,
-deprecated, duplicate, and post-overlap counts. Ambiguous mappings should fail
-by default; neither selecting the first identifier nor appending suffixes makes
-a scientifically equivalent gene.
+to the identifiers used by scDRS uses a pinned, build- and species-specific
+crosswalk. The current implementation records input, mapped, unmapped,
+duplicate-check, and post-overlap counts, retains the checksummed crosswalk, and
+fails ambiguous source or target mappings. Classification of deprecated IDs
+requires a release-aware reference bundle and remains an extension. Neither
+selecting the first identifier nor appending suffixes makes a scientifically
+equivalent gene.
 
 ### 4. Validate the effective gene set
 
@@ -227,16 +238,17 @@ primary result.
 
 ### 5. Keep covariate decisions explicit
 
-PostGWAS should propose candidate columns from metadata but never silently add
-them to the model. Technical depth and detected-gene metrics are common
-candidates. Disease status, age, sex, donor, region, and batch can be either
-confounders or part of the biological question. The resolved configuration and
-log must state why each covariate was included, its encoding, missingness, and
-whether it is constant or collinear.
+PostGWAS never silently adds covariates. The current validator requires numeric
+values, the configured constant column, and cell overlap above 75%; packaged
+settings require exact cell IDs. Technical depth and detected-gene metrics are
+common candidates. Disease status, age, sex, donor, region, and batch can be
+either confounders or part of the biological question. Automated candidate
+proposal, study-specific rationale capture, and collinearity reporting remain
+future extensions.
 
 ### 6. Protect inference and interpretation
 
-PostGWAS should retain native raw scores, normalized scores, control scores,
+PostGWAS retains native raw scores, normalized scores, control scores,
 Monte Carlo P values, and Monte Carlo Z scores. It should calculate adjusted
 values only in a declared family such as all cell groups for one trait and one
 annotation. Before running, it should report whether `n_ctrl` permits the
@@ -257,15 +269,16 @@ At minimum, a completed run should publish:
 - MAGMA provenance and the exact gene-statistics table;
 - identifier-conversion and gene-overlap reports;
 - generated `.gs` file and selection report;
-- scDRS command, version, seed, resource usage, and native outputs;
+- scDRS command, version, fixed upstream internal seed, and native outputs;
 - adjusted downstream result tables with declared testing families;
 - resolved configuration and a checksummed completion manifest.
 
 ## Remaining implementation questions
 
-The initial implementation resolved the executable version as pinned stable
-v1.0.3b, rejects ambiguous mappings, and records rather than relabels the
-general MAGMA profile. The following extensions remain open:
+The initial implementation pins the stable v1.0.3b source revision (which
+reports version 1.0.3), rejects ambiguous mappings, records the upstream
+internal seed 0, and records rather than relabels the general MAGMA profile.
+The following extensions remain open:
 
 1. Should an explicitly named original 10/10-kb MAGMA profile be added alongside
    the recorded general PostGWAS MAGMA profile?

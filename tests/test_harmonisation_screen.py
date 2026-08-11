@@ -1,9 +1,70 @@
 """Tests for dataset-level user-facing harmonisation output."""
 
+import inspect
+
+import polars as pl
+
+from postgwas.modules.harmonisation.cli import (
+    _dataset_start_block,
+    _preparation_block,
+    _run_validated_rows,
+)
 from postgwas.modules.harmonisation.service import (
+    _input_validation_summary_block,
+    _ready_variant_type_counts,
     _study_decisions_block,
     _validated_column_mapping_block,
 )
+
+
+def test_run_preparation_context_precedes_dataset_processing():
+    text = _preparation_block(
+        sample_sheet="/data/studies.csv",
+        dataset_count=7,
+        resource_directory="/references",
+        output_directory="/results",
+    )
+
+    assert text.splitlines() == [
+        "    ▶️  Preparing PostGWAS harmonisation",
+        "        🔹  Sample sheet         : /data/studies.csv",
+        "        🧮  Datasets selected    : 7",
+        "        🔹  Resource directory   : /references",
+        "        🔹  Output directory     : /results",
+        "        🔹  Current stage        : Validating configuration and required resources",
+    ]
+    source = inspect.getsource(_run_validated_rows)
+    assert source.index("_preparation_block(") < source.index(
+        "for dataset_index, row in enumerate(rows, start=1):"
+    )
+
+
+def test_direct_mode_preparation_does_not_invent_a_sample_sheet_path():
+    text = _preparation_block(
+        sample_sheet=None,
+        dataset_count=1,
+        resource_directory="/references",
+        output_directory="/results",
+    )
+
+    assert "Sample sheet         : Direct API input — no sample-sheet path" in text
+
+
+def test_each_dataset_start_shows_position_identity_and_input_file():
+    text = _dataset_start_block(
+        dataset_index=3,
+        dataset_count=7,
+        dataset_id="ADHD_female",
+        input_file="/data/ADHD_female.sumstats.tsv.gz",
+    )
+
+    assert text.splitlines() == [
+        "    ▶️  Starting dataset 3 of 7 — ADHD_female",
+        "        🔹  Summary statistics   : /data/ADHD_female.sumstats.tsv.gz",
+    ]
+    source = inspect.getsource(_run_validated_rows)
+    assert "for dataset_index, row in enumerate(rows, start=1):" in source
+    assert source.index("_dataset_start_block(") < source.index("_write_run_metadata(")
 
 
 def test_study_decisions_are_shown_as_aligned_user_facing_values():
@@ -23,6 +84,33 @@ def test_study_decisions_are_shown_as_aligned_user_facing_values():
         "        🧬  Frequency type   : effect allele frequency",
         "        🧬  Strand consensus : forward",
     ]
+
+
+def test_input_validation_reports_ready_snp_and_indel_other_counts():
+    frame = pl.DataFrame({
+        "EA": ["A", "A", "AC", "g"],
+        "OA": ["G", "AT", "GT", "c"],
+    })
+    counts = _ready_variant_type_counts(
+        frame, {"ea_col": "EA", "oa_col": "OA"},
+    )
+
+    assert counts == {"snps": 2, "indels_or_other_variants": 2}
+    text = _input_validation_summary_block(
+        input_variants=6,
+        variants_read=6,
+        missing_required=1,
+        invalid_coordinates=0,
+        non_standard_alleles=0,
+        duplicate_variants=1,
+        ready_variants=4,
+        ready_snps=counts["snps"],
+        ready_indels_or_other=counts["indels_or_other_variants"],
+    )
+
+    assert "Ready for harmonisation        : 4" in text
+    assert "Ready SNPs                     : 2" in text
+    assert "Ready indels / other variants  : 2" in text
 
 
 def test_maf_like_study_decision_is_displayed_as_provisional():

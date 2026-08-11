@@ -139,7 +139,9 @@ def test_filter_reason_report_is_reloadable_and_records_reconciliation(tmp_path)
         "reconciled": True,
     }
 
-    report = _write_filter_reason_report(statistics, str(tmp_path), "study")
+    report = _write_filter_reason_report(
+        statistics, tmp_path / "study_filter_reason_summary.tsv"
+    )
 
     with open(report, encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))

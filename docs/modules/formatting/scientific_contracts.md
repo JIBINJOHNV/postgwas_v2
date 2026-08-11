@@ -11,7 +11,7 @@ extension is retained only when a later PostGWAS stage needs it.
 | GCTA mBAT-combo | `SNP A1 A2 freq BETA SE P N` | Effect-allele frequency | Total sample size | `A1 <- ALT`, `A2 <- REF`, `freq <- AF`, and `N <- SS` |
 | FINEMAP | `rsid chromosome position allele1 allele2 maf beta se` | Minor allele frequency | `n_samples` in the master file | `maf <- min(EAF, 1-EAF)`; retain `NEF` so the PostGWAS adapter can create locus-specific `n_samples` |
 | SuSiE-RSS | Z scores, an allele-aligned LD matrix, and the configured PostGWAS identity/coordinate fields | Optional in `susie_rss`; used only when a MAF threshold is requested | `n` is recommended | The current PostGWAS engine uses `EZ`, LD, and median `NEF`; it does not pass MAF, so `AF` is not exported |
-| PRED-LD | `snp chr pos A1 A2 beta SE`; `A1=ALT`, `A2=REF` | Study AF is not an input; `--maf` filters the reference resource | None | `NC SS AF LP SI` remain carry-through metadata because PostGWAS re-harmonises the imputed results |
+| PRED-LD | `snp chr pos A1 A2 beta SE`; `A1=ALT`, `A2=REF` | Study AF is not an input; `--maf` filters the reference resource | None | `NC SS AF LP SI` remain carry-through metadata because PostGWAS re-harmonises the imputed results. Only normalized chromosomes in the configured `chromosomes` list are published; excluded labels and row counts are recorded explicitly |
 | CBIIT LDSC | `SNP A1 A2 P`, a signed statistic, and sample size | `FRQ` is optional QC input; `munge_sumstats.py` converts allele frequency to MAF for filtering | Binary: `N_CAS` and `N_CON`; quantitative: `N` | Infer binary when any `FORMAT/NC` value exists; infer quantitative only when `NC` is entirely missing and `FORMAT/NCO` is present. For quantitative traits, write `N <- NCO` |
 | MiXeR `fit1`/`test1` | `SNP CHR BP A1 A2 N Z` | Not required | Binary: effective `N = 4/(1/Ncase + 1/Ncontrol)`; quantitative: total `N` | Write harmonised `ALT` as effect allele `A1`, `REF` as other allele `A2`, and `FORMAT/NEF` as `N`; apply configured INFO, sample-size, and SNP checks before export |
 
@@ -28,6 +28,8 @@ typed configuration model. The mappings have two explicit stages:
 1. `vcf_fields`: canonical formatter-table column → bcftools query expression.
 2. `variant_identifiers`: general default and per-target ID selection, extraction pattern, and unique-ID template.
 3. `exports.<target>`: canonical formatter-table column → downstream tool column.
+4. `custom_output.field_contracts`: canonical source, transformation, and
+   validity rule used when direct CLI custom columns are requested.
 
 The same YAML also owns output filename patterns, named transformations,
 numeric parsing, validation columns, chromosome-label normalization,
@@ -40,6 +42,25 @@ table names are not fixed in Python: `vcf_fields`, semantic roles, validation
 lists, and export mappings are validated together. Exporter code applies these
 declarations; it does not maintain a second set of column aliases.
 
+## Custom CLI output contract
+
+The optional custom table is additive and does not change a built-in tool
+schema or downstream handoff. Users activate it with `--custom-output`, name
+the identifier column with `--id`, and optionally request other fields by
+supplying their output header names. The CLI option order is the output column
+order. The identifier uses the existing configured `rsid` or `unique` policy.
+
+All requested sources are required per written row. Missing or non-finite
+values, nonpositive position/sample-size/standard-error values, negative LP,
+and EAF/INFO outside `[0,1]` are excluded and counted. `ALT` remains the effect
+allele and `REF` the other allele. `--p` applies the same configured
+`10^-LP` conversion and minimum numeric bound as built-in outputs; `--lp`
+retains LP. `--maf` applies `min(EAF, 1-EAF)` while `--eaf` retains effect-allele
+frequency. Both members of either pair may be requested because each output
+expression is represented independently even though it shares a canonical
+source. The custom table does not infer study design and does not claim
+compatibility with an unspecified external tool.
+
 ## Corrected formatter mappings
 
 | Target | Previous mapping | Reviewed mapping |
@@ -50,10 +71,13 @@ declarations; it does not maintain a second set of column aliases.
 | PRED-LD `NC` | `FORMAT/NC` (cases), although the PostGWAS handoff treated it as controls | `FORMAT/NCO` (controls) |
 | LDSC sample size | Case/control columns when available | Binary: `N_CAS <- FORMAT/NC`, `N_CON <- FORMAT/NCO`; quantitative: `N <- FORMAT/NCO` |
 
-Study type is inferred only from the sample-count values; no separate VCF
-metadata declaration is expected or written. `NCO` must contain at least one
-value. If `NC` is absent or entirely missing, the trait is quantitative; if any
-`NC` value is present, it is binary.
+Study type is inferred only when LDSC or MiXeR is selected, because those are
+the only formatter contracts with trait-specific sample-size interpretation.
+MAGMA, GCTA, SuSiE, FINEMAP, and PRED-LD validate their own configured fields
+without triggering inference. For LDSC or MiXeR, inference uses only sample-count
+values; no separate VCF metadata declaration is expected or written. `NCO` must
+contain at least one value. If `NC` is absent or entirely missing, the trait is
+quantitative; if any `NC` value is present, it is binary.
 
 ## Primary sources
 

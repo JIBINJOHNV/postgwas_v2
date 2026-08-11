@@ -51,6 +51,47 @@ def _installed_script(name: str) -> str:
     return path
 
 
+def build_munge_sumstats_command(
+    executable: str,
+    *,
+    sumstats: str | Path,
+    output_prefix: str | Path,
+    merge_alleles: str | Path,
+    minimum_info: float,
+    minimum_maf: float,
+) -> list[str]:
+    """Build the shared LDSC HapMap3 munging command without executing it."""
+    return [
+        str(executable),
+        "--sumstats", str(sumstats),
+        "--out", str(output_prefix),
+        "--merge-alleles", str(merge_alleles),
+        "--info-min", str(minimum_info),
+        "--maf-min", str(minimum_maf),
+    ]
+
+
+def build_h2_cts_command(
+    executable: str,
+    *,
+    sumstats: str | Path,
+    baseline_ld_prefixes: list[str] | tuple[str, ...],
+    weights_ld_prefix: str,
+    ldcts_file: str | Path,
+    output_prefix: str | Path,
+    prefix_separator: str,
+) -> list[str]:
+    """Build the official LDSC ``--h2-cts`` regression command."""
+    return [
+        str(executable),
+        "--h2-cts", str(sumstats),
+        "--ref-ld-chr", prefix_separator.join(baseline_ld_prefixes),
+        "--w-ld-chr", str(weights_ld_prefix),
+        "--ref-ld-chr-cts", str(ldcts_file),
+        "--out", str(output_prefix),
+    ]
+
+
 # =========================================================
 # SUBPROCESS RUNNER (Replaces Docker Runner)
 # =========================================================
@@ -184,14 +225,15 @@ def run_ldsc(
     munged_prefix = out_prefix
     munged_file = f"{munged_prefix}.sumstats.gz"
 
-    cmd_munge = [
-        sys.executable, munge_script,
-        "--sumstats", _d(sumstats_tsv),
-        "--out", _d(munged_prefix),
-        "--merge-alleles", _d(hm3_snplist),
-        "--info-min", str(info_min),
-        "--maf-min", str(maf_min)
-    ]
+    cmd_munge = build_munge_sumstats_command(
+        sys.executable,
+        sumstats=_d(sumstats_tsv),
+        output_prefix=_d(munged_prefix),
+        merge_alleles=_d(hm3_snplist),
+        minimum_info=info_min,
+        minimum_maf=maf_min,
+    )
+    cmd_munge.insert(1, munge_script)
 
     run_subprocess(cmd_munge, log_file, "MUNGE_SUMSTATS")
 

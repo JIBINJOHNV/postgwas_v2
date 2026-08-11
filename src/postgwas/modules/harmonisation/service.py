@@ -72,9 +72,9 @@ from postgwas.modules.harmonisation.rejects import (
 )
 from postgwas.modules.harmonisation.summary_statistics_io import (
     read_summary_statistics,
-    resolve_resource_file,
     inspect_summary_statistics_file,
 )
+from postgwas.modules.harmonisation.resource_paths import resolve_resource_file
 from postgwas.modules.harmonisation.input_validation import (
     validate_config,
     validate_header,
@@ -448,6 +448,98 @@ def _count(value):
         return "{:,}".format(int(value))
     except (TypeError, ValueError):
         return str(value)
+
+
+def _ready_variant_type_counts(df, sample_column_dict):
+    # type: (pl.DataFrame, Dict[str, Any]) -> Dict[str, int]
+    """Count SNPs versus indels/other among input-QC-retained study rows.
+
+    A SNP requires two single-base DNA alleles. Every retained row outside that
+    definition is reported as indel/other so the two categories always reconcile
+    exactly to ``Ready for harmonisation``.
+    """
+    ea_col = optional_text(sample_column_dict.get("ea_col"))
+    oa_col = optional_text(sample_column_dict.get("oa_col"))
+    missing = [
+        column
+        for column in (ea_col, oa_col)
+        if column is None or column not in df.columns
+    ]
+    if missing:
+        raise PipelineError(
+            "Cannot classify input variant types because the validated effect- "
+            "and other-allele columns are unavailable: %s."
+            % ", ".join(str(column) for column in missing)
+        )
+    bases = ["A", "C", "G", "T"]
+    effect = pl.col(ea_col).cast(pl.String, strict=False).str.to_uppercase()
+    other = pl.col(oa_col).cast(pl.String, strict=False).str.to_uppercase()
+    is_snp = (
+        (effect.str.len_chars() == 1)
+        & (other.str.len_chars() == 1)
+        & effect.is_in(bases)
+        & other.is_in(bases)
+    ).fill_null(False)
+    snps = int(df.select(is_snp.sum().alias("snps")).item() or 0)
+    return {
+        "snps": snps,
+        "indels_or_other_variants": int(df.height) - snps,
+    }
+
+
+def _input_validation_summary_block(
+    *,
+    input_variants,
+    variants_read,
+    missing_required,
+    invalid_coordinates,
+    non_standard_alleles,
+    duplicate_variants,
+    ready_variants,
+    ready_snps,
+    ready_indels_or_other,
+):
+    """Render input-QC accounting and its ready-row variant-type breakdown."""
+    return "\n".join([
+        screen_line("count", "Input validation summary", indent=4),
+        screen_field(
+            "count", "Input variants", _count(input_variants),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "count", "Variants read", _count(variants_read),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "loss", "Missing required values", _count(missing_required),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "loss", "Invalid coordinates", _count(invalid_coordinates),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "loss", "Non-standard alleles", _count(non_standard_alleles),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "loss", "Duplicate variants", _count(duplicate_variants),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "success", "Ready for harmonisation", _count(ready_variants),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "genetic", "Ready SNPs", _count(ready_snps),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "genetic", "Ready indels / other variants",
+            _count(ready_indels_or_other),
+            indent=8, label_width=30,
+        ),
+    ])
 
 
 def _chromosome_sort_key(chromosome):
@@ -931,11 +1023,13 @@ def build_resource_map(
     target_build: str,
     resource_folder: str,
     user_eaf_file: str,
+    default_eaf_reference_source: str,
     default_comparison_af_file: str,
     resource_layout: Dict[str, str],
     user_info_file: Optional[str],
     dbsnp: str,
     user_eaf_column: Optional[str],
+    default_eaf_reference_column: Optional[str],
     default_comparison_af_column: Optional[str],
     user_info_column: Optional[str],
     require_default_eaf: bool = False,
@@ -951,7 +1045,6 @@ def build_resource_map(
         "build": grch_version,
         "target_build": target_build,
         "source_build": grch_version,
-        "source": default_comparison_af_file,
         "chromosome": chromosome,
     }
 
@@ -983,8 +1076,12 @@ def build_resource_map(
         chromosome=chromosome,
         must_exist=validate_files,
     )
-    default_eaf_path = configured_path("default_eaf")
-    default_comparison_af_path = configured_path("comparison_af")
+    default_eaf_path = configured_path(
+        "default_eaf", source=default_eaf_reference_source,
+    )
+    default_comparison_af_path = configured_path(
+        "comparison_af", source=default_comparison_af_file,
+    )
     user_info_path = resolve_resource_file(
         input_file=user_info_file,
         grch_version=grch_version,
@@ -1030,6 +1127,7 @@ def build_resource_map(
         "default_eaf_file": default_eaf_path,
         "default_comparison_af_file": default_comparison_af_path,
         "user_eaf_column": user_eaf_column,
+        "default_eaf_reference_column": default_eaf_reference_column,
         "default_comparison_af_column": default_comparison_af_column,
         "user_info_file": user_info_path,
         "user_info_column": user_info_column,
@@ -1049,11 +1147,13 @@ def preflight_harmonisation_resources(
     target_build,
     resource_folder,
     user_eaf_file,
+    default_eaf_reference_source,
     default_comparison_af_file,
     resource_layout,
     user_info_file,
     dbsnp,
     user_eaf_column,
+    default_eaf_reference_column,
     default_comparison_af_column,
     user_info_column,
     default_eaf_colmap,
@@ -1076,10 +1176,12 @@ def preflight_harmonisation_resources(
                 target_build=target_build,
                 resource_folder=resource_folder,
                 user_eaf_file=user_eaf_file,
+                default_eaf_reference_source=default_eaf_reference_source,
                 default_comparison_af_file=default_comparison_af_file,
                 resource_layout=resource_layout,
                 user_info_file=user_info_file,
                 user_eaf_column=user_eaf_column,
+                default_eaf_reference_column=default_eaf_reference_column,
                 default_comparison_af_column=default_comparison_af_column,
                 user_info_column=user_info_column,
                 dbsnp=dbsnp,
@@ -1145,6 +1247,7 @@ def process_one_chromosome(
     resource_folder: str,
     grch_version: str,
     user_eaf_file: str,
+    default_eaf_reference_source: str,
     default_comparison_af_file: str,
     resource_layout: Dict[str, str],
     output_layout: Dict[str, str],
@@ -1154,6 +1257,7 @@ def process_one_chromosome(
     gwas2vcf_main_script_path: str,
     user_info_file: Optional[str],
     user_eaf_column: Optional[str],
+    default_eaf_reference_column: Optional[str],
     default_comparison_af_column: Optional[str],
     user_info_column: Optional[str],
     dbsnp: str,
@@ -1307,10 +1411,12 @@ def process_one_chromosome(
                     target_build=vcf_config["target_builds"][grch_version],
                     resource_folder=resource_folder,
                     user_eaf_file=user_eaf_file,
+                    default_eaf_reference_source=default_eaf_reference_source,
                     default_comparison_af_file=default_comparison_af_file,
                     resource_layout=resource_layout,
                     user_info_file=user_info_file,
                     user_eaf_column=user_eaf_column,
+                    default_eaf_reference_column=default_eaf_reference_column,
                     default_comparison_af_column=default_comparison_af_column,
                     user_info_column=user_info_column,
                     dbsnp=dbsnp,
@@ -1396,7 +1502,7 @@ def process_one_chromosome(
             eaffile=res["user_eaf_file"],
             external_eaf_colmap=external_eaf_colmap,
             default_eaf_file=res["default_eaf_file"],
-            default_eaf_column=res["default_comparison_af_column"],
+            default_eaf_column=res["default_eaf_reference_column"],
             default_eaf_colmap=default_eaf_colmap,
             policies=pol,
             logger=logger,
@@ -1853,6 +1959,7 @@ def harmonise_chromosomes(
     sample_column_dict,
     output_dir,
     resource_folder,
+    default_eaf_reference_source,
     default_comparison_af_file,
     dbsnp,
     resource_layout,
@@ -1865,6 +1972,7 @@ def harmonise_chromosomes(
     user_eaf_column,
     user_info_file,
     user_info_column,
+    default_eaf_reference_column,
     default_comparison_af_column,
     gwas2vcf_main_script_path,
     build_reference_files,
@@ -1965,38 +2073,23 @@ def harmonise_chromosomes(
         ctx.set_rows(df.height)
         ctx.rows_in = polars_rows
 
-    input_counts = "\n" + "\n".join([
-        screen_line("count", "Input validation summary", indent=4),
-        screen_field(
-            "count", "Input variants", _count(file_cvariant_count),
-            indent=8, label_width=24,
+    ready_variant_types = _ready_variant_type_counts(df, sample_column_dict)
+    _announce(
+        logger,
+        "\n" + _input_validation_summary_block(
+            input_variants=file_cvariant_count,
+            variants_read=polars_rows,
+            missing_required=removed_missing_count,
+            invalid_coordinates=removed_coords,
+            non_standard_alleles=non_standard_allele_count,
+            duplicate_variants=removed_duplicates_count,
+            ready_variants=df.height,
+            ready_snps=ready_variant_types["snps"],
+            ready_indels_or_other=ready_variant_types[
+                "indels_or_other_variants"
+            ],
         ),
-        screen_field(
-            "count", "Variants read", _count(polars_rows),
-            indent=8, label_width=24,
-        ),
-        screen_field(
-            "loss", "Missing required values", _count(removed_missing_count),
-            indent=8, label_width=24,
-        ),
-        screen_field(
-            "loss", "Invalid coordinates", _count(removed_coords),
-            indent=8, label_width=24,
-        ),
-        screen_field(
-            "loss", "Non-standard alleles", _count(non_standard_allele_count),
-            indent=8, label_width=24,
-        ),
-        screen_field(
-            "loss", "Duplicate variants", _count(removed_duplicates_count),
-            indent=8, label_width=24,
-        ),
-        screen_field(
-            "success", "Ready for harmonisation", _count(df.height),
-            indent=8, label_width=24,
-        ),
-    ])
-    _announce(logger, input_counts)
+    )
 
     # ------------------------------------------------------------------
     # 04/08  validate_content
@@ -2211,11 +2304,13 @@ def harmonise_chromosomes(
             target_build=vcf_config["target_builds"][grch_version],
             resource_folder=resource_folder,
             user_eaf_file=user_eaf_file,
+            default_eaf_reference_source=default_eaf_reference_source,
             default_comparison_af_file=default_comparison_af_file,
             resource_layout=resource_layout,
             user_info_file=user_info_file,
             dbsnp=dbsnp,
             user_eaf_column=user_eaf_column,
+            default_eaf_reference_column=default_eaf_reference_column,
             default_comparison_af_column=default_comparison_af_column,
             user_info_column=user_info_column,
             default_eaf_colmap=default_eaf_colmap,
@@ -2391,9 +2486,11 @@ def harmonise_chromosomes(
         "resource_folder": resource_folder,
         "grch_version": grch_version,
         "user_eaf_file": user_eaf_file,
+        "default_eaf_reference_source": default_eaf_reference_source,
         "default_comparison_af_file": default_comparison_af_file,
         "user_info_file": user_info_file,
         "user_eaf_column": user_eaf_column,
+        "default_eaf_reference_column": default_eaf_reference_column,
         "default_comparison_af_column": default_comparison_af_column,
         "user_info_column": user_info_column,
         "dbsnp": dbsnp,
@@ -2602,29 +2699,6 @@ def harmonise_chromosomes(
             summary = summaries.get(chrom) or {}
             counts_by_source[chrom] = dict(summary.get("reject_counts") or {})
 
-        try:
-            combined = concat_reject_files(
-                reject_paths,
-                str(configured_output_path(
-                    output_dir_path,
-                    output_layout["dataset_reject"],
-                    dataset_id=sample_id,
-                )),
-                delimiter=gwas2vcf_input["delimiter"],
-                logger=logger,
-                compress=True,
-            )
-        except RejectOutputError as exc:
-            raise PipelineError(
-                "%s The dataset cannot be finalised without complete rejection "
-                "provenance." % exc,
-                results=per_chr_qc,
-                status="FAILED",
-            ) from exc
-        dataset_extra["reject_files"] = reject_paths
-        dataset_extra["rejected_variants_file"] = combined.get("path")
-        dataset_extra["rejected_variants_rows"] = combined.get("rows")
-
         reject_reason_table, reject_counts = _write_reject_reason_table(
             configured_output_path(
                 output_dir_path,
@@ -2637,6 +2711,36 @@ def harmonise_chromosomes(
         )
         dataset_extra["reject_reason_table"] = reject_reason_table
         dataset_extra["reject_counts"] = reject_counts
+
+        try:
+            combined = concat_reject_files(
+                reject_paths,
+                str(configured_output_path(
+                    output_dir_path,
+                    output_layout["dataset_reject"],
+                    dataset_id=sample_id,
+                )),
+                delimiter=gwas2vcf_input["delimiter"],
+                logger=logger,
+                compress=True,
+                remove_sources=True,
+            )
+        except RejectOutputError as exc:
+            raise PipelineError(
+                "%s The dataset cannot be finalised without complete rejection "
+                "provenance." % exc,
+                results=per_chr_qc,
+                status="FAILED",
+            ) from exc
+        dataset_extra["reject_files"] = [combined.get("path")]
+        dataset_extra["rejected_variants_file"] = combined.get("path")
+        dataset_extra["rejected_variants_rows"] = combined.get("rows")
+        dataset_extra["reject_source_files_removed"] = combined.get(
+            "source_files_removed", []
+        )
+        dataset_extra["reject_source_files_retained"] = combined.get(
+            "source_files_retained", []
+        )
     else:
         logger.warn(
             "rejects.enabled is false, so no rejected-variants file and no "
@@ -2689,6 +2793,10 @@ def harmonise_chromosomes(
     per_chr_qc["total_variant_removed_null_coords"] = removed_coords
     per_chr_qc["total_variant_removed_non_standard_alleles"] = non_standard_allele_count
     per_chr_qc["total_variant_remaining_for_harmonisation"] = df.height
+    per_chr_qc["total_variant_ready_snps"] = ready_variant_types["snps"]
+    per_chr_qc["total_variant_ready_indels_or_other"] = ready_variant_types[
+        "indels_or_other_variants"
+    ]
     per_chr_qc["total_variant_removed_missing_values"] = removed_missing_count
     per_chr_qc["total_variant_removed_duplicates"] = removed_duplicates_count
 
@@ -2841,6 +2949,8 @@ def _fallback_qc_frame(qc_results):
         "total_variant_removed_null_coords",
         "total_variant_removed_non_standard_alleles",
         "total_variant_remaining_for_harmonisation",
+        "total_variant_ready_snps",
+        "total_variant_ready_indels_or_other",
         "total_variant_removed_missing_values",
         "total_variant_removed_duplicates",
     ]
@@ -2891,6 +3001,12 @@ def run_harmonisation_pipeline(
         )
 
     # Extract all defaults safely
+    default_eaf_reference_source = default_cfg_obj[
+        "default_eaf_reference_source"
+    ]
+    default_eaf_reference_column = default_cfg_obj[
+        "default_eaf_reference_column"
+    ]
     default_comparison_af = default_cfg_obj["default_comparison_af_file"]
     comparison_cols = default_cfg_obj["default_comparison_af_column"]
     dbsnp = default_cfg_obj["default_dbsnp"]
@@ -2912,19 +3028,16 @@ def run_harmonisation_pipeline(
     # Every value the run uses, resolved once, reported everywhere.
     policies = _resolve_policies(default_cfg_obj, sample_column_dict)
 
-    # Build clean path using pathlib
-    output_root = Path(sample_column_dict["output_folder"])
+    # The sample-sheet boundary has already resolved the canonical dataset
+    # harmonisation root. All configured result paths are relative to it.
+    output_folder = Path(
+        sample_column_dict["output_folder"]
+    ).expanduser().resolve()
     gwas2vcf_script = str(
         Path(__file__).parent / "adapters" / "gwas2vcf" / "main.py"
     )
 
-    # Save normalized output_folder back to dict
-    output_folder = configured_output_path(
-        output_root,
-        output_layout["analysis_directory"],
-        error_type=PipelineError,
-        dataset_id=sample_column_dict.get("gwas_outputname"),
-    )
+    # Save the normalized root back for every chromosome and post-merge caller.
     sample_column_dict["output_folder"] = str(output_folder)
     # Clean whitespace from keys AND values
     sample_column_dict = {
@@ -3026,14 +3139,17 @@ def run_harmonisation_pipeline(
         _announce(
             logger,
             "\n" + "\n".join([
-                screen_line("genetic", "Reference-frequency comparison", indent=4),
+                screen_line("genetic", "Allele-frequency references", indent=4),
                 screen_field(
-                    "genetic", "Frequency column", comparison_cols,
-                    indent=8, label_width=18,
+                    "genetic", "VCF annotation / QC", "%s · %s" % (
+                        default_comparison_af, comparison_cols,
+                    ), indent=8, label_width=23,
                 ),
                 screen_field(
-                    "info", "Reference files", default_comparison_af,
-                    indent=8, label_width=18,
+                    "genetic", "Strand / MAF–EAF", "%s · %s" % (
+                        default_eaf_reference_source,
+                        default_eaf_reference_column,
+                    ), indent=8, label_width=23,
                 ),
             ]),
         )
@@ -3159,6 +3275,7 @@ def run_harmonisation_pipeline(
                 sample_column_dict=sample_column_dict,
                 output_dir=sample_column_dict["output_folder"],
                 resource_folder=sample_column_dict["resource_folder"],
+                default_eaf_reference_source=default_eaf_reference_source,
                 default_comparison_af_file=default_comparison_af,
                 dbsnp=dbsnp,
                 resource_layout=resource_layout,
@@ -3171,6 +3288,7 @@ def run_harmonisation_pipeline(
                 user_eaf_column=sample_column_dict["eafcolumn"],
                 user_info_file=sample_column_dict["infofile"],
                 user_info_column=sample_column_dict["infocolumn"],
+                default_eaf_reference_column=default_eaf_reference_column,
                 default_comparison_af_column=comparison_cols,
                 build_reference_files=build_reference_files,
                 build_check_colmap=build_check_colmap,
@@ -3431,23 +3549,29 @@ def run_harmonisation_pipeline(
             )
 
         pre_vcf_summary = {
-            "total_variant_infile": qc_results.get("total_variant_infile", pd.NA),
-            "total_variant_read": qc_results.get("total_variant_read", pd.NA),
+            "total_variant_infile": qc_results.get("total_variant_infile"),
+            "total_variant_read": qc_results.get("total_variant_read"),
             "total_variant_in_vcf_input": total_variants_in_gwas2vcf_input,
             "total_variant_removed_missing_values": qc_results.get(
-                "total_variant_removed_missing_values", pd.NA
+                "total_variant_removed_missing_values"
             ),
             "total_variant_removed_duplicates": qc_results.get(
-                "total_variant_removed_duplicates", pd.NA
+                "total_variant_removed_duplicates"
             ),
             "total_variant_removed_null_coords": qc_results.get(
-                "total_variant_removed_null_coords", pd.NA
+                "total_variant_removed_null_coords"
             ),
             "total_variant_removed_non_standard_alleles": qc_results.get(
-                "total_variant_removed_non_standard_alleles", pd.NA
+                "total_variant_removed_non_standard_alleles"
             ),
             "total_variant_remaining_for_harmonisation": qc_results.get(
-                "total_variant_remaining_for_harmonisation", pd.NA
+                "total_variant_remaining_for_harmonisation"
+            ),
+            "total_variant_ready_snps": qc_results.get(
+                "total_variant_ready_snps"
+            ),
+            "total_variant_ready_indels_or_other": qc_results.get(
+                "total_variant_ready_indels_or_other"
             ),
             "total_variant_removed_palindromic_ambiguous": (
                 dataset_extra.get("reject_counts") or {}
@@ -3467,6 +3591,7 @@ def run_harmonisation_pipeline(
             "total_variant_with_missing_eaf": missing_eaf_count,
             "total_variant_with_invalid_beta_se": invalid_beta_se_count,
         }
+        manifest["pre_vcf_summary"] = pre_vcf_summary
 
         # =====================================================
         # POST MERGE 04/05 — one VCF extraction, raw QC and virtual filters
@@ -3559,6 +3684,8 @@ def run_harmonisation_pipeline(
                 merge_summary=concated_vcf_files,
                 primary_outputs=primary_outputs,
                 final_status=status,
+                reference_source=default_comparison_af,
+                reference_population=comparison_cols,
             )) + "\n",
         )
         _announce(

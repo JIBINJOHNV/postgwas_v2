@@ -33,6 +33,16 @@ class StudyDesign:
     control_counts_present: int
 
 
+@dataclass(frozen=True)
+class FormattingColumnSpec:
+    """One ordered output expression, including duplicate canonical sources."""
+
+    source: str
+    destination: str
+    transformation: str | None = None
+    integer: bool = False
+
+
 def load_harmonised_vcf(
     vcf_path: str | Path,
     work_table: str | Path,
@@ -218,17 +228,36 @@ def mapped_table(
     minimum_p_value: float,
     *,
     columns: dict[str, str] | None = None,
+    column_specs: Iterable[FormattingColumnSpec] | None = None,
 ) -> pl.DataFrame:
     """Apply one ordered canonical-column -> tool-column mapping."""
-    mapping = schema.columns if columns is None else columns
-    missing = [source for source in mapping if source not in frame.columns]
+    if columns is not None and column_specs is not None:
+        raise FormattingError("Provide columns or column_specs, not both.")
+    if column_specs is None:
+        mapping = schema.columns if columns is None else columns
+        specs = [
+            FormattingColumnSpec(
+                source=source,
+                destination=destination,
+                transformation=schema.transformations.get(source),
+                integer=source in schema.integer_columns,
+            )
+            for source, destination in mapping.items()
+        ]
+    else:
+        specs = list(column_specs)
+    missing = sorted({
+        spec.source for spec in specs if spec.source not in frame.columns
+    })
     if missing:
         raise FormattingError(
             "Configured formatter source columns are missing: %s" % ", ".join(missing)
         )
     expressions = []
-    for source, destination in mapping.items():
-        transform = schema.transformations.get(source)
+    for spec in specs:
+        source = spec.source
+        destination = spec.destination
+        transform = spec.transformation
         if transform == "negative_log10_to_raw_p":
             expression = negative_log10_to_raw_p(
                 source, minimum_p_value, output_name=destination,
@@ -240,7 +269,7 @@ def mapped_table(
             expression = pl.col(source).alias(destination)
         else:  # Pydantic rejects this; retain a clear boundary error for callers.
             raise FormattingError("Unknown formatter transformation: %s" % transform)
-        if source in schema.integer_columns:
+        if spec.integer:
             expression = expression.cast(pl.Int64, strict=False).alias(destination)
         expressions.append(expression)
     return frame.select(*expressions)
@@ -308,6 +337,7 @@ def transformation_source(schema, transformation: str) -> str:
 
 
 __all__ = [
+    "FormattingColumnSpec",
     "FormattingError",
     "StudyDesign",
     "complete_rows",

@@ -383,8 +383,10 @@ def remove_partial_chromosome_outputs(
     round-two failure and reaches the merge, because ``validate_and_fix_vcf``
     only rejects files under 100 bytes.
 
-    The log is deliberately **not** removed: it is opened in append mode, so
-    every attempt for this chromosome stays in the one file.
+    The validated chromosome input table and immutable source snapshot are
+    deliberately retained because every retry reads them again. The log is
+    also retained: it is opened in append mode, so every attempt for this
+    chromosome stays in the one file.
 
     Returns the number of files and directories removed.
     """
@@ -404,8 +406,8 @@ def remove_partial_chromosome_outputs(
         "target_build": "*",
     }
     for pattern_name in (
-        "chromosome_table", "chromosome_reject", "adapter_input",
-        "adapter_mapping", "adapter_summary", "adapter_output_vcf",
+        "chromosome_reject", "adapter_input", "adapter_mapping",
+        "adapter_summary", "adapter_output_vcf",
         "chromosome_raw_vcf", "chromosome_original_vcf",
         "chromosome_normalized_vcf", "chromosome_id_vcf",
         "chromosome_frequency_vcf", "chromosome_annotated_vcf",

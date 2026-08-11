@@ -56,13 +56,9 @@ def _pipeline_arguments(tmp_path):
         output_directory=tmp_path,
         output_layout=defaults["output_layout"],
     )
-    analysis_directory = configured_output_path(
-        engine_input["output_folder"],
-        defaults["output_layout"]["analysis_directory"],
-        dataset_id=row.dataset_id,
-    )
+    harmonisation_directory = Path(engine_input["output_folder"])
     configured_output_path(
-        analysis_directory,
+        harmonisation_directory,
         defaults["output_layout"]["gwas2vcf_summary"],
         dataset_id=row.dataset_id,
     ).parent.mkdir(parents=True, exist_ok=True)

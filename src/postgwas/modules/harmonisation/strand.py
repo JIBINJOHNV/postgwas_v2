@@ -1,10 +1,10 @@
 """Reference-based allele orientation for one chromosome.
 
 The supplied reference remains a normal CHROM/POS/REF/ALT/population-AF table.
-One coordinate join is followed by vectorised tests of the four valid allele
-orientations; no fourfold reference table is materialised. Study-wide strand
-consensus is used only to arbitrate palindromic SNPs, whose allele letters
-cannot identify the strand on their own.
+One coordinate join is followed by vectorised tests of direct/swapped allele
+order and, for SNVs, the two reverse-complement forms; no fourfold reference
+table is materialised. Study-wide strand consensus is used only to arbitrate
+palindromic SNPs, whose allele letters cannot identify the strand on their own.
 
 Scientific method: NHGRI-EBI GWAS Catalog summary-statistics harmonisation,
 https://www.ebi.ac.uk/gwas/docs/methods/summary-statistics.
@@ -18,6 +18,7 @@ from postgwas.core.dataframes import chromosome_expression, position_expression
 from postgwas.core.io.tables import read_delimited_table
 from postgwas.core.values import optional_text
 
+from .shared.allele_join import deduplicate_reference_values
 from .shared.runtime import reject_rows, resolve_policies
 from .shared.variant_columns import (
     has_canonical_variant_columns,
@@ -45,9 +46,9 @@ POLICY_KEYS = (
     "strand.ambiguous_action",
     "strand.af_tolerance",
     "strand.af_discordance_action",
-    "eaf.palindromic_ambiguous_lower",
-    "eaf.palindromic_ambiguous_upper",
-    "eaf.palindromic_resolve_tolerance",
+    "strand.palindromic_af_discordance_action",
+    "external_reference.exact_duplicate_action",
+    "external_reference.non_identical_duplicate_action",
 )
 
 
@@ -159,7 +160,7 @@ def _load_reference(path, population_col, colmap, policies, chromosome):
         pl.col("__strand_ref").cast(pl.Utf8).str.to_uppercase(),
         pl.col("__strand_alt").cast(pl.Utf8).str.to_uppercase(),
         pl.col("__strand_af").cast(pl.Float64, strict=False),
-    ]).unique(maintain_order=True)
+    ])
     invalid = reference.filter(
         pl.col("__strand_af").is_not_null()
         & ((pl.col("__strand_af") < 0.0) | (pl.col("__strand_af") > 1.0))
@@ -169,7 +170,19 @@ def _load_reference(path, population_col, colmap, policies, chromosome):
             "The strand reference '%s' contains %s values outside 0 to 1 in column '%s'."
             % (path, "{:,}".format(invalid), population_col)
         )
-    return reference
+    return deduplicate_reference_values(
+        reference,
+        ["__strand_chr", "__strand_pos", "__strand_ref", "__strand_alt"],
+        "__strand_af",
+        exact_action=str(
+            policies.get("external_reference.exact_duplicate_action")
+        ),
+        non_identical_action=str(
+            policies.get("external_reference.non_identical_duplicate_action")
+        ),
+        reference_label="strand reference '%s'" % path,
+        error_type=StrandOrientationError,
+    )
 
 
 def _study_value(decision, key, default=None):
@@ -196,7 +209,15 @@ def harmonise_strand_orientation(
     """Orient one chromosome with a single raw-reference coordinate join."""
     pol = resolve_policies(policies)
     if not bool(pol.get("strand.enabled")):
-        return df, {"status": "disabled", "initial_variants": df.height}, sample_column_dict
+        output = df.with_columns(
+            pl.lit("disabled").alias(STRAND_ACTION_COLUMN)
+        )
+        return output, {
+            "status": "disabled",
+            "initial_variants": df.height,
+            "final_variants": output.height,
+            "actions": {"disabled": output.height},
+        }, sample_column_dict
     if not reference_file or not population_col or not reference_colmap:
         raise StrandOrientationError(
             "Strand orientation requires a raw chromosome reference file, its population AF "
@@ -255,9 +276,23 @@ def harmonise_strand_orientation(
             value=str(_study_value(study_decision, "strand", "unresolved") or "unresolved"),
         )
 
-    reference = _load_reference(
+    reference, reference_duplicate_stats = _load_reference(
         reference_file, population_col, reference_colmap, pol, chromosome,
     )
+    if ctx is not None and reference_duplicate_stats["reference_duplicate_groups"]:
+        ctx.info(
+            "Strand reference duplicate groups: %s exact and %s non-identical; "
+            "%s groups discarded by the configured shared reference policy."
+            % (
+                reference_duplicate_stats["reference_exact_duplicate_groups"],
+                reference_duplicate_stats[
+                    "reference_non_identical_duplicate_groups"
+                ],
+                reference_duplicate_stats[
+                    "reference_duplicate_groups_discarded"
+                ],
+            )
+        )
     study = df.with_row_index(row_col)
     if not has_canonical_variant_columns(df, sample_column_dict):
         study_schema = dict(df.schema)
@@ -286,29 +321,36 @@ def harmonise_strand_orientation(
     oa = pl.col(oa_col)
     ref = pl.col("__strand_ref")
     alt = pl.col("__strand_alt")
+    snv = (
+        (ea.str.len_chars() == 1)
+        & (oa.str.len_chars() == 1)
+        & (ref.str.len_chars() == 1)
+        & (alt.str.len_chars() == 1)
+    )
     orientations = [
-        ("forward", (ea == alt) & (oa == ref), False, pl.col("__strand_af")),
-        ("forward_swapped", (ea == ref) & (oa == alt), True, 1.0 - pl.col("__strand_af")),
+        ("forward", (ea == alt) & (oa == ref), False),
+        ("forward_swapped", (ea == ref) & (oa == alt), True),
         (
             "reverse_complement",
-            (pl.col("__strand_ea_rc") == alt) & (pl.col("__strand_oa_rc") == ref),
+            snv
+            & (pl.col("__strand_ea_rc") == alt)
+            & (pl.col("__strand_oa_rc") == ref),
             False,
-            pl.col("__strand_af"),
         ),
         (
             "reverse_complement_swapped",
-            (pl.col("__strand_ea_rc") == ref) & (pl.col("__strand_oa_rc") == alt),
+            snv
+            & (pl.col("__strand_ea_rc") == ref)
+            & (pl.col("__strand_oa_rc") == alt),
             True,
-            1.0 - pl.col("__strand_af"),
         ),
     ]
     candidate_frames = [
         joined.filter(condition).with_columns([
             pl.lit(action).alias(STRAND_ACTION_COLUMN),
             pl.lit(swapped).alias("__strand_swapped"),
-            expected.alias("__strand_expected_input_af"),
         ])
-        for action, condition, swapped, expected in orientations
+        for action, condition, swapped in orientations
     ]
     candidates = pl.concat(candidate_frames, how="vertical_relaxed").unique(
         subset=[
@@ -321,11 +363,7 @@ def harmonise_strand_orientation(
     candidates = candidates.with_columns(
         pair.is_in(list(PALINDROMIC_PAIRS)).alias("__strand_palindromic")
     )
-    has_true_eaf = eaf_col is not None and eaf_col in candidates.columns and not eaf_is_maf
     consensus = str(_study_value(study_decision, "strand", "unresolved") or "unresolved")
-    lower = float(pol.get("eaf.palindromic_ambiguous_lower"))
-    upper = float(pol.get("eaf.palindromic_ambiguous_upper"))
-    tolerance = float(pol.get("eaf.palindromic_resolve_tolerance"))
 
     candidate_strand = (
         pl.when(pl.col(STRAND_ACTION_COLUMN).str.starts_with("forward"))
@@ -333,39 +371,16 @@ def harmonise_strand_orientation(
         .otherwise(pl.lit("reverse"))
     )
     candidates = candidates.with_columns(candidate_strand.alias("__strand_basis"))
-    if has_true_eaf:
-        study_eaf = pl.col(eaf_col).cast(pl.Float64, strict=False)
-        candidates = candidates.with_columns([
-            (study_eaf - pl.col("__strand_expected_input_af")).abs().alias("__strand_af_diff"),
-            (
-                study_eaf.is_between(lower, upper, closed="both")
-                & pl.col("__strand_expected_input_af").is_between(lower, upper, closed="both")
-            ).alias("__strand_af_ambiguous"),
-        ])
-    else:
-        candidates = candidates.with_columns([
-            pl.lit(None, dtype=pl.Float64).alias("__strand_af_diff"),
-            pl.lit(False).alias("__strand_af_ambiguous"),
-        ])
 
     consensus_known = consensus in ("forward", "reverse")
-    consensus_ok = (
-        pl.col("__strand_basis") == pl.lit(consensus)
-        if consensus_known else pl.lit(True)
+    pal_pool = (
+        candidates.filter(
+            pl.col("__strand_palindromic")
+            & (pl.col("__strand_basis") == pl.lit(consensus))
+        )
+        if consensus_known
+        else candidates.head(0)
     )
-    pal_pool = candidates.filter(
-        pl.col("__strand_palindromic") & consensus_ok
-    )
-    if has_true_eaf:
-        pal_pool = pal_pool.with_columns(
-            pl.col("__strand_af_diff").min().over(row_col).alias("__strand_min_diff")
-        ).filter(
-            ~pl.col("__strand_af_ambiguous")
-            & (pl.col("__strand_af_diff") <= tolerance)
-            & (pl.col("__strand_af_diff") == pl.col("__strand_min_diff"))
-        ).select(candidates.columns)
-    elif not consensus_known:
-        pal_pool = pal_pool.head(0)
 
     eligible = pl.concat([
         candidates.filter(~pl.col("__strand_palindromic")),
@@ -431,7 +446,10 @@ def harmonise_strand_orientation(
     tagged, n_palindromic = reject_rows(
         tagged, ambiguous_pal, step_label=STEP_LABEL, reason="palindromic_ambiguous",
         context=ctx, collector=rejects,
-        detail="study consensus and reference AF did not select one safe orientation",
+        detail=(
+            "study-wide non-palindromic strand consensus was mixed, unresolved, "
+            "or did not leave exactly one safe reference orientation"
+        ),
     )
     tagged, n_ambiguous = reject_rows(
         tagged, ambiguous_reference, step_label=STEP_LABEL, reason="reference_ambiguous",
@@ -477,11 +495,13 @@ def harmonise_strand_orientation(
         "reference_file": reference_file,
         "reference_population_column": population_col,
         "study_strand_consensus": consensus,
+        "palindromic_orientation_basis": "study_wide_non_palindromic_consensus",
         "actions": action_counts,
         "reference_unmatched": n_unmatched,
         "palindromic_ambiguous": n_palindromic,
         "reference_ambiguous": n_ambiguous,
     }
+    qc.update(reference_duplicate_stats)
     if ctx is not None:
         ctx.info(
             "Reference orientation retained %s of %s variants; actions: %s."

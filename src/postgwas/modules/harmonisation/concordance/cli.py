@@ -42,9 +42,10 @@ def get_validation_parser() -> argparse.ArgumentParser:
             "Compare one original summary-statistics dataset with its corresponding "
             "same-build harmonised GWAS-VCF.\n\n"
             "PostGWAS checks variant retention, effect estimates, allele frequencies, "
-            "and Z scores. If the input has no Z column, it calculates Z from the "
+            "standard errors, and Z scores. If the input has no Z column, it calculates Z from the "
             "available effect statistics. SNP and indel concordance are reported "
-            "separately. Indels are compared exactly as written."
+            "separately. Unmatched variants are reported without failing the value audit; "
+            "one-to-one unmatched records at the same position receive diagnostic value checks."
         ),
         epilog=format_cli_examples(
             (
@@ -82,7 +83,7 @@ def get_validation_parser() -> argparse.ArgumentParser:
         "--run-config", default=argparse.SUPPRESS, metavar="PATH",
         help=(
             "Optional YAML configuration controlling concordance tolerances, strand "
-            "matching, palindromic variants, and normalized-indel handling."
+            "matching, palindromic variants, and failure thresholds."
         ),
     )
     files.add_argument(

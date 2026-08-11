@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from postgwas.core.errors import PipelinePlanningError
 from postgwas.pipeline.registry import ModuleRegistry, REGISTRY
@@ -24,7 +24,11 @@ def _unique(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
-def _dependency_order(targets: Iterable[str], registry: ModuleRegistry) -> list[str]:
+def _dependency_order(
+    targets: Iterable[str],
+    registry: ModuleRegistry,
+    dependency_overrides: Mapping[str, Iterable[str]],
+) -> list[str]:
     ordered = []
     visiting = set()
     visited = set()
@@ -33,10 +37,13 @@ def _dependency_order(targets: Iterable[str], registry: ModuleRegistry) -> list[
         if name in visited:
             return
         if name in visiting:
-            raise PipelinePlanningError("Dependency cycle detected at module '%s'" % name)
+            raise PipelinePlanningError(
+                "Dependency cycle detected at module '%s'" % name
+            )
         spec = registry.require_pipeline_enabled(name)
         visiting.add(name)
-        for dependency in spec.dependencies:
+        dependencies = dependency_overrides.get(name, spec.dependencies)
+        for dependency in dependencies:
             visit(dependency)
         visiting.remove(name)
         visited.add(name)
@@ -55,6 +62,7 @@ def build_pipeline_plan(
     apply_manhattan: bool = False,
     heritability: bool = False,
     registry: ModuleRegistry = REGISTRY,
+    dependency_overrides: Mapping[str, Iterable[str]] | None = None,
 ) -> PipelinePlan:
     """Validate targets and produce the pipeline step order once.
 
@@ -75,7 +83,7 @@ def build_pipeline_plan(
     if not requested:
         raise PipelinePlanningError("Select at least one pipeline module")
 
-    active = _dependency_order(requested, registry)
+    active = _dependency_order(requested, registry, dependency_overrides or {})
     active_set = set(active)
     steps = []
 

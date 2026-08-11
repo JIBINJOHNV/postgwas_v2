@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -67,6 +68,183 @@ def _warning_if_nonzero(value: Any) -> str:
         return "warning"
 
 
+def effect_scale_description(effect_type: Any) -> str:
+    """Describe the final harmonised effect scale without reinterpreting data."""
+    normalized = str(effect_type or "").strip().lower()
+    if normalized == "odds_ratio":
+        return "odds ratio harmonised to log-odds BETA"
+    if normalized == "beta":
+        return "BETA-scale effect"
+    return "effect type unresolved"
+
+
+_ORIENTED_STRAND_ACTIONS = (
+    "forward",
+    "forward_swapped",
+    "reverse_complement",
+    "reverse_complement_swapped",
+)
+
+
+def _nonnegative_integer(value: Any) -> int | None:
+    """Return one internal count without accepting booleans or negative values."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
+def summarise_strand_orientation(
+    dataset_summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine completed-chromosome strand counters without rescanning variants."""
+    completed = [str(value) for value in dataset_summary.get("completed") or []]
+    chromosome_state = dataset_summary.get("chromosomes") or {}
+    expected = len(chromosome_state) or (
+        len(completed) + len(dataset_summary.get("failed") or [])
+    )
+    summaries = dataset_summary.get("chromosome_summaries") or {}
+    actions = {name: 0 for name in (*_ORIENTED_STRAND_ACTIONS, "disabled")}
+    removed = {
+        "reference_unmatched": 0,
+        "palindromic_ambiguous": 0,
+        "reference_ambiguous": 0,
+    }
+    evaluated = 0
+    retained = 0
+    summarized = 0
+    counts_complete = True
+    statuses: set[str] = set()
+    populations: set[str] = set()
+    consensuses: set[str] = set()
+    reference_files: set[str] = set()
+    population_observations = 0
+    consensus_observations = 0
+    reference_file_observations = 0
+
+    for chromosome in completed:
+        summary = summaries.get(chromosome) or {}
+        orientation = (
+            ((summary.get("stage_qc") or {}).get("eaf_qc") or {}).get(
+                "strand_orientation"
+            )
+            or {}
+        )
+        if not orientation:
+            continue
+        summarized += 1
+        orientation_status = str(
+            orientation.get("status") or "unknown"
+        ).strip().lower()
+        statuses.add(orientation_status)
+        population = orientation.get("reference_population_column")
+        consensus = orientation.get("study_strand_consensus")
+        reference_file = orientation.get("reference_file")
+        if population:
+            populations.add(str(population))
+            population_observations += 1
+        if consensus:
+            consensuses.add(str(consensus))
+            consensus_observations += 1
+        if reference_file:
+            reference_files.add(str(reference_file))
+            reference_file_observations += 1
+
+        for name in actions:
+            value = _nonnegative_integer(
+                (orientation.get("actions") or {}).get(name, 0)
+            )
+            if value is None:
+                counts_complete = False
+            else:
+                actions[name] += value
+        for name in removed:
+            value = _nonnegative_integer(
+                orientation.get(name, 0 if orientation_status == "disabled" else None)
+            )
+            if value is None:
+                counts_complete = False
+            else:
+                removed[name] += value
+        initial = _nonnegative_integer(orientation.get("initial_variants"))
+        final = _nonnegative_integer(orientation.get("final_variants"))
+        if initial is None or final is None:
+            counts_complete = False
+        else:
+            evaluated += initial
+            retained += final
+
+    oriented_matched = sum(actions[name] for name in _ORIENTED_STRAND_ACTIONS)
+    removed_total = sum(removed.values())
+    disabled = statuses == {"disabled"}
+    coverage_complete = summarized == len(completed) == expected
+    metadata_mixed = len(populations) > 1 or len(consensuses) > 1
+    metadata_complete = disabled or (
+        population_observations == summarized
+        and consensus_observations == summarized
+        and reference_file_observations == summarized
+    )
+    accounting_balanced = (
+        counts_complete
+        and evaluated == retained + removed_total
+        and retained == sum(actions.values())
+        and (disabled or retained == oriented_matched)
+    )
+    if summarized == 0:
+        status = "unavailable"
+    elif disabled:
+        status = "disabled" if coverage_complete else "partial"
+    elif "disabled" in statuses or len(statuses) > 1 or metadata_mixed:
+        status = "mixed"
+    elif not coverage_complete:
+        status = "partial"
+    elif statuses != {"success"} or not metadata_complete:
+        status = "inconsistent"
+    elif not accounting_balanced:
+        status = "inconsistent"
+    else:
+        status = "success"
+
+    def one_or_mixed(values: set[str]) -> str | None:
+        if not values:
+            return None
+        return next(iter(values)) if len(values) == 1 else "mixed"
+
+    return {
+        "status": status,
+        "chromosomes_expected": expected,
+        "chromosomes_completed": len(completed),
+        "chromosomes_summarized": summarized,
+        "complete_chromosome_coverage": coverage_complete,
+        "metadata_complete": metadata_complete,
+        "reference_population": one_or_mixed(populations),
+        "reference_file_count": len(reference_files),
+        "reference_files": sorted(reference_files),
+        "study_consensus": one_or_mixed(consensuses),
+        "variants_evaluated": evaluated if counts_complete and summarized else None,
+        "variants_retained": retained if counts_complete and summarized else None,
+        "variants_matched": (
+            None if disabled or not counts_complete or not summarized
+            else oriented_matched
+        ),
+        "forward": actions["forward"],
+        "forward_swapped": actions["forward_swapped"],
+        "reverse_complement": actions["reverse_complement"],
+        "reverse_complement_swapped": actions["reverse_complement_swapped"],
+        "disabled": actions["disabled"],
+        "reference_unmatched": removed["reference_unmatched"],
+        "palindromic_ambiguous": removed["palindromic_ambiguous"],
+        "reference_ambiguous": removed["reference_ambiguous"],
+        "removed_total": removed_total if counts_complete and summarized else None,
+        "accounting_balanced": accounting_balanced,
+    }
+
+
 def _field(kind: str, label: str, value: Any, indent: int) -> list[str]:
     return screen_field(
         kind, label, value, indent=indent, label_width=_qc_label_width(indent),
@@ -112,6 +290,8 @@ def harmonisation_qc_summary_lines(
         ("Invalid coordinates", "total_variant_removed_null_coords", "loss"),
         ("Non-standard alleles", "total_variant_removed_non_standard_alleles", "loss"),
         ("Passed initial input validation", "total_variant_remaining_for_harmonisation", "success"),
+        ("Ready SNPs", "total_variant_ready_snps", "genetic"),
+        ("Ready indels / other variants", "total_variant_ready_indels_or_other", "genetic"),
         ("Palindromic ambiguous removed", "total_variant_removed_palindromic_ambiguous", "loss"),
         ("Reference unmatched removed", "total_variant_removed_reference_unmatched", "loss"),
         ("Reference ambiguous removed", "total_variant_removed_reference_ambiguous", "loss"),
@@ -355,6 +535,8 @@ def harmonisation_qc_takeaway_lines(
     merge_summary: dict[str, Any],
     primary_outputs: dict[str, str],
     final_status: str,
+    reference_source: str | None = None,
+    reference_population: str | None = None,
 ) -> list[str]:
     """Render six compact QC cards using only previously calculated results."""
     raw = assessment["raw"]
@@ -463,21 +645,99 @@ def harmonisation_qc_takeaway_lines(
         and _available(testable)
         and strand in {"forward", "reverse"}
     )
-    add_card(
-        "success" if build_resolved else "warning",
-        "Reference alignment",
-        [
-            (
-                "genetic",
-                "Genome build",
-                "%s · %s / %s testable variants matched (%s)"
-                % (
-                    genome_build, _count(build_matches), _count(testable),
-                    _percent(build_matches, testable),
-                ),
+    build_source = (
+        "configured explicitly"
+        if genome_build_info.get("forced") is True
+        else "automatically detected"
+    )
+    orientation = summarise_strand_orientation(dataset_summary)
+    orientation_status = str(orientation["status"])
+    reference_population_value = (
+        orientation.get("reference_population") or reference_population
+    )
+    reference_text = " · ".join(
+        str(value)
+        for value in (reference_source, reference_population_value)
+        if value
+    ) or "unavailable"
+    if orientation.get("reference_file_count"):
+        reference_text += " · %s chromosome reference file%s" % (
+            _count(orientation["reference_file_count"]),
+            "" if orientation["reference_file_count"] == 1 else "s",
+        )
+    alignment_details = [
+        (
+            "genetic",
+            "Genome build",
+            "%s · %s · %s / %s testable variants matched (%s)"
+            % (
+                genome_build, build_source, _count(build_matches), _count(testable),
+                _percent(build_matches, testable),
             ),
-            ("genetic", "Strand", strand_text),
-        ],
+        ),
+        ("genetic", "Strand consensus", strand_text),
+    ]
+    if orientation_status != "unavailable":
+        alignment_details.append(("info", "Reference panel", reference_text))
+        if orientation_status == "disabled":
+            alignment_details.append((
+                "warning",
+                "Strand orientation",
+                "disabled · %s / %s chromosomes summarized"
+                % (
+                    _count(orientation["chromosomes_summarized"]),
+                    _count(orientation["chromosomes_expected"]),
+                ),
+            ))
+        else:
+            alignment_details.extend([
+                (
+                    "success" if orientation_status == "success" else "warning",
+                    "Strand matched",
+                    "%s total · forward %s · forward-swapped %s · "
+                    "reverse-complement %s · reverse-complement-swapped %s"
+                    % (
+                        _count(orientation["variants_matched"]),
+                        _count(orientation["forward"]),
+                        _count(orientation["forward_swapped"]),
+                        _count(orientation["reverse_complement"]),
+                        _count(orientation["reverse_complement_swapped"]),
+                    ),
+                ),
+                (
+                    "loss" if orientation["removed_total"] else "success",
+                    "Strand removed",
+                    "%s total · unmatched %s · palindromic ambiguous %s · "
+                    "reference ambiguous %s"
+                    % (
+                        _count(orientation["removed_total"]),
+                        _count(orientation["reference_unmatched"]),
+                        _count(orientation["palindromic_ambiguous"]),
+                        _count(orientation["reference_ambiguous"]),
+                    ),
+                ),
+                (
+                    "success" if orientation["accounting_balanced"] else "warning",
+                    "Strand accounting",
+                    "%s evaluated = %s retained + %s removed · %s / %s "
+                    "chromosomes summarized"
+                    % (
+                        _count(orientation["variants_evaluated"]),
+                        _count(orientation["variants_retained"]),
+                        _count(orientation["removed_total"]),
+                        _count(orientation["chromosomes_summarized"]),
+                        _count(orientation["chromosomes_expected"]),
+                    ),
+                ),
+            ])
+    add_card(
+        (
+            "success"
+            if build_resolved and orientation_status in {"success", "unavailable"}
+            else "warning"
+        ),
+        "Reference alignment",
+        alignment_details,
     )
 
     frequency_type = str(
@@ -580,13 +840,23 @@ def harmonisation_qc_takeaway_lines(
     )
 
     effect_type = str(study_decisions.get("effect_type") or "unresolved")
-    effect_text = (
-        "odds ratio harmonised to log-odds BETA"
-        if effect_type == "odds_ratio"
-        else "BETA-scale effect"
-        if effect_type == "beta"
-        else "effect type unresolved"
-    )
+    effect_source = str(study_decisions.get("effect_type_source") or "unavailable")
+    effect_detected = study_decisions.get("effect_type_detected")
+    pvalue_type = str(study_decisions.get("pvalue_type") or "unresolved")
+    pvalue_source = str(study_decisions.get("pvalue_type_source") or "unavailable")
+    pvalue_detected = study_decisions.get("pvalue_type_detected")
+
+    def decision_text(value: str, source: str, detected: Any) -> str:
+        if source == "detector":
+            return "%s · automatically detected" % value
+        if detected is not None:
+            agreement = "detector agrees" if str(detected) == value else (
+                "detector found %s" % detected
+            )
+            return "%s · source %s; %s" % (value, source, agreement)
+        return "%s · source %s" % (value, source)
+
+    effect_text = effect_scale_description(effect_type)
     invalid_effects = pre_vcf.get("total_variant_with_invalid_beta_se")
     missing_neff = passed.get("effective_sample_size_missing_or_invalid")
     missing_info = passed.get("format_si_missing")
@@ -599,6 +869,14 @@ def harmonisation_qc_takeaway_lines(
         "warning" if statistical_warning else "success",
         "Statistical quality",
         [
+            (
+                "analysis", "Effect type",
+                decision_text(effect_type, effect_source, effect_detected),
+            ),
+            (
+                "analysis", "P-value type",
+                decision_text(pvalue_type, pvalue_source, pvalue_detected),
+            ),
             ("analysis", "Effect scale", effect_text),
             (
                 "analysis",

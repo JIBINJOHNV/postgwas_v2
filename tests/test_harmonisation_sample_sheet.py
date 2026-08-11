@@ -10,6 +10,8 @@ from postgwas.modules.harmonisation.sample_sheet import (
     load_harmonisation_sample_sheet,
     to_harmonisation_input,
 )
+from postgwas.modules.harmonisation.input_validation import validate_config
+from postgwas.modules.harmonisation.policies import load_policies
 
 
 FIXTURE_DIR = Path(__file__).parent / "data" / "harmonisation"
@@ -79,6 +81,10 @@ class HarmonisationSampleSheetTests(unittest.TestCase):
         self.assertIsNone(values["provided_external_info_file"])
         self.assertIsNone(values["provided_external_eaf_file"])
         self.assertNotIn("NA", values.values())
+        self.assertEqual(
+            Path(values["output_folder"]),
+            FIXTURE_DIR / row.dataset_id / "harmonisation",
+        )
 
     def test_engine_output_root_uses_the_configured_dataset_layout(self):
         row = load_harmonisation_sample_sheet(MANIFEST)[0]
@@ -184,6 +190,130 @@ class HarmonisationSampleSheetTests(unittest.TestCase):
         self.assertEqual(values["infofile"], str(MANIFEST.resolve()))
         self.assertEqual(values["infocolumn"], "REFERENCE_INFO")
         self.assertIsNone(values["fixed_info"])
+
+    def test_missing_eaf_error_names_dataset_and_fields_to_complete(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory) / "manifest.csv"
+            self._write_manifest_with_values(
+                temporary,
+                effect_allele_frequency_column="NA",
+                external_eaf_file="NA",
+                external_eaf_column="NA",
+            )
+            with self.assertRaises(ConfigurationError) as caught:
+                load_harmonisation_sample_sheet(temporary)
+
+        message = str(caught.exception)
+        self.assertIn(
+            "sample-sheet row 2 for dataset 'ADHD2022_iPSYCH_deCODE_PGC'",
+            message,
+        )
+        self.assertIn("ADHD2022_iPSYCH_deCODE_PGC", message)
+        self.assertIn("has no allele-frequency source", message)
+        self.assertIn("effect_allele_frequency_column", message)
+        self.assertIn("external_eaf_file", message)
+        self.assertIn("external_eaf_column", message)
+        self.assertNotIn("pydantic.dev", message)
+
+    def test_partial_and_conflicting_eaf_errors_explain_the_correction(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            partial = Path(directory) / "partial.csv"
+            self._write_manifest_with_values(
+                partial,
+                effect_allele_frequency_column="NA",
+                external_eaf_file=str(MANIFEST),
+                external_eaf_column="NA",
+            )
+            with self.assertRaisesRegex(
+                ConfigurationError,
+                "incomplete external EAF source: external_eaf_column is missing",
+            ):
+                load_harmonisation_sample_sheet(partial)
+
+            conflicting = Path(directory) / "conflicting.csv"
+            self._write_manifest_with_values(
+                conflicting,
+                external_eaf_file=str(MANIFEST),
+                external_eaf_column="EUR",
+            )
+            with self.assertRaisesRegex(
+                ConfigurationError,
+                "provides two allele-frequency sources",
+            ):
+                load_harmonisation_sample_sheet(conflicting)
+
+    def test_external_chromosome_templates_are_accepted_and_prefixes_explained(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            frequency = root / "panel_chr1.tsv.gz"
+            frequency.write_text("CHROM\tPOS\tREF\tALT\tEUR\n", encoding="utf-8")
+            template = root / "panel_chr{chromosome}.tsv.gz"
+            valid = root / "valid.csv"
+            self._write_manifest_with_values(
+                valid,
+                effect_allele_frequency_column="NA",
+                external_eaf_file=str(template),
+                external_eaf_column="EUR",
+            )
+
+            row = load_harmonisation_sample_sheet(valid)[0]
+            self.assertEqual(row.external_eaf_file, template.resolve(strict=False))
+
+            prefix = root / "panel"
+            invalid = root / "invalid.csv"
+            self._write_manifest_with_values(
+                invalid,
+                effect_allele_frequency_column="NA",
+                external_eaf_file=str(prefix),
+                external_eaf_column="EUR",
+            )
+            with self.assertRaises(ConfigurationError) as caught:
+                load_harmonisation_sample_sheet(invalid)
+
+        message = str(caught.exception)
+        self.assertIn("filename prefix, not a file", message)
+        self.assertIn("panel_chr1.tsv.gz", message)
+        self.assertIn("{chromosome}", message)
+
+    def test_engine_config_validation_accepts_external_chromosome_template(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            frequency = root / "panel_chr1.tsv"
+            frequency.write_text(
+                "CHROM\tPOS\tREF\tALT\tEUR\n1\t10\tA\tG\t0.2\n",
+                encoding="utf-8",
+            )
+            template = root / "panel_chr{chromosome}.tsv"
+            manifest = root / "manifest.csv"
+            self._write_manifest_with_values(
+                manifest,
+                effect_allele_frequency_column="NA",
+                external_eaf_file=str(template),
+                external_eaf_column="EUR",
+            )
+            row = load_harmonisation_sample_sheet(manifest)[0]
+            config = load_configuration()
+            values = to_harmonisation_input(
+                row,
+                resource_directory=FIXTURE_DIR,
+                output_directory=root,
+                output_layout={"dataset_directory": "{dataset_id}"},
+            )
+
+            ok, problems = validate_config(
+                values,
+                policies=load_policies(config.modules.harmonisation.policies),
+            )
+
+        self.assertTrue(ok, [str(problem) for problem in problems])
 
     def test_quantitative_trait_rejects_case_counts(self):
         text = MANIFEST.read_text(encoding="utf-8")

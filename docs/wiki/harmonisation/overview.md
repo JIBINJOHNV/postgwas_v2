@@ -60,7 +60,7 @@ postgwas harmonisation \
   --run-config harmonisation.yaml \
   --resource-directory /absolute/path/to/resources \
   --output-directory /absolute/path/to/results \
-  --comparison-af-source 1000G \
+  --comparison-af-source ALFA \
   --comparison-af-column EUR \
   --threads 8 \
   --memory-gb 32 \
@@ -140,8 +140,11 @@ the manifest and QC evidence with every downstream result.
 
 Automatic inference is evidence-based but cannot repair mislabeled study
 metadata. Liftover cannot guarantee identical variant representation across
-builds. Optional concordance validation does not normalize indels against a
-FASTA. The output QC subset is virtual, not a second filtered VCF.
+builds. Optional concordance reports unmatched representations rather than
+using their count as a value-integrity failure; same-position checks cannot
+prove two differently represented variants are biologically identical and are
+therefore restricted to allele-unmatched, one-to-one, same-type records. The
+output QC subset is virtual, not a second filtered VCF.
 
 ## Scientific references
 

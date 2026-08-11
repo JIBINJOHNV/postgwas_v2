@@ -18,6 +18,12 @@ from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
 from postgwas.core.paths import configured_output_path, resolve_executable
 from postgwas.core.ui.screen import screen_field, screen_line
 
+from .contracts import (
+    CUSTOM_OUTPUT_TARGET,
+    FORMAT_CONTRACTS,
+    formatter_result_targets,
+)
+from .exporters.custom import export_custom
 from .exporters.finemap import export_finemap
 from .exporters.gcta_gene import export_gcta_gene
 from .exporters.ldsc import export_ldsc
@@ -25,17 +31,17 @@ from .exporters.magma import export_magma
 from .exporters.mixer import export_mixer
 from .exporters.pred_ld import export_pred_ld
 from .exporters.susie import export_susie
-from .contracts import FORMAT_CONTRACTS
+from .resume import (
+    formatter_output_paths,
+    formatter_resolved_paths,
+    resume_formatter_outputs,
+    write_formatter_completion_manifest,
+)
 from .table import (
     FormattingError,
     infer_study_design,
     load_harmonised_vcf,
     select_variant_identifiers,
-)
-from .resume import (
-    formatter_resolved_paths,
-    resume_formatter_outputs,
-    write_formatter_completion_manifest,
 )
 
 
@@ -50,6 +56,50 @@ EXPORTERS = {
 }
 
 
+def _validate_output_destinations(
+    output_directory: Path,
+    dataset_id: str,
+    selected: list[str],
+    module,
+) -> dict[str, str]:
+    """Resolve every selected output and reject collisions before extraction."""
+    output_paths = formatter_output_paths(
+        output_directory, dataset_id, selected, module,
+    )
+    destinations: dict[Path, list[str]] = {}
+    for label, path in output_paths.items():
+        destinations.setdefault(path, []).append(label)
+    if module.custom_output.active:
+        for label, pattern in {
+            "formatter log": module.runtime.log_file,
+            "resolved configuration": module.runtime.resolved_config_file,
+            "completion manifest": module.runtime.completion_manifest_file,
+        }.items():
+            path = configured_output_path(
+                output_directory,
+                pattern,
+                error_type=FormattingError,
+                dataset_id=dataset_id,
+            )
+            destinations.setdefault(path, []).append(label)
+
+    collisions = [
+        (path, labels)
+        for path, labels in destinations.items()
+        if len(labels) > 1
+    ]
+    if collisions:
+        details = "; ".join(
+            "%s resolve to %s" % (" and ".join(labels), path)
+            for path, labels in collisions
+        )
+        raise FormattingError(
+            "Formatter output collision: %s. Configure a unique output_file or "
+            "partition_file for each selected output." % details
+        )
+    return {label: str(path) for label, path in output_paths.items()}
+
+
 def _resolved_configuration(args):
     module_overrides = explicit_overrides(
         args,
@@ -61,6 +111,10 @@ def _resolved_configuration(args):
     )
     if "variant_identifiers.default_type" in module_overrides:
         module_overrides["variant_identifiers.target_types"] = {}
+    if hasattr(args, "custom_output_file"):
+        module_overrides["custom_output.output_file"] = args.custom_output_file
+    if hasattr(args, "custom_columns"):
+        module_overrides["custom_output.columns"] = dict(args.custom_columns)
     global_overrides = explicit_overrides(
         args,
         {
@@ -103,7 +157,17 @@ def _screen_summary(
         screen_field(
             "genetic", "Input GWAS-VCF", vcf, indent=6, label_width=label_width,
         ),
-        screen_field(
+    ]
+    if study_design is None:
+        lines.append(screen_field(
+            "info",
+            "Study-design inference",
+            "not required for the selected formats",
+            indent=6,
+            label_width=label_width,
+        ))
+    else:
+        lines.append(screen_field(
             "analysis",
             "Inferred trait type",
             "%s (%s present for %s/%s variants; %s present for %s/%s)"
@@ -118,8 +182,7 @@ def _screen_summary(
             ),
             indent=6,
             label_width=label_width,
-        ),
-    ]
+        ))
     for target, observation in variant_id_observations.items():
         identifier_label = (
             "rsIDs"
@@ -135,15 +198,44 @@ def _screen_summary(
             label_width=label_width,
         ))
     for target, result in results.items():
+        exclusion_counts = [
+            (
+                int(result.get("identifier_rows_excluded", 0)),
+                "missing or invalid identifiers",
+            ),
+            (
+                int(result.get(
+                    "rows_excluded_unconfigured_chromosome", 0,
+                )),
+                "outside configured chromosomes",
+            ),
+            (
+                int(result.get("schema_rows_excluded", 0)),
+                "missing or invalid required values",
+            ),
+        ]
+        exclusion_details = [
+            "%s %s" % (f"{count:,}", reason)
+            for count, reason in exclusion_counts
+            if count
+        ]
+        categorized = sum(count for count, _ in exclusion_counts)
+        uncategorized = int(result["rows_excluded"]) - categorized
+        if uncategorized > 0:
+            exclusion_details.append(
+                "%s other exclusions" % f"{uncategorized:,}"
+            )
+        exclusion_summary = "%s excluded" % f"{result['rows_excluded']:,}"
+        if exclusion_details:
+            exclusion_summary += " (%s)" % "; ".join(exclusion_details)
         lines.append(screen_field(
             "success",
             target,
-            "%s variants exported using %s; %s excluded because the "
-            "identifier or required values were missing or invalid"
+            "%s variants exported using %s; %s"
             % (
                 f"{result['rows_out']:,}",
                 "rsIDs" if result["variant_id_type"] == "rsid" else "unique IDs",
-                f"{result['rows_excluded']:,}",
+                exclusion_summary,
             ),
             indent=6,
             label_width=label_width,
@@ -182,13 +274,34 @@ def _print_contract_table(selected, module, trait_type):
     table.add_column("Allele frequency", ratio=3)
     table.add_column("Sample size", ratio=3)
     for target in selected:
-        contract = FORMAT_CONTRACTS[target]
-        table.add_row(
-            contract.name,
-            _configured_output_columns(module.exports[target], trait_type),
-            contract.frequency,
-            contract.sample_size,
-        )
+        if target == CUSTOM_OUTPUT_TARGET:
+            roles = set(module.custom_output.columns)
+            frequency = (
+                "EAF retained and/or MAF derived from EAF"
+                if roles & {"eaf", "maf"}
+                else "not requested"
+            )
+            sample_size = (
+                ", ".join(
+                    role for role in ("n", "neff", "n_case", "n_control")
+                    if role in roles
+                )
+                or "not requested"
+            )
+            table.add_row(
+                "Custom CLI table",
+                ", ".join(module.custom_output.columns.values()),
+                frequency,
+                sample_size,
+            )
+        else:
+            contract = FORMAT_CONTRACTS[target]
+            table.add_row(
+                contract.name,
+                _configured_output_columns(module.exports[target], trait_type),
+                contract.frequency,
+                contract.sample_size,
+            )
     console = Console(width=128)
     console.print()
     console.print(table)
@@ -251,10 +364,12 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             )
         vcf = Path(vcf_value).expanduser().resolve()
         selected = list(module.formats)
-        if not selected:
+        targets = formatter_result_targets(module, selected)
+        if not targets:
             raise FormattingError(
-                "No output format was selected. Provide --format followed by one or "
-                "more of: %s, or set modules.formatting.formats in --run-config."
+                "No output was selected. Provide --format followed by one or more "
+                "of: %s, or provide --custom-output with --id and the requested "
+                "column-name options."
                 % ", ".join(EXPORTERS)
             )
         if len(selected) != len(set(selected)):
@@ -274,6 +389,12 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             "variant_identifiers": identifier_policy,
         })
         configuration.modules.formatting = module
+        output_destinations = _validate_output_destinations(
+            output_directory,
+            dataset_id,
+            selected,
+            module,
+        )
 
         bcftools = configuration.resources.executables.bcftools
         try:
@@ -287,7 +408,13 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             ) from exc
 
         logger.record("INPUT", "formatter_run", dataset=dataset_id, vcf=str(vcf))
-        logger.record("PARAM", "formats", values=selected)
+        logger.record("PARAM", "formats", values=targets)
+        logger.record(
+            "VALIDATE",
+            "formatter_output_destinations",
+            status="PASSED",
+            values=output_destinations,
+        )
         logger.record("PARAM", "minimum_p_value", value=module.minimum_p_value)
         logger.record("PARAM", "vcf_fields", values=module.vcf_fields.model_dump())
         logger.record(
@@ -317,6 +444,21 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                 },
                 frequency=contract.frequency,
                 sample_size=contract.sample_size, source=contract.source,
+            )
+        if module.custom_output.active:
+            logger.record(
+                "PARAM",
+                "formatter_schema",
+                target=CUSTOM_OUTPUT_TARGET,
+                output_file=module.custom_output.output_file,
+                columns=module.custom_output.columns,
+                field_contracts={
+                    role: module.custom_output.field_contracts[role].model_dump(
+                        mode="json"
+                    )
+                    for role in module.custom_output.columns
+                },
+                required_field_policy="exclude_rows_missing_any_requested_field",
             )
         resolved_config_path = configured_output_path(
             output_directory,
@@ -348,11 +490,11 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     ctx["formatter"] = resumed
                 logger.record(
                     "SKIP", "formatter_run", reason="validated_resume",
-                    formats=selected,
+                    formats=targets,
                 )
                 logger.record(
                     "STATUS", "formatter_run", status="COMPLETED",
-                    formats=selected, resumed=True,
+                    formats=targets, resumed=True,
                 )
                 print(screen_line(
                     "success",
@@ -378,7 +520,7 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
         work_table = Path(handle.name)
         handle.close()
         with logger.step(
-            1, len(selected) + 1, "Read harmonised GWAS-VCF", "load_harmonised_vcf",
+            1, len(targets) + 1, "Read harmonised GWAS-VCF", "load_harmonised_vcf",
         ) as step:
             frame = load_harmonised_vcf(
                 vcf,
@@ -391,40 +533,60 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             step.set_rows(frame.height, removed=0)
             step.output("canonical_variants", rows=frame.height)
 
-        study_design = infer_study_design(
-            frame,
-            module.study_design.case_count_column,
-            module.study_design.control_count_column,
-        )
-        logger.record(
-            "DECIDE",
-            "study_design",
-            trait_type=study_design.trait_type,
-            rule="quantitative_if_case_count_entirely_missing_otherwise_binary",
-            case_count_column=module.study_design.case_count_column,
-            control_count_column=module.study_design.control_count_column,
-            case_count_present=study_design.case_counts_present,
-            control_count_present=study_design.control_counts_present,
-            variants=study_design.rows,
-            metadata_header_used=False,
-        )
-        if (
-            study_design.trait_type == "binary"
-            and (
-                study_design.case_counts_present < study_design.rows
-                or study_design.control_counts_present < study_design.rows
+        study_design_required_by = [
+            target for target in selected
+            if target in module.study_design.required_formats
+        ]
+        study_design = None
+        if study_design_required_by:
+            study_design = infer_study_design(
+                frame,
+                module.study_design.case_count_column,
+                module.study_design.control_count_column,
             )
-        ):
-            logger.warning(
-                "The study is binary because the configured case-count column contains "
-                "at least one value, but case/control counts are incomplete for some "
-                "variants. Count-dependent outputs will exclude those variants."
+            logger.record(
+                "DECIDE",
+                "study_design",
+                trait_type=study_design.trait_type,
+                required_by=study_design_required_by,
+                rule="quantitative_if_case_count_entirely_missing_otherwise_binary",
+                case_count_column=module.study_design.case_count_column,
+                control_count_column=module.study_design.control_count_column,
+                case_count_present=study_design.case_counts_present,
+                control_count_present=study_design.control_counts_present,
+                variants=study_design.rows,
+                metadata_header_used=False,
+            )
+            if (
+                study_design.trait_type == "binary"
+                and (
+                    study_design.case_counts_present < study_design.rows
+                    or study_design.control_counts_present < study_design.rows
+                )
+            ):
+                logger.warning(
+                    "The study is binary because the configured case-count column "
+                    "contains at least one value, but case/control counts are "
+                    "incomplete for some variants. Count-dependent outputs will "
+                    "exclude those variants."
+                )
+        else:
+            logger.record(
+                "SKIP",
+                "study_design",
+                reason="not_required_for_selected_formats",
+                formats=selected,
             )
 
-        _print_contract_table(selected, module, study_design.trait_type)
+        _print_contract_table(
+            targets,
+            module,
+            study_design.trait_type if study_design is not None else None,
+        )
 
         results = {}
-        for number, target in enumerate(selected, 2):
+        exporters = {**EXPORTERS, CUSTOM_OUTPUT_TARGET: export_custom}
+        for number, target in enumerate(targets, 2):
             identifier_type = module.variant_identifiers.target_types.get(
                 target, module.variant_identifiers.default_type,
             )
@@ -437,19 +599,30 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             )
             with logger.step(
                 number,
-                len(selected) + 1,
+                len(targets) + 1,
                 "Create %s input" % target,
-                EXPORTERS[target].__name__,
+                exporters[target].__name__,
                 rows_in=frame.height,
             ) as step:
-                result = EXPORTERS[target](
+                exporter_kwargs = {
+                    "overwrite": configuration.run.overwrite,
+                }
+                if target in study_design_required_by:
+                    exporter_kwargs["study_design"] = study_design
+                result = exporters[target](
                     target_frame,
                     output_directory,
                     dataset_id,
                     module,
-                    overwrite=configuration.run.overwrite,
+                    **exporter_kwargs,
                 )
                 excluded = int(result["rows_excluded"])
+                chromosome_excluded = int(
+                    result.get("rows_excluded_unconfigured_chromosome", 0)
+                )
+                rows_on_configured_chromosomes = (
+                    target_frame.height - chromosome_excluded
+                )
                 identifier_excluded = int(identifier_qc["identifier_rows_excluded"])
                 if identifier_excluded:
                     step.qc(
@@ -461,10 +634,26 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                         reason="missing_or_invalid_variant_identifier",
                         warn=True,
                     )
+                if chromosome_excluded:
+                    step.observed(
+                        "excluded_unconfigured_chromosomes",
+                        target=target,
+                        chromosomes=result.get("excluded_chromosomes", {}),
+                        variants=chromosome_excluded,
+                    )
+                    step.qc(
+                        "configured formatter chromosomes",
+                        "Exclude records whose normalized chromosome is not "
+                        "configured for this output.",
+                        target_frame.height,
+                        rows_on_configured_chromosomes,
+                        reason="unconfigured_chromosome",
+                        warn=True,
+                    )
                 step.qc(
                     "required formatter fields",
                     "Exclude records that cannot be represented correctly in this tool's input.",
-                    target_frame.height,
+                    rows_on_configured_chromosomes,
                     int(result["rows_out"]),
                     reason="missing_or_invalid_required_value",
                     warn=excluded > 0,
@@ -473,7 +662,8 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                 if bounded:
                     step.qc(
                         "raw p-value numeric bound",
-                        "Bound raw p-values at the configured minimum to avoid floating-point underflow.",
+                        "Bound raw p-values at the configured minimum to avoid "
+                        "floating-point underflow.",
                         int(result["rows_out"]),
                         int(result["rows_out"]),
                         changed=bounded,
@@ -507,7 +697,7 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
         )
         logger.record(
             "STATUS", "formatter_run", status="COMPLETED",
-            formats=selected, input_variants=frame.height,
+            formats=targets, input_variants=frame.height,
         )
         print(_screen_summary(
             dataset_id,

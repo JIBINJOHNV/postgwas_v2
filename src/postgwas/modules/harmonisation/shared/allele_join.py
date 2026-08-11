@@ -22,38 +22,56 @@ def _unused_name(prefix: str, *frames: pl.DataFrame) -> str:
     return name
 
 
-def _deduplicate_reference_values(
+def deduplicate_reference_values(
     reference: pl.DataFrame,
     keys: Sequence[str],
     value_column: str,
     *,
-    source_count_column: str,
+    exact_action: str,
+    non_identical_action: str,
     reference_label: str,
     error_type: Type[Exception],
+    exact_policy_key: str = "external_reference.exact_duplicate_action",
+    non_identical_policy_key: str = (
+        "external_reference.non_identical_duplicate_action"
+    ),
 ) -> tuple[pl.DataFrame, dict[str, int]]:
-    """Collapse safe duplicates and reject conflicting scientific values.
-
-    A finite annotation is preferred over an earlier null, NaN, infinity or
-    unparseable value. Equivalent finite values are harmless duplicates. Two
-    distinct finite values for the same exact allele-specific key are
-    scientifically ambiguous, so the caller must repair the reference rather
-    than having this function select one arbitrarily.
-    """
+    """Resolve repeated allele keys without selecting among different values."""
+    if exact_action not in ("keep_one", "discard_all", "fail"):
+        raise error_type(
+            "%s must be 'keep_one', 'discard_all' or 'fail'; received %r."
+            % (exact_policy_key, exact_action)
+        )
+    if non_identical_action not in ("discard_all", "fail"):
+        raise error_type(
+            "%s must be 'discard_all' or 'fail'; received %r."
+            % (non_identical_policy_key, non_identical_action)
+        )
     count_name = _unused_name("__postgwas_duplicate_count__", reference)
     first_name = _unused_name("__postgwas_first_value__", reference)
-    usable_name = _unused_name("__postgwas_first_usable_value__", reference)
-    distinct_name = _unused_name("__postgwas_distinct_usable_values__", reference)
+    distinct_name = _unused_name("__postgwas_distinct_values__", reference)
     value = pl.col(value_column)
-    usable = value.is_not_null() & value.is_finite()
     grouped = reference.group_by(list(keys), maintain_order=True).agg([
         pl.len().cast(pl.UInt32).alias(count_name),
         value.first().alias(first_name),
-        value.filter(usable).first().alias(usable_name),
-        value.filter(usable).n_unique().alias(distinct_name),
+        # n_unique includes null and distinguishes NaN and infinities. Thus a
+        # missing value beside a finite annotation is non-identical rather
+        # than an invitation to select the finite row silently.
+        value.n_unique().alias(distinct_name),
     ])
 
-    conflicts = grouped.filter(pl.col(distinct_name) > 1)
-    if conflicts.height:
+    duplicate = pl.col(count_name) > 1
+    exact = duplicate & (pl.col(distinct_name) == 1)
+    non_identical = duplicate & (pl.col(distinct_name) > 1)
+    exact_groups = int(grouped.select(exact.sum()).item() or 0)
+    non_identical_groups = int(
+        grouped.select(non_identical.sum()).item() or 0
+    )
+
+    def fail_for(mask: pl.Expr, kind: str, policy_key: str) -> None:
+        conflicts = grouped.filter(mask)
+        if not conflicts.height:
+            return
         example = conflicts.row(0, named=True)
         key_mask = pl.lit(True)
         for key in keys:
@@ -64,8 +82,8 @@ def _deduplicate_reference_values(
                 else pl.col(key) == pl.lit(key_value)
             )
             key_mask = key_mask & condition
-        conflicting_values = (
-            reference.filter(key_mask & usable)
+        values = (
+            reference.filter(key_mask)
             .get_column(value_column)
             .unique(maintain_order=True)
             .head(10)
@@ -75,38 +93,55 @@ def _deduplicate_reference_values(
             "%s=%r" % (key, example[key]) for key in keys
         )
         raise error_type(
-            "%s contains conflicting finite values for duplicate allele-specific "
-            "reference key %s: %r. PostGWAS cannot choose one without changing "
-            "scientific data. Make the duplicate values identical or remove the "
-            "incorrect rows."
-            % (reference_label, key_text, conflicting_values)
+            "%s contains %s duplicate values for allele-specific reference key "
+            "%s: %r. Policy '%s' is 'fail'. Make the values identical, repair "
+            "the reference, or choose a permitted discard policy."
+            % (reference_label, kind, key_text, values, policy_key)
         )
 
-    duplicate_groups = int(
-        grouped.select((pl.col(count_name) > 1).sum()).item() or 0
-    )
-    preferred_usable = int(
+    if exact_action == "fail":
+        fail_for(
+            exact,
+            "exact",
+            exact_policy_key,
+        )
+    if non_identical_action == "fail":
+        fail_for(
+            non_identical,
+            "non-identical",
+            non_identical_policy_key,
+        )
+
+    exact_rows = int(
         grouped.select(
-            (
-                (pl.col(count_name) > 1)
-                & ~(
-                    pl.col(first_name).is_not_null()
-                    & pl.col(first_name).is_finite()
-                )
-                & pl.col(usable_name).is_not_null()
-            ).sum()
+            pl.when(exact).then(pl.col(count_name)).otherwise(0).sum()
         ).item()
         or 0
     )
-    resolved = grouped.select([
+    non_identical_rows = int(
+        grouped.select(
+            pl.when(non_identical).then(pl.col(count_name)).otherwise(0).sum()
+        ).item()
+        or 0
+    )
+    discard = pl.lit(False)
+    if exact_action == "discard_all":
+        discard = discard | exact
+    if non_identical_action == "discard_all":
+        discard = discard | non_identical
+    discarded_groups = int(grouped.select(discard.sum()).item() or 0)
+
+    resolved = grouped.filter(~discard).select([
         *[pl.col(key) for key in keys],
-        pl.coalesce([pl.col(usable_name), pl.col(first_name)]).alias(value_column),
-        pl.col(count_name).alias(source_count_column),
+        pl.col(first_name).alias(value_column),
     ])
     return resolved, {
-        "reference_duplicate_groups": duplicate_groups,
-        "reference_duplicate_groups_preferred_usable_value": preferred_usable,
-        "reference_conflicting_duplicate_groups": 0,
+        "reference_duplicate_groups": exact_groups + non_identical_groups,
+        "reference_exact_duplicate_groups": exact_groups,
+        "reference_non_identical_duplicate_groups": non_identical_groups,
+        "reference_duplicate_groups_discarded": discarded_groups,
+        "reference_exact_duplicate_rows": exact_rows,
+        "reference_non_identical_duplicate_rows": non_identical_rows,
     }
 
 
@@ -118,22 +153,23 @@ def allele_oriented_left_join(
     reference_columns: Mapping[str, str],
     value_column: str,
     output_column: str,
+    duplicate_exact_action: str,
+    duplicate_non_identical_action: str,
     orientations: Sequence[str] = ("direct", "swap"),
     swapped_value: str = "same",
-    deduplicate_reference: bool = True,
     prefer_non_null_value: bool = False,
     study_columns_canonical: bool = True,
     error_type: Type[Exception] = RuntimeError,
     warn: Callable[[str], None] | None = None,
     reference_label: str = "reference table",
-    duplicate_policy_name: str | None = None,
 ) -> tuple[pl.DataFrame, str, dict[str, int]]:
     """Attach one numeric annotation using direct and/or swapped alleles.
 
     The function performs exactly one study/reference join and never changes
-    the number or order of study rows. When reference deduplication is enabled,
-    a finite value is preferred over an earlier missing or non-finite duplicate;
-    conflicting finite values fail rather than being selected arbitrarily.
+    the number or order of study rows. Exact allele-key plus annotation-value
+    duplicates follow ``duplicate_exact_action``. Different values for one key
+    follow ``duplicate_non_identical_action`` and are never selected by row
+    order.
     Direct orientation has precedence when both allele orders provide a value;
     ``prefer_non_null_value=True`` permits a populated swapped record to fill
     an empty direct record.
@@ -154,7 +190,6 @@ def allele_oriented_left_join(
             "swapped_value must be 'same' or 'one_minus'; received %r."
             % swapped_value
         )
-
     required_keys = ("chr", "pos", "ea", "oa")
     missing_study = [key for key in required_keys if not study_columns.get(key)]
     missing_reference = [
@@ -232,28 +267,16 @@ def allele_oriented_left_join(
         warn=warn,
     )
 
-    source_duplicates = _unused_name(
-        "__postgwas_source_duplicate_count__", study, reference
-    )
     rows_before_deduplication = reference.height
-    duplicate_stats = {
-        "reference_duplicate_groups": 0,
-        "reference_duplicate_groups_preferred_usable_value": 0,
-        "reference_conflicting_duplicate_groups": 0,
-    }
-    if deduplicate_reference:
-        reference, duplicate_stats = _deduplicate_reference_values(
-            reference,
-            study_keys,
-            value_column,
-            source_count_column=source_duplicates,
-            reference_label=reference_label,
-            error_type=error_type,
-        )
-    else:
-        reference = reference.with_columns(
-            pl.len().over(study_keys).cast(pl.UInt32).alias(source_duplicates)
-        )
+    reference, duplicate_stats = deduplicate_reference_values(
+        reference,
+        study_keys,
+        value_column,
+        exact_action=duplicate_exact_action,
+        non_identical_action=duplicate_non_identical_action,
+        reference_label=reference_label,
+        error_type=error_type,
+    )
     rows_after_deduplication = reference.height
 
     value_name = _unused_name("__postgwas_reference_value__", study, reference)
@@ -261,9 +284,6 @@ def allele_oriented_left_join(
         "__postgwas_allele_match_orientation__", study, reference
     )
     priority_name = _unused_name("__postgwas_match_priority__", study, reference)
-    matched_duplicates = _unused_name(
-        "__postgwas_matched_duplicate_count__", study, reference
-    )
     reference = reference.rename({value_column: value_name})
 
     frames = []
@@ -281,15 +301,10 @@ def allele_oriented_left_join(
             pl.col(study_columns["oa"]).alias(study_columns["ea"]),
             pl.col(study_columns["ea"]).alias(study_columns["oa"]),
             swapped_expression.alias(value_name),
-            pl.col(source_duplicates),
             pl.lit(1, dtype=pl.Int8).alias(orientation_name),
         ]))
 
     oriented = pl.concat(frames, how="vertical")
-    duplicate_expression = pl.col(source_duplicates).max().over(study_keys)
-    oriented = oriented.with_columns(
-        duplicate_expression.alias(matched_duplicates)
-    )
     if prefer_non_null_value:
         oriented = (
             oriented
@@ -322,23 +337,6 @@ def allele_oriented_left_join(
             % (reference_label, rows_before_join, joined.height)
         )
 
-    duplicated_matches = int(joined.select(
-        (
-            pl.col(orientation_name).is_not_null()
-            & (pl.col(matched_duplicates) > 1)
-        ).sum()
-    ).item() or 0)
-    if duplicated_matches and not deduplicate_reference:
-        policy = (
-            " Set %s to true, or deduplicate the reference file."
-            % duplicate_policy_name
-            if duplicate_policy_name else " Deduplicate the reference file."
-        )
-        raise error_type(
-            "%s contains repeated allele-specific rows matching %d study variants.%s"
-            % (reference_label, duplicated_matches, policy)
-        )
-
     counts = joined.select([
         (pl.col(orientation_name) == 0).sum().alias("direct_key_matches"),
         (pl.col(orientation_name) == 1).sum().alias("swapped_key_matches"),
@@ -363,8 +361,8 @@ def allele_oriented_left_join(
 
     joined = joined.with_columns(
         pl.col(value_name).alias(output_column)
-    ).drop([value_name, source_duplicates, matched_duplicates])
+    ).drop(value_name)
     return joined, orientation_name, stats
 
 
-__all__ = ["allele_oriented_left_join"]
+__all__ = ["allele_oriented_left_join", "deduplicate_reference_values"]

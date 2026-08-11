@@ -246,12 +246,29 @@ class HarmonisationConfigTests(unittest.TestCase):
     def test_converter_summary_location_is_owned_by_canonical_output_layout(self):
         config = load_configuration().modules.harmonisation
         self.assertEqual(
+            config.output_layout.root["dataset_directory"],
+            "{dataset_id}/harmonisation",
+        )
+        self.assertNotIn("analysis_directory", config.output_layout.root)
+        self.assertEqual(
             config.output_layout.root["gwas2vcf_summary"],
             "qc_summary/{dataset_id}_gwas2vcf_summary.tsv",
         )
         self.assertEqual(
             config.output_layout.root["chromosome_source_snapshot"],
             "rejected/{dataset_id}_chr{chromosome}_source.parquet",
+        )
+        self.assertEqual(
+            config.output_layout.root["dataset_reject"],
+            "rejected/{dataset_id}_rejected_variants.tsv.gz",
+        )
+        self.assertEqual(
+            config.output_layout.root["duplicates"],
+            "qc_summary/{dataset_id}_duplicates.tsv",
+        )
+        self.assertEqual(
+            config.output_layout.root["qc_summary"],
+            "qc_summary/{dataset_id}_QC_summary.txt",
         )
 
     def test_export_has_no_duplicate_module_and_policy_settings(self):
@@ -277,7 +294,45 @@ class HarmonisationConfigTests(unittest.TestCase):
             "schema_inference_rows", "null_values", "p_value_tail",
             "p_value_floor", "p_value_ceiling",
         } & set(exported["concordance_validation"]))
+        self.assertIn("standard_error", exported["concordance_validation"])
+        self.assertEqual(
+            exported["concordance_validation"]["palindromic_action"],
+            "compare_resolved",
+        )
+        self.assertNotIn(
+            "indel_representation_action", exported["concordance_validation"],
+        )
+        self.assertEqual(
+            set(exported["concordance_validation"]["failure"]),
+            {
+                "maximum_value_mismatch_fraction",
+                "maximum_vcf_duplicate_records",
+                "maximum_invalid_vcf_records",
+            },
+        )
         self.assertEqual(exported["policies"]["build"]["mode"], "auto")
+        self.assertEqual(
+            exported["policies"]["strand"][
+                "palindromic_af_discordance_action"
+            ],
+            "reject",
+        )
+        self.assertEqual(
+            exported["policies"]["external_reference"],
+            {
+                "exact_duplicate_action": "keep_one",
+                "non_identical_duplicate_action": "discard_all",
+            },
+        )
+        self.assertNotIn("deduplicate_reference", exported["policies"]["eaf"])
+        self.assertNotIn("deduplicate_reference", exported["policies"]["info"])
+        self.assertEqual(
+            exported["policies"]["eaf"]["palindromic_handling"],
+            "ignore",
+        )
+        self.assertNotIn(
+            "palindromic_resolve_tolerance", exported["policies"]["eaf"]
+        )
         self.assertEqual(
             list(exported["policies"]["build"]),
             [
@@ -372,12 +427,12 @@ class HarmonisationConfigTests(unittest.TestCase):
     def test_comparison_af_comes_from_configuration(self):
         config = load_configuration(
             cli_overrides={
-                "modules.harmonisation.comparison_af.source": "ALFA",
+                "modules.harmonisation.comparison_af.source": "1000G",
                 "modules.harmonisation.comparison_af.column": "AFR",
             }
         )
         defaults = _engine_defaults(config)
-        self.assertEqual(defaults["default_comparison_af_file"], "ALFA")
+        self.assertEqual(defaults["default_comparison_af_file"], "1000G")
         self.assertEqual(defaults["default_comparison_af_column"], "AFR")
 
     def test_population_frequency_qc_uses_exactly_five_configured_info_fields(self):
@@ -400,8 +455,15 @@ class HarmonisationConfigTests(unittest.TestCase):
 
     def test_default_eaf_table_contract_comes_from_configuration(self):
         config = load_configuration().modules.harmonisation
+        expected_sources = ["ALFA", "wgs_ukb", "panukb", "1000G", "fingen"]
 
-        self.assertEqual(config.comparison_af.source, "1000G")
+        self.assertEqual(config.comparison_af.source, "ALFA")
+        self.assertEqual(config.default_eaf.source, "ALFA")
+        self.assertEqual(config.default_eaf.column, "EUR")
+        self.assertEqual(config.default_eaf.available_sources, expected_sources)
+        self.assertEqual(
+            set(config.default_eaf.resource_examples), set(expected_sources)
+        )
         self.assertEqual(config.default_eaf_mapping.chromosome, "CHROM")
         self.assertEqual(config.default_eaf_mapping.position, "POS")
         self.assertEqual(config.default_eaf_mapping.effect_allele, "ALT")
@@ -412,10 +474,32 @@ class HarmonisationConfigTests(unittest.TestCase):
             {"chr": "CHROM", "pos": "POS", "a1": "ALT", "a2": "REF", "delimiter": "tab"},
         )
         self.assertEqual(
+            _engine_defaults(load_configuration())["default_eaf_reference_source"],
+            "ALFA",
+        )
+        self.assertEqual(
+            _engine_defaults(load_configuration())["default_eaf_reference_column"],
+            "EUR",
+        )
+        self.assertEqual(
             config.resource_layout.default_eaf,
             "{build}/default_af/tab_files/"
             "{build}_{source}_freq_chr{chromosome}.tsv.gz",
         )
+
+    def test_default_eaf_source_must_be_declared_in_canonical_registry(self):
+        for source in ("ALFA", "wgs_ukb", "panukb", "1000G", "fingen"):
+            config = load_configuration(cli_overrides={
+                "modules.harmonisation.default_eaf.source": source,
+            })
+            self.assertEqual(config.modules.harmonisation.default_eaf.source, source)
+
+        with self.assertRaisesRegex(
+            ConfigurationError, "source must be one of available_sources"
+        ):
+            load_configuration(cli_overrides={
+                "modules.harmonisation.default_eaf.source": "unknown_panel",
+            })
 
     def test_missing_vcf_id_format_uses_bcftools_escaped_separators(self):
         config = load_configuration().modules.harmonisation.vcf_processing
@@ -441,6 +525,13 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertEqual(defaults["policies"]["eaf"]["maf_decision_cutoff"], 0.9)
         self.assertNotIn("maf_eaf_decision_cutoff", defaults)
 
+    def test_maf_reference_confirmation_has_conservative_canonical_defaults(self):
+        defaults = default_policies()
+
+        self.assertEqual(defaults.get("eaf.reference_minor_fraction_cutoff"), 0.95)
+        self.assertEqual(defaults.get("eaf.maf_reference_error_margin"), 0.02)
+        self.assertNotIn("eaf.on_maf_check_inconclusive", defaults)
+
     @patch(
         "postgwas.modules.harmonisation.service.resolve_resource_file",
         side_effect=lambda input_file, **_: input_file,
@@ -458,11 +549,13 @@ class HarmonisationConfigTests(unittest.TestCase):
             target_build="GRCh38",
             resource_folder="/reference",
             user_eaf_file="external_eaf.tsv",
-            default_comparison_af_file="1000G",
+            default_eaf_reference_source="1000G",
+            default_comparison_af_file="ALFA",
             resource_layout=_engine_defaults(load_configuration())["resource_layout"],
             user_info_file="external_info.tsv",
             dbsnp="dbSNP157",
             user_eaf_column=None,
+            default_eaf_reference_column="EUR",
             default_comparison_af_column=None,
             user_info_column=None,
         )
@@ -472,6 +565,9 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertNotIn("default_info_file", resources)
         self.assertEqual(len(validated_paths), 7)
         self.assertIn("GRCh37_1000G_freq_chr1.tsv.gz", validated_paths[0])
+        self.assertTrue(any(
+            "GRCh37_ALFA_freq_chr1.vcf.gz" in path for path in validated_paths
+        ))
 
         validated_paths.clear()
         build_resource_map(**arguments, require_default_eaf=False)

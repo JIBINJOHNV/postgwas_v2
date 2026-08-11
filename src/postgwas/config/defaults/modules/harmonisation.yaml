@@ -21,16 +21,30 @@ module:
   enabled: false
 
   comparison_af:
-    source: 1000G
+    source: ALFA
     column: EUR
     available_sources: [ALFA, 1000G]
     resource_examples:
       ALFA: GRCh37_ALFA_freq_chr[1..22,X,Y].vcf.gz
       1000G: GRCh37_1000G_freq_chr[1..22,X,Y].vcf.gz
 
-  # Default EAF validation table. The source and population column are the
-  # comparison_af.source and comparison_af.column values above. Frequencies in
-  # the selected population column are ALT-allele frequencies.
+  # Allele-orientation and MAF/EAF validation table. This is intentionally
+  # separate from comparison_af because chromosome harmonisation consumes
+  # tabular reference frequencies rather than annotation VCFs. Select exactly
+  # one source per run; ALFA EUR is the packaged default.
+  default_eaf:
+    source: ALFA
+    column: EUR
+    available_sources: [ALFA, wgs_ukb, panukb, 1000G, fingen]
+    resource_examples:
+      ALFA: GRCh37_ALFA_freq_chr[1..22].tsv.gz
+      wgs_ukb: GRCh37_wgs_ukb_freq_chr[1..22].tsv.gz
+      panukb: GRCh37_panukb_freq_chr[1..22].tsv.gz
+      1000G: GRCh37_1000G_freq_chr[1..22].tsv.gz
+      fingen: GRCh37_fingen_freq_chr[1..22].tsv.gz
+
+  # Frequencies in the selected default_eaf population column are ALT-allele
+  # frequencies.
   default_eaf_mapping:
     chromosome: CHROM
     position: POS
@@ -62,6 +76,313 @@ module:
     value: null
     column: __postgwas_fixed_info
 
+  # Header aliases used by the optional sample-sheet generator. These aliases
+  # select column names only; the harmonisation preflight still validates the
+  # selected columns and infers study properties from the complete dataset.
+  sample_sheet_generator:
+    supported_suffixes:
+      - .vcf.gz
+      - .vcf.bgz
+      - .vcf.bz2
+      - .vcf.xz
+      - .vcf.zip
+      - .tsv.gz
+      - .txt.gz
+      - .csv.gz
+      - .sumstats.gz
+      - .meta.gz
+      - .tsv.bgz
+      - .txt.bgz
+      - .tsv.bz2
+      - .txt.bz2
+      - .tsv.xz
+      - .txt.xz
+      - .tsv.zip
+      - .txt.zip
+      - .tsv
+      - .txt
+      - .csv
+      - .sumstats
+      - .meta
+      - .vcf
+      - .gz
+      - .bgz
+      - .bz2
+      - .xz
+      - .zip
+    trait_type: auto
+    effect_type: auto
+    p_value_type: auto
+    on_missing_sample_size: write_draft
+    effect_frequency_prefixes: [FRQ_U, FREQ_U]
+    # ALT-labelled frequencies are valid study EAF only when the selected
+    # effect-allele column is itself ALT-labelled.
+    alternative_frequency:
+      allele_columns:
+        - ALT
+        - ALT_ALLELE
+        - ALTALLELE
+        - ALTERNATIVE
+        - ALTERNATIVE_ALLELE
+        - ALTERNATIVEALLELE
+      frequency_columns:
+        - AF_ALT
+        - ALT_AF
+        - ALT_FREQ
+        - ALT_ALLELE_FREQ
+        - ALT_ALLELE_FREQUENCY
+        - ALTERNATIVE_AF
+        - POOLED_ALT_AF
+    column_aliases:
+      chromosome_column:
+        - CHR
+        - CHROM
+        - CHROMOSOME
+        - CHROMOSOMES
+        - CHROMS
+        - HG19CHRC
+        - SEQ
+        - SEQNAME
+        - SEQNAMES
+        - SEQS
+      position_column:
+        - BASE
+        - BASE_GRCH37
+        - BASE_GRCH38
+        - BASE_PAIR_LOCATION
+        - BASE_PAIR_POSITION
+        - BASEGRCH37
+        - BASEGRCH38
+        - BP
+        - BP_HG19
+        - BP_HG38
+        - BPHG19
+        - BPHG38
+        - BPOS
+        - GEN_POS
+        - GENOMEPOS
+        - GENPOS
+        - POS
+        - POS_B37
+        - POS_B38
+        - POS_GRCH37
+        - POS_GRCH38
+        - POS37
+        - POS38
+        - POSGEN
+        - POSGRCH37
+        - POSGRCH38
+        - POSITION
+        - POSITION_BP
+        - POSITION37
+        - POSITION38
+        - START
+      chromosome_position_column:
+        - CHR_POS
+        - CHROM_POS
+        - CHROMOSOME_POSITION
+      variant_id_column:
+        - RSID
+        - SNP
+        - SNP_ID
+        - SNPID
+        - ID
+        - ID_DBSNP49
+        - MARKER
+        - MARKER_NAME
+        - MARKERNAME
+        - PREDICTOR
+        - RS
+        - RS_ID
+        - RS_NUMBER
+        - RS_NUMBERS
+        - RSNUMBERS
+        - SNPNAME
+        - VARIANT
+        - VARIANT_ID
+      effect_allele_column:
+        - A1
+        - AL1
+        - ALLELE1
+        - ALT
+        - ALT_ALLELE
+        - ALTALLELE
+        - ALTERNATIVE
+        - ALTERNATIVE_ALLELE
+        - ALTERNATIVEALLELE
+        - EA
+        - EFF_ALLELE
+        - EFFALLELE
+        - EFFECT_ALLELE
+        - EFFECTALLELE
+        - TESTED_ALLELE
+        - TESTEDALLELE
+      other_allele_column:
+        - A2
+        - AL2
+        - ALLELE0
+        - ALLELE2
+        - OA
+        - NEA
+        - NON_EFFECT_ALLELE
+        - NONEA
+        - NONEFFECT_ALLELE
+        - NONEFFECTALLELE
+        - OTHER_ALLELE
+        - OTHERALLELE
+        - REF
+        - REFALLELE
+        - REFERENCE
+        - REFERENCE_ALLELE
+        - REFERENCEALLELE
+      effect_allele_frequency_column:
+        - EAF
+        - A1FREQ
+        - AF_EFF
+        - EFF_AF
+        - EFFECT_AF
+        - EFFECT_ALLELE_FREQ
+        - EFFECT_ALLELE_FREQUENCY
+        - EFFECT_ALLELE_FRQ
+        - EFFECTALLELEFREQ
+        - FREQ_EFFECT
+        - FREQ_EFFECT_ALLELE
+        - FREQ_TESTED_ALLELE
+        - FREQ_TESTED_ALLELE_IN_HRS
+        - FRQ_EFFECT_ALLELE
+        - FRQ_TESTED_ALLELE
+        - TESTED_AF
+      maf_frequency_column:
+        - MAF
+        - MINOR_AF
+        - FRQMAX
+      ambiguous_frequency_column:
+        - AF
+        - ALL_AF
+        - ALL_META_AF
+        - ALLELE_FREQ
+        - ALLELE_FREQUENCY
+        - ALLELE_FRQ
+        - EST_FRQ
+        - F_U
+        - FCON
+        - FREQ
+        - FREQUENCY
+        - FRQ
+        - HRC_FRQ_A1
+        - INC_AF
+      reference_frequency_column:
+        - EAF_HRC
+        - FREQ_EUROPEAN_1000GENOMES
+        - FREQ_HAPMAP
+      beta_effect_column:
+        - ALL_INV_VAR_META_BETA
+        - ALT_EFFSIZE
+        - B
+        - BETA
+        - BETA_SLEEPDURATION
+        - EFFECT_BETA
+        - INV_VAR_META_BETA
+        - LOG_ODDS
+        - LOGOR
+        - MTAG_BETA
+        - STDBETA
+        - EFFECTSIZE_BETA
+      odds_ratio_effect_column:
+        - OR
+        - ODDS_RATIO
+        - ODDS_RAT
+        - ODDSRATIO
+        - EFFECTSIZE_OR
+      ambiguous_effect_column:
+        - EFFECT
+        - EFFECT_SIZE
+        - EFFECT_WEIGHT
+        - EFFECTS
+        - ES
+        - EST
+      standard_error_column:
+        - SE
+        - ALL_INV_VAR_META_SEBETA
+        - INV_VAR_META_SEBETA
+        - MTAG_SE
+        - SE_DGC
+        - SE_SLEEPDURATION
+        - SEBETA
+        - STANDARD_ERROR
+        - STANDARDERROR
+        - STDERR
+        - STDERR_BETA
+        - STDERRLOGOR
+      z_score_column:
+        - Z
+        - EZ
+        - MTAG_Z
+        - Z_SCORE
+        - ZSCORE
+        - Z_ESTIMATE
+      p_value_column:
+        - P
+        - ALL_INV_VAR_META_P
+        - INV_VAR_META_P
+        - LOG10_P
+        - LOG10P
+        - MLOG10P
+        - MTAG_PVAL
+        - P_WALD
+        - P_BOLT_LMM
+        - P_DGC
+        - P_LINREG
+        - P_SLEEPDURATION
+        - P_VAL
+        - P_VALUE
+        - PVAL
+        - PVALUE
+        - NEG_LOG_10_P_VALUE
+        - NEG_LOG_PVALUE
+        - PVAL_ESTIMATE
+      control_count_column:
+        - CONTROLS_N
+        - N_CON
+        - N_CONTROL
+        - N_CONTROLS
+        - N_CTRL
+        - NCO
+        - NCON
+        - NCONTROL
+      case_count_column:
+        - CASES_N
+        - N_CAS
+        - N_CASE
+        - N_CASES
+        - N_EVENT
+        - NC
+        - NCA
+        - NCAS
+        - NCASE
+        - NCASES
+      total_sample_size_column:
+        - N
+        - TOTAL_N
+        - N_TOTAL
+        - SAMPLE_SIZE
+        - SAMPLESIZE
+        - OBS_CT
+      effective_sample_size_column:
+        - NEFF
+        - N_EFF
+      invalid_sample_size_column:
+        - WEIGHT
+      imputation_info_column:
+        - INFO
+        - IMPUTATIONACCURACY
+        - MEDIAN_INFO
+        - IMPINFO
+        - IMPUTATION
+        - R2HAT
+        - RSQ
+        - MININFO
+
   build_check_mapping:
     chromosome: CHROM
     position: POS
@@ -80,11 +401,11 @@ module:
     chain: "chain_files/{source_build}_to_{target_build}.chain"
     build_check: "GRCh37_38_check_files/{build}_check_file.tsv"
 
-  # Relative paths below the dataset output root. These are the only canonical
-  # names used by harmonisation, concordance validation, and cleanup.
+  # dataset_directory is the harmonisation result root below the run output.
+  # Every remaining path is relative to that root and is shared by
+  # harmonisation, concordance validation, and cleanup.
   output_layout:
     dataset_directory: '{dataset_id}/harmonisation'
-    analysis_directory: 00_harmonised_sumstat
     logs_directory: logs
     rejected_directory: rejected
     frequency_qc_directory: eaf_qc
@@ -96,7 +417,7 @@ module:
     chromosome_log: 'logs/{dataset_id}_chr{chromosome}.log'
     chromosome_reject: 'rejected/{dataset_id}_chr{chromosome}_rejected.tsv'
     input_reject: 'rejected/{dataset_id}_input_rejected.tsv'
-    duplicates: '{dataset_id}_duplicates.tsv'
+    duplicates: 'qc_summary/{dataset_id}_duplicates.tsv'
     adapter_input: '{dataset_id}_chr{chromosome}_vcf_input.tsv'
     adapter_mapping: '{dataset_id}_chr{chromosome}.dict'
     adapter_summary: '{dataset_id}_chr{chromosome}_summary.tsv'
@@ -117,10 +438,10 @@ module:
     merged_build_vcf: '{dataset_id}_{build}_merged.vcf.gz'
     merged_raw_vcf: '{dataset_id}_gwas2vcf_{build}_merged.vcf.gz'
     merged_not_lifted_vcf: '{dataset_id}_notlifted_{target_build}_merged.vcf.gz'
-    dataset_reject: '{dataset_id}_rejected_variants.tsv.gz'
+    dataset_reject: 'rejected/{dataset_id}_rejected_variants.tsv.gz'
     reject_summary: 'qc_summary/{dataset_id}_reject_reasons.tsv'
     run_manifest: '{dataset_id}_run_manifest.json'
-    qc_summary: '{dataset_id}_QC_summary.txt'
+    qc_summary: 'qc_summary/{dataset_id}_QC_summary.txt'
     gwas2vcf_summary: 'qc_summary/{dataset_id}_gwas2vcf_summary.tsv'
     qc_assessment_summary: 'qc_summary/{dataset_id}_{build}_qc_assessment.tsv'
     qc_filter_rules: 'qc_summary/{dataset_id}_{build}_qc_filter_rules.tsv'
@@ -128,6 +449,8 @@ module:
     qc_assessment_temporary: 'qc_summary/.{dataset_id}_{build}_qc_table_'
     population_frequency_qc: 'qc_summary/{dataset_id}_{build}_population_frequency_qc.json'
     population_frequency_temporary: 'qc_summary/.{dataset_id}_{build}_population_frequency_'
+    # Plain-text stdout transcript at the dataset harmonisation root.
+    screen_report: '{dataset_id}_screen_report.txt'
     dataset_log: 'logs/{dataset_id}_dataset.log'
     combined_log: 'logs/{dataset_id}_combined.log'
     concordance_log: 'logs/{dataset_id}_concordance_validation.log'
@@ -136,6 +459,7 @@ module:
     concordance_input_only: 'qc_summary/concordance/{dataset_id}_input_only.tsv.gz'
     concordance_vcf_only: 'qc_summary/concordance/{dataset_id}_vcf_only.tsv.gz'
     concordance_vcf_duplicates: 'qc_summary/concordance/{dataset_id}_vcf_duplicate_records.tsv.gz'
+    concordance_position_matches: 'qc_summary/concordance/{dataset_id}_same_position_matches.tsv.gz'
     concordance_all_matches: 'qc_summary/concordance/{dataset_id}_all_matches.tsv.gz'
     concordance_temporary: 'qc_summary/concordance/.{dataset_id}_vcf_'
     missing_eaf: 'eaf_qc/{dataset_id}_missing_eaf_chr{chromosome}.tsv'
@@ -144,6 +468,10 @@ module:
   gwas2vcf_input:
     required_column_keys: [chr_col, pos_col, snp_id_col, ea_col, oa_col, eaf_col, beta_col, se_col, imp_z_col, pval_col, ncontrol_col]
     optional_column_keys: [ncase_col, imp_info_col]
+    # Appended after every mapped scientific column. Audit columns remain in
+    # the TSV for provenance but are deliberately absent from the positional
+    # JSON mapping, so the bundled GWAS-to-VCF adapter ignores them.
+    audit_columns: [strand_action]
     renamed_keys: {snp_id_col: snp_col}
     delimiter: "\t"
     header: true
@@ -205,9 +533,13 @@ module:
     on_error: warn
 
   runtime:
+    # --show-screen/--hide-screen override terminal display only. The required
+    # per-dataset screen report is written for both settings.
+    display_screen: true
     metadata_directory: '{dataset_id}/run_metadata'
     top_metadata_directory: run_metadata
     resolved_config_file: resolved_config.yaml
+    run_summary_file: harmonisation_run_summary.csv
     sample_sheet_row_file: sample_sheet_row.json
     command_file: command.txt
     supplied_config_file: supplied_config.yaml
@@ -217,22 +549,18 @@ module:
   concordance_validation:
     enabled: false
     allow_strand_complement: true
-    palindromic_action: exclude
-    # bcftools normalizes indels against FASTA before this audit. With `warn`,
-    # balanced input-only and VCF-only indels are treated as possible (not
-    # proven) representation changes only when the SNP stratum passes fully;
-    # unpaired indels still use the configured failure thresholds. `fail`
-    # applies those thresholds to every exact indel mismatch.
-    indel_representation_action: warn
+    # Compare a retained A/T or C/G SNP only when the run manifest records the
+    # forward/reverse study consensus that harmonisation used to orient it.
+    palindromic_action: compare_resolved
     write_all_matches: false
     effect: {absolute: 1.0e-6, relative: 1.0e-5}
+    standard_error: {absolute: 1.0e-6, relative: 1.0e-5}
     allele_frequency: {absolute: 1.0e-6, relative: 1.0e-5}
     z_score: {absolute: 1.0e-5, relative: 1.0e-5}
     failure:
       maximum_value_mismatch_fraction: 0.0
-      maximum_vcf_only_variants: 0
       maximum_vcf_duplicate_records: 0
-      minimum_retained_fraction: null
+      maximum_invalid_vcf_records: 0
 
   # Run-specific overrides of the registry below are merged here.
   policies: {}
@@ -250,7 +578,8 @@ common:
   - eaf.out_of_range
   - eaf.degenerate
   - eaf.palindromic_handling
-  - eaf.on_maf_check_inconclusive
+  - eaf.reference_minor_fraction_cutoff
+  - eaf.maf_reference_error_margin
   - info.out_of_range
   - validation.se_invalid
   - validation.beta_zero
@@ -508,6 +837,7 @@ group_order:
       - ambiguous_action
       - af_tolerance
       - af_discordance_action
+      - palindromic_af_discordance_action
   - group: effect
     order: 9
     stage: dataset 07 / chromosome 03   decide once, convert before allele orientation
@@ -538,27 +868,30 @@ group_order:
       - out_of_range
       - verify_per_chromosome
       - se_tail
-  - group: eaf
+  - group: external_reference
     order: 11
+    stage: chromosome 04 / 11   duplicate strand AF, external EAF and INFO references
+    keys:
+      - exact_duplicate_action
+      - non_identical_duplicate_action
+  - group: eaf
+    order: 12
     stage: chromosome 04   effect allele frequency
     keys:
       - clip_tolerance
       - out_of_range
       - external_min_match_fraction
-      - deduplicate_reference
       - palindromic_handling
       - match_orientations
-      - palindromic_ambiguous_lower
-      - palindromic_ambiguous_upper
-      - palindromic_resolve_tolerance
       - maf_decision_cutoff
       - maf_reference_min_overlap
+      - reference_minor_fraction_cutoff
+      - maf_reference_error_margin
       - invalid_fraction_cutoff
       - missing_fraction_cutoff
       - degenerate
-      - on_maf_check_inconclusive
   - group: sample_size
-    order: 12
+    order: 13
     stage: dataset 04 / chromosome 05   missing sample size and effective N
     keys:
       - trait_type
@@ -568,7 +901,7 @@ group_order:
       - missing_action
       - max_missing_fraction
   - group: validation
-    order: 13
+    order: 14
     stage: dataset 02/07 / chromosome 10   declarations and the SE / BETA / Z gates
     keys:
       - se_division_floor
@@ -589,7 +922,7 @@ group_order:
       - fuzzy_match_cutoff
       - on_duplicate_header
   - group: info
-    order: 14
+    order: 15
     stage: chromosome 11   imputation quality
     keys:
       - out_of_range
@@ -598,17 +931,16 @@ group_order:
       - clip_tolerance
       - low_quality_threshold
       - on_missing
-      - deduplicate_reference
       - source
   - group: final_check
-    order: 15
+    order: 16
     stage: chromosome 13   final completeness gate
     keys:
       - require
       - treat_as_missing
       - on_missing
   - group: vcf
-    order: 16
+    order: 17
     stage: chromosome 16-17 and the merge   VCF conversion and liftover
     keys:
       - liftover_swap
@@ -623,7 +955,7 @@ group_order:
       - concat_max_attempts
       - on_merge_failure
   - group: filter
-    order: 17
+    order: 18
     stage: post-merge 03   sequential QC assessment on the raw-VCF table
     keys:
       - lp_cutoff
@@ -643,13 +975,13 @@ group_order:
       - mhc_start
       - mhc_end
   - group: qc
-    order: 18
+    order: 19
     stage: post-merge 03   raw and virtual QC-passed summaries
     keys:
       - target_build
       - sample_size_outlier_standard_deviations
   - group: execution
-    order: 19
+    order: 20
     stage: throughout      threads, retries, memory
     keys:
       - threads_per_chromosome
@@ -659,7 +991,7 @@ group_order:
       - retry_requires_progress
       - fail_dataset_on_chr_error
   - group: logging
-    order: 20
+    order: 21
     stage: throughout      logging and screen output
     keys:
       - append_across_retries
@@ -667,7 +999,7 @@ group_order:
       - level
       - screen_level
   - group: rejects
-    order: 21
+    order: 22
     stage: throughout      the rejected-variant file
     keys:
       - enabled
@@ -815,21 +1147,23 @@ policies:
       - NA
       - NAN
       - ''
+      - '.'
       help: |-
         What it does: Lists the exact text values that are read as 'missing' rather than as data.
         When it applies: dataset step 03, on every read attempt (first read, low-memory retry,
           whitespace-repaired read), and at chromosome step 13 to spot an rsID that must be rebuilt.
         Values: each member is compared literally and case-sensitively against the raw text of a field;
           a match becomes a missing value. Order does not matter and anything unlisted stays as text.
-        Example: with the default [NA, NAN, ''] a P column holding 'NA' reads as missing while a single
-          '.' keeps that text; the whole column is cast later, so that '.' is reported unparseable and,
-          above the cast tolerance, the P column stays text.
-        Note: Recommended [NA, NAN, '', ., -] - standard dbSNP and PLINK markers whose absence is a
-          regression. Setting this key at all also replaces the per-chromosome read's own list at
+        Example: with the default [NA, NAN, '', .], either 'NA' or '.' in a P column reads as missing;
+          the remaining values are converted independently, so one unusable cell cannot leave the
+          complete scientific column as text.
+        Note: A dash is not a default missing token because it can encode an allele in some inputs;
+          add '-' only when the study's documentation defines it as missing. Setting this key at all
+          also replaces the per-chromosome read's own list at
           chromosome step 01 (["", "NA", "NaN", ".", "null"]), so 'NaN' and 'null' stop counting there.
           Case matters here but not at step 13, where the comparison is upper-cased first.
       origin: summary_statistics_io.py:load_summary_statistics_table
-      recommendation: '[NA, NAN, '''', ., -]'
+      recommendation: null
       type: list
       validator:
         allow_empty: true
@@ -845,14 +1179,14 @@ policies:
         What it does: Sets how many rows are examined before each column's data type is fixed.
         When it applies: dataset step 03, on every read of the study file.
         Values:
-          0 - the default: read every column as text, then cast afterwards. A column whose values
-            do not all parse is LEFT AS TEXT, not partly converted.
+          0 - the default: read every column as text, then cast each configured scientific value;
+            an unusable scalar cell becomes missing without changing the valid cells in its column.
           a positive number - type each column from that many rows; larger sees more of the file,
             smaller risks typing a column from its opening rows alone.
-        Example: a P column with one stray '.' at row 4,000,000. At 0 the whole P column stays text
-          and every later numeric test on it fails; at 1000 the read fails on reaching the '.'.
-        Note: neither outcome is good. The fix is to add '.' to input.null_values, so the cell reads
-          as missing and the column still becomes numeric.
+        Example: a P column with one stray '.' at row 4,000,000 reads that configured missing token
+          as null while every valid P value remains numeric.
+        Note: With a positive inference limit, an unexpected non-numeric token beyond the sampled rows
+          can still make Polars stop during the initial read. Keep 0 for heterogeneous public GWAS files.
       origin: summary_statistics_io.py:load_summary_statistics_table
       recommendation: null
       type: int
@@ -1660,7 +1994,7 @@ policies:
         kind: flag
 
   # =================================================================
-  # 08  dataset 06 / chromosome 03   reference strand orientation
+  # 08  dataset 06 / chromosome 04   reference strand orientation
   # =================================================================
   strand:
     enabled:
@@ -1714,7 +2048,8 @@ policies:
           variants before a study-wide strand consensus is trusted.
         When it applies: dataset step 06. A smaller evidence set is labelled unresolved; ordinary
           non-palindromic variants can still be oriented individually, while palindromic variants
-          require usable frequency evidence or are rejected.
+          are rejected because population frequency is not permitted to replace missing strand
+          evidence.
         Values: a non-negative whole number. Zero removes the absolute evidence floor.
         Example: 800 perfectly forward matches remain unresolved at the default 1000 rather than
           allowing a small or specialised input to determine every palindromic variant.
@@ -1748,14 +2083,16 @@ policies:
     ambiguous_action:
       default: reject
       help: |-
-        What it does: Controls variants for which reference alleles, strand consensus and a true
-          study EAF do not leave exactly one scientifically supported orientation.
-        When it applies: chromosome step 04, including palindromic variants near frequency 0.5 and
-          multiallelic coordinates with more than one remaining match.
+        What it does: Controls variants for which reference alleles and study-wide strand consensus
+          do not leave exactly one scientifically supported orientation.
+        When it applies: chromosome step 04. Palindromic variants require a strong study-wide
+          consensus from non-palindromic variants; non-palindromic variants are ambiguous when a
+          multiallelic or conflicting reference leaves more than one exact orientation.
         Values: reject records palindromic_ambiguous or reference_ambiguous and continues; fail
           stops that chromosome.
-        Example: A/T with study EAF 0.49 and reference AF 0.48 is rejected because both readings
-          lie inside the configured ambiguous-frequency band.
+        Example: an A/T variant is retained under a strong forward consensus even when EAF is near
+          0.5, then checked against reference AF as QC. Under mixed or unresolved consensus it is
+          rejected because its allele letters cannot identify the strand.
       origin: strand.py:harmonise_strand_orientation
       recommendation: null
       type: enum
@@ -1789,16 +2126,37 @@ policies:
     af_discordance_action:
       default: warn
       help: |-
-        What it does: Controls final EAF values farther from the aligned population reference than
-          strand.af_tolerance.
-        When it applies: chromosome step 04 after frequency harmonisation.
+        What it does: Controls final non-palindromic EAF values farther from the aligned population
+          reference than strand.af_tolerance.
+        When it applies: chromosome step 04 after allele orientation and frequency harmonisation.
         Values: warn keeps the row and records the discordance; reject writes it with reason
           af_discordant; fail stops the chromosome. Warn is the default because population AF is
-          supporting evidence rather than proof for an individual study.
+          supporting QC evidence rather than proof of strand for an individual study.
         Example: a study from a population different from the configured panel may produce many
           warnings; select the correct population column rather than weakening allele matching.
       origin: allele_frequency.py:harmonise_allele_frequency
       recommendation: null
+      type: enum
+      validator:
+        allow_none: false
+        kind: enum
+        members: [warn, reject, fail]
+    palindromic_af_discordance_action:
+      default: reject
+      help: |-
+        What it does: Controls a palindromic variant whose final effect-aligned study frequency
+          differs from the already-oriented population-reference ALT frequency by more than
+          strand.af_tolerance.
+        When it applies: chromosome step 04 only after a strong study-wide non-palindromic strand
+          consensus has selected the palindromic orientation. Reference AF is a QC check here; it
+          is never used to choose the strand.
+        Values: reject records af_discordant and removes the row; warn retains it with a warning;
+          fail stops the chromosome. Reject is conservative because A/T and C/G allele letters
+          cannot independently confirm the selected strand.
+        Example: a consensus-oriented A/T variant with study EAF 0.85 and aligned reference AF
+          0.10 differs by 0.75 and is rejected at the default tolerance 0.20.
+      origin: allele_frequency.py:harmonise_allele_frequency
+      recommendation: reject
       type: enum
       validator:
         allow_none: false
@@ -2436,6 +2794,57 @@ policies:
         number_kind: int
 
   # =================================================================
+  # Shared chromosome 04 / 11 policy for user-provided EAF and INFO files
+  # =================================================================
+  external_reference:
+    exact_duplicate_action:
+      default: keep_one
+      help: |-
+        What it does: Decides how repeated allele-specific reference rows are handled when the
+          normalized chromosome, position, both alleles and selected annotation value are
+          identical. The same setting governs the chromosome strand/AF reference and user-provided
+          EAF and INFO files.
+        When it applies: chromosome step 04 for strand and EAF references and chromosome step 11
+          for external INFO, before allele matching.
+        Values:
+          keep_one - retain the first identical row and remove the redundant copies.
+          discard_all - remove every reference row at that duplicated allele key.
+          fail - stop the chromosome and report an example duplicated key.
+        Example: duplicate EUR frequencies [0.25, 0.25] under keep_one supply one 0.25 value.
+        Note: Equality is assessed after coordinate/allele normalization and numeric conversion
+          of the selected EAF or INFO column. Other unused reference columns do not affect it.
+      origin: shared/allele_join.py:deduplicate_reference_values
+      recommendation: keep_one
+      type: enum
+      validator:
+        allow_none: false
+        kind: enum
+        members: [keep_one, discard_all, fail]
+    non_identical_duplicate_action:
+      default: discard_all
+      help: |-
+        What it does: Decides how repeated reference allele keys are handled when their selected AF,
+          EAF or INFO values differ. The same setting governs strand, external EAF and external INFO
+          references.
+        When it applies: chromosome step 04 for strand and EAF references and chromosome step 11
+          for external INFO, before any annotation value is attached to a study variant.
+        Values:
+          discard_all - remove every reference row for the ambiguous allele key; the affected
+            study row is unmatched and follows the existing EAF or INFO missing-value policy.
+          fail - stop the chromosome and report the key and distinct values for repair.
+        Example: [0.25, 0.45] and [missing, 0.25] are both non-identical duplicates. The default
+          discards both rows instead of guessing that one value is scientifically preferable.
+        Note: keep-one is deliberately unavailable here because row order cannot establish which
+          different scientific annotation is correct. Counts are written to the chromosome log.
+      origin: shared/allele_join.py:deduplicate_reference_values
+      recommendation: discard_all
+      type: enum
+      validator:
+        allow_none: false
+        kind: enum
+        members: [discard_all, fail]
+
+  # =================================================================
   # 10  chromosome 04   effect allele frequency
   # =================================================================
   eaf:
@@ -2534,51 +2943,29 @@ policies:
         maximum: 1.0
         minimum: 0.0
         number_kind: float
-    deduplicate_reference:
-      default: true
-      help: |-
-        What it does: Resolves repeated chromosome/position/effect-allele/other-allele rows
-          in an external EAF reference before matching study variants.
-        When it applies: chromosome step 04, only when EAF is read from an external file.
-        Values:
-          true - collapse equivalent duplicates and prefer one finite frequency over an earlier
-            missing, non-numeric, NaN or infinite value. Distinct finite frequencies for the same
-            exact allele key stop the chromosome because selecting one would change scientific data.
-          false - any repeated allele-specific reference key matching a study variant stops the
-            chromosome and names this policy; no duplicate can multiply a study row.
-        Example: duplicate values [missing, 0.25] produce 0.25 with true. Values [0.25, 0.45]
-          fail clearly under true because neither value can be preferred scientifically.
-        Note: This is the same duplicate-resolution contract used for external INFO. It changes
-          only the reference annotation chosen; it never removes or multiplies study variants.
-      origin: shared/allele_join.py:allele_oriented_left_join
-      recommendation: 'true'
-      type: bool
-      validator:
-        kind: flag
     palindromic_handling:
       default: ignore
       help: |-
-        What it does: Decides what happens to palindromic variants (A/T, C/G) after a panel match.
-        When it applies: chromosome step 04, external-file path only; never for the study's own column.
+        What it does: Optionally applies an additional conservative exclusion to matched
+          palindromic variants (A/T, C/G) when EAF comes from an external file.
+        When it applies: chromosome step 04 after study-wide consensus has already fixed strand;
+          never for the study's own frequency column.
         Values:
           ignore - nothing is done and the eaf_palindromic_flag column is not created.
-          resolve_by_frequency - the study's own frequency picks keep, 1-AF (flagged
-            strand_corrected) or blank, under eaf.palindromic_ambiguous_lower/_upper and
-            eaf.palindromic_resolve_tolerance; with no study frequency nothing changes and it warns.
           null - blanks the frequency of every matched palindromic variant.
-          reject - resolve as above, then remove what stays ambiguous or discordant; with no study
-            frequency column, every matched palindromic variant is removed.
-        Example: chr7:1000 A/T, panel 0.30, study 0.72 - flipping fits far better, so 0.70 is used.
-        Note: Recommended: resolve_by_frequency; either strand matches, so a strand error gives 1-AF.
-      origin: allele_frequency.py:412
-      recommendation: resolve_by_frequency
+          reject - removes every matched palindromic variant and records rejection provenance.
+        Example: under reject, a consensus-oriented A/T row is still removed when its EAF source is
+          external; under ignore it proceeds to the standard post-orientation reference-AF QC.
+        Note: Frequency-based strand resolution is intentionally unavailable. Population AF never
+          chooses strand or changes strand_action, BETA, Z, or EAF orientation.
+      origin: allele_frequency.py:merge_external_allele_frequencies
+      recommendation: ignore
       type: enum
       validator:
         allow_none: false
         kind: enum
         members:
         - ignore
-        - resolve_by_frequency
         - 'null'
         - reject
     match_orientations:
@@ -2622,101 +3009,16 @@ policies:
         kind: list
         unique: true
         upper: false
-    palindromic_ambiguous_lower:
-      default: 0.4
-      help: |-
-        What it does: Sets the lower edge of the frequency band in which a value and one minus that
-          value are equally plausible, so the orientation of a palindromic variant cannot be decided
-          and is not guessed.
-        When it applies: chromosome step 04, only when the frequency comes from an external panel,
-          eaf.palindromic_handling is 'resolve_by_frequency' or 'reject', and the study has a
-          frequency column of its own to arbitrate with. Both the study value and the panel value
-          must fall inside the band for the variant to be called ambiguous.
-        Values: Raising it narrows the ambiguous band, so more palindromic variants are given an
-          orientation and fewer are blanked; lowering it widens the band and blanks more. The
-          ceiling is 0.5, and it must stay below eaf.palindromic_ambiguous_upper or the run is
-          refused before it starts.
-        Example: study 0.47 against panel 0.52 - both inside 0.40 to 0.60, so the variant is
-          flagged palindromic_ambiguous and its frequency is emptied. Study 0.12 against panel 0.11
-          falls outside the band, so the two orientations are compared instead. Both edges are
-          inclusive: exactly 0.40 is inside the band.
-      origin: new
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 0.5
-        minimum: 0.0
-        number_kind: float
-    palindromic_ambiguous_upper:
-      default: 0.6
-      help: |-
-        What it does: Sets the upper edge of the frequency band in which a value and one minus that
-          value are equally plausible, so the orientation of a palindromic variant cannot be decided
-          and is not guessed.
-        When it applies: chromosome step 04, only when the frequency comes from an external panel,
-          eaf.palindromic_handling is 'resolve_by_frequency' or 'reject', and the study has a
-          frequency column of its own to arbitrate with. Both the study value and the panel value
-          must fall inside the band for the variant to be called ambiguous.
-        Values: Lowering it narrows the ambiguous band, so more palindromic variants are given an
-          orientation and fewer are blanked; raising it widens the band and blanks more. The floor
-          is 0.5, and it must stay above eaf.palindromic_ambiguous_lower or the run is refused
-          before it starts.
-        Example: study 0.58 against panel 0.44 - both inside 0.40 to 0.60, so the variant is
-          flagged palindromic_ambiguous and its frequency is emptied. Widened to 0.70, the band
-          would also swallow study 0.65 against panel 0.62. Both edges are inclusive: exactly 0.60
-          is inside the band.
-      origin: new
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 1.0
-        minimum: 0.5
-        number_kind: float
-    palindromic_resolve_tolerance:
-      default: 0.2
-      help: |-
-        What it does: Sets how far the study frequency may sit from the panel frequency, under the
-          better of the two orientations, before the variant is treated as discordant with the panel
-          rather than resolved.
-        When it applies: chromosome step 04, only when the frequency comes from an external panel,
-          eaf.palindromic_handling is 'resolve_by_frequency' or 'reject', and the study has a
-          frequency column of its own to arbitrate with.
-        Values: Larger accepts looser agreement and resolves more palindromic variants; smaller
-          demands closer agreement and flags more as discordant. Units are frequency, on the 0 to 1
-          scale. At 0 only an exact match resolves; at 1 nothing can ever be discordant.
-        Example: study 0.30 against panel 0.62 - the unflipped gap is 0.32 and the flipped gap
-          |0.30 - 0.38| is 0.08, so at the default 0.2 the flipped reading is used and the frequency
-          becomes 0.38. Study 0.30 against panel 0.95 gives gaps of 0.65 and 0.25, both above 0.2,
-          so the variant is flagged af_discordant and its frequency is emptied - and removed as well
-          if eaf.palindromic_handling is 'reject'.
-      origin: new
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 1.0
-        minimum: 0.0
-        number_kind: float
     maf_decision_cutoff:
       default: 0.95
       help: |-
         What it does: Sets the share of frequency values at or below 0.5 above which a column is
           suspected of holding minor allele frequencies rather than effect allele frequencies.
-        When it applies: Twice, and only when the study supplies its own frequency column. Dataset
-          step 07 uses it to make the study-wide decision on the whole file before the split, and
-          chromosome step 04 repeats the same test to decide whether the reference panel needs to
-          be consulted. Both measure the share among the non-empty values only.
+        When it applies: Only when the study supplies its own frequency column. Dataset step 07
+          uses it to make the study-wide screening decision on the whole file before the split.
+          Chromosome step 04 reports the same statistic while validating the selected column; a
+          direct library caller without a study-wide decision is not allowed to guess. The share
+          is measured among non-empty values only.
         Values: Larger makes the pipeline slower to suspect a minor allele frequency; smaller
           suspects one sooner. A real effect allele frequency column has roughly half its values at
           or below 0.5; a real minor allele frequency column has all of them.
@@ -2742,8 +3044,8 @@ policies:
         When it applies: chromosome step 04 only after the whole-study distribution flags the
           supplied frequency column as MAF-like. Direct and allele-swapped matches both count.
         Values: Larger requires stronger chromosome-level evidence; smaller permits a decision
-          from fewer variants. Below this count the result is inconclusive and
-          eaf.on_maf_check_inconclusive controls whether processing stops or accepts the column.
+          from fewer variants. Below this count the result is inconclusive and processing stops;
+          PostGWAS never guesses that an unconfirmed MAF-like column is effect-aligned EAF.
         Scientific basis: frequency is usable only when it is aligned to the listed effect allele;
           the comparison therefore tests input AF against both aligned reference EAF and reference
           MAF after allele matching. The default is deliberately conservative for GWAS-scale data.
@@ -2758,6 +3060,56 @@ policies:
         maximum: null
         minimum: 1
         number_kind: int
+    reference_minor_fraction_cutoff:
+      default: 0.95
+      help: |-
+        What it does: Detects a reference comparison that cannot reliably distinguish EAF from MAF
+          because almost every matched reference effect allele is itself minor (reference EAF at or
+          below 0.5). Such a panel makes aligned EAF and folded MAF nearly identical.
+        When it applies: chromosome step 04, after a study column was flagged MAF-like and at least
+          eaf.maf_reference_min_overlap non-palindromic reference matches are available.
+        Values: If the share is greater than this cutoff, the result is inconclusive and the
+          chromosome stops. Larger values permit more reference sets to reach the error comparison;
+          smaller values are more conservative. This is deliberately separate from
+          eaf.maf_decision_cutoff, which screens the study column rather than the reference panel.
+        Example: if 980 of 1,000 aligned reference frequencies are at or below 0.5, the share is
+          0.98. That exceeds the default 0.95, so PostGWAS reports inconclusive instead of treating
+          equal EAF and MAF errors as proof of EAF.
+      origin: allele_frequency.py:confirm_eaf_with_reference
+      recommendation: null
+      type: float
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: false
+        kind: num
+        maximum: 1.0
+        minimum: 0.0
+        number_kind: float
+    maf_reference_error_margin:
+      default: 0.02
+      help: |-
+        What it does: Sets the minimum separation required between mean absolute error as aligned
+          EAF and mean absolute error as folded MAF before either interpretation is accepted.
+        When it applies: chromosome step 04, only for a MAF-like study column after the overlap and
+          reference-informativeness checks pass.
+        Values: Units are allele-frequency points on the 0 to 1 scale. EAF is confirmed only when
+          its mean error plus this margin is lower than the MAF error; MAF is confirmed by the
+          reverse inequality. A tie or smaller difference is inconclusive and stops processing.
+          Larger values demand stronger evidence; 0 allows any strict difference to decide.
+        Example: mean errors 0.01 as EAF and 0.20 as MAF confirm EAF at the default 0.02 margin.
+          Errors 0.10 and 0.11 differ by only 0.01, so PostGWAS stops rather than letting noise decide.
+      origin: allele_frequency.py:confirm_eaf_with_reference
+      recommendation: null
+      type: float
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: false
+        kind: num
+        maximum: 1.0
+        minimum: 0.0
+        number_kind: float
     invalid_fraction_cutoff:
       default: 0.05
       help: |-
@@ -2837,27 +3189,6 @@ policies:
         - reject
         - 'null'
         - keep
-        - fail
-    on_maf_check_inconclusive:
-      default: fail
-      help: |-
-        What it does: Decides what happens when a supplied frequency column looks MAF-like but the
-          default EAF comparison has too few usable matches to determine whether it is aligned to
-          the listed effect allele. It also covers direct library use without a study-wide decision.
-        When it applies: chromosome step 04, only for a MAF-like supplied frequency column.
-        Values:
-          accept - treat the column as an effect allele frequency and carry on.
-          fail - stop rather than export a potentially misoriented frequency.
-        Note: the normal pipeline supplies one decision made from the complete study. The safe
-          default protects direct library calls that omit that decision.
-      origin: allele_frequency.py:harmonise_allele_frequency
-      recommendation: null
-      type: enum
-      validator:
-        allow_none: false
-        kind: enum
-        members:
-        - accept
         - fail
   # =================================================================
   # 11  dataset 04 / chromosome 05   missing sample size and effective N
@@ -3633,29 +3964,6 @@ policies:
         - keep
         - reject
         - fail
-    deduplicate_reference:
-      default: true
-      help: |-
-        What it does: Removes repeated rows from the imputation-quality reference file before the
-          scores are matched onto the variants.
-        When it applies: chromosome step 11, only when the score comes from a reference file -
-          that is, when the study has no imputation quality column of its own, or info.source is
-          'reference' or 'external'. It is never consulted when the study's own column is used.
-        Values:
-          true - equivalent duplicates are collapsed, and one finite score is preferred over an
-            earlier missing, non-numeric, NaN or infinite value. Distinct finite scores for the
-            same exact allele key stop the chromosome instead of being selected arbitrarily.
-          false - repeated rows remain scientifically invalid. The shared matcher detects a
-            repeated allele-specific match and stops before it can multiply a study variant.
-        Example: duplicate scores [missing, 0.9] produce 0.9 with true. Scores [0.7, 0.9]
-          fail clearly under true. With false, either pair stops as a repeated reference key.
-        Note: EAF and INFO use the same row-preserving allele-oriented matcher. Safe duplicates
-          no longer discard a usable value, and conflicting scientific values are never guessed.
-      origin: shared/allele_join.py:allele_oriented_left_join
-      recommendation: 'true'
-      type: bool
-      validator:
-        kind: flag
     source:
       default: auto
       help: |-
@@ -4624,15 +4932,17 @@ policies:
         When it applies: At the start of every retry round (round 2 onward), for each chromosome about to
           be run again. Never in round 1.
         Values:
-          true - that chromosome's VCFs and indexes, its per-chromosome TSVs, its rejected-variants file
-            and its bcftools sort temp directory are removed first, and the count removed is announced.
+          true - that chromosome's partial VCFs and indexes, adapter input/mapping/summary files,
+            rejected-variants file and bcftools sort temp directory are removed first, and the count
+            removed is announced. The validated chromosome input table and immutable source snapshot
+            are retained because the retry reads them again.
           false - they are left on disk and a WARNING says the old partial files may reach the merge.
         Example: chromosome 7 dies in round 1 having written a truncated GWAS_chr7_GRCh38_CSQ.vcf.gz of
           4 KB. With true that file is gone before round 2 starts. With false, and round 2 failing
           earlier at step 12, the 4 KB file survives and the merge accepts it, because a VCF is only
           treated as empty below vcf.min_valid_size_bytes, which is 100 bytes.
-        Note: logs are never deleted. They are opened in append mode so that every attempt is preserved,
-          and the retry cleanup skips anything in the logs directory.
+        Note: validated chromosome input tables, immutable source snapshots and logs are never deleted
+          by retry cleanup. Logs are opened in append mode so every attempt is preserved.
       origin: new
       recommendation: null
       type: bool

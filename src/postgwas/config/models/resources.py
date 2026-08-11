@@ -11,6 +11,8 @@ class ExecutableResources(StrictModel):
     plink2: str
     magma: str
     scdrs: str
+    ldsc: str
+    munge_sumstats: str
     finemap: str
     gcta: str
     rscript: str

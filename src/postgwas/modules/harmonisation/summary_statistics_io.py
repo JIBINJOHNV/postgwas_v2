@@ -15,7 +15,10 @@ from postgwas.core.values import optional_text
 
 from .coordinates import harmonise_coordinates_and_alleles
 from .rejects import RejectCollector, SOURCE_INPUT_ROW_COLUMN
-from .sample_size import effective_sample_size_expression
+from .sample_size import (
+    effective_sample_size_expression,
+    sample_count_expression,
+)
 from .shared.runtime import emit_message, reject_rows, resolve_policies
 from .shared.variant_columns import (
     mark_canonical_variant_columns,
@@ -267,6 +270,8 @@ def normalise_summary_statistics_values(
     strings_normalised=False,
     preserved_columns=None,
     numeric_columns=None,
+    sample_count_columns=None,
+    compound_numeric_columns=None,
 ) -> pl.DataFrame:
     """
     Normalize configured scientific numeric columns after the first read.
@@ -275,16 +280,19 @@ def normalise_summary_statistics_values(
     columns are forced to strings by :func:`load_summary_statistics_table`, so
     numeric-looking IDs never pass through Float64.
 
-    A configured numeric column is converted only when every non-null value is
-    parseable. This lossless gate is an input-integrity invariant: mixed fields
-    such as comma-separated INFO values remain intact for their field-specific
-    parser instead of becoming null here.
+    Scalar numeric values that cannot be parsed become null and are reported;
+    the immutable source snapshot retains their original text for rejection
+    provenance. Sample-count columns reuse their whole-number parser, while
+    configured compound numeric columns such as comma-separated INFO remain
+    text for their field-specific parser.
     """
     if df.height == 0:
         return df
     resolve_policies(policies)
     preserved = set(preserved_columns or ())
     numeric = set(numeric_columns or ())
+    sample_counts = set(sample_count_columns or ())
+    compound_numeric = set(compound_numeric_columns or ())
     # 1. Clean Headers
     df = df.rename({c: c.strip() for c in df.columns})
     # 2. Clean String Values — one pass over every string column, not one
@@ -298,23 +306,28 @@ def normalise_summary_statistics_values(
         if col == chr_col or col in preserved or col not in numeric:
             valid_cols.append(pl.col(col))
             continue
-        original = df[col]
-        numeric_series = original.cast(pl.Float64, strict=False)
-        new_nulls = numeric_series.null_count() - original.null_count()
-        if new_nulls <= 0:
-            valid_cols.append(numeric_series)
+        original = df.get_column(col)
+        if (
+            col in compound_numeric
+            and original.dtype == pl.String
+            and bool(original.str.contains(",", literal=True).any())
+        ):
+            valid_cols.append(pl.col(col))
             continue
-        non_null = original.len() - original.null_count()
-        # Preserve every original value when even one value is not parseable.
-        # The field-specific step later decides whether those values are invalid
-        # or use an intentional compound representation such as INFO lists.
-        valid_cols.append(pl.col(col))
-        if new_nulls < non_null:
+        numeric_series = (
+            df.select(sample_count_expression(df, col).alias(col)).get_column(col)
+            if col in sample_counts
+            else original.cast(pl.Float64, strict=False)
+        )
+        new_nulls = numeric_series.null_count() - original.null_count()
+        valid_cols.append(numeric_series)
+        if new_nulls > 0:
+            non_null = original.len() - original.null_count()
             _emit(
                 logger,
-                "Configured numeric column '%s' stayed as text because %d of %d "
-                "non-null values do not parse as numbers. Its field-specific "
-                "validation step will handle those values."
+                "Configured numeric column '%s' had %d of %d non-missing values "
+                "that could not be parsed; those cells were set to missing. "
+                "Original input values remain available in rejection provenance."
                 % (col, new_nulls, non_null),
                 warn=True,
             )
@@ -1003,6 +1016,16 @@ def read_summary_statistics(
             for key in NUMERIC_COLUMN_CONFIG_KEYS
             if (column := optional_text(sample_column_dict.get(key))) is not None
         ]
+        sample_count_columns = [
+            column
+            for key in ("ncontrol_col", "ncase_col")
+            if (column := optional_text(sample_column_dict.get(key))) is not None
+        ]
+        compound_numeric_columns = [
+            column
+            for key in ("imp_info_col",)
+            if (column := optional_text(sample_column_dict.get(key))) is not None
+        ]
 
         canonical_columns = [
             column for column in (chr_col, pos_col, ea_col, oa_col) if column
@@ -1019,6 +1042,8 @@ def read_summary_statistics(
             strings_normalised=True,
             preserved_columns=canonical_columns,
             numeric_columns=numeric_columns,
+            sample_count_columns=sample_count_columns,
+            compound_numeric_columns=compound_numeric_columns,
         )
 
         _emit(logger, "Recovery successful: %d rows loaded." % df.height)
@@ -1114,6 +1139,7 @@ def read_summary_statistics(
             dataset_id=gwas_name,
         )
         if dup_df.height > 0:
+            dup_file.parent.mkdir(parents=True, exist_ok=True)
             dup_df.write_csv(dup_file, separator=table_delimiter)
             _emit(logger, "Duplicate assessment saved to %s" % dup_file)
 
@@ -1234,23 +1260,3 @@ def check_file_truncation(file_path, policies=None, logger=None):
         file_path, policies=policies, logger=logger,
     )
     return warnings
-
-
-def resolve_resource_file(
-    input_file, grch_version, chromosome, *, must_exist=True,
-):
-    """Resolve an optional user-file template and optionally verify the path."""
-    input_file = optional_text(input_file)
-    if input_file is None:
-        return None
-    try:
-        resolved = str(input_file).format(
-            build=grch_version, chromosome=chromosome
-        )
-    except (KeyError, ValueError) as exc:
-        raise ValueError("Invalid external-file path template %r: %s" % (input_file, exc))
-    if must_exist and not Path(resolved).is_file():
-        raise FileNotFoundError(
-            "External file not found for chromosome %s: %s" % (chromosome, resolved)
-        )
-    return resolved

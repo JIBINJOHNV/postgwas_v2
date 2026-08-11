@@ -23,19 +23,23 @@ modules:
   harmonisation:
     enabled: true
     comparison_af:
-      source: 1000G
+      source: ALFA
+      column: EUR
+    # Tabular reference used for strand and MAF/EAF validation. Other validated
+    # sources are wgs_ukb, panukb, 1000G, and fingen.
+    default_eaf:
+      source: ALFA
       column: EUR
     concordance_validation:
       enabled: false
       allow_strand_complement: true
-      palindromic_action: exclude
-      indel_representation_action: warn
+      palindromic_action: compare_resolved
       write_all_matches: false
       effect: {absolute: 1.0e-6, relative: 1.0e-5}
+      standard_error: {absolute: 1.0e-6, relative: 1.0e-5}
       allele_frequency: {absolute: 1.0e-6, relative: 1.0e-5}
       z_score: {absolute: 1.0e-5, relative: 1.0e-5}
       failure:
         maximum_value_mismatch_fraction: 0.0
-        maximum_vcf_only_variants: 0
         maximum_vcf_duplicate_records: 0
-        minimum_retained_fraction: null
+        maximum_invalid_vcf_records: 0

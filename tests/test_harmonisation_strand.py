@@ -62,19 +62,55 @@ def test_raw_reference_single_join_resolves_four_actions_and_rejects_unsafe_rows
         policies=default_policies(),
     )
 
-    assert out.get_column("POS").to_list() == [100, 200, 300, 400, 500]
+    assert out.get_column("POS").to_list() == [100, 200, 300, 400, 500, 600]
     assert out.get_column("strand_action").to_list() == [
         "forward", "forward_swapped", "reverse_complement",
         "reverse_complement_swapped", "reverse_complement",
+        "reverse_complement",
     ]
-    assert out.get_column("EA").to_list() == ["A", "T", "G", "C", "G"]
-    assert out.get_column("OA").to_list() == ["G", "C", "A", "T", "C"]
-    assert out.get_column("EAF").to_list() == pytest.approx([0.31, 0.28, 0.25, 0.19, 0.11])
-    assert out.get_column("EFFECT").to_list() == pytest.approx([0.20, -0.40, -0.15, -0.30, 0.12])
-    assert out.get_column("Z").to_list() == pytest.approx([2.0, -4.0, -2.0, -3.0, 1.2])
-    assert out.get_column(SOURCE_INPUT_ROW_COLUMN).to_list() == [1, 2, 3, 4, 5]
-    assert qc["palindromic_ambiguous"] == 1
+    assert out.get_column("EA").to_list() == ["A", "T", "G", "C", "G", "T"]
+    assert out.get_column("OA").to_list() == ["G", "C", "A", "T", "C", "A"]
+    assert out.get_column("EAF").to_list() == pytest.approx(
+        [0.31, 0.28, 0.25, 0.19, 0.11, 0.49]
+    )
+    assert out.get_column("EFFECT").to_list() == pytest.approx(
+        [0.20, -0.40, -0.15, -0.30, 0.12, 0.10]
+    )
+    assert out.get_column("Z").to_list() == pytest.approx(
+        [2.0, -4.0, -2.0, -3.0, 1.2, 1.0]
+    )
+    assert out.get_column(SOURCE_INPUT_ROW_COLUMN).to_list() == [1, 2, 3, 4, 5, 6]
+    assert qc["palindromic_ambiguous"] == 0
     assert qc["reference_unmatched"] == 1
+    assert qc["palindromic_orientation_basis"] == (
+        "study_wide_non_palindromic_consensus"
+    )
+
+
+def test_palindromic_variant_requires_strong_study_consensus(tmp_path):
+    frame = _study().filter(pl.col("POS") == 600)
+    out, qc, _ = harmonise_strand_orientation(
+        "1", frame, dict(COLUMNS), _reference(tmp_path), "EUR", MAPPING,
+        study_decision={"strand": "mixed", "eaf_is_maf": False, "effect_type": "beta"},
+        policies=default_policies(),
+    )
+
+    assert out.is_empty()
+    assert qc["palindromic_ambiguous"] == 1
+
+
+def test_strong_consensus_orients_near_half_palindromic_frequency(tmp_path):
+    frame = _study().filter(pl.col("POS") == 600)
+    out, qc, _ = harmonise_strand_orientation(
+        "1", frame, dict(COLUMNS), _reference(tmp_path), "EUR", MAPPING,
+        study_decision={"strand": "reverse", "eaf_is_maf": False, "effect_type": "beta"},
+        policies=default_policies(),
+    )
+
+    assert out.height == 1
+    assert out.item(0, "strand_action") == "reverse_complement"
+    assert out.item(0, "EAF") == pytest.approx(0.49)
+    assert qc["palindromic_ambiguous"] == 0
 
 
 def test_join_normalizes_integer_study_chromosome_to_reference_type(tmp_path):
@@ -234,6 +270,35 @@ def test_absent_coordinate_is_rejected_as_reference_unmatched(tmp_path):
     assert qc["reference_unmatched"] == 1
 
 
+def test_indels_use_direct_matching_but_never_reverse_complement(tmp_path):
+    reference = tmp_path / "indel.tsv"
+    reference.write_text(
+        "CHROM\tPOS\tREF\tALT\tEUR\n1\t800\tA\tAG\t0.20\n",
+        encoding="utf-8",
+    )
+    base = {
+        "CHR": ["1"], "POS": [800], "EAF": [0.20],
+        "EFFECT": [0.10], "Z": [1.0],
+    }
+    direct = pl.DataFrame(dict(base, EA=["AG"], OA=["A"]))
+    out, _, _ = harmonise_strand_orientation(
+        "1", direct, dict(COLUMNS), str(reference), "EUR", MAPPING,
+        study_decision={"strand": "reverse", "eaf_is_maf": False, "effect_type": "beta"},
+        policies=default_policies(),
+    )
+    assert out.height == 1
+    assert out.item(0, "strand_action") == "forward"
+
+    reverse_complement_only = pl.DataFrame(dict(base, EA=["CT"], OA=["T"]))
+    out, qc, _ = harmonise_strand_orientation(
+        "1", reverse_complement_only, dict(COLUMNS), str(reference), "EUR", MAPPING,
+        study_decision={"strand": "reverse", "eaf_is_maf": False, "effect_type": "beta"},
+        policies=default_policies(),
+    )
+    assert out.is_empty()
+    assert qc["reference_unmatched"] == 1
+
+
 def test_disabled_strand_policy_skips_consensus_and_chromosome_orientation(tmp_path):
     policies = default_policies().with_overrides({"strand": {"enabled": False}})
     decision = resolve_strand_consensus({}, "GRCh37", policies)
@@ -243,8 +308,10 @@ def test_disabled_strand_policy_skips_consensus_and_chromosome_orientation(tmp_p
     )
 
     assert decision["strand"] == "disabled"
-    assert out.equals(_study())
+    assert out.drop("strand_action").equals(_study())
+    assert out.get_column("strand_action").to_list() == ["disabled"] * 7
     assert qc["status"] == "disabled"
+    assert qc["actions"] == {"disabled": 7}
 
 
 def test_maf_confirmation_reuses_aligned_reference_without_reading_file():
@@ -291,6 +358,69 @@ def test_final_eaf_is_compared_with_aligned_reference_af(tmp_path):
     assert out.item(0, "strand_af_difference") == pytest.approx(0.60)
     assert qc["strand_af_comparable"] == 1
     assert qc["strand_af_discordant"] == 1
+    assert qc["strand_non_palindromic_af_discordant"] == 1
+    assert qc["strand_palindromic_af_discordant"] == 0
+
+
+def test_palindromic_af_discordance_is_rejected_after_consensus_orientation(tmp_path):
+    frame = _study().filter(pl.col("POS") == 500)
+    columns = dict(COLUMNS, gwas_outputname="study", output_folder=str(tmp_path))
+    layout = {
+        "frequency_qc_directory": "eaf_qc",
+        "missing_eaf": "eaf_qc/{dataset_id}_missing_chr{chromosome}.tsv",
+        "out_of_range_eaf": "eaf_qc/{dataset_id}_range_chr{chromosome}.tsv",
+    }
+
+    out, qc, _ = harmonise_allele_frequency(
+        "1", frame, columns, layout, "\t",
+        external_eaf_colmap=MAPPING,
+        default_eaf_file=_reference(tmp_path),
+        default_eaf_column="EUR",
+        default_eaf_colmap=MAPPING,
+        study_decision={"strand": "forward", "eaf_is_maf": False, "effect_type": "beta"},
+        policies=default_policies(),
+    )
+
+    assert out.is_empty()
+    assert qc["strand_palindromic_af_comparable"] == 1
+    assert qc["strand_palindromic_af_discordant"] == 1
+    assert qc["strand_palindromic_af_discordance_action"] == "reject"
+
+
+def test_strand_reference_duplicate_policy_keeps_exact_and_discards_conflict(tmp_path):
+    exact = tmp_path / "exact.tsv"
+    exact.write_text(
+        "CHROM\tPOS\tREF\tALT\tEUR\n"
+        "1\t100\tG\tA\t0.30\n"
+        "1\t100\tG\tA\t0.30\n",
+        encoding="utf-8",
+    )
+    frame = _study().filter(pl.col("POS") == 100)
+    out, qc, _ = harmonise_strand_orientation(
+        "1", frame, dict(COLUMNS), str(exact), "EUR", MAPPING,
+        study_decision={"strand": "forward", "eaf_is_maf": False, "effect_type": "beta"},
+        policies=default_policies(),
+    )
+    assert out.height == 1
+    assert qc["reference_exact_duplicate_groups"] == 1
+    assert qc["reference_non_identical_duplicate_groups"] == 0
+
+    conflict = tmp_path / "conflict.tsv"
+    conflict.write_text(
+        "CHROM\tPOS\tREF\tALT\tEUR\n"
+        "1\t100\tG\tA\t0.30\n"
+        "1\t100\tG\tA\t0.45\n",
+        encoding="utf-8",
+    )
+    out, qc, _ = harmonise_strand_orientation(
+        "1", frame, dict(COLUMNS), str(conflict), "EUR", MAPPING,
+        study_decision={"strand": "forward", "eaf_is_maf": False, "effect_type": "beta"},
+        policies=default_policies(),
+    )
+    assert out.is_empty()
+    assert qc["reference_non_identical_duplicate_groups"] == 1
+    assert qc["reference_duplicate_groups_discarded"] == 1
+    assert qc["reference_unmatched"] == 1
 
 
 def test_maf_like_column_proven_to_be_eaf_is_then_inverted_for_swapped_row(tmp_path):

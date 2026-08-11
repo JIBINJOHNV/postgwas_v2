@@ -12,6 +12,7 @@ from postgwas.modules.harmonisation.policies import PolicyError, default_policie
 from postgwas.modules.harmonisation.qc_reporting import (
     harmonisation_qc_summary_lines,
     harmonisation_qc_takeaway_lines,
+    summarise_strand_orientation,
 )
 from postgwas.modules.qc_summary.assessment import (
     assess_variant_table,
@@ -365,6 +366,11 @@ def test_final_takeaways_reuse_existing_counts_and_show_precise_af_percentages(t
         },
         study_decisions={
             "effect_type": "odds_ratio",
+            "effect_type_detected": "odds_ratio",
+            "effect_type_source": "detector",
+            "pvalue_type": "raw",
+            "pvalue_type_detected": "raw",
+            "pvalue_type_source": "detector",
             "frequency_type": "effect_allele_frequency",
             "strand": "forward",
             "strand_consensus": {"dominant_fraction": 1.0},
@@ -381,6 +387,29 @@ def test_final_takeaways_reuse_existing_counts_and_show_precise_af_percentages(t
             "completed": ["1"],
             "failed": [],
             "chromosomes": {"1": {"status": "ok"}},
+            "chromosome_summaries": {
+                "1": {
+                    "stage_qc": {
+                        "eaf_qc": {
+                            "strand_orientation": {
+                                "status": "success",
+                                "initial_variants": 10,
+                                "final_variants": 8,
+                                "reference_file": "/reference/panel_chr1.tsv.gz",
+                                "reference_population_column": "EUR",
+                                "study_strand_consensus": "forward",
+                                "actions": {
+                                    "forward": 7,
+                                    "forward_swapped": 1,
+                                },
+                                "reference_unmatched": 1,
+                                "palindromic_ambiguous": 1,
+                                "reference_ambiguous": 0,
+                            }
+                        }
+                    }
+                }
+            },
             "reconciliation": {"balanced": True},
             "rejected_variants_rows": 2,
             "rejected_variants_file": str(tmp_path / "rejected.tsv.gz"),
@@ -395,6 +424,8 @@ def test_final_takeaways_reuse_existing_counts_and_show_precise_af_percentages(t
             "gwas2vcf": "raw.vcf.gz",
         },
         final_status="OK",
+        reference_source="1000G",
+        reference_population="EUR",
     )
     output = " ".join("\n".join(lines).split())
 
@@ -411,6 +442,12 @@ def test_final_takeaways_reuse_existing_counts_and_show_precise_af_percentages(t
         "|AF difference| ≤ 0.2"
     ) in output
     assert "2 variants removed with reasons recorded" in output
+    assert "GRCh37 · automatically detected" in output
+    assert "1000G · EUR · 1 chromosome reference file" in output
+    assert "8 total · forward 7 · forward-swapped 1" in output
+    assert "10 evaluated = 8 retained + 2 removed" in output
+    assert "odds_ratio · automatically detected" in output
+    assert "raw · automatically detected" in output
     assert "7 merged-VCF variants failed ≥1 of 6 active rules" in output
     assert "Variant and chromosome counts reconciled" in output
     assert "1 / 1 completed" in output
@@ -438,3 +475,129 @@ def test_final_takeaways_reuse_existing_counts_and_show_precise_af_percentages(t
     assert detail_lines
     assert len({line.index(" : ") for line in detail_lines}) == 1
     assert next(line for line in lines if "Input / read" in line).startswith(" " * 12)
+
+
+def test_strand_summary_combines_completed_chromosomes_without_rescanning_rows():
+    def chromosome(initial, final, actions, unmatched, palindromic, ambiguous, name):
+        return {
+            "stage_qc": {
+                "eaf_qc": {
+                    "strand_orientation": {
+                        "status": "success",
+                        "initial_variants": initial,
+                        "final_variants": final,
+                        "reference_file": "/reference/%s.tsv.gz" % name,
+                        "reference_population_column": "EUR",
+                        "study_strand_consensus": "forward",
+                        "actions": actions,
+                        "reference_unmatched": unmatched,
+                        "palindromic_ambiguous": palindromic,
+                        "reference_ambiguous": ambiguous,
+                    }
+                }
+            }
+        }
+
+    summary = summarise_strand_orientation({
+        "completed": ["1", "2"],
+        "failed": [],
+        "chromosomes": {"1": {"status": "ok"}, "2": {"status": "ok"}},
+        "chromosome_summaries": {
+            "1": chromosome(
+                10, 8,
+                {"forward": 5, "forward_swapped": 2, "reverse_complement": 1},
+                1, 0, 1, "panel_chr1",
+            ),
+            "2": chromosome(
+                20, 17,
+                {
+                    "forward": 15,
+                    "forward_swapped": 1,
+                    "reverse_complement_swapped": 1,
+                },
+                1, 1, 1, "panel_chr2",
+            ),
+        },
+    })
+
+    assert summary == {
+        "status": "success",
+        "chromosomes_expected": 2,
+        "chromosomes_completed": 2,
+        "chromosomes_summarized": 2,
+        "complete_chromosome_coverage": True,
+        "metadata_complete": True,
+        "reference_population": "EUR",
+        "reference_file_count": 2,
+        "reference_files": [
+            "/reference/panel_chr1.tsv.gz",
+            "/reference/panel_chr2.tsv.gz",
+        ],
+        "study_consensus": "forward",
+        "variants_evaluated": 30,
+        "variants_retained": 25,
+        "variants_matched": 25,
+        "forward": 20,
+        "forward_swapped": 3,
+        "reverse_complement": 1,
+        "reverse_complement_swapped": 1,
+        "disabled": 0,
+        "reference_unmatched": 2,
+        "palindromic_ambiguous": 1,
+        "reference_ambiguous": 2,
+        "removed_total": 5,
+        "accounting_balanced": True,
+    }
+
+
+def test_strand_summary_marks_partial_disabled_and_malformed_evidence():
+    disabled = {
+        "stage_qc": {
+            "eaf_qc": {
+                "strand_orientation": {
+                    "status": "disabled",
+                    "initial_variants": 4,
+                    "final_variants": 4,
+                    "actions": {"disabled": 4},
+                }
+            }
+        }
+    }
+    result = summarise_strand_orientation({
+        "completed": ["1"],
+        "failed": [],
+        "chromosomes": {"1": {"status": "ok"}},
+        "chromosome_summaries": {"1": disabled},
+    })
+    assert result["status"] == "disabled"
+    assert result["removed_total"] == 0
+    assert result["accounting_balanced"] is True
+
+    malformed = {
+        "stage_qc": {
+            "eaf_qc": {
+                "strand_orientation": {
+                    "status": "success",
+                    "initial_variants": 4.5,
+                    "final_variants": 4,
+                    "actions": {"forward": 4},
+                    "reference_unmatched": 0,
+                    "palindromic_ambiguous": 0,
+                    "reference_ambiguous": 0,
+                }
+            }
+        }
+    }
+    result = summarise_strand_orientation({
+        "completed": ["1"],
+        "failed": ["2"],
+        "chromosomes": {
+            "1": {"status": "ok"},
+            "2": {"status": "failed"},
+        },
+        "chromosome_summaries": {"1": malformed},
+    })
+    assert result["status"] == "partial"
+    assert result["complete_chromosome_coverage"] is False
+    assert result["variants_evaluated"] is None
+    assert result["accounting_balanced"] is False

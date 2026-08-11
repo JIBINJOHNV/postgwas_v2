@@ -10,7 +10,7 @@ from pydantic import Field, RootModel, field_validator, model_validator
 from postgwas.config.models.common import ModuleConfig, StrictModel
 
 
-class ComparisonAFConfig(StrictModel):
+class FrequencyReferenceConfig(StrictModel):
     source: str
     column: str
     available_sources: list[str]
@@ -26,15 +26,25 @@ class ComparisonAFConfig(StrictModel):
 
     @model_validator(mode="after")
     def supported_source(self):
-        if not self.available_sources or len(self.available_sources) != len(set(self.available_sources)):
+        if (
+            not self.available_sources
+            or len(self.available_sources) != len(set(self.available_sources))
+        ):
             raise ValueError("available_sources must contain unique values")
         if self.source not in self.available_sources:
             raise ValueError("source must be one of available_sources")
         if set(self.resource_examples) != set(self.available_sources):
             raise ValueError("resource_examples must define every available source")
-        if any(not key.strip() or not value.strip() for key, value in self.resource_examples.items()):
+        if any(
+            not key.strip() or not value.strip()
+            for key, value in self.resource_examples.items()
+        ):
             raise ValueError("available sources and resource examples must not be empty")
         return self
+
+
+class ComparisonAFConfig(FrequencyReferenceConfig):
+    """Frequency reference stored as an indexed annotation VCF."""
 
 
 class HarmonisationReferenceConfig(StrictModel):
@@ -86,6 +96,154 @@ class FixedInfoConfig(StrictModel):
         return value
 
 
+class SampleSheetColumnAliases(StrictModel):
+    """Configured input-header aliases used only to draft sample sheets."""
+
+    chromosome_column: list[str]
+    position_column: list[str]
+    chromosome_position_column: list[str]
+    variant_id_column: list[str]
+    effect_allele_column: list[str]
+    other_allele_column: list[str]
+    effect_allele_frequency_column: list[str]
+    maf_frequency_column: list[str]
+    ambiguous_frequency_column: list[str]
+    reference_frequency_column: list[str]
+    beta_effect_column: list[str]
+    odds_ratio_effect_column: list[str]
+    ambiguous_effect_column: list[str]
+    standard_error_column: list[str]
+    z_score_column: list[str]
+    p_value_column: list[str]
+    control_count_column: list[str]
+    case_count_column: list[str]
+    total_sample_size_column: list[str]
+    effective_sample_size_column: list[str]
+    invalid_sample_size_column: list[str]
+    imputation_info_column: list[str]
+
+    @field_validator("*")
+    @classmethod
+    def nonempty_unique_aliases(cls, values: list[str]) -> list[str]:
+        cleaned = [str(value).strip() for value in values]
+        normalized = [re.sub(r"[^A-Z0-9]+", "_", value.upper()).strip("_") for value in cleaned]
+        if not cleaned or any(not value for value in cleaned):
+            raise ValueError("column-alias lists must not be empty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("column aliases must be unique after normalization")
+        return cleaned
+
+    @model_validator(mode="after")
+    def aliases_do_not_cross_scientific_fields(self):
+        owners: dict[str, str] = {}
+        for field, values in self.model_dump().items():
+            for value in values:
+                normalized = re.sub(r"[^A-Z0-9]+", "_", value.upper()).strip("_")
+                previous = owners.get(normalized)
+                if previous is not None:
+                    raise ValueError(
+                        "column alias %r is assigned to both %s and %s"
+                        % (value, previous, field)
+                    )
+                owners[normalized] = field
+        return self
+
+
+class SampleSheetAlternativeFrequencyAliases(StrictModel):
+    """ALT-labelled allele and frequency headers that must remain aligned."""
+
+    allele_columns: list[str]
+    frequency_columns: list[str]
+
+    @field_validator("*")
+    @classmethod
+    def nonempty_unique_aliases(cls, values: list[str]) -> list[str]:
+        cleaned = [str(value).strip() for value in values]
+        normalized = [
+            re.sub(r"[^A-Z0-9]+", "_", value.upper()).strip("_")
+            for value in cleaned
+        ]
+        if not cleaned or any(not value for value in cleaned):
+            raise ValueError("alternative-frequency alias lists must not be empty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError(
+                "alternative-frequency aliases must be unique after normalization"
+            )
+        return cleaned
+
+
+class SampleSheetGeneratorConfig(StrictModel):
+    """File discovery and header semantics for v2 sample-sheet generation."""
+
+    supported_suffixes: list[str]
+    trait_type: Literal["auto"]
+    effect_type: Literal["auto"]
+    p_value_type: Literal["auto"]
+    on_missing_sample_size: Literal["write_draft", "fail"]
+    effect_frequency_prefixes: list[str]
+    alternative_frequency: SampleSheetAlternativeFrequencyAliases
+    column_aliases: SampleSheetColumnAliases
+
+    @field_validator("supported_suffixes")
+    @classmethod
+    def valid_suffixes(cls, values: list[str]) -> list[str]:
+        cleaned = [str(value).strip().lower() for value in values]
+        if not cleaned or any(not value.startswith(".") for value in cleaned):
+            raise ValueError("supported_suffixes must contain non-empty dot-prefixed suffixes")
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("supported_suffixes must be unique")
+        return cleaned
+
+    @field_validator("effect_frequency_prefixes")
+    @classmethod
+    def valid_frequency_prefixes(cls, values: list[str]) -> list[str]:
+        cleaned = [
+            re.sub(r"[^A-Z0-9]+", "_", str(value).upper()).strip("_")
+            for value in values
+        ]
+        if not cleaned or any(not value for value in cleaned):
+            raise ValueError("effect_frequency_prefixes must not be empty")
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("effect_frequency_prefixes must be unique")
+        return cleaned
+
+    @model_validator(mode="after")
+    def alternative_frequency_aliases_are_consistent(self):
+        def normalize(value: str) -> str:
+            return re.sub(
+                r"[^A-Z0-9]+", "_", str(value).upper()
+            ).strip("_")
+
+        effect_alleles = {
+            normalize(value) for value in self.column_aliases.effect_allele_column
+        }
+        alternative_alleles = {
+            normalize(value) for value in self.alternative_frequency.allele_columns
+        }
+        unknown_alleles = sorted(alternative_alleles - effect_alleles)
+        if unknown_alleles:
+            raise ValueError(
+                "alternative-frequency allele aliases must also be configured as "
+                "effect-allele aliases: %s" % ", ".join(unknown_alleles)
+            )
+
+        ordinary_aliases = {
+            normalize(value)
+            for values in self.column_aliases.model_dump().values()
+            for value in values
+        }
+        alternative_frequencies = {
+            normalize(value) for value in self.alternative_frequency.frequency_columns
+        }
+        overlap = sorted(alternative_frequencies & ordinary_aliases)
+        if overlap:
+            raise ValueError(
+                "alternative-frequency aliases must not also appear in ordinary "
+                "column aliases: %s" % ", ".join(overlap)
+            )
+        return self
+
+
 class HarmonisationResourceLayout(StrictModel):
     """Relative resource paths, formatted below the configured resource root."""
 
@@ -111,12 +269,12 @@ class HarmonisationResourceLayout(StrictModel):
 
 
 class HarmonisationOutputLayout(RootModel[dict[str, str]]):
-    """Named relative output paths consumed by harmonisation components."""
+    """Canonical dataset root and relative harmonisation result paths."""
 
     @model_validator(mode="after")
     def required_output_paths(self):
         required = {
-            "dataset_directory", "analysis_directory", "logs_directory", "rejected_directory",
+            "dataset_directory", "logs_directory", "rejected_directory",
             "frequency_qc_directory", "qc_directory", "concordance_directory",
             "adapter_log_directory", "chromosome_table", "chromosome_source_snapshot",
             "chromosome_log",
@@ -133,10 +291,12 @@ class HarmonisationOutputLayout(RootModel[dict[str, str]]):
             "qc_assessment_summary", "qc_filter_rules", "qc_assessment_json",
             "qc_assessment_temporary",
             "population_frequency_qc", "population_frequency_temporary",
+            "screen_report",
             "combined_log", "concordance_log", "concordance_summary",
             "concordance_mismatches", "concordance_input_only",
             "concordance_vcf_only", "concordance_vcf_duplicates",
-            "concordance_all_matches", "missing_eaf", "out_of_range_eaf",
+            "concordance_position_matches", "concordance_all_matches",
+            "missing_eaf", "out_of_range_eaf",
             "concordance_temporary",
             "adapter_merged_mapping", "adapter_input_archive",
         }
@@ -153,16 +313,24 @@ class HarmonisationOutputLayout(RootModel[dict[str, str]]):
 class Gwas2VcfInputConfig(StrictModel):
     required_column_keys: list[str]
     optional_column_keys: list[str]
+    audit_columns: list[str]
     renamed_keys: dict[str, str]
     delimiter: str
     header: bool
 
-    @field_validator("required_column_keys", "optional_column_keys")
+    @field_validator(
+        "required_column_keys", "optional_column_keys", "audit_columns",
+    )
     @classmethod
-    def unique_mapping_keys(cls, values: list[str]) -> list[str]:
-        if not values or len(values) != len(set(values)):
-            raise ValueError("must contain unique column keys and must not be empty")
-        return values
+    def unique_nonempty_entries(cls, values: list[str]) -> list[str]:
+        cleaned = [str(value).strip() for value in values]
+        if (
+            not cleaned
+            or any(not value for value in cleaned)
+            or len(cleaned) != len(set(cleaned))
+        ):
+            raise ValueError("must contain unique non-empty values")
+        return cleaned
 
     @model_validator(mode="after")
     def consistent_mapping(self):
@@ -359,15 +527,18 @@ class PopulationFrequencyQCConfig(StrictModel):
 
 
 class HarmonisationRuntimeConfig(StrictModel):
+    display_screen: bool
     metadata_directory: str
     top_metadata_directory: str
     resolved_config_file: str
+    run_summary_file: str
     sample_sheet_row_file: str
     command_file: str
     supplied_config_file: str
 
     @field_validator(
         "metadata_directory", "top_metadata_directory", "resolved_config_file",
+        "run_summary_file",
         "sample_sheet_row_file", "command_file", "supplied_config_file",
     )
     @classmethod
@@ -385,18 +556,19 @@ class ConcordanceToleranceConfig(StrictModel):
 
 class ConcordanceFailureConfig(StrictModel):
     maximum_value_mismatch_fraction: float = Field(ge=0, le=1)
-    maximum_vcf_only_variants: int = Field(ge=0)
     maximum_vcf_duplicate_records: int = Field(ge=0)
-    minimum_retained_fraction: float | None = Field(default=None, ge=0, le=1)
+    maximum_invalid_vcf_records: int = Field(ge=0)
 
 
 class ConcordanceValidationConfig(StrictModel):
     enabled: bool
     allow_strand_complement: bool
-    palindromic_action: Literal["exclude", "compare_as_listed"]
-    indel_representation_action: Literal["warn", "fail"]
+    palindromic_action: Literal[
+        "exclude", "compare_resolved", "compare_as_listed",
+    ]
     write_all_matches: bool
     effect: ConcordanceToleranceConfig
+    standard_error: ConcordanceToleranceConfig
     allele_frequency: ConcordanceToleranceConfig
     z_score: ConcordanceToleranceConfig
     failure: ConcordanceFailureConfig
@@ -404,11 +576,13 @@ class ConcordanceValidationConfig(StrictModel):
 
 class HarmonisationConfig(ModuleConfig):
     comparison_af: ComparisonAFConfig
+    default_eaf: FrequencyReferenceConfig
     default_eaf_mapping: VariantReferenceMappingConfig
     reference: HarmonisationReferenceConfig
     external_eaf_mapping: VariantReferenceMappingConfig
     external_info_mapping: VariantReferenceMappingConfig
     fixed_info: FixedInfoConfig
+    sample_sheet_generator: SampleSheetGeneratorConfig
     build_check_mapping: VariantReferenceMappingConfig
     resource_layout: HarmonisationResourceLayout
     output_layout: HarmonisationOutputLayout

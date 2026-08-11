@@ -96,6 +96,39 @@ def configure_reference_variant_identifiers(
     return observations
 
 
+def configure_required_variant_identifier_type(
+    args,
+    formatting_config,
+    *,
+    consumer: str,
+    formatter_target: str,
+    required_type: str,
+) -> None:
+    """Set one protocol-required target identifier type or reject conflicts."""
+    requested_type = getattr(args, "variant_id_type", None)
+    if requested_type is not None and requested_type != required_type:
+        raise ValueError(
+            "--variant-id-type %s conflicts with the %s requirement for %s."
+            % (requested_type, consumer, required_type)
+        )
+    target_types = dict(
+        getattr(args, "variant_id_types", None)
+        or formatting_config.variant_identifiers.target_types
+    )
+    configured_type = target_types.get(formatter_target)
+    if configured_type is not None and configured_type != required_type:
+        raise ValueError(
+            "%s requires formatter target %s to use %s, but configuration "
+            "requests %s."
+            % (
+                consumer, formatter_target, required_type, configured_type,
+            )
+        )
+    target_types[formatter_target] = required_type
+    args.variant_id_types = target_types
+
+
 __all__ = [
     "BimIdentifierRequirement", "configure_reference_variant_identifiers",
+    "configure_required_variant_identifier_type",
 ]

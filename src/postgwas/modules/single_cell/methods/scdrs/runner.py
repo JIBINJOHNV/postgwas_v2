@@ -6,7 +6,6 @@ import csv
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
-import shutil
 from typing import Any, Mapping
 
 import numpy as np
@@ -21,6 +20,7 @@ from postgwas.core.completion import (
 from postgwas.core.io.reports import write_delimited_report, write_yaml_report
 from postgwas.core.paths import (
     configured_output_path,
+    remove_owned_directory,
     require_nonempty_file,
     resolve_executable,
     validate_filename_component,
@@ -99,34 +99,30 @@ def _expressed_counts(chunk) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
-def _validate_annotation_values(adata, method) -> dict[str, Any]:
-    downstream = method.downstream
-    categorical = list(downstream.group_analysis)
-    if method.adjust_proportion_column is not None:
-        categorical.append(method.adjust_proportion_column)
-    continuous = list(downstream.correlation_analysis)
-    requested = categorical + continuous
-    missing_columns = [name for name in requested if name not in adata.obs.columns]
-    if missing_columns:
-        raise SingleCellError(
-            "scDRS annotations are absent from adata.obs: %s"
-            % ", ".join(missing_columns)
-        )
+def _group_count_summary(obs, names: list[str]) -> dict[str, list[dict]]:
+    summary = {}
+    for name in names:
+        counts = obs[name].value_counts(dropna=False)
+        summary[name] = [
+            {
+                "value": None if pd.isna(value) else str(value),
+                "cells": int(count),
+            }
+            for value, count in counts.items()
+        ]
+    return summary
 
-    missing_counts: dict[str, int] = {}
-    for name in requested:
-        missing = int(adata.obs[name].isna().sum())
-        missing_counts[name] = missing
-        if missing and not method.validation.allow_missing_annotation_values:
-            raise SingleCellError(
-                "scDRS annotation %r contains %d missing values; either curate "
-                "the H5AD file or explicitly permit missing annotation values"
-                % (name, missing)
-            )
-    continuous_summaries = {}
-    for name in continuous:
+
+def _continuous_annotation_summary(
+    obs,
+    names: list[str],
+    *,
+    context: str,
+) -> dict[str, dict]:
+    summary = {}
+    for name in names:
         try:
-            values = np.asarray(adata.obs[name], dtype=float)
+            values = np.asarray(obs[name], dtype=float)
         except (TypeError, ValueError) as exc:
             raise SingleCellError(
                 "scDRS correlation annotation %r must be numeric" % name
@@ -139,27 +135,58 @@ def _validate_annotation_values(adata, method) -> dict[str, Any]:
         if observed.size < 2 or np.ptp(observed) <= 0:
             raise SingleCellError(
                 "scDRS correlation annotation %r requires at least two "
-                "finite, nonconstant values" % name
+                "finite, nonconstant values %s" % (name, context)
             )
-        continuous_summaries[name] = {
+        summary[name] = {
             "observed_cells": int(observed.size),
             "minimum": float(np.min(observed)),
             "maximum": float(np.max(observed)),
         }
-    group_counts = {}
-    for name in categorical:
-        counts = adata.obs[name].value_counts(dropna=False)
-        group_counts[name] = [
-            {
-                "value": None if pd.isna(value) else str(value),
-                "cells": int(count),
-            }
-            for value, count in counts.items()
-        ]
+    return summary
+
+
+def _requested_annotation_names(method) -> tuple[list[str], list[str]]:
+    categorical = list(method.downstream.group_analysis)
+    if method.adjust_proportion_column is not None:
+        categorical.append(method.adjust_proportion_column)
+    continuous = list(method.downstream.correlation_analysis)
+    return categorical, continuous
+
+
+def _validate_annotation_values(adata, method) -> dict[str, Any]:
+    categorical, continuous = _requested_annotation_names(method)
+    requested = categorical + continuous
+    missing_columns = [name for name in requested if name not in adata.obs.columns]
+    if missing_columns:
+        raise SingleCellError(
+            "scDRS annotations are absent from adata.obs: %s"
+            % ", ".join(missing_columns)
+        )
+
+    missing_counts: dict[str, int] = {}
+    for name in requested:
+        missing = int(adata.obs[name].isna().sum())
+        missing_counts[name] = missing
+        if missing and name == method.adjust_proportion_column:
+            raise SingleCellError(
+                "scDRS proportion-adjustment annotation %r contains %d missing "
+                "values; the upstream cell-weight lookup requires every cell "
+                "to have a group" % (name, missing)
+            )
+        if missing and not method.validation.allow_missing_annotation_values:
+            raise SingleCellError(
+                "scDRS annotation %r contains %d missing values; either curate "
+                "the H5AD file or explicitly permit missing annotation values"
+                % (name, missing)
+            )
     return {
         "missing_values": missing_counts,
-        "group_counts": group_counts,
-        "continuous_summaries": continuous_summaries,
+        "input_group_counts": _group_count_summary(adata.obs, categorical),
+        "input_continuous_summaries": _continuous_annotation_summary(
+            adata.obs,
+            continuous,
+            context="in the input H5AD",
+        ),
     }
 
 
@@ -183,6 +210,7 @@ def validate_scdrs_h5ad(path: str | Path, method) -> dict[str, Any]:
 
         annotation_summary = _validate_annotation_values(adata, method)
         gene_cell_counts = np.zeros(int(adata.n_vars), dtype=np.int64)
+        passing_cell_mask = np.zeros(int(adata.n_obs), dtype=bool)
         passing_cells = 0
         maximum_fractional_part = 0.0
         chunk_rows = method.validation.matrix_chunk_rows
@@ -214,6 +242,7 @@ def validate_scdrs_h5ad(path: str | Path, method) -> dict[str, Any]:
                 passing = cell_gene_counts >= method.minimum_genes_per_cell
             else:
                 passing = np.ones(stop - start, dtype=bool)
+            passing_cell_mask[start:stop] = passing
             passing_cells += int(np.sum(passing))
             if np.any(passing):
                 _, filtered_gene_counts = _expressed_counts(chunk[passing])
@@ -232,6 +261,31 @@ def validate_scdrs_h5ad(path: str | Path, method) -> dict[str, Any]:
             raise SingleCellError(
                 "No H5AD genes pass the configured scDRS minimum_cells_per_gene"
             )
+        categorical, continuous = _requested_annotation_names(method)
+        analysis_obs = adata.obs.iloc[np.flatnonzero(passing_cell_mask)]
+        if method.adjust_proportion_column is not None:
+            # scDRS 1.0.3 enforces fewer than one group per ten analyzed cells
+            # before it computes inverse group-size weights.
+            group_count = int(
+                analysis_obs[method.adjust_proportion_column].nunique()
+            )
+            if group_count >= 0.1 * passing_cells:
+                raise SingleCellError(
+                    "scDRS proportion adjustment has %d groups among %d "
+                    "post-filter cells; the supported upstream algorithm "
+                    "requires fewer than one group per ten cells"
+                    % (group_count, passing_cells)
+                )
+        annotation_summary["analysis_group_counts"] = _group_count_summary(
+            analysis_obs, categorical,
+        )
+        annotation_summary["analysis_continuous_summaries"] = (
+            _continuous_annotation_summary(
+                analysis_obs,
+                continuous,
+                context="after configured scDRS cell filtering",
+            )
+        )
         gene_universe = tuple(
             str(value)
             for value in adata.var_names[np.asarray(passing_genes, dtype=bool)]
@@ -960,18 +1014,6 @@ def _downstream_command(
     return command
 
 
-def _safe_remove_owned_directory(path: Path, output_root: Path) -> None:
-    resolved = path.resolve()
-    root = output_root.resolve()
-    if resolved == root or root not in resolved.parents:
-        raise SingleCellError(
-            "Refusing to remove an scDRS directory outside the output root: %s"
-            % resolved
-        )
-    if resolved.exists():
-        shutil.rmtree(resolved)
-
-
 def run_scdrs(
     *,
     preflight: ScdrsPreflight,
@@ -1076,9 +1118,19 @@ def run_scdrs(
                 "An isolated incomplete scDRS run exists at %s; review it or "
                 "use --overwrite" % staging
             )
-        _safe_remove_owned_directory(staging, Path(configuration.run.output_directory))
+        remove_owned_directory(
+            staging,
+            configuration.run.output_directory,
+            "incomplete scDRS staging directory",
+            error_type=SingleCellError,
+        )
     if configuration.run.overwrite:
-        _safe_remove_owned_directory(engine, Path(configuration.run.output_directory))
+        remove_owned_directory(
+            engine,
+            configuration.run.output_directory,
+            "scDRS engine directory",
+            error_type=SingleCellError,
+        )
         manifest_path.unlink(missing_ok=True)
 
     staging.mkdir(parents=True, exist_ok=False)

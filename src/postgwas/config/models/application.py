@@ -75,6 +75,10 @@ class PostGWASConfig(StrictModel):
         if self.pipeline.stop_after and self.pipeline.stop_after not in self.pipeline.modules:
             raise ValueError("pipeline.stop_after must name an enabled pipeline module")
         configured_builds = set(self.resources.genomes)
+        if self.modules.filtering.genome_build.value not in configured_builds:
+            raise ValueError(
+                "modules.filtering.genome_build must be defined in resources.genomes"
+            )
         if self.modules.mixer.genome_build not in configured_builds:
             raise ValueError(
                 "modules.mixer.genome_build must be defined in resources.genomes"

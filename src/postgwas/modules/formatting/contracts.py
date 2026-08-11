@@ -82,6 +82,8 @@ FORMAT_CONTRACTS = {
     ),
 }
 
+CUSTOM_OUTPUT_TARGET = "custom"
+
 # Stable Python result keys are internal handoff contracts, not configurable
 # scientific values. Keeping them here prevents exporters and resume recovery
 # from defining parallel interfaces.
@@ -94,7 +96,28 @@ NAMED_OUTPUT_RESULT_KEYS = {
         "p_values": "pval_file",
     },
 }
+SINGLE_OUTPUT_RESULT_KEYS = {
+    "susie": "susie_input",
+    "finemap": "finemap_input",
+    "ldsc": "ldsc_file",
+    "mixer": "mixer_input",
+    CUSTOM_OUTPUT_TARGET: "custom_output_file",
+}
+PARTITIONED_OUTPUT_RESULT_KEYS = {
+    "pred_ld": {
+        "directory": "pred_ld_folder",
+        "files": "files",
+    },
+}
 GCTA_SAMPLE_SIZE_MODE = "total_sample_size_from_FORMAT_SS"
+
+
+def formatter_result_targets(config, selected: list[str]) -> list[str]:
+    """Return built-in targets plus the optional additive custom export."""
+    targets = list(selected)
+    if config.custom_output.active:
+        targets.append(CUSTOM_OUTPUT_TARGET)
+    return targets
 
 
 def required_formats(config, modules=(), requested=()):
@@ -107,8 +130,12 @@ def required_formats(config, modules=(), requested=()):
 
 __all__ = [
     "FORMAT_CONTRACTS",
+    "CUSTOM_OUTPUT_TARGET",
     "GCTA_SAMPLE_SIZE_MODE",
     "NAMED_OUTPUT_RESULT_KEYS",
+    "PARTITIONED_OUTPUT_RESULT_KEYS",
+    "SINGLE_OUTPUT_RESULT_KEYS",
     "FormatContract",
+    "formatter_result_targets",
     "required_formats",
 ]

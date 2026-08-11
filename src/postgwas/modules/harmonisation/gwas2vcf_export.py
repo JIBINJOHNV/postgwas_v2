@@ -75,6 +75,7 @@ def export_gwas2vcf_input(
     """Write one adapter input TSV, its index-based mapping, and QC summary."""
     required_keys = tuple(input_config["required_column_keys"])
     optional_keys = tuple(input_config["optional_column_keys"])
+    audit_columns = tuple(input_config["audit_columns"])
     missing = [
         key for key in required_keys
         if optional_text(sample_column_dict.get(key)) is None
@@ -96,10 +97,43 @@ def export_gwas2vcf_input(
             "Cannot export chromosome %s; mapped columns are absent: %s"
             % (chromosome, ", ".join(absent))
         )
+    absent_audit = [column for column in audit_columns if column not in df.columns]
+    if absent_audit:
+        raise ValueError(
+            "Cannot export chromosome %s; configured audit columns are absent: %s"
+            % (chromosome, ", ".join(absent_audit))
+        )
+    audit_null_counts = df.select([
+        pl.col(column).null_count().alias(column) for column in audit_columns
+    ]).row(0, named=True)
+    incomplete_audit = {
+        column: int(count)
+        for column, count in audit_null_counts.items()
+        if count
+    }
+    if incomplete_audit:
+        raise ValueError(
+            "Cannot export chromosome %s; configured audit columns contain missing "
+            "values: %s"
+            % (
+                chromosome,
+                ", ".join(
+                    "%s=%s" % (column, count)
+                    for column, count in incomplete_audit.items()
+                ),
+            )
+        )
+    mapped_audit = sorted(set(pairs.values()) & set(audit_columns))
+    if mapped_audit:
+        raise ValueError(
+            "Cannot export chromosome %s; audit columns must not also be mapped "
+            "GWAS-to-VCF columns: %s"
+            % (chromosome, ", ".join(mapped_audit))
+        )
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    export_df = df.select(list(pairs.values()))
+    export_df = df.select(list(pairs.values()) + list(audit_columns))
     values = {"dataset_id": gwas_outputname, "chromosome": chromosome}
     tsv_path = configured_output_path(
         output, layout["adapter_input"], **values,
@@ -139,5 +173,6 @@ def export_gwas2vcf_input(
         logger.record(
             "OUTPUT", "adapter_input", rows=export_df.height,
             table=str(tsv_path), mapping=str(dict_path), summary=str(summary_path),
+            audit_columns=",".join(audit_columns),
         )
     return summary

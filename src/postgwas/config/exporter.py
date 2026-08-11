@@ -12,6 +12,11 @@ from postgwas.config.loader import (
     load_configuration,
     load_module_configuration,
 )
+from postgwas.config.models.modules.single_cell import (
+    single_cell_formatter_targets,
+    single_cell_pipeline_dependencies,
+    single_cell_supporting_configurations,
+)
 from postgwas.core.errors import ConfigurationError
 from postgwas.pipeline.planner import build_pipeline_plan
 from postgwas.modules.formatting.contracts import required_formats
@@ -120,7 +125,13 @@ _FORMATTING_COMMENTS = {
     "variant_identifiers.unique_id_template": (
         "Template used to construct an ID from VCF chromosome, position, REF, and ALT.",
     ),
-    "study_design": ("Columns used to infer binary versus quantitative traits.",),
+    "study_design": (
+        "Columns and target formats used to infer binary versus quantitative traits.",
+    ),
+    "study_design.required_formats": (
+        "Formatter targets that require trait-specific sample-size interpretation.",
+        "The validated scientific contract requires exactly LDSC and MiXeR.",
+    ),
     "runtime": ("Configured formatter logs, metadata paths, and I/O settings.",),
     "vcf_include_expression": ("Optional bcftools expression applied during extraction.",),
     "exports": (
@@ -402,27 +413,52 @@ def render_pipeline_configuration(
     config_file: str | Path | None = None,
     style: str = "minimal",
 ) -> str:
-    """Render the target modules and every planned prerequisite in run order."""
+    """Render executable steps plus supporting method configuration."""
     if style not in EXPORT_STYLES:
         raise ConfigurationError("Unknown export style: %s" % style)
-    plan = build_pipeline_plan(targets)
+    config = load_configuration(config_file)
+    single_cell_tools = (
+        config.modules.single_cell.tools if "single_cell" in targets else []
+    )
+    dependency_overrides = (
+        {
+            "single_cell": single_cell_pipeline_dependencies(
+                single_cell_tools
+            )
+        }
+        if single_cell_tools else None
+    )
+    plan = build_pipeline_plan(
+        targets, dependency_overrides=dependency_overrides,
+    )
     selected = list(
         dict.fromkeys(canonical_module_name(step) for step in plan.steps)
     )
-    config = load_configuration(config_file)
+    supporting = single_cell_supporting_configurations(single_cell_tools)
+    rendered_modules = []
+    for name in selected:
+        if name == "single_cell":
+            rendered_modules.extend(supporting)
+        rendered_modules.append(name)
+    rendered_modules = list(dict.fromkeys(rendered_modules))
 
     values = config.model_dump(mode="json")
     all_modules = values.pop("modules")
     values["pipeline"]["modules"] = selected
     if "formatting" in selected:
+        requested_formats = list(all_modules["formatting"].get("formats", ()))
+        requested_formats.extend(
+            single_cell_formatter_targets(single_cell_tools)
+        )
         all_modules["formatting"]["formats"] = required_formats(
             config.modules.formatting,
             plan.active_modules,
-            all_modules["formatting"].get("formats", ()),
+            requested_formats,
         )
     output = _dump_values(values).rstrip() + "\nmodules:\n"
-    for name in selected:
-        all_modules[name]["enabled"] = True
+    for name in rendered_modules:
+        if name in selected:
+            all_modules[name]["enabled"] = True
         output += "  %s:\n" % name
         if name == "harmonisation":
             rendered = _render_harmonisation(getattr(config.modules, name), style)

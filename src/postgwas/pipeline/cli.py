@@ -23,6 +23,10 @@ from postgwas.core.ui import (
     help_with_default,
 )
 from postgwas.config import load_configuration
+from postgwas.config.models.modules.single_cell import (
+    SINGLE_CELL_TOOLS,
+    single_cell_pipeline_dependencies,
+)
 from postgwas.pipeline.planner import build_pipeline_plan
 from postgwas.pipeline.registry import REGISTRY, resolve_reference
 from postgwas.cli.compute import resolve_compute_args
@@ -78,6 +82,8 @@ def main():
     mini.add_argument("--apply-imputation", action="store_true")
     mini.add_argument("--apply-manhattan", action="store_true")
     mini.add_argument("--heritability", action="store_true")
+    mini.add_argument("--tools", nargs="+", choices=SINGLE_CELL_TOOLS)
+    mini.add_argument("--run-config")
     mini.add_argument("-h", "--help", action="store_true")
 
     a1, _ = mini.parse_known_args()
@@ -122,14 +128,22 @@ def main():
     # 3. Validate targets and build the execution plan exactly once.
     raw_modules = list(a1.modules or [])
     try:
+        dependency_overrides = None
+        if "single_cell" in raw_modules:
+            configuration = load_configuration(a1.run_config)
+            tools = a1.tools or configuration.modules.single_cell.tools
+            dependency_overrides = {
+                "single_cell": single_cell_pipeline_dependencies(tools)
+            }
         plan = build_pipeline_plan(
             raw_modules,
             apply_filter=a1.apply_filter,
             apply_imputation=a1.apply_imputation,
             apply_manhattan=a1.apply_manhattan,
             heritability=a1.heritability,
+            dependency_overrides=dependency_overrides,
         )
-    except PipelinePlanningError as exc:
+    except (ConfigurationError, PipelinePlanningError) as exc:
         console.print(f"\n❌ [bold red]Pipeline Planning Error:[/bold red] {exc}")
         sys.exit(2)
 

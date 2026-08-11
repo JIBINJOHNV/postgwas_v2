@@ -43,7 +43,9 @@ is removed, where "missing" means null, NaN OR inf - a NaN is as unusable
 downstream as a null.  Fields are evaluated ONE AT A TIME, in the configured
 order, so a variant missing three fields is attributed to the first one, which
 is what keeps "a variant appears exactly once" true.  INFO is deliberately not
-in the list; it stays under ``info.on_missing``.
+in the list; it stays under ``info.on_missing``. Unmapped internal working
+columns are then removed. An internal column still named by the resolved column
+mapping must survive until adapter export, which selects only mapped columns.
 
 Python 3.8 compatible.  Imports polars and the standard library at module level;
 policies / numpy / scipy are imported lazily so the module stays importable in a
@@ -818,8 +820,10 @@ def final_completeness_check(
     Removes any variant with a missing value in a required field, where missing
     means null, NaN or inf.  One field at a time, in the configured order, so a
     variant missing three fields is attributed to the first - the same rule that
-    makes the reject counts reconcile.  Also drops every internal ``__`` working
-    column, so nothing derived leaks into the exported file.
+    makes the reject counts reconcile.  Also drops unmapped internal ``__``
+    working columns. A mapped internal column is retained until adapter export,
+    which selects only the resolved output columns; this is required for the
+    explicit fixed-INFO column.
 
     Returns ``(df, qc_info, sample_column_dict)``.
     """
@@ -901,16 +905,42 @@ def final_completeness_check(
                     qc_info["removed_by_reason"][reason] = int(removed)
 
         # ------------------------------------------------------------------
-        # Internal working columns never reach the exported file.
+        # Drop temporary columns that no resolved column mapping still uses.
+        # Adapter export selects mapped columns explicitly, so retaining an
+        # internal mapped column here cannot leak unrelated working state.
         # ------------------------------------------------------------------
-        internal = [name for name in df.columns if name.startswith("__")]
+        mapped_columns = {
+            value
+            for value in sample_column_dict.values()
+            if isinstance(value, str) and value in df.columns
+        }
+        internal = [
+            name
+            for name in df.columns
+            if name.startswith("__") and name not in mapped_columns
+        ]
+        retained_internal = [
+            name
+            for name in df.columns
+            if name.startswith("__") and name in mapped_columns
+        ]
         if internal:
             df = df.drop(internal)
             ctx.info(
                 "Dropped %d internal working column%s before export: %s."
                 % (len(internal), "" if len(internal) == 1 else "s", ", ".join(internal))
             )
+        if retained_internal:
+            ctx.info(
+                "Retained %d internal mapped column%s through adapter export: %s."
+                % (
+                    len(retained_internal),
+                    "" if len(retained_internal) == 1 else "s",
+                    ", ".join(retained_internal),
+                )
+            )
         qc_info["internal_columns_dropped"] = internal
+        qc_info["internal_columns_retained_for_export"] = retained_internal
 
         rows_out = df.height
         qc_info["final_variants"] = rows_out

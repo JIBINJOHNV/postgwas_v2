@@ -1,4 +1,4 @@
-"""Scientific validation and normalization for single-cell analyses."""
+"""Scientific validation and normalization for MAGMA cell typing."""
 
 from __future__ import annotations
 

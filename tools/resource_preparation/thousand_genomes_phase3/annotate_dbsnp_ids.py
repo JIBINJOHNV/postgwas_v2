@@ -50,43 +50,16 @@ def run_chromosome(population: str, chromosome: str, temporary: Path) -> Path:
     annotation = DBSNP_DIRECTORY / DBSNP_TEMPLATE.format(chromosome=chromosome)
     reference = reference_for(chromosome)
     output = temporary / f"{population}.chr{chromosome}.vcf.gz"
-    view = subprocess.Popen(
-        [BCFTOOLS_EXECUTABLE, "view", "--regions", chromosome, "--output-type", "u", "--no-version", str(source)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if view.stdout is None:
-        raise RuntimeError(f"view pipe unavailable: {population} chr{chromosome}")
-    norm = subprocess.Popen(
-        [BCFTOOLS_EXECUTABLE, "norm", "--fasta-ref", str(reference), "--multiallelics", "-any", "-d", "exact", "--output-type", "u", "--no-version", "-"],
-        stdin=view.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    view.stdout.close()
-    if norm.stdout is None:
-        view.kill(); norm.kill()
-        raise RuntimeError(f"norm pipe unavailable: {population} chr{chromosome}")
-    fallback = subprocess.Popen(
-        [BCFTOOLS_EXECUTABLE, "annotate", "--set-id", "%CHROM_%POS_%REF_%FIRST_ALT", "--output-type", "u", "--no-version", "-"],
-        stdin=norm.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    norm.stdout.close()
-    if fallback.stdout is None:
-        view.kill(); norm.kill(); fallback.kill()
-        raise RuntimeError(f"fallback-ID pipe unavailable: {population} chr{chromosome}")
-    annotate = subprocess.Popen(
-        [BCFTOOLS_EXECUTABLE, "annotate", "--annotations", str(annotation), "--columns", "ID", "--pair-logic", "exact", "--output-type", "z", "--output", str(output), "--no-version", "-"],
-        stdin=fallback.stdout, stderr=subprocess.PIPE,
-    )
-    fallback.stdout.close()
-    annotate_return = annotate.wait()
-    fallback_return = fallback.wait()
-    norm_return = norm.wait()
-    view_return = view.wait()
-    if any(code != 0 for code in (view_return, norm_return, fallback_return, annotate_return)):
-        errors = []
-        for process, label in ((view, "view"), (norm, "norm"), (fallback, "set-id"), (annotate, "annotate")):
-            if process.stderr is not None:
-                errors.append(f"{label}: {process.stderr.read().decode(errors='replace')}")
-        raise RuntimeError(f"failed {population} chr{chromosome}: {'; '.join(errors)}")
+    extracted = temporary / f"{population}.chr{chromosome}.extracted.vcf.gz"
+    normalized = temporary / f"{population}.chr{chromosome}.normalized.vcf.gz"
+    fallback = temporary / f"{population}.chr{chromosome}.fallback.vcf.gz"
+    subprocess.run([BCFTOOLS_EXECUTABLE, "view", "--regions", chromosome, "--output-type", "z", "--output", str(extracted), "--no-version", str(source)], check=True)
+    subprocess.run([BCFTOOLS_EXECUTABLE, "index", "--force", "--tbi", str(extracted)], check=True)
+    subprocess.run([BCFTOOLS_EXECUTABLE, "norm", "--fasta-ref", str(reference), "--multiallelics", "-any", "-d", "exact", "--output-type", "z", "--output", str(normalized), "--no-version", str(extracted)], check=True)
+    subprocess.run([BCFTOOLS_EXECUTABLE, "index", "--force", "--tbi", str(normalized)], check=True)
+    subprocess.run([BCFTOOLS_EXECUTABLE, "annotate", "--set-id", "%CHROM\\_%POS\\_%REF\\_%ALT", "--output-type", "z", "--output", str(fallback), "--no-version", str(normalized)], check=True)
+    subprocess.run([BCFTOOLS_EXECUTABLE, "index", "--force", "--tbi", str(fallback)], check=True)
+    subprocess.run([BCFTOOLS_EXECUTABLE, "annotate", "--annotations", str(annotation), "--columns", "ID", "--pair-logic", "exact", "--output-type", "z", "--output", str(output), "--no-version", str(fallback)], check=True)
     subprocess.run([BCFTOOLS_EXECUTABLE, "index", "--force", "--tbi", str(output)], check=True)
     return output
 

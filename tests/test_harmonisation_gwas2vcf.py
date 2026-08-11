@@ -13,10 +13,17 @@ import pysam
 
 from postgwas.config import load_configuration
 from postgwas.modules.harmonisation.cli import _engine_defaults
+from postgwas.modules.harmonisation.effect_validation import (
+    final_completeness_check,
+)
 from postgwas.modules.harmonisation.gwas2vcf_runner import run_gwas2vcf
 from postgwas.modules.harmonisation.gwas2vcf_export import (
     export_gwas2vcf_input,
 )
+from postgwas.modules.harmonisation.imputation_quality import (
+    harmonise_imputation_quality,
+)
+from postgwas.modules.harmonisation.policies import default_policies
 from postgwas.modules.harmonisation.adapters.gwas2vcf.gwas import normalize_alleles
 from postgwas.modules.harmonisation.adapters.gwas2vcf.main import main as adapter_main
 from postgwas.modules.harmonisation.vcf_processing import (
@@ -100,18 +107,77 @@ def test_export_does_not_apply_a_second_unreported_variant_filter():
             "A1": ["A", "C"], "A2": ["G", "T"], "EAF": [0.2, 0.3],
             "BETA": [0.1, 0.0], "SE": [0.2, 0.0], "Z": [0.5, 0.0],
             "P": [0.6, 1.0], "N": [100, 100],
+            "strand_action": ["forward", "forward_swapped"],
         }
     )
     with TemporaryDirectory() as directory:
         defaults = _harmonisation_defaults()
+        assert defaults["gwas2vcf_input"]["audit_columns"] == ["strand_action"]
+        with pytest.raises(ValueError, match="configured audit columns are absent"):
+            export_gwas2vcf_input(
+                frame.drop("strand_action"), columns, directory, "study", "1",
+                genome_build="GRCh37", layout=defaults["output_layout"],
+                input_config=defaults["gwas2vcf_input"],
+            )
         summary = export_gwas2vcf_input(
             frame, columns, directory, "study", "1", genome_build="GRCh37",
             layout=defaults["output_layout"],
             input_config=defaults["gwas2vcf_input"],
         )
         exported = pl.read_csv(Path(directory) / "study_chr1_vcf_input.tsv", separator="\t")
+        mapping = json.loads(
+            (Path(directory) / "study_chr1.dict").read_text(encoding="utf-8")
+        )
     assert exported.height == frame.height
+    assert exported.columns[-1] == "strand_action"
+    assert exported["strand_action"].to_list() == ["forward", "forward_swapped"]
+    assert "strand_action" not in mapping
     assert summary["num_rows"][0] == frame.height
+
+
+def test_fixed_info_survives_completeness_check_and_reaches_adapter_export(tmp_path):
+    columns = {
+        "chr_col": "CHR", "pos_col": "BP", "snp_id_col": "SNP",
+        "ea_col": "A1", "oa_col": "A2", "eaf_col": "EAF",
+        "beta_col": "BETA", "se_col": "SE", "imp_z_col": "Z",
+        "pval_col": "P", "ncontrol_col": "NEFF", "imp_info_col": None,
+        "fixed_info": 0.9, "fixed_info_column": "__postgwas_fixed_info",
+        "info_source": "fixed_cli",
+    }
+    frame = pl.DataFrame({
+        "CHR": ["1"], "BP": [10], "SNP": ["rs1"],
+        "A1": ["A"], "A2": ["G"], "EAF": [0.2],
+        "BETA": [0.1], "SE": [0.05], "Z": [2.0],
+        "P": [0.0455], "NEFF": [1000], "__temporary_qc_flag": [True],
+        "strand_action": ["forward"],
+    })
+    policies = default_policies()
+
+    frame, _info_qc, columns = harmonise_imputation_quality(
+        "1", frame, columns, policies=policies,
+    )
+    frame, completeness_qc, columns = final_completeness_check(
+        "1", frame, columns, policies=policies,
+    )
+    defaults = _harmonisation_defaults()
+    export_gwas2vcf_input(
+        frame, columns, str(tmp_path), "study", "1", genome_build="GRCh37",
+        layout=defaults["output_layout"],
+        input_config=defaults["gwas2vcf_input"],
+    )
+
+    exported = pl.read_csv(
+        tmp_path / "study_chr1_vcf_input.tsv", separator="\t",
+    )
+    assert "__temporary_qc_flag" not in frame.columns
+    assert frame["__postgwas_fixed_info"].to_list() == [0.9]
+    assert exported["__postgwas_fixed_info"].to_list() == [0.9]
+    assert completeness_qc["internal_columns_dropped"] == [
+        "__temporary_qc_flag",
+    ]
+    assert completeness_qc["internal_columns_retained_for_export"] == [
+        "__postgwas_fixed_info",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -132,8 +198,8 @@ def test_adapter_cli_needs_no_dbsnp_and_preserves_study_id_in_format(tmp_path):
     pysam.faidx(str(reference))
     input_table = tmp_path / "study.tsv"
     input_table.write_text(
-        "CHR\tPOS\tEA\tOA\tBETA\tSE\tP\tID\n"
-        "1\t2\tG\tA\t0.1\t0.05\t0.01\tstudy:variant=1\n",
+        "CHR\tPOS\tEA\tOA\tBETA\tSE\tP\tID\tstrand_action\n"
+        "1\t2\tG\tA\t0.1\t0.05\t0.01\tstudy:variant=1\tforward\n",
         encoding="utf-8",
     )
     output = tmp_path / "study.vcf"
