@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
 import yaml
+
+from postgwas.pipeline.registry import REGISTRY
 
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -154,13 +157,46 @@ def test_readme_uses_current_repository_and_version_two_interfaces():
 
 def test_readme_indexes_every_manifest_page_in_order():
     text = ROOT_README.read_text(encoding="utf-8")
+    documentation = text[text.index("## Documentation") :]
     positions = []
     for page in _wiki_pages():
         link = f']({page["source"]})'
-        assert link in text, page
-        positions.append(text.index(link))
+        assert link in documentation, page
+        positions.append(documentation.index(link))
 
     assert positions == sorted(positions)
+
+
+def test_readme_lists_public_commands_and_supported_execution_modes():
+    text = ROOT_README.read_text(encoding="utf-8")
+
+    for command in REGISTRY.commands():
+        assert (
+            f"`{command}`" in text or f"`postgwas {command}`" in text
+        ), command
+
+    for name in REGISTRY.names():
+        specification = REGISTRY.get(name)
+        if specification.pipeline_enabled and specification.runner:
+            assert f"`{name}`" in text, name
+
+    assert "### Direct mode: run one module" in text
+    assert "### Pipeline mode: request final analyses" in text
+    assert "No — required before the pipeline" in text
+    assert "No — standalone terminal analysis" in text
+    assert "`qc_summary`" in text
+    assert "allele_orientation" not in text
+
+
+def test_readme_local_links_exist():
+    text = ROOT_README.read_text(encoding="utf-8")
+    targets = re.findall(r"\[[^\]]+\]\(([^)]+)\)", text)
+
+    for target in targets:
+        if "://" in target or target.startswith("#"):
+            continue
+        relative_path = target.split("#", 1)[0]
+        assert (REPOSITORY_ROOT / relative_path).exists(), target
 
 
 def test_documentation_workflow_validates_without_wiki_publication():
