@@ -42,8 +42,9 @@ def get_validation_parser() -> argparse.ArgumentParser:
             "Compare one original summary-statistics dataset with its corresponding "
             "same-build harmonised GWAS-VCF.\n\n"
             "PostGWAS checks variant retention, effect estimates, allele frequencies, "
-            "standard errors, and Z scores. If the input has no Z column, it calculates Z from the "
-            "available effect statistics. SNP and indel concordance are reported "
+            "standard errors, Z scores, and p-values. If the input has no Z column, "
+            "it calculates Z from the available effect statistics. SNP and indel "
+            "concordance are reported "
             "separately. Unmatched variants are reported without failing the value audit; "
             "one-to-one unmatched records at the same position receive diagnostic value checks."
         ),

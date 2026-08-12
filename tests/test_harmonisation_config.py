@@ -252,7 +252,11 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertNotIn("analysis_directory", config.output_layout.root)
         self.assertEqual(
             config.output_layout.root["gwas2vcf_summary"],
-            "qc_summary/{dataset_id}_gwas2vcf_summary.tsv",
+            "qc_summary/{dataset_id}_pre_vcf_column_statistics.tsv",
+        )
+        self.assertEqual(
+            config.output_layout.root["adapter_merged_mapping"],
+            "qc_summary/{dataset_id}_gwas2vcf_column_mapping.json",
         )
         self.assertEqual(
             config.output_layout.root["chromosome_source_snapshot"],
@@ -268,7 +272,15 @@ class HarmonisationConfigTests(unittest.TestCase):
         )
         self.assertEqual(
             config.output_layout.root["qc_summary"],
-            "qc_summary/{dataset_id}_QC_summary.txt",
+            "qc_summary/{dataset_id}_chromosomewise_harmonisation_metrics.tsv",
+        )
+        self.assertEqual(
+            config.output_layout.root["qc_assessment_summary"],
+            "qc_summary/{dataset_id}_{build}_vcf_qc_metrics.tsv",
+        )
+        self.assertEqual(
+            config.output_layout.root["qc_filter_rules"],
+            "qc_summary/{dataset_id}_{build}_vcf_qc_rule_results.tsv",
         )
 
     def test_export_has_no_duplicate_module_and_policy_settings(self):
@@ -295,6 +307,11 @@ class HarmonisationConfigTests(unittest.TestCase):
             "p_value_floor", "p_value_ceiling",
         } & set(exported["concordance_validation"]))
         self.assertIn("standard_error", exported["concordance_validation"])
+        self.assertIn("p_value", exported["concordance_validation"])
+        self.assertEqual(
+            exported["vcf_processing"]["concordance_fields"]["LP"],
+            "[%LP]",
+        )
         self.assertEqual(
             exported["concordance_validation"]["palindromic_action"],
             "compare_resolved",

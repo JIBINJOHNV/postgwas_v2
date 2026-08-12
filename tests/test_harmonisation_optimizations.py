@@ -1,5 +1,6 @@
 """Regression tests for behavior-preserving Harmonisation optimizations."""
 
+import csv
 import json
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from postgwas.modules.harmonisation.rejects import (
     SOURCE_INPUT_ROW_COLUMN,
 )
 from postgwas.modules.harmonisation.sample_size import harmonise_sample_sizes
+from postgwas.modules.harmonisation.service import _save_qc_results
 from postgwas.modules.harmonisation.study_properties import resolve_study_properties
 from postgwas.modules.harmonisation.summary_statistics_io import (
     check_file_truncation,
@@ -54,7 +56,7 @@ from postgwas.modules.harmonisation.shared.variant_columns import (
 def _cleanup_layout():
     return {
         "qc_directory": "qc_summary",
-        "adapter_merged_mapping": "qc_summary/{dataset_id}.dict",
+        "adapter_merged_mapping": "qc_summary/{dataset_id}_column_mapping.json",
         "gwas2vcf_summary": "qc_summary/{dataset_id}_summary.tsv",
         "adapter_mapping": "{dataset_id}_chr{chromosome}.dict",
         "adapter_summary": "{dataset_id}_chr{chromosome}_summary.tsv",
@@ -216,8 +218,36 @@ def test_successful_cleanup_removes_internal_source_snapshots(tmp_path):
         str(adapter_mapping),
         str(adapter_summary),
     }
-    assert Path(result["dict"]).read_text(encoding="utf-8") == '{"chr_col": 0}\n'
+    assert json.loads(Path(result["dict"]).read_text(encoding="utf-8")) == {
+        "chr_col": 0,
+    }
     assert "snp_id_col" in Path(result["summary"]).read_text(encoding="utf-8")
+
+
+def test_cleanup_rejects_inconsistent_chromosome_column_mappings(tmp_path):
+    (tmp_path / "study_chr1.dict").write_text(
+        '{"chr_col": 0}\n', encoding="utf-8",
+    )
+    (tmp_path / "study_chr2.dict").write_text(
+        '{"chr_col": 1}\n', encoding="utf-8",
+    )
+    for chromosome in ("1", "2"):
+        (tmp_path / ("study_chr%s_summary.tsv" % chromosome)).write_text(
+            "chromosome\tkey\tnum_rows\n%s\tsnp_id_col\t1\n" % chromosome,
+            encoding="utf-8",
+        )
+
+    with pytest.raises(RuntimeError, match="column mappings are inconsistent"):
+        finalise_harmonisation_outputs(
+            output_dir=str(tmp_path),
+            gwas_outputname="study",
+            output_layout=_cleanup_layout(),
+            threads=1,
+            compression_executable=None,
+        )
+
+    assert (tmp_path / "study_chr1.dict").is_file()
+    assert (tmp_path / "study_chr2.dict").is_file()
 
 
 def test_cleanup_rejects_stale_merged_side_outputs(tmp_path):
@@ -225,7 +255,7 @@ def test_cleanup_rejects_stale_merged_side_outputs(tmp_path):
     chromosome_table.write_text("CHR\tPOS\n1\t100\n", encoding="utf-8")
     qc_dir = tmp_path / "qc_summary"
     qc_dir.mkdir()
-    stale_mapping = qc_dir / "study.dict"
+    stale_mapping = qc_dir / "study_column_mapping.json"
     stale_summary = qc_dir / "study_summary.tsv"
     stale_mapping.write_text("previous mapping\n", encoding="utf-8")
     stale_summary.write_text("previous summary\n", encoding="utf-8")
@@ -805,6 +835,39 @@ def test_qc_table_from_memory_matches_saved_json(tmp_path):
     from_disk = qc_results_to_dataframe(path, allowed_chromosomes=allowed)
 
     assert from_memory.equals(from_disk)
+
+
+def test_chromosomewise_harmonisation_metrics_are_written_as_tsv(tmp_path):
+    path = tmp_path / "study_chromosomewise_harmonisation_metrics.tsv"
+    table = _save_qc_results(
+        {
+            "1": {"effect_qc": {"final_variants": 10}},
+            "total_variant_read": 10,
+        },
+        path,
+        allowed_chromosomes=["1", "2"],
+        delimiter="\t",
+        null_output="",
+    )
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+
+    assert list(table.columns) == ["section", "metric", "chr1", "GLOBAL_VALUE"]
+    assert rows == [
+        {
+            "section": "effect_qc",
+            "metric": "final_variants",
+            "chr1": "10",
+            "GLOBAL_VALUE": "",
+        },
+        {
+            "section": "GLOBAL",
+            "metric": "total_variant_read",
+            "chr1": "",
+            "GLOBAL_VALUE": "10",
+        },
+    ]
 
 
 def test_resolved_executable_preflight_is_recorded_in_engine_defaults():

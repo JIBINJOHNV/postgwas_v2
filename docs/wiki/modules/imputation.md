@@ -57,7 +57,6 @@ postgwas imputation \
   --imputation-r2-threshold 0.8 \
   --imputation-minimum-maf 0.001 \
   --ref TOP_LD \
-  --correlation-method pearson \
   --resource-directory resources \
   --population EUR \
   --dataset-id STUDY \
@@ -68,9 +67,12 @@ postgwas imputation \
 ## Parameters
 
 Only `pred_ld` is implemented in direct mode. The direct defaults are minimum
-LD r² 0.8, reference MAF 0.001, population EUR, reference mode `TOP_LD`, and
-Pearson post-processing correlation. The runner applies additional memory-
-aware scheduling; begin with conservative parallel settings for a new system.
+LD r² 0.8, reference MAF 0.001, population EUR, and reference mode `TOP_LD`. The
+runner applies additional memory-aware scheduling; begin with conservative
+parallel settings for a new system.
+
+`--correlation-method` is currently accepted by the parser but is not delivered
+to the post-processing step, so the value has no effect. Do not rely on it.
 
 ## Processing steps
 

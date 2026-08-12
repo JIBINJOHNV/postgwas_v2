@@ -34,25 +34,52 @@ different data.
 The contextual help page shows the actual steps and options for the selected
 target. Inspect it before starting a run.
 
+## How the execution order is decided
+
+Each target's registered dependencies are expanded recursively and cycles are
+rejected. The resulting steps are then emitted in a fixed order:
+
+1. filtering;
+2. formatting and imputation, followed by an internal post-imputation filtering
+   step when filtering and imputation are both active;
+3. LD-block annotation;
+4. formatting for downstream tools;
+5. the analysis modules;
+6. Manhattan plotting;
+7. the GWAS-VCF QC summary.
+
+Step directories are numbered by their position in the plan, so the same module
+can appear more than once with different numbers, and a different target set
+produces different numbers. For `--modules flames` the plan is
+`annot_ldblock`, `formatter`, `ld_clump`, `magma`, `magmacovar`, `pops`,
+`finemap`, `flames`.
+
 ## Optional workflow stages
 
 The pipeline also accepts workflow switches that add filtering, imputation,
-plotting, or heritability estimation:
+plotting, or heritability estimation without naming them as targets:
+`--apply-filter`, `--apply-imputation`, `--apply-manhattan`, and
+`--heritability`.
 
 ```console
 postgwas pipeline \
-  --modules finemap \
-  --apply-filter \
+  --modules magma \
   --apply-imputation \
   --apply-manhattan \
   --heritability \
   --help
 ```
 
-When filtering and imputation are combined, the planner can schedule filtering
+When filtering and imputation are combined, the planner schedules filtering
 before imputation and a distinct post-imputation filtering stage. Always inspect
 the displayed plan rather than assuming that a command-line option maps to only
 one physical step.
+
+`--apply-filter` cannot currently be combined with a target whose plan also
+defines a genome-build option — this includes `finemap`, `ld_clump`,
+`qc_summary`, `caldera`, `flames`, `mixer`, `gcta_cojo`, and `gcta_gene`. Run
+`postgwas sumstat_filter` as a separate step and pass the filtered VCF to the
+pipeline instead.
 
 ## Export the matching configuration
 

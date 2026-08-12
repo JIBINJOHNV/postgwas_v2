@@ -9,9 +9,9 @@ out of the user's config CSV is ever handed to a shell.
 
 Three ordering rules are load-bearing:
 
-1. A concatenation writes to a temporary file and renames it into place.  All
-   required current-run sources must exist before any merge begins; otherwise
-   finalisation fails instead of accepting a merged file left by an earlier
+1. Each merged side output is written to a temporary file and renamed into
+   place.  All required current-run sources must exist before any merge begins;
+   otherwise finalisation fails instead of accepting a file left by an earlier
    run.  Shell ``>`` truncated the destination *before* ``cat`` ran, so a
    re-run, a second config row sharing an output directory, or a clean run with
    no errors destroyed the previously merged file.
@@ -23,6 +23,7 @@ Three ordering rules are load-bearing:
 """
 
 import gzip
+import json
 import os
 import shutil
 from functools import partial
@@ -102,6 +103,77 @@ def _concatenate(sources, destination, logger=None):
     _emit(
         logger,
         "Merged %d file(s) into %s." % (len(sources), destination),
+    )
+    return destination
+
+
+def _merge_identical_json_mappings(sources, destination, logger=None):
+    # type: (Sequence[Path], Path, Any) -> Optional[Path]
+    """Validate chromosome mappings and write one atomic JSON document."""
+    sources = [Path(source) for source in sources if Path(source).is_file()]
+    if not sources:
+        _emit(
+            logger,
+            "Nothing matched for %s, so the existing file was left untouched."
+            % destination.name,
+        )
+        return None
+
+    mappings = []
+    for source in sources:
+        try:
+            with source.open("r", encoding="utf-8") as handle:
+                mapping = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Cannot read GWAS-to-VCF column mapping %s as JSON: %s."
+                % (source, exc)
+            ) from exc
+        if not isinstance(mapping, dict):
+            raise RuntimeError(
+                "GWAS-to-VCF column mapping %s must contain one JSON object."
+                % source
+            )
+        mappings.append(mapping)
+
+    first = mappings[0]
+    differing = [
+        str(source)
+        for source, mapping in zip(sources[1:], mappings[1:])
+        if mapping != first
+    ]
+    if differing:
+        raise RuntimeError(
+            "Per-chromosome GWAS-to-VCF column mappings are inconsistent. "
+            "The first mapping is %s; differing mapping file(s): %s. Column "
+            "positions must be identical before one dataset-level mapping can "
+            "be reported."
+            % (sources[0], ", ".join(differing))
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".part%d" % os.getpid())
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(first, handle, indent=2)
+            handle.write("\n")
+        os.replace(str(temporary), str(destination))
+    except OSError as exc:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        _emit(
+            logger,
+            "Could not write %s (%s); the previous file is unchanged."
+            % (destination, exc),
+            warn=True,
+        )
+        return None
+    _emit(
+        logger,
+        "Validated %d chromosome mapping file(s) and wrote %s."
+        % (len(sources), destination),
     )
     return destination
 
@@ -221,23 +293,29 @@ def finalise_harmonisation_outputs(
     }
 
     # ------------------------------------------------------------------
-    # 1. Merge the log-like files.
+    # 1. Validate and merge the per-chromosome side outputs.
     #    Shell '>' truncated the destination before cat ran, so an empty
     #    glob left a 0-byte file where the previous merge used to be.
     # ------------------------------------------------------------------
     side_outputs = (
-        ("dict", "mapping", "adapter_mapping", mapping_path),
-        ("summary", "summary", "adapter_summary", summary_path),
+        (
+            "dict", "mapping", "adapter_mapping", mapping_path,
+            _merge_identical_json_mappings,
+        ),
+        (
+            "summary", "summary", "adapter_summary", summary_path,
+            _concatenate,
+        ),
     )
     source_groups = {
         key: sorted(configured_output_matches(
             outdir, output_layout[pattern_name], **values,
         ))
-        for key, _label, pattern_name, _destination in side_outputs
+        for key, _label, pattern_name, _destination, _merge in side_outputs
     }
     missing = [
         label
-        for key, label, _pattern_name, _destination in side_outputs
+        for key, label, _pattern_name, _destination, _merge in side_outputs
         if not source_groups[key]
     ]
     if missing:
@@ -251,9 +329,9 @@ def finalise_harmonisation_outputs(
         )
 
     merged_sources = {}
-    for key, label, _pattern_name, destination in side_outputs:
+    for key, label, _pattern_name, destination, merge in side_outputs:
         sources = source_groups[key]
-        written = _concatenate(sources, destination, logger=logger)
+        written = merge(sources, destination, logger=logger)
         if written is None:
             raise RuntimeError(
                 "Cannot finalise GWAS-to-VCF side outputs for dataset %s: "

@@ -32,9 +32,8 @@ the packaged values for the current checkout.
 When the same setting is supplied more than once, PostGWAS applies this order:
 
 1. Packaged defaults.
-2. An optional packaged profile.
-3. Values in your YAML file.
-4. Explicit command-line overrides.
+2. Values in your YAML file, including any files it pulls in with `include:`.
+3. Explicit command-line overrides.
 
 The command-line value therefore has the highest priority. Hardware-dependent
 values such as `threads: auto` and `memory_gb: auto` are resolved for the

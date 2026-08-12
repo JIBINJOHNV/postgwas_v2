@@ -421,7 +421,7 @@ module:
     adapter_input: '{dataset_id}_chr{chromosome}_vcf_input.tsv'
     adapter_mapping: '{dataset_id}_chr{chromosome}.dict'
     adapter_summary: '{dataset_id}_chr{chromosome}_summary.tsv'
-    adapter_merged_mapping: 'qc_summary/{dataset_id}_gwas2vcf.dict'
+    adapter_merged_mapping: 'qc_summary/{dataset_id}_gwas2vcf_column_mapping.json'
     adapter_input_archive: 'qc_summary/{dataset_id}_gwas2vcf_input'
     adapter_transcript: 'logs/adapters/gwas2vcf/{dataset_id}_chr{chromosome}.log'
     adapter_output_vcf: '{dataset_id}_chr{chromosome}_{build}.vcf'
@@ -441,10 +441,10 @@ module:
     dataset_reject: 'rejected/{dataset_id}_rejected_variants.tsv.gz'
     reject_summary: 'qc_summary/{dataset_id}_reject_reasons.tsv'
     run_manifest: '{dataset_id}_run_manifest.json'
-    qc_summary: 'qc_summary/{dataset_id}_QC_summary.txt'
-    gwas2vcf_summary: 'qc_summary/{dataset_id}_gwas2vcf_summary.tsv'
-    qc_assessment_summary: 'qc_summary/{dataset_id}_{build}_qc_assessment.tsv'
-    qc_filter_rules: 'qc_summary/{dataset_id}_{build}_qc_filter_rules.tsv'
+    qc_summary: 'qc_summary/{dataset_id}_chromosomewise_harmonisation_metrics.tsv'
+    gwas2vcf_summary: 'qc_summary/{dataset_id}_pre_vcf_column_statistics.tsv'
+    qc_assessment_summary: 'qc_summary/{dataset_id}_{build}_vcf_qc_metrics.tsv'
+    qc_filter_rules: 'qc_summary/{dataset_id}_{build}_vcf_qc_rule_results.tsv'
     qc_assessment_json: 'qc_summary/{dataset_id}_{build}_qc_assessment.json'
     qc_assessment_temporary: 'qc_summary/.{dataset_id}_{build}_qc_table_'
     population_frequency_qc: 'qc_summary/{dataset_id}_{build}_population_frequency_qc.json'
@@ -504,6 +504,7 @@ module:
       SE: '[%SE]'
       EZ: '[%EZ]'
       AF: '[%AF]'
+      LP: '[%LP]'
     table_delimiter: "\t"
     table_null_values: ['', '.']
     table_null_output: ''
@@ -557,6 +558,11 @@ module:
     standard_error: {absolute: 1.0e-6, relative: 1.0e-5}
     allele_frequency: {absolute: 1.0e-6, relative: 1.0e-5}
     z_score: {absolute: 1.0e-5, relative: 1.0e-5}
+    # GWAS-VCF stores the association p-value as FORMAT/LP = -log10(P).
+    # Compare on that scale to match storage and avoid unstable comparisons of
+    # extremely small raw probabilities. Specification:
+    # https://github.com/MRCIEU/gwas-vcf-specification
+    p_value: {absolute: 1.0e-5, relative: 1.0e-5}
     failure:
       maximum_value_mismatch_fraction: 0.0
       maximum_vcf_duplicate_records: 0

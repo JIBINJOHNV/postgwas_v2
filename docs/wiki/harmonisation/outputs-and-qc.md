@@ -107,13 +107,18 @@ smallest P value.
 
 ## QC summaries
 
-- `qc_summary/<dataset>_QC_summary.txt`: serialized per-chromosome and dataset
-  processing metrics; partial results may be written after chromosome failure.
-- `qc_summary/<dataset>_gwas2vcf_summary.tsv`: adapter-input counts.
-- `qc_summary/<dataset>_<build>_qc_assessment.tsv`: raw merged-VCF and final
+- `qc_summary/<dataset>_chromosomewise_harmonisation_metrics.tsv`: flattened
+  chromosome-wise and dataset-level processing metrics; partial results may be
+  written after chromosome failure.
+- `qc_summary/<dataset>_pre_vcf_column_statistics.tsv`: per-chromosome
+  statistics for the harmonised columns exported for VCF creation.
+- `qc_summary/<dataset>_gwas2vcf_column_mapping.json`: the validated common
+  mapping from GWAS-to-VCF field names to exported column positions.
+- `qc_summary/<dataset>_<build>_vcf_qc_metrics.tsv`: raw merged-VCF and final
   virtual-subset metrics.
-- `qc_summary/<dataset>_<build>_qc_filter_rules.tsv`: independent rule and
-  reason counts evaluated against all raw records.
+- `qc_summary/<dataset>_<build>_vcf_qc_rule_results.tsv`: each active rule,
+  criterion, action, and affected-variant count evaluated against all raw
+  records.
 - `qc_summary/<dataset>_<build>_qc_assessment.json`: complete structured QC.
 
 Rule counts can overlap. Only the combined mask defines total excluded and

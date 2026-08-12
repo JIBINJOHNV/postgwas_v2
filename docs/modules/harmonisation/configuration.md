@@ -447,8 +447,15 @@ excluded and QC-passed totals.
 
 Persistent reports are written to the dataset's `qc_summary/` directory:
 
-- `<dataset>_<build>_qc_assessment.tsv` contains raw and final metrics;
-- `<dataset>_<build>_qc_filter_rules.tsv` contains raw-VCF rule and reason counts;
+- `<dataset>_chromosomewise_harmonisation_metrics.tsv` contains flattened
+  chromosome-wise and dataset-level harmonisation metrics;
+- `<dataset>_pre_vcf_column_statistics.tsv` contains per-chromosome statistics
+  for the harmonised columns exported for VCF creation;
+- `<dataset>_gwas2vcf_column_mapping.json` contains the validated common
+  mapping from GWAS-to-VCF field names to exported column positions;
+- `<dataset>_<build>_vcf_qc_metrics.tsv` contains raw and final metrics;
+- `<dataset>_<build>_vcf_qc_rule_results.tsv` contains raw-VCF rule criteria,
+  actions, and affected-variant counts;
 - `<dataset>_<build>_qc_assessment.json` contains the complete structured result.
 
 The temporary extracted TSV is always removed, including when assessment fails.

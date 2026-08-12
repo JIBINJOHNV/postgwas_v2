@@ -73,8 +73,8 @@ Use the sample-sheet column names shown below. Do not add unsupported columns.
 | `control_count` | At least one control/N source is required | Positive whole-number constant used as total analyzed N for quantitative traits or control N for case-control traits. Use this when the count is the same for all variants. |
 | `case_count_column` | Required for case-control traits unless constant supplied | Input column containing case N. Use this for per-variant counts. Quantitative traits must not provide case-count fields. |
 | `case_count` | Required for case-control traits unless column supplied | Positive whole-number constant case N. Use this when the count is the same for all variants. Quantitative traits must not provide case-count fields. |
-| `imputation_info_column` | Exactly one INFO source | Input column containing study imputation quality. Do not also supply external INFO fields. |
-| `external_info_file` | Exactly one INFO source | External study-INFO file. It must be paired with `external_info_column` and cannot be combined with `imputation_info_column`. |
+| `imputation_info_column` | Internal INFO takes priority | Input column containing study imputation quality. When an external source is also listed it is ignored, and the run reports that it was ignored. |
+| `external_info_file` | Used when no internal INFO column is mapped | External study-INFO file. It must be paired with `external_info_column`. |
 | `external_info_column` | Required with external INFO file | Name of the INFO value column in `external_info_file`. |
 | `delimiter` | Optional/inferred | `tab`, `comma`, `semicolon`, `space`, `whitespace`, or `auto`. Aliases include `\\t`, `csv`, and `comma-separated`. |
 
@@ -82,6 +82,12 @@ For case-control traits, effective sample size is calculated as
 `4 / (1/Ncase + 1/Ncontrol)`. The sample sheet must therefore provide both a
 case source and a control source, using either mapped columns or positive
 whole-number constants.
+
+Effect-allele frequency requires exactly one source: supplying both the internal
+column and the external file/column pair, or neither, is an error. Imputation
+quality is different — the internal column wins when both are listed, and a
+dataset that maps no INFO source at all requires the `--fixed-info` command-line
+value.
 
 See [Harmonisation Sample Sheet](../harmonisation/sample-sheet.md) for validation
 rules, quantitative and case-control templates, and common errors.
@@ -102,7 +108,7 @@ created. Do not hand-edit VCF fields or headers between stages.
 ## Module-specific inputs
 
 Formatting creates tool-specific tables for consumers such as LDSC, MAGMA,
-GCTA gene analysis, fine-mapping, PrediXcan-style LD imputation workflows, and
+GCTA gene analysis, fine-mapping, PRED-LD summary-statistic imputation, and
 MiXeR. A table formatted for one consumer is not automatically valid for
 another. Follow the producing and consuming module pages together.
 

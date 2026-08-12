@@ -75,11 +75,17 @@ postgwas sumstat_filter \
   --dataset-id STUDY \
   --output-directory results \
   --run-config filtering.yaml \
-  --maf-min 0.01 \
-  --info-min 0.7 \
-  --minimum-neglog10-p 0 \
+  --minimum-maf 0.01 \
+  --minimum-info 0.7 \
+  --minimum-neglog10-p 7.30103 \
   --remove-mhc
 ```
+
+Command-line option names are not always identical to the configuration keys
+they set: `--minimum-maf` sets `maf_min`, `--minimum-info` sets `info_min`, and
+`--maximum-info` sets `info_max`. Use `postgwas sumstat_filter --help` for the
+current option names and `postgwas config export --module filtering` for the
+current configuration keys.
 
 ## Parameters
 

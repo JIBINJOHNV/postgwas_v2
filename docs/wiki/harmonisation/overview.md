@@ -98,8 +98,13 @@ The command and input declaration are preflighted before full reading. After
 the data reveal the genome build and observed chromosomes, a second exact
 resource preflight must pass before partition files or chromosome workers are
 created. The dataset is then harmonised per chromosome, converted and annotated
-as VCF, and finally merged and assessed. See
-[Harmonisation Processing Order](processing-order.md).
+as VCF, and finally merged and assessed.
+
+**[How Harmonisation Processes Your Data](processing-order.md)** is the
+step-by-step walkthrough of that sequence. It lists all seven stages and the 29
+numbered steps in the exact order they run, using the same labels that appear in
+the log files, and explains what each step reads, decides, and writes. Read it
+before interpreting a harmonisation log or QC report.
 
 ## Outputs
 

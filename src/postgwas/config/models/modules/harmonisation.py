@@ -415,7 +415,9 @@ class HarmonisationVcfConfig(StrictModel):
     @field_validator("concordance_fields")
     @classmethod
     def complete_concordance_fields(cls, values: dict[str, str]) -> dict[str, str]:
-        required = {"CHROM", "POS", "ID", "REF", "ALT", "ES", "SE", "EZ", "AF"}
+        required = {
+            "CHROM", "POS", "ID", "REF", "ALT", "ES", "SE", "EZ", "AF", "LP",
+        }
         if set(values) != required or any(not str(value).strip() for value in values.values()):
             raise ValueError(
                 "concordance_fields must define non-empty queries for %s"
@@ -571,6 +573,7 @@ class ConcordanceValidationConfig(StrictModel):
     standard_error: ConcordanceToleranceConfig
     allele_frequency: ConcordanceToleranceConfig
     z_score: ConcordanceToleranceConfig
+    p_value: ConcordanceToleranceConfig
     failure: ConcordanceFailureConfig
 
 

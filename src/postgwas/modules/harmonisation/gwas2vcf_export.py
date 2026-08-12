@@ -10,15 +10,15 @@ from postgwas.core.values import optional_text
 
 
 def summarise_gwas2vcf_columns(
-    df: pl.DataFrame, sample_column_dict: Dict, chromosome: str
+    df: pl.DataFrame, exported_column_mappings: Dict, chromosome: str
 ) -> pl.DataFrame:
-    """Summarize all exported columns with one Polars aggregation."""
+    """Summarize only the scientific mappings exported to GWAS-to-VCF."""
     numeric_types = {
         pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64,
         pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
     }
     mappings = []
-    for key, value in sample_column_dict.items():
+    for key, value in exported_column_mappings.items():
         column = optional_text(value)
         if column is not None and column in df.columns:
             mappings.append((key, column))
@@ -160,10 +160,8 @@ def export_gwas2vcf_input(
         json.dump(column_positions, handle, indent=2)
         handle.write("\n")
 
-    summary = summarise_gwas2vcf_columns(export_df, sample_column_dict, chromosome)
+    summary = summarise_gwas2vcf_columns(export_df, pairs, chromosome)
     summary = summary.with_columns(
-        pl.lit(str(tsv_path)).alias("tsv_path"),
-        pl.lit(str(dict_path)).alias("dict_path"),
         pl.lit(export_df.height).alias("num_rows"),
         pl.lit(export_df.width).alias("num_cols"),
         pl.lit("success").alias("status"),

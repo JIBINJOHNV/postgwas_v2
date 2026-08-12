@@ -1,8 +1,10 @@
 """Pure Polars analysis for input-versus-GWAS-VCF concordance.
 
 The comparison is intentionally independent of the GWAS-to-VCF adapter.  It
-uses the sample-sheet mapping, transforms every statistic to the VCF ALT-allele
-orientation, and reports both retention and per-value agreement.
+uses the sample-sheet mapping, transforms every allele-specific statistic to
+the VCF ALT-allele orientation, and reports both retention and per-value
+agreement. P-values are compared as GWAS-VCF FORMAT/LP = -log10(P), as defined
+by https://github.com/MRCIEU/gwas-vcf-specification.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ import polars as pl
 from scipy.stats import norm
 
 from ..coordinates import position_text_expression
+from ..p_values import harmonise_p_values
+from ..shared.allele_join import allele_oriented_left_join
 
 
 INPUT_SOURCE_ROW_COLUMN = "__concordance_input_source_row"
@@ -63,6 +67,7 @@ METRIC_OBSERVED_COLUMNS = {
     "standard_error": "vcf_se",
     "allele_frequency": "observed_frequency",
     "z_score": "vcf_z",
+    "p_value": "vcf_lp",
 }
 
 
@@ -154,15 +159,29 @@ def vcf_chromosome_expression() -> pl.Expr:
     return _chromosome(pl.col("CHROM"))
 
 
-def _p_to_raw(values: np.ndarray, p_value_type: str) -> np.ndarray:
-    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        if p_value_type == "raw":
-            return values.astype(float, copy=True)
-        if p_value_type == "neglog10":
-            return np.power(10.0, -values, dtype=float)
-        if p_value_type == "negln":
-            return np.exp(-values, dtype=float)
-    return np.full(values.shape, np.nan, dtype=float)
+def _attach_harmonised_p_values(
+    frame: pl.DataFrame,
+    p_value_type: str,
+    policies,
+) -> pl.DataFrame:
+    """Attach the exact raw-P and LP representation used by harmonisation."""
+    mapping = {"pval_col": "input_p"}
+    harmonised, _, mapping = harmonise_p_values(
+        chromosome="concordance",
+        df=frame.select("input_row", "input_p"),
+        sample_column_dict=mapping,
+        output_col="__concordance_raw_p",
+        policies=policies,
+        decision=p_value_type,
+    )
+    raw_column = mapping["pval_col"]
+    expected = harmonised.select(
+        "input_row",
+        pl.col(raw_column).cast(pl.Float64, strict=False).alias("input_p_harmonised"),
+    ).with_columns(
+        (-pl.col("input_p_harmonised").log10()).alias("input_lp")
+    )
+    return frame.join(expected, on="input_row", how="left")
 
 
 def prepare_input_table(
@@ -175,8 +194,6 @@ def prepare_input_table(
     eaf_is_maf: bool | None,
     settings,
     policies,
-    external_eaf_frame: pl.DataFrame | None = None,
-    external_eaf_mapping=None,
 ) -> pl.DataFrame:
     """Normalize only representation; indels are never reference-normalized."""
     chrom, pos = _input_coordinates(row, policies)
@@ -260,21 +277,20 @@ def prepare_input_table(
         .drop("_can_z_from_se")
     )
 
-    # If neither supplied Z nor BETA/SE can provide Z, use the configured
-    # P-value scale and tail. scipy's survival function remains stable at
+    # Reuse the production p-value step so clipping, raw/-log10/-ln conversion,
+    # and invalid-value handling cannot drift between harmonisation and this
+    # audit. The resulting LP is also the expected GWAS-VCF value.
+    result = _attach_harmonised_p_values(result, p_value_type, policies)
+
+    # If neither supplied Z nor BETA/SE can provide Z, use the harmonised raw
+    # p-value and configured tail. scipy's survival function remains stable at
     # genome-wide p-values where `1 - p` loses floating-point precision.
     needs_p = result.get_column("input_z").is_null().to_numpy()
     beta_values = result.get_column("input_beta").to_numpy()
-    p_values = result.get_column("input_p").to_numpy()
-    raw_p = _p_to_raw(p_values, p_value_type)
+    raw_p = result.get_column("input_p_harmonised").to_numpy()
     usable_p = needs_p & np.isfinite(beta_values) & np.isfinite(raw_p)
-    clipped = np.clip(
-        raw_p,
-        float(policies.get("pvalue.clip_low")),
-        float(policies.get("pvalue.clip_high")),
-    )
     divisor = float(policies.get("pvalue.se_tail"))
-    calculated = np.sign(beta_values) * norm.isf(clipped / divisor)
+    calculated = np.sign(beta_values) * norm.isf(raw_p / divisor)
     calculated[~usable_p] = np.nan
     result = result.with_columns(pl.Series("_z_from_p", calculated, dtype=pl.Float64))
     result = result.with_columns(
@@ -359,41 +375,64 @@ def prepare_input_table(
         .otherwise(None)
         .alias("complement_key"),
     )
-    if external_eaf_frame is not None:
-        if external_eaf_mapping is None or not row.external_eaf_column:
-            raise ValueError("External EAF data require a column mapping and frequency column.")
-        external = (
-            external_eaf_frame.select(
-                _chromosome(pl.col(external_eaf_mapping.chromosome)).alias("external_chrom"),
-                pl.col(external_eaf_mapping.position).cast(pl.Int64, strict=False).alias("external_pos"),
-                _allele(pl.col(external_eaf_mapping.effect_allele)).alias("external_effect_allele"),
-                _allele(pl.col(external_eaf_mapping.other_allele)).alias("external_other_allele"),
-                pl.col(row.external_eaf_column).cast(pl.Float64, strict=False).alias("external_af"),
-            )
-            .with_columns(
-                _canonical_key(
-                    "external_chrom", "external_pos",
-                    "external_effect_allele", "external_other_allele",
-                ).alias("external_key")
-            )
-            .unique(subset=["external_key"], keep="first", maintain_order=True)
-        )
-        result = (
-            result.join(external, left_on="direct_key", right_on="external_key", how="left")
-            .with_columns(
-                pl.when(pl.col("input_effect_allele") == pl.col("external_effect_allele"))
-                .then(pl.col("external_af"))
-                .when(pl.col("input_effect_allele") == pl.col("external_other_allele"))
-                .then(1.0 - pl.col("external_af"))
-                .otherwise(None)
-                .alias("input_af")
-            )
-            .drop(
-                "external_chrom", "external_pos", "external_effect_allele",
-                "external_other_allele", "external_af",
-            )
-        )
     return result
+
+
+def _attach_external_eaf_to_matches(
+    matched: pl.DataFrame,
+    row,
+    external_eaf_frame: pl.DataFrame,
+    external_eaf_mapping,
+    policies,
+) -> pl.DataFrame:
+    """Reconstruct source EAF after the final VCF allele orientation is known."""
+    if external_eaf_mapping is None or not row.external_eaf_column:
+        raise ValueError(
+            "External EAF data require a column mapping and frequency column."
+        )
+    external_vcf_af = "__concordance_external_vcf_af"
+    while external_vcf_af in matched.columns:
+        external_vcf_af += "_"
+    joined, orientation_column, _ = allele_oriented_left_join(
+        matched,
+        external_eaf_frame,
+        study_columns={
+            "chr": "vcf_chrom",
+            "pos": "vcf_pos",
+            "ea": "vcf_alt",
+            "oa": "vcf_ref",
+        },
+        reference_columns={
+            "chr": external_eaf_mapping.chromosome,
+            "pos": external_eaf_mapping.position,
+            "ea": external_eaf_mapping.effect_allele,
+            "oa": external_eaf_mapping.other_allele,
+        },
+        value_column=row.external_eaf_column,
+        output_column=external_vcf_af,
+        duplicate_exact_action=policies.get(
+            "external_reference.exact_duplicate_action"
+        ),
+        duplicate_non_identical_action=policies.get(
+            "external_reference.non_identical_duplicate_action"
+        ),
+        orientations=("direct", "swap"),
+        swapped_value="one_minus",
+        prefer_non_null_value=True,
+        study_columns_canonical=True,
+        error_type=ValueError,
+        reference_label="external EAF reference used by concordance",
+    )
+    # Harmonisation first establishes reference REF/ALT, then attaches external
+    # EAF. Convert that ALT-aligned value back to the raw study effect allele;
+    # the normal concordance orientation step will independently convert it to
+    # final VCF ALT and can therefore detect any exported AF discrepancy.
+    return joined.with_columns(
+        pl.when(pl.col("_effect_is_alt"))
+        .then(pl.col(external_vcf_af))
+        .otherwise(1.0 - pl.col(external_vcf_af))
+        .alias("input_af")
+    ).drop(orientation_column, external_vcf_af)
 
 
 def _apply_duplicate_report(
@@ -525,6 +564,7 @@ def prepare_vcf_table(frame: pl.DataFrame) -> pl.DataFrame:
             pl.col("SE").cast(pl.Float64, strict=False).alias("vcf_se"),
             pl.col("EZ").cast(pl.Float64, strict=False).alias("vcf_z"),
             pl.col("AF").cast(pl.Float64, strict=False).alias("vcf_af"),
+            pl.col("LP").cast(pl.Float64, strict=False).alias("vcf_lp"),
         )
         .with_columns(
             (
@@ -779,8 +819,9 @@ def _position_diagnostics(
 
     Allele correspondence is unknown once exact allele matching has failed.
     Position-level effect and Z comparisons therefore use magnitudes, and AF is
-    folded to minor frequency. These diagnostics never establish orientation
-    and never determine pass/fail status.
+    folded to minor frequency. SE and p-value are allele-independent and remain
+    directly comparable. These diagnostics never establish orientation and
+    never determine pass/fail status.
     """
     input_keys = ["input_chrom", "input_pos"]
     vcf_keys = ["vcf_chrom", "vcf_pos"]
@@ -899,6 +940,14 @@ def _position_diagnostics(
         orientation_unknown,
         settings.z_score,
     )
+    position_pairs = _metric_columns(
+        position_pairs,
+        "p_value",
+        pl.col("input_lp"),
+        pl.col("vcf_lp"),
+        orientation_unknown,
+        settings.p_value,
+    )
     position_pairs = position_pairs.with_columns(
         pl.concat_str([
             pl.when(pl.col("effect_checked") & ~pl.col("effect_concordant"))
@@ -913,6 +962,8 @@ def _position_diagnostics(
             ).then(pl.lit("allele_frequency_mismatch")).otherwise(pl.lit("")),
             pl.when(pl.col("z_score_checked") & ~pl.col("z_score_concordant"))
             .then(pl.lit("z_score_mismatch")).otherwise(pl.lit("")),
+            pl.when(pl.col("p_value_checked") & ~pl.col("p_value_concordant"))
+            .then(pl.lit("p_value_mismatch")).otherwise(pl.lit("")),
         ], separator=";")
         .str.replace_all(r";+", ";")
         .str.strip_chars(";")
@@ -925,6 +976,7 @@ def _position_diagnostics(
         | pl.col("standard_error_checked")
         | pl.col("allele_frequency_checked")
         | pl.col("z_score_checked")
+        | pl.col("p_value_checked")
     )
     checked_pairs = position_pairs.filter(checked_any)
     mismatch_pairs = checked_pairs.filter(pl.col("position_value_reasons") != "")
@@ -1102,6 +1154,7 @@ def _variant_type_counts(
             | pl.col("standard_error_checked")
             | pl.col("allele_frequency_checked")
             | pl.col("z_score_checked")
+            | pl.col("p_value_checked")
         )
         checked_counts = _counts_by_type(checked, "input_variant_type")
         mismatch_counts = _counts_by_type(
@@ -1295,8 +1348,6 @@ def compare_input_to_vcf(
         input_frame, row, effect_type=effect_type, se_scale=se_scale,
         p_value_type=p_value_type,
         eaf_is_maf=eaf_is_maf, settings=settings, policies=policies,
-        external_eaf_frame=external_eaf_frame,
-        external_eaf_mapping=external_eaf_mapping,
     )
     vcf_table = prepare_vcf_table(vcf_frame)
 
@@ -1312,8 +1363,6 @@ def compare_input_to_vcf(
             effect_type=effect_type, se_scale=se_scale,
             p_value_type=p_value_type,
             eaf_is_maf=eaf_is_maf, settings=settings, policies=policies,
-            external_eaf_frame=external_eaf_frame,
-            external_eaf_mapping=external_eaf_mapping,
         )
         input_unique, duplicate_input = _apply_duplicate_report(
             input_eligible, prepared_report,
@@ -1367,6 +1416,14 @@ def compare_input_to_vcf(
     else:
         effect_is_alt = listed_effect_is_alt
     matched = matched.with_columns(effect_is_alt.alias("_effect_is_alt"))
+    if external_eaf_frame is not None:
+        matched = _attach_external_eaf_to_matches(
+            matched,
+            row,
+            external_eaf_frame,
+            external_eaf_mapping,
+            policies,
+        )
 
     palindromic_resolved = (
         settings.palindromic_action == "compare_resolved"
@@ -1447,6 +1504,10 @@ def compare_input_to_vcf(
         pl.col("input_z") * pl.col("orientation_factor"),
         pl.col("vcf_z"), pl.col("orientation_comparable"), settings.z_score,
     )
+    matched = _metric_columns(
+        matched, "p_value",
+        pl.col("input_lp"), pl.col("vcf_lp"), pl.lit(True), settings.p_value,
+    )
     matched = matched.with_columns(
         pl.concat_str([
             pl.when(pl.col("effect_checked") & ~pl.col("effect_concordant"))
@@ -1459,6 +1520,8 @@ def compare_input_to_vcf(
             .then(pl.lit("allele_frequency_mismatch")).otherwise(pl.lit("")),
             pl.when(pl.col("z_score_checked") & ~pl.col("z_score_concordant"))
             .then(pl.lit("z_score_mismatch")).otherwise(pl.lit("")),
+            pl.when(pl.col("p_value_checked") & ~pl.col("p_value_concordant"))
+            .then(pl.lit("p_value_mismatch")).otherwise(pl.lit("")),
         ], separator=";")
         .str.replace_all(r";+", ";")
         .str.strip_chars(";")
@@ -1510,6 +1573,7 @@ def compare_input_to_vcf(
                 | pl.col("standard_error_checked")
                 | pl.col("allele_frequency_checked")
                 | pl.col("z_score_checked")
+                | pl.col("p_value_checked")
             ).sum()
         ).item() or 0)
     mismatch_fraction = mismatches.height / checked_any if checked_any else 0.0
@@ -1646,6 +1710,7 @@ def combine_concordance_partitions(
                 | pl.col("standard_error_checked")
                 | pl.col("allele_frequency_checked")
                 | pl.col("z_score_checked")
+                | pl.col("p_value_checked")
             ).sum().alias("checked_any")
         ).collect().item()
         or 0

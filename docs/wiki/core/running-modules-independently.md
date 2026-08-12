@@ -12,11 +12,11 @@ harmonised GWAS-VCF and associated QC evidence.
 
 ## Downstream standalone commands
 
-Public analysis commands include filtering, formatting, imputation, LD
-annotation, LD clumping, LDSC, fine-mapping, MAGMA, MAGMAcovar, GCTA gene
-analysis, single-cell integration, PoPS, FLAMES, MiXeR, Manhattan plotting,
-pathway enrichment, and QC. Their exact installed names are shown by
-`postgwas --help`.
+Every analysis module has a standalone command: `sumstat_filter`, `formatter`,
+`imputation`, `annot_ldblock`, `ld_clump`, `manhattan`, `qc`, `heritability`,
+`finemap`, `magma`, `gcta_cojo`, `gcta_gene`, `magmacovar`, `single_cell`,
+`pops`, `kpops`, `caldera`, `flames`, `mixer`, and `pathway_enrichment`. Their
+exact installed names are shown by `postgwas --help`.
 
 Before running one directly:
 
@@ -31,10 +31,11 @@ Before running one directly:
 
 ## Important module relationships
 
-Important relationships include formatting before imputation, MAGMA, GCTA gene analysis, LDSC,
-fine-mapping, and MiXeR; LD annotation before LD clumping; LD clumping plus
-formatting before fine-mapping; MAGMA before MAGMAcovar and PoPS; and
-fine-mapping, MAGMAcovar, and PoPS before FLAMES.
+Important relationships include formatting before imputation, MAGMA, GCTA gene
+analysis, GCTA-COJO, LDSC, fine-mapping, and MiXeR; LD annotation before LD
+clumping; LD clumping plus formatting before fine-mapping; MAGMA before
+MAGMAcovar, PoPS, K-POPS, and single-cell integration; PoPS plus fine-mapping
+before CALDERA; and fine-mapping, MAGMAcovar, and PoPS before FLAMES.
 
 The planner can repeat formatting around imputation because the imputed data
 must be exported again for downstream consumers. Inspect the printed plan rather

@@ -1,15 +1,124 @@
-# Harmonisation Processing Order
+# How Harmonisation Processes Your Data
 
 PostGWAS takes a study's raw GWAS summary-statistics table and produces
 allele-aligned, build-resolved GWAS-VCFs with QC and rejection evidence.
 
-This page follows the real processing order. It first gives a visual map, then
-explains every logged step in plain English.
+This page is the step-by-step walkthrough of that process. It follows the real
+runtime order: the same stage and step names appear in the log files, so you can
+read a log alongside this page and know exactly where a run is. Nothing here is
+a simplification of a different order.
+
+Read it in three passes if you are new to the command:
+
+1. **What goes in and what comes out** — the boundary of the whole operation.
+2. **The complete sequence at a glance** — every numbered step in order, one line
+   each.
+3. **The stages in detail** — what each step actually does, and why.
+
+## What goes in and what comes out
+
+| You supply | Where it is declared |
+|---|---|
+| One raw summary-statistics table per dataset | `input_file` in the sample sheet |
+| The meaning of each of its columns | the remaining sample-sheet columns |
+| A reference-resource tree for the study's genome build | `--resource-directory` or `resources.root` |
+| Optional policy overrides | `--run-config` and command-line flags |
+
+| PostGWAS produces | Purpose |
+|---|---|
+| One merged GWAS-VCF per configured build, bgzipped and indexed | the input to every downstream module |
+| Raw GWAS-to-VCF adapter output | audit of the conversion step |
+| A rejected-variant file and a reason-by-chromosome matrix | why every discarded row was discarded |
+| QC reports, an EAF/MAF audit, and a population-frequency comparison | evidence that the file is fit to analyse |
+| A run manifest, resolved configuration, command, and logs | reproducibility |
+| One row per dataset in `harmonisation_run_summary.csv` | status of every dataset in the run |
+
+A single command drives all of it:
+
+```console
+postgwas harmonisation \
+  --sample-sheet studies.csv \
+  --run-config harmonisation.yaml \
+  --resource-directory /absolute/path/to/resources \
+  --output-directory results
+```
 
 The command first prints a run-level preparation block with the sample sheet,
 number of selected datasets, resource directory, output directory, and current
 preflight stage. Per-dataset resolved settings follow it; the analysis-start
 message is printed only when harmonisation is ready to read that dataset.
+
+## The complete sequence at a glance
+
+Seven stages run in this order. Stages 2–6 repeat for every dataset in the
+sample sheet; datasets are processed one at a time.
+
+| Stage | Runs | What it achieves |
+|---|---|---|
+| 1. Run preflight | once per command | Reject an unusable command before reading a large file. |
+| 2. Dataset preparation | once per dataset | Clean the study and make the decisions every chromosome must share. |
+| 3. Chromosome processing | once per chromosome | Harmonise individual variants and build chromosome VCFs. |
+| 4. Failure handling and row reconciliation | once per dataset | Retry, account for every input row, and write rejection provenance. |
+| 5. Merge and final QC | once per dataset | Concatenate, annotate, assess, and finish the dataset. |
+| 6. Optional input-to-VCF validation | only with `--validate` | Independently re-compare the original input with the merged VCF. |
+| 7. Run summary | once per command | Record the outcome of every dataset. |
+
+The 29 numbered steps inside stages 2, 3 and 5 are the ones named in the logs:
+
+| Stage | Log label | What happens |
+|---|---|---|
+| 2 | Dataset step 1 | Check configuration, column mappings, and policy compatibility. |
+| 2 | Dataset step 2 | Check the header and count data rows. |
+| 2 | Dataset step 3 | Read and clean the study; reject unusable rows. |
+| 2 | Dataset step 4 | Check parsed values and plan missing sample sizes. |
+| 2 | Dataset step 5 | Determine the genome build from the data. |
+| 2 | Dataset step 6 | Determine whole-study strand consensus. |
+| 2 | Dataset step 7 | Determine effect, SE, P-value, and frequency types. |
+| — | *exact resource preflight* | Verify every per-chromosome resource for the inferred build. |
+| 2 | Dataset step 8 | Split retained rows into per-chromosome work files. |
+| 3 | Chromosome step 1 | Load the chromosome partition. |
+| 3 | Chromosome step 2 | Re-resolve this chromosome's reference files. |
+| 3 | Chromosome step 3 | Put effects on the BETA scale. |
+| 3 | Chromosome step 4 | Orient alleles against the reference and settle EAF. |
+| 3 | Chromosome step 5 | Calculate sample size or effective sample size. |
+| 3 | Chromosome step 6 | Recover BETA or SE from Z where possible. |
+| 3 | Chromosome step 7 | Harmonise P values. |
+| 3 | Chromosome step 8 | Derive a still-missing SE from BETA and P. |
+| 3 | Chromosome step 9 | Produce the final Z score. |
+| 3 | Chromosome step 10 | Check that BETA, SE, Z, and P agree. |
+| 3 | Chromosome step 11 | Obtain INFO. |
+| 3 | Chromosome step 12 | Complete variant identifiers. |
+| 3 | Chromosome step 13 | Check required output fields and reconcile row counts. |
+| 3 | Chromosome step 14 | Export the adapter input table. |
+| 3 | Chromosome step 15 | Create the first VCF with the GWAS-to-VCF adapter. |
+| 3 | Chromosome step 16 | Normalize, annotate, and lift over with bcftools. |
+| 5 | Post-merge step 1 | Merge chromosome VCFs. |
+| 5 | Post-merge step 2 | Compare population frequencies. |
+| 5 | Post-merge step 3 | Combine side files and clean up. |
+| 5 | Post-merge step 4 | Assess the raw merged VCF. |
+| 5 | Post-merge step 5 | Validate promised outputs and finish the dataset. |
+
+## How your data is represented at each hand-off
+
+Following the data itself is often the fastest way to understand the order. Each
+row below is a real hand-off; the representation changes only where shown.
+
+| After | Your data is | Held as |
+|---|---|---|
+| Stage 1 | still untouched on disk | your original file |
+| Dataset step 3 | one cleaned in-memory table with a stable source-row number | Polars table + raw snapshot for rejections |
+| Dataset step 7 | the same table, plus study-wide decisions recorded once | table + resolved metadata |
+| Dataset step 8 | one work file per chromosome, retained rows only | per-chromosome partitions |
+| Chromosome step 13 | fully harmonised rows, allele-aligned and statistically complete | per-chromosome table |
+| Chromosome step 14 | a TSV plus a JSON column mapping the adapter understands | adapter input |
+| Chromosome step 15 | a first, unnormalized VCF in the study's own build | per-chromosome VCF |
+| Chromosome step 16 | a normalized, dbSNP- and AF-annotated VCF in both builds | per-chromosome VCF ×2 builds |
+| Post-merge step 1 | one whole-genome VCF per build | merged, bgzipped, indexed VCF |
+| Post-merge step 5 | a validated, QC-assessed deliverable | the file downstream modules consume |
+
+The rejected rows leave this chain at the step that rejected them and are
+written separately with their original values. They never rejoin the retained
+path.
 
 ## Visual workflow
 
@@ -63,7 +172,10 @@ study EAF.
 | Dataset finalization | Once after chromosome work | Merge VCFs, assess QC, and write final status. |
 | Concordance validation | Only with `--validate` | Compare the original input with the same-build merged VCF. |
 
-## Stage A — Check the run before reading the large file
+## Stage 1 — Check the run before reading the large file
+
+**In:** your command, sample sheet, and configuration.
+**Out:** a validated run context, or a stop before any large file is read.
 
 PostGWAS performs these checks first:
 
@@ -90,7 +202,11 @@ The screen report is an output-routing step, not a second analysis. PostGWAS
 copies each emitted stdout message to the active dataset report and optionally
 to the terminal. It performs no additional GWAS scan or scientific calculation.
 
-## Stage B — Prepare the complete dataset
+## Stage 2 — Prepare the complete dataset
+
+**In:** the raw summary-statistics table for one dataset.
+**Out:** one work file per chromosome, plus study-wide decisions that every
+chromosome will reuse.
 
 These eight steps run once on the complete study.
 
@@ -183,7 +299,11 @@ and the standard
 At this point PostGWAS has not yet created VCFs. It has a validated study,
 recorded study-wide decisions, and one work file per chromosome.
 
-## Stage C — Process every chromosome
+## Stage 3 — Process every chromosome
+
+**In:** one chromosome work file plus that chromosome's reference resources.
+**Out:** a normalized, annotated, lifted-over VCF for that chromosome in both
+configured builds.
 
 Chromosomes may run in parallel, but the following sixteen steps always occur
 in this order inside each chromosome.
@@ -308,7 +428,7 @@ An imbalance stops the chromosome because a row was lost or counted twice.
     warning/failure thresholds, and a required target VCF with zero surviving
     variants always fails.
 
-## A simple allele-swapping example
+### A simple allele-swapping example
 
 Assume one input row contains:
 
@@ -334,7 +454,7 @@ The ordered transformations are:
 The direction changed because the reported allele changed. The biological
 association did not change.
 
-## Possible allele-orientation results
+### Possible allele-orientation results
 
 | Result | What PostGWAS does |
 |---|---|
@@ -347,7 +467,7 @@ association did not change.
 | Reference ambiguous | Reject or fail because more than one reference orientation remains. |
 | Reference unmatched | Reject or fail because no reference allele pair matches. |
 
-## How missing effect statistics are completed
+### How missing effect statistics are completed
 
 | Values available after effect conversion | Action |
 |---|---|
@@ -362,7 +482,11 @@ The Z-only calculation produces a standardized effect estimate. It depends on
 correct EAF and sample-size assumptions. EAF from a population reference rather
 than the measured study sample may make the approximation less accurate.
 
-## Stage D — Handle chromosome failures and reconcile rows
+## Stage 4 — Handle chromosome failures and reconcile rows
+
+**In:** the per-chromosome results, complete or failed.
+**Out:** a decided dataset status and one combined rejection file whose row count
+is proven against the input.
 
 After each chromosome round:
 
@@ -379,7 +503,11 @@ After each chromosome round:
 8. Finalize the EAF/MAF decision using chromosome reference evidence. This final
    decision replaces the initial MAF suspicion in later QC and concordance.
 
-## Stage E — Merge chromosome results and run final QC
+## Stage 5 — Merge chromosome results and run final QC
+
+**In:** the per-chromosome VCFs.
+**Out:** the merged GWAS-VCFs that downstream modules consume, with QC evidence
+and a final status.
 
 These five steps run once after chromosome processing.
 
@@ -420,7 +548,10 @@ For example, the allele-frequency card shows ⚠️ when even a small number of
 variants are discordant or missing reference AF. That warning does not by
 itself mean the complete dataset failed.
 
-## Stage F — Optional input-to-VCF validation
+## Stage 6 — Optional input-to-VCF validation
+
+**In:** the original input table and the merged VCF in the same build.
+**Out:** a concordance verdict and per-category difference reports.
 
 This stage runs only with `--validate`, after required VCFs and QC are complete.
 
@@ -442,7 +573,14 @@ This stage runs only with `--validate`, after required VCFs and QC are complete.
 A validation failure does not erase harmonised files, but the dataset is not
 reported as successfully validated.
 
-## Stage G — Finalize the multi-dataset run summary
+The same comparison can be run later against an existing merged VCF with
+`postgwas --validate`. See the
+[Validation Reference](../reference/validation.md).
+
+## Stage 7 — Finalize the multi-dataset run summary
+
+**In:** the outcome of every dataset in the sample sheet.
+**Out:** one auditable row per dataset in the run summary CSV.
 
 After each dataset finishes, fails, or is interrupted, PostGWAS updates that
 dataset's row in
@@ -495,6 +633,13 @@ failed, or not finished.
 8. Raw and virtual QC counts are acceptable for the intended downstream method.
 9. Optional concordance passed when `--validate` was requested.
 
-See [Harmonisation Outputs and QC](outputs-and-qc.md) for file locations and
-[Harmonisation Configuration](../../modules/harmonisation/configuration.md) for
-the policies controlling these decisions.
+## Related pages
+
+- [Harmonisation Overview](overview.md) — what the command is for and how to run
+  it.
+- [Harmonisation Sample Sheet](sample-sheet.md) — how to declare your study's
+  columns.
+- [Harmonisation Outputs and QC](outputs-and-qc.md) — where every file described
+  above is written.
+- [Harmonisation Configuration](../../modules/harmonisation/configuration.md) —
+  the policies and thresholds controlling these decisions.

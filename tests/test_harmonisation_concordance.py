@@ -68,6 +68,10 @@ def _policies():
     return load_policies(load_configuration().modules.harmonisation.policies)
 
 
+def _lp(values):
+    return [-math.log10(value) for value in values]
+
+
 class ConcordanceAnalysisTests(unittest.TestCase):
     def test_standalone_cli_has_the_requested_contract(self):
         parser = get_validation_parser()
@@ -81,6 +85,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         self.assertEqual(args.vcf, "study1_GRCh37_merged.vcf.gz")
         help_text = parser.format_help()
         self.assertIn("effect estimates, allele frequencies, standard errors", help_text)
+        self.assertIn("Z scores, and p-values", help_text)
         self.assertIn("Unmatched variants are reported without failing", help_text)
 
     def test_top_level_validate_flag_dispatches_to_standalone_command(self):
@@ -207,6 +212,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "SE": [0.1] * 6,
             "EZ": [2.0, 3.0, 4.0, -5.0, 6.0, 7.0],
             "AF": [0.2, 0.3, 0.1, 0.6, 0.2, 0.3],
+            "LP": _lp([0.05] * 6),
         })
 
         result = compare_input_to_vcf(
@@ -235,6 +241,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         self.assertEqual(result.metric_summary["standard_error"]["concordant"], 6)
         self.assertEqual(result.metric_summary["allele_frequency"]["concordant"], 6)
         self.assertEqual(result.metric_summary["z_score"]["concordant"], 6)
+        self.assertEqual(result.metric_summary["p_value"]["concordant"], 6)
         self.assertEqual(
             result.metric_summary_by_variant_type["indels"]["effect"]["concordant"],
             1,
@@ -264,6 +271,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "REF": ["A", "T"], "ALT": ["T", "A"],
             "ES": [0.2, -0.3], "SE": [0.1, 0.1], "EZ": [2.0, -3.0],
             "AF": [0.2, 0.7],
+            "LP": _lp([0.05, 0.01]),
         })
 
         result = compare_input_to_vcf(
@@ -305,6 +313,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["T"],
             "ALT": ["A"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
             "AF": [0.2],
+            "LP": _lp([0.05]),
         })
 
         result = compare_input_to_vcf(
@@ -332,6 +341,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "REF": ["G", "AA"], "ALT": ["A", "A"],
             "ES": [0.2, 0.4], "SE": [0.1, 0.1], "EZ": [2.0, 4.0],
             "AF": [0.2, 0.3],
+            "LP": _lp([0.05, 0.01]),
         })
 
         result = compare_input_to_vcf(
@@ -371,6 +381,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "REF": ["G", "AA"], "ALT": ["A", "A"],
             "ES": [0.2, 0.4], "SE": [0.1, 0.1], "EZ": [2.0, 4.0],
             "AF": [0.2, 0.3],
+            "LP": _lp([0.05, 0.01]),
         })
 
         result = compare_input_to_vcf(
@@ -394,6 +405,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "REF": ["G", "AA"], "ALT": ["A", "A"],
             "ES": [0.2, 0.4], "SE": [0.1, 0.1], "EZ": [2.0, 4.0],
             "AF": [0.2, 0.3],
+            "LP": _lp([0.05, 0.01]),
         })
 
         result = compare_input_to_vcf(
@@ -418,6 +430,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [20], "POS": [45796847], "ID": ["rs34733467"],
             "REF": ["GT"], "ALT": ["G"], "ES": [-0.0431],
             "SE": [0.0261], "EZ": [-1.65134], "AF": [0.00811],
+            "LP": _lp([0.09894]),
         })
 
         result = compare_input_to_vcf(
@@ -443,6 +456,11 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             ["standard_error"]["concordant"],
             1,
         )
+        self.assertEqual(
+            result.position_metric_summary_by_variant_type["indels"]
+            ["p_value"]["concordant"],
+            1,
+        )
 
     def test_multiallelic_unmatched_position_is_not_paired_arbitrarily(self):
         input_frame = pl.DataFrame({
@@ -455,6 +473,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [100], "ID": ["v1"], "REF": ["ATT"],
             "ALT": ["A"], "ES": [0.1], "SE": [0.1], "EZ": [1.0],
             "AF": [0.2],
+            "LP": _lp([0.3]),
         })
 
         result = compare_input_to_vcf(
@@ -483,6 +502,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [100], "ID": ["v1"], "REF": ["A"],
             "ALT": ["AT"], "ES": [0.1], "SE": [0.1], "EZ": [1.0],
             "AF": [0.2],
+            "LP": _lp([0.3]),
         })
 
         result = compare_input_to_vcf(
@@ -513,6 +533,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [100], "ID": ["v1"], "REF": ["G"],
             "ALT": ["A"], "ES": [0.1], "SE": [0.1], "EZ": [1.0],
             "AF": [0.2],
+            "LP": _lp([0.3]),
         })
         result = compare_input_to_vcf(
             input_frame, vcf_frame, _row(), effect_type="beta",
@@ -541,6 +562,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             screen,
         )
         self.assertIn("5. Concordance reports", screen)
+        self.assertIn("P-value (-log10)", screen)
         self.assertNotIn("Variant matching", screen)
 
     def test_calculates_z_from_effect_and_two_sided_p_value(self):
@@ -570,6 +592,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["mnv"], "REF": ["GT"],
             "ALT": ["AC"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
             "AF": [0.2],
+            "LP": _lp([0.05]),
         })
 
         result = compare_input_to_vcf(
@@ -602,6 +625,55 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(prepared.item(0, "input_z"), 0.0)
 
+    def test_expected_vcf_lp_reuses_every_supported_p_value_conversion(self):
+        cases = (
+            ("raw", 0.01, 2.0),
+            ("neglog10", 2.0, 2.0),
+            ("negln", -math.log(0.01), 2.0),
+            ("raw", 0.0, 300.0),
+        )
+        for p_value_type, supplied, expected_lp in cases:
+            with self.subTest(p_value_type=p_value_type, supplied=supplied):
+                frame = pl.DataFrame({
+                    "CHR": [1], "BP": [101], "EA": ["A"], "OA": ["G"],
+                    "EAF": [0.2], "BETA": [0.2], "SE": [0.1], "Z": [2.0],
+                    "P": [supplied],
+                })
+                prepared = prepare_input_table(
+                    frame, _row(), effect_type="beta",
+                    p_value_type=p_value_type, eaf_is_maf=False,
+                    settings=_settings(), policies=_policies(),
+                )
+
+                self.assertAlmostEqual(
+                    prepared.item(0, "input_lp"), expected_lp, places=10,
+                )
+
+    def test_p_value_mismatch_is_reported_and_fails_by_default(self):
+        input_frame = pl.DataFrame({
+            "CHR": [1], "BP": [101], "EA": ["A"], "OA": ["G"],
+            "EAF": [0.2], "BETA": [0.2], "SE": [0.1], "Z": [2.0],
+            "P": [0.05],
+        })
+        vcf_frame = pl.DataFrame({
+            "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["G"],
+            "ALT": ["A"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
+            "AF": [0.2], "LP": _lp([0.01]),
+        })
+
+        result = compare_input_to_vcf(
+            input_frame, vcf_frame, _row(), effect_type="beta",
+            p_value_type="raw", eaf_is_maf=False, settings=_settings(),
+            policies=_policies(),
+        )
+
+        self.assertEqual(result.metric_summary["p_value"]["checked"], 1)
+        self.assertEqual(result.metric_summary["p_value"]["mismatches"], 1)
+        self.assertEqual(
+            result.mismatches.item(0, "failure_reasons"), "p_value_mismatch",
+        )
+        self.assertEqual(result.status, "FAIL")
+
     def test_odds_ratio_scale_standard_error_is_compared_on_log_odds_scale(self):
         input_frame = pl.DataFrame({
             "CHR": [1], "BP": [101], "EA": ["A"], "OA": ["G"],
@@ -612,6 +684,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["G"],
             "ALT": ["A"], "ES": [math.log(2.0)], "SE": [0.15],
             "EZ": [math.log(2.0) / 0.15], "AF": [0.2],
+            "LP": _lp([0.05]),
         })
 
         result = compare_input_to_vcf(
@@ -633,6 +706,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["G"],
             "ALT": ["A"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
             "AF": [0.2],
+            "LP": _lp([0.05]),
         })
 
         result = compare_input_to_vcf(
@@ -663,6 +737,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "REF": ["G", "T"], "ALT": ["A", "C"],
             "ES": [0.2, 0.3], "SE": [0.1, 0.1], "EZ": [2.0, 3.0],
             "AF": [0.2, 0.3],
+            "LP": _lp([0.05, 0.05]),
         })
         row = _row(
             effect_allele_frequency_column=None,
@@ -686,6 +761,65 @@ class ConcordanceAnalysisTests(unittest.TestCase):
 
         self.assertEqual(result.status, "PASS")
         self.assertEqual(result.metric_summary["allele_frequency"]["concordant"], 2)
+
+    def test_external_frequency_uses_final_vcf_orientation_for_reciprocal_indels(self):
+        input_frame = pl.DataFrame({
+            "CHR": [6], "BP": [135158129], "EA": ["T"], "OA": ["TC"],
+            "BETA": [0.2], "SE": [0.1], "Z": [2.0], "P": [0.05],
+        })
+        external = pl.DataFrame({
+            "CHROM": [6, 6], "POS": [135158129, 135158129],
+            "REF": ["T", "TC"], "ALT": ["TC", "T"],
+            "FREQ": [0.6581, 0.0],
+        })
+        vcf_frame = pl.DataFrame({
+            "CHROM": [6], "POS": [135158129], "ID": ["indel"],
+            "REF": ["T"], "ALT": ["TC"], "ES": [-0.2], "SE": [0.1],
+            "EZ": [-2.0], "AF": [0.6581],
+            "LP": _lp([0.05]),
+        })
+        row = _row(
+            effect_allele_frequency_column=None,
+            external_eaf_file=Path("frequencies.tsv"),
+            external_eaf_column="FREQ",
+        )
+        config = load_configuration()
+
+        for reference in (external, external.reverse()):
+            with self.subTest(reference_order=reference["REF"].to_list()):
+                result = compare_input_to_vcf(
+                    input_frame,
+                    vcf_frame,
+                    row,
+                    effect_type="beta",
+                    p_value_type="raw",
+                    eaf_is_maf=False,
+                    settings=config.modules.harmonisation.concordance_validation,
+                    policies=load_policies(config.modules.harmonisation.policies),
+                    external_eaf_frame=reference,
+                    external_eaf_mapping=(
+                        config.modules.harmonisation.external_eaf_mapping
+                    ),
+                )
+
+                self.assertEqual(result.status, "PASS")
+                self.assertAlmostEqual(
+                    result.matched.item(0, "input_af"), 0.3419,
+                )
+                self.assertAlmostEqual(
+                    result.matched.item(0, "expected_allele_frequency"),
+                    0.6581,
+                )
+                self.assertEqual(
+                    result.metric_summary["allele_frequency"]["concordant"],
+                    1,
+                )
+                self.assertEqual(
+                    result.summary["variant_types"]["indels"][
+                        "exact_matched_variants"
+                    ],
+                    1,
+                )
 
     def test_single_external_eaf_file_with_build_template_is_staged_once(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -761,6 +895,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
                 "SE": [0.1, 0.1],
                 "EZ": [2.0, -3.0],
                 "AF": [0.2, 0.3],
+                "LP": _lp([0.05, 0.01]),
                 PARTITION_COLUMN: ["1", "2"],
             })
             input_frame.write_parquet(input_path)
@@ -848,6 +983,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["G"],
             "ALT": ["A"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
             "AF": [0.8],
+            "LP": _lp([0.05]),
         })
 
         result = compare_input_to_vcf(
@@ -869,6 +1005,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["G"],
             "ALT": ["A"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
             "AF": [0.8],
+            "LP": _lp([0.05]),
         })
 
         result = compare_input_to_vcf(
@@ -895,6 +1032,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["G"],
             "ALT": ["A"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
             "AF": [0.2],
+            "LP": _lp([0.05]),
         })
         result = compare_input_to_vcf(
             input_frame,
@@ -925,6 +1063,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["G"],
             "ALT": ["A"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
             "AF": [0.2],
+            "LP": _lp([0.05]),
         })
 
         result = compare_input_to_vcf(
@@ -958,6 +1097,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1], "POS": [101], "ID": ["v1"], "REF": ["G"],
             "ALT": ["A"], "ES": [0.2], "SE": [0.1], "EZ": [2.0],
             "AF": [0.2],
+            "LP": _lp([0.05]),
         })
 
         result = compare_input_to_vcf(
@@ -1003,6 +1143,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             "CHROM": [1, 1], "POS": [101, 101], "ID": ["v1", "v1-copy"],
             "REF": ["G", "G"], "ALT": ["A", "A"], "ES": [0.2, 0.2],
             "SE": [0.1, 0.1], "EZ": [2.0, 2.0], "AF": [0.2, 0.2],
+            "LP": _lp([0.05, 0.05]),
         })
         result = compare_input_to_vcf(
             input_frame,
@@ -1054,6 +1195,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
                 "SE": [0.1, 0.1, 0.1],
                 "EZ": [-3.0, 2.0, 4.0],
                 "AF": [0.3, 0.2, 0.4],
+                "LP": _lp([0.01, 0.05, 0.001]),
             })
 
             def write_extracted_table(

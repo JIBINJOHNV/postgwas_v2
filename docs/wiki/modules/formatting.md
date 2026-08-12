@@ -84,8 +84,9 @@ postgwas formatter \
 
 ## Parameters
 
-`--format` accepts `magma`, `gcta_gene`, `susie`, `finemap`, `pred_ld`, `ldsc`,
-and `mixer` plus documented aliases. When omitted, formats come from YAML.
+`--format` accepts exactly `magma`, `gcta_gene`, `susie`, `finemap`, `pred_ld`,
+`ldsc`, and `mixer`. No aliases or alternative spellings are accepted. When
+omitted, formats come from YAML.
 `--variant-id-type rsid` extracts an rsID from the VCF `ID` field;
 `--variant-id-type unique` constructs the configured chromosome-position-REF-ALT
 identifier. `variant_identifiers.target_types` can set different conventions

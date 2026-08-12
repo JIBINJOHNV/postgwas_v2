@@ -2887,17 +2887,33 @@ def harmonise_chromosomes(
 #  High-level pipeline wrapper
 # ===============================================================
 
-def _save_qc_results(qc_results: Dict[str, Any], out_file: Path) -> None:
-    """Save the QC dictionary to disk as JSON.
-
-    ``default=str`` means a value the JSON encoder does not understand becomes
-    its text form instead of demoting the whole file to ``str(dict)``, which
-    ``qc_results_to_dataframe`` cannot read back.
-    """
+def _save_qc_results(
+    qc_results: Dict[str, Any],
+    out_file: Path,
+    *,
+    allowed_chromosomes,
+    delimiter: str,
+    null_output: str,
+):
+    """Write chromosome-wise harmonisation metrics as a readable TSV."""
     out_file = Path(out_file)
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    with out_file.open("w", encoding="utf-8") as f:
-        json.dump(qc_results, f, indent=4, default=str)
+    table = qc_results_to_dataframe(
+        data=qc_results,
+        allowed_chromosomes=allowed_chromosomes,
+    )
+    if table is None or table.empty:
+        table = _fallback_qc_frame(qc_results)
+    table.to_csv(
+        out_file,
+        sep=delimiter,
+        index=False,
+        na_rep=null_output,
+        # Seventeen significant digits preserve round-trippable Float64 values
+        # while rendering integer-valued counts as 10 rather than 10.0.
+        float_format="%.17g",
+    )
+    return table
 
 
 def _metric_total(frame, metric):
@@ -3313,6 +3329,9 @@ def run_harmonisation_pipeline(
                         error_type=PipelineError,
                         dataset_id=sample_id,
                     ),
+                    allowed_chromosomes=policies.get("chromosome.allowed"),
+                    delimiter=vcf_config["table_delimiter"],
+                    null_output=vcf_config["table_null_output"],
                 )
             manifest["status"] = getattr(exc, "status", "FAILED")
             manifest["failed_chromosomes"] = getattr(exc, "chromosomes", [])
@@ -3327,26 +3346,13 @@ def run_harmonisation_pipeline(
             error_type=PipelineError,
             dataset_id=sample_id,
         )
-        _save_qc_results(qc_results=qc_results, out_file=qc_summary_path)
-
-        try:
-            postgwas_qc_df2 = qc_results_to_dataframe(
-                data=qc_results,
-                allowed_chromosomes=policies.get("chromosome.allowed"),
-            )
-            if postgwas_qc_df2 is None or getattr(postgwas_qc_df2, "empty", True):
-                raise ValueError("qc_results_to_dataframe produced no rows.")
-        except Exception as e:
-            _announce(
-                logger,
-                screen_field(
-                    "warning", "QC summary",
-                    "per-chromosome table unavailable (%s); using dataset totals" % e,
-                    indent=4, label_width=18,
-                ),
-                marker="WARNING",
-            )
-            postgwas_qc_df2 = _fallback_qc_frame(qc_results)
+        postgwas_qc_df2 = _save_qc_results(
+            qc_results=qc_results,
+            out_file=qc_summary_path,
+            allowed_chromosomes=policies.get("chromosome.allowed"),
+            delimiter=vcf_config["table_delimiter"],
+            null_output=vcf_config["table_null_output"],
+        )
 
         # =====================================================
         # POST MERGE 01/05 — concatenate the per-chromosome VCFs

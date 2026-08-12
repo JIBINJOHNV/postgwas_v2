@@ -4,6 +4,28 @@ PostGWAS groups outputs by dataset and analysis stage. Exact filenames and
 subdirectories are module configuration, so consult the resolved YAML and the
 module page instead of reconstructing paths from memory.
 
+## Where files are written
+
+Harmonisation writes one tree per dataset below the output directory:
+`<dataset>/harmonisation/` for the merged GWAS-VCFs, logs, rejected variants and
+QC evidence, `<dataset>/run_metadata/` for the resolved configuration,
+sample-sheet row and executed command, and a top-level `run_metadata/` holding
+the run summary and run log.
+
+A pipeline run creates one numbered directory per executed step directly below
+`--output-directory`, in the form `NN_<step>`. The number is the step's position
+in the plan, so it is not a fixed module identifier: a module that runs twice
+receives two numbers, and a different target set renumbers every step. The
+directory listing is therefore a record of the plan that actually ran. Some step
+names differ from the module name — for example `magmacovar` writes
+`NN_magma_covar`, and filtering writes `NN_filter_pre_imp` or
+`NN_filter_post_imp` depending on where it sits relative to imputation.
+
+Within a step, modules use a consistent internal layout: `results/` for
+normalised tables, `raw/` for native external-tool output, `inputs/` for prepared
+tool inputs, `logs/`, and `run_metadata/` for the resolved configuration and any
+completion manifest.
+
 ## Output classes
 
 - Primary results: harmonised VCFs, filtered data, formatted tables, clumps,

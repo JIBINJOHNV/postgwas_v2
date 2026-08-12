@@ -99,7 +99,9 @@ preceding modules automatically.
 | Fine-map association signals | [Fine Mapping](modules/fine-mapping.md) | `--modules finemap` |
 | Test gene and gene-set association | [MAGMA](modules/magma.md) | `--modules magma` |
 | Run GCTA gene, segment, or set tests | [GCTA Gene Analysis](modules/gcta-gene.md) | `--modules gcta_gene` |
+| Run GCTA-COJO conditional or joint analysis | `docs/modules/gcta_cojo/README.md` in the repository | `--modules gcta_cojo` |
 | Test gene properties with MAGMA | [MAGMAcovar](modules/magmacovar.md) | `--modules magmacovar` |
+| Identify GWAS-associated cell types | [Single-Cell Integration](modules/single-cell.md) | `--modules single_cell` |
 | Prioritise genes with PoPS | [PoPS](modules/pops.md) | `--modules pops` |
 | Prioritise genes with K-POPS | [K-POPS](../modules/kpops.md) | `--modules kpops` |
 | Combine PoPS with credible sets | [CALDERA](../modules/caldera.md) | `--modules caldera` |

@@ -53,7 +53,7 @@ wiki:
       slug: Harmonisation-Configuration
       source: docs/modules/harmonisation/configuration.md
       section: Harmonisation
-    - title: Harmonisation Processing Order
+    - title: How Harmonisation Processes Your Data
       slug: Harmonisation-Processing-Order
       source: docs/wiki/harmonisation/processing-order.md
       section: Harmonisation

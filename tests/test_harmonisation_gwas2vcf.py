@@ -94,12 +94,15 @@ def test_adapter_failure_raises_with_captured_diagnostic():
         assert "exit_code=7" in transcript
 
 
-def test_export_does_not_apply_a_second_unreported_variant_filter():
+def test_export_preserves_rows_and_summarises_only_adapter_mappings():
     columns = {
         "chr_col": "CHR", "pos_col": "BP", "snp_id_col": "SNP",
         "ea_col": "A1", "oa_col": "A2", "eaf_col": "EAF",
         "beta_col": "BETA", "se_col": "SE", "imp_z_col": "Z",
         "pval_col": "P", "ncontrol_col": "N",
+        # Source/provenance mappings can point to final exported columns after
+        # harmonisation, but they are not separate GWAS-to-VCF inputs.
+        "eafcolumn": "EAF", "beta_or_col": "BETA",
     }
     frame = pl.DataFrame(
         {
@@ -133,6 +136,14 @@ def test_export_does_not_apply_a_second_unreported_variant_filter():
     assert exported["strand_action"].to_list() == ["forward", "forward_swapped"]
     assert "strand_action" not in mapping
     assert summary["num_rows"][0] == frame.height
+    assert summary["key"].to_list() == list(
+        defaults["gwas2vcf_input"]["required_column_keys"]
+    )
+    assert "eafcolumn" not in summary["key"].to_list()
+    assert "beta_or_col" not in summary["key"].to_list()
+    assert summary.filter(pl.col("key") == "eaf_col").height == 1
+    assert "tsv_path" not in summary.columns
+    assert "dict_path" not in summary.columns
 
 
 def test_fixed_info_survives_completeness_check_and_reaches_adapter_export(tmp_path):

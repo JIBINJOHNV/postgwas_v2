@@ -877,6 +877,7 @@ def _screen_summary(dataset_id: str, analysis: ConcordanceAnalysis, reports: dic
         ("Standard error", "standard_error", "analysis"),
         ("Allele frequency", "allele_frequency", "genetic"),
         ("Z score", "z_score", "analysis"),
+        ("P-value (-log10)", "p_value", "analysis"),
     )
     lines = [
         screen_line("analysis", "Harmonisation concordance validation", indent=4),
@@ -984,7 +985,7 @@ def _screen_summary(dataset_id: str, analysis: ConcordanceAnalysis, reports: dic
     elif palindromic_excluded:
         palindromic_message = (
             "%s; %s compared and %s excluded because a safe strand orientation "
-            "was unavailable or disabled by policy; SE remains comparable"
+            "was unavailable or disabled by policy; SE and p-value remain comparable"
             % (
                 fraction_text(palindromic, summary["matched_variants"]),
                 f"{palindromic_compared:,}",

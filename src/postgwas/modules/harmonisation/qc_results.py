@@ -1,4 +1,4 @@
-"""Convert the structured harmonisation QC JSON to a tabular report."""
+"""Convert structured harmonisation QC metrics to a tabular report."""
 
 import json
 
