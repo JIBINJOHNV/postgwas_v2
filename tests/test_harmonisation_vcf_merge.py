@@ -1,6 +1,9 @@
 """Regression contracts for complete and validated chromosome VCF merges."""
 
 from pathlib import Path
+import shlex
+import shutil
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -21,27 +24,30 @@ def _configuration():
     return dict(config.output_layout.root), config.vcf_processing.model_dump()
 
 
-def _arguments(tmp_path, policies=None):
+def _arguments(tmp_path, policies=None, grch_version="GRCh37"):
     output_layout, vcf_config = _configuration()
     return {
         "output_dir": str(tmp_path),
         "gwas_outputname": "study",
-        "grch_version": "GRCh37",
+        "grch_version": grch_version,
         "expected_chromosomes": ["1"],
         "threads": 2,
         "output_layout": output_layout,
-        "executables": {"bcftools": "bcftools", "tabix": "tabix"},
+        "executables": {
+            "bash": "bash", "bcftools": "bcftools", "tabix": "tabix",
+        },
         "vcf_config": vcf_config,
         "policies": policies or default_policies(),
     }
 
 
-def _required_inputs(tmp_path):
-    output_layout, _vcf_config = _configuration()
+def _required_inputs(tmp_path, grch_version="GRCh37"):
+    output_layout, vcf_config = _configuration()
+    target_build = vcf_config["target_builds"][grch_version]
     paths = [
         configured_output_path(
             tmp_path, output_layout[pattern], dataset_id="study", chromosome="1",
-            build="GRCh37", target_build="GRCh38",
+            build=grch_version, target_build=target_build,
         )
         for pattern in (
             "chromosome_annotated_vcf",
@@ -54,6 +60,35 @@ def _required_inputs(tmp_path):
         path.write_bytes(b"v" * 200)
         Path(str(path) + ".tbi").write_bytes(b"index")
     return paths
+
+
+def _merge_output(arguments):
+    """Return the output path from the streamed concat/annotate command."""
+    if len(arguments) < 3 or arguments[1] != "-c":
+        return None
+    script = arguments[2]
+    if "bcftools concat" not in script or "bcftools annotate" not in script:
+        return None
+    annotate = shlex.split(script.split(" | ", 1)[1])
+    return Path(annotate[annotate.index("--output") + 1])
+
+
+def _merge_header(arguments):
+    """Return the configured header from the streamed merge command."""
+    if _merge_output(arguments) is None:
+        return None
+    annotate = shlex.split(arguments[2].split(" | ", 1)[1])
+    return annotate[annotate.index("--header-line") + 1]
+
+
+def _expected_header(path):
+    name = Path(path).name
+    build = (
+        "GRCh38"
+        if "_GRCh38_merged" in name and "_notlifted_" not in name
+        else "GRCh37"
+    )
+    return "##genome_build=%s\n" % build
 
 
 def _annotation_arguments(tmp_path):
@@ -161,11 +196,13 @@ def test_zero_record_required_merged_vcf_fails_validation(tmp_path):
     inputs = _required_inputs(tmp_path)
 
     def command(arguments, _purpose, **_kwargs):
-        if len(arguments) > 1 and arguments[1] == "concat":
-            output = Path(arguments[arguments.index("--output") + 1])
+        output = _merge_output(arguments)
+        if output is not None:
             output.write_bytes(b"v" * 200)
             Path(str(output) + ".tbi").write_bytes(b"index")
             return ""
+        if len(arguments) > 2 and arguments[1:3] == ["view", "--header-only"]:
+            return _expected_header(arguments[-1])
         if len(arguments) > 2 and arguments[1:3] == ["index", "-n"]:
             return "0\n" if "merged" in str(arguments[-1]) else "1\n"
         raise AssertionError("unexpected command: %r" % arguments)
@@ -205,11 +242,16 @@ def test_continue_marks_successfully_merged_subset_as_partial(tmp_path):
     arguments["expected_chromosomes"] = ["1", "2"]
 
     def command(command_arguments, _purpose, **_kwargs):
-        if len(command_arguments) > 1 and command_arguments[1] == "concat":
-            output = Path(command_arguments[command_arguments.index("--output") + 1])
+        output = _merge_output(command_arguments)
+        if output is not None:
             output.write_bytes(b"v" * 200)
             Path(str(output) + ".tbi").write_bytes(b"index")
             return ""
+        if (
+            len(command_arguments) > 2
+            and command_arguments[1:3] == ["view", "--header-only"]
+        ):
+            return _expected_header(command_arguments[-1])
         if len(command_arguments) > 2 and command_arguments[1:3] == ["index", "-n"]:
             return "1\n"
         raise AssertionError("unexpected command: %r" % command_arguments)
@@ -236,14 +278,16 @@ def test_transient_concat_failure_is_retried_and_can_recover(tmp_path):
     attempts = {}
 
     def command(arguments, _purpose, **_kwargs):
-        if len(arguments) > 1 and arguments[1] == "concat":
-            output = Path(arguments[arguments.index("--output") + 1])
+        output = _merge_output(arguments)
+        if output is not None:
             attempts[output.name] = attempts.get(output.name, 0) + 1
             if output.name == "study_GRCh37_merged.vcf.gz" and attempts[output.name] == 1:
                 raise RuntimeError("temporary concat failure")
             output.write_bytes(b"v" * 200)
             Path(str(output) + ".tbi").write_bytes(b"index")
             return ""
+        if len(arguments) > 2 and arguments[1:3] == ["view", "--header-only"]:
+            return _expected_header(arguments[-1])
         if len(arguments) > 2 and arguments[1:3] == ["index", "-n"]:
             return "1\n"
         raise AssertionError("unexpected command: %r" % arguments)
@@ -275,13 +319,15 @@ def test_optional_merge_failure_does_not_downgrade_required_outputs(tmp_path):
     Path(str(optional_input) + ".tbi").write_bytes(b"index")
 
     def command(arguments, _purpose, **_kwargs):
-        if len(arguments) > 1 and arguments[1] == "concat":
-            output = Path(arguments[arguments.index("--output") + 1])
+        output = _merge_output(arguments)
+        if output is not None:
             if output.name == "study_notlifted_GRCh38_merged.vcf.gz":
                 raise RuntimeError("optional concat failure")
             output.write_bytes(b"v" * 200)
             Path(str(output) + ".tbi").write_bytes(b"index")
             return ""
+        if len(arguments) > 2 and arguments[1:3] == ["view", "--header-only"]:
+            return _expected_header(arguments[-1])
         if len(arguments) > 2 and arguments[1:3] == ["index", "-n"]:
             return "1\n"
         raise AssertionError("unexpected command: %r" % arguments)
@@ -304,8 +350,8 @@ def test_missing_merged_index_is_a_failure_and_inputs_are_retained(tmp_path):
     def command(arguments, _purpose, **kwargs):
         if len(arguments) > 2 and arguments[1:3] == ["index", "-n"]:
             return "1\n"
-        if len(arguments) > 1 and arguments[1] == "concat":
-            output = Path(arguments[arguments.index("--output") + 1])
+        output = _merge_output(arguments)
+        if output is not None:
             output.write_bytes(b"v" * 200)
             missing = [
                 str(path) for path in kwargs.get("expected_outputs", [])
@@ -326,15 +372,101 @@ def test_missing_merged_index_is_a_failure_and_inputs_are_retained(tmp_path):
     assert not list(tmp_path.glob("study_*_merged.vcf.gz"))
 
 
-def test_success_requires_readable_merged_vcf_and_index(tmp_path):
-    _required_inputs(tmp_path)
+def test_wrong_or_missing_merged_build_header_is_a_failure(tmp_path):
+    inputs = _required_inputs(tmp_path)
 
     def command(arguments, _purpose, **_kwargs):
-        if len(arguments) > 1 and arguments[1] == "concat":
-            output = Path(arguments[arguments.index("--output") + 1])
+        output = _merge_output(arguments)
+        if output is not None:
             output.write_bytes(b"v" * 200)
             Path(str(output) + ".tbi").write_bytes(b"index")
             return ""
+        if len(arguments) > 2 and arguments[1:3] == ["view", "--header-only"]:
+            return "##genome_build=WrongBuild\n"
+        if len(arguments) > 2 and arguments[1:3] == ["index", "-n"]:
+            return "1\n"
+        raise AssertionError("unexpected command: %r" % arguments)
+
+    with patch(
+        "postgwas.modules.harmonisation.vcf_processing.run_checked_command",
+        side_effect=command,
+    ), pytest.raises(VcfMergeError, match="must contain exactly one"):
+        concat_vcfs_by_build(**_arguments(tmp_path))
+
+    assert all(path.is_file() for path in inputs)
+    assert not list(tmp_path.glob("study_*_merged.vcf.gz"))
+
+
+@pytest.mark.parametrize(
+    ("input_build", "target_build"),
+    [("GRCh37", "GRCh38"), ("GRCh38", "GRCh37")],
+)
+def test_success_requires_build_header_readable_vcf_and_index(
+    tmp_path, input_build, target_build,
+):
+    _required_inputs(tmp_path, grch_version=input_build)
+    written_headers = {}
+
+    def command(arguments, _purpose, **_kwargs):
+        output = _merge_output(arguments)
+        if output is not None:
+            written_headers[str(output)] = _merge_header(arguments)
+            output.write_bytes(b"v" * 200)
+            Path(str(output) + ".tbi").write_bytes(b"index")
+            return ""
+        if len(arguments) > 2 and arguments[1:3] == ["view", "--header-only"]:
+            return written_headers[str(arguments[-1])] + "\n"
+        if len(arguments) > 2 and arguments[1:3] == ["index", "-n"]:
+            return "1\n"
+        raise AssertionError("unexpected command: %r" % arguments)
+
+    with patch(
+        "postgwas.modules.harmonisation.vcf_processing.run_checked_command",
+        side_effect=command,
+    ):
+        result = concat_vcfs_by_build(
+            **_arguments(tmp_path, grch_version=input_build)
+        )
+
+    assert result["merge_failures"] == []
+    assert result["merge_failure_details"] == {}
+    for key in ("grch37", "grch38", "gwas2vcf"):
+        assert Path(result[key]).is_file()
+        assert Path(result[key] + ".tbi").is_file()
+    assert {Path(path).name: header for path, header in written_headers.items()} == {
+        "study_%s_merged.vcf.gz" % input_build:
+            "##genome_build=%s" % input_build,
+        "study_%s_merged.vcf.gz" % target_build:
+            "##genome_build=%s" % target_build,
+        "study_gwas2vcf_%s_merged.vcf.gz" % input_build:
+            "##genome_build=%s" % input_build,
+    }
+
+
+def test_notlifted_vcf_declares_source_not_attempted_target_build(tmp_path):
+    _required_inputs(tmp_path)
+    output_layout, _vcf_config = _configuration()
+    optional_input = configured_output_path(
+        tmp_path,
+        output_layout["chromosome_not_lifted_vcf"],
+        dataset_id="study",
+        chromosome="1",
+        build="GRCh37",
+        target_build="GRCh38",
+    )
+    optional_input.write_bytes(b"v" * 200)
+    Path(str(optional_input) + ".tbi").write_bytes(b"index")
+    headers = {}
+
+    def command(arguments, _purpose, **_kwargs):
+        output = _merge_output(arguments)
+        if output is not None:
+            headers[str(output)] = _merge_header(arguments)
+            output.write_bytes(b"v" * 200)
+            Path(str(output) + ".tbi").write_bytes(b"index")
+            return ""
+        if len(arguments) > 2 and arguments[1:3] == ["view", "--header-only"]:
+            return headers[str(arguments[-1])] + "\n"
         if len(arguments) > 2 and arguments[1:3] == ["index", "-n"]:
             return "1\n"
         raise AssertionError("unexpected command: %r" % arguments)
@@ -345,8 +477,81 @@ def test_success_requires_readable_merged_vcf_and_index(tmp_path):
     ):
         result = concat_vcfs_by_build(**_arguments(tmp_path))
 
-    assert result["merge_failures"] == []
-    assert result["merge_failure_details"] == {}
-    for key in ("grch37", "grch38", "gwas2vcf"):
-        assert Path(result[key]).is_file()
-        assert Path(result[key] + ".tbi").is_file()
+    notlifted = result["notlifted"]
+    assert notlifted is not None
+    assert headers[notlifted] == "##genome_build=GRCh37"
+
+
+@pytest.mark.skipif(
+    not all(shutil.which(command) for command in ("bash", "bcftools", "tabix")),
+    reason="bash, bcftools and tabix are required for the merge integration test",
+)
+def test_real_streamed_merge_writes_exact_build_headers(tmp_path):
+    output_layout, vcf_config = _configuration()
+    source = tmp_path / "source.vcf"
+    source.write_text(
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=1,length=1000>\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        "1\t100\t.\tA\tG\t.\tPASS\t.\n",
+        encoding="utf-8",
+    )
+    for pattern in (
+        "chromosome_annotated_vcf",
+        "chromosome_lifted_vcf",
+        "chromosome_raw_vcf",
+    ):
+        destination = configured_output_path(
+            tmp_path,
+            output_layout[pattern],
+            dataset_id="study",
+            chromosome="1",
+            build="GRCh37",
+            target_build="GRCh38",
+        )
+        subprocess.run(
+            [
+                shutil.which("bcftools"), "view", "--output-type", "z",
+                "--output", str(destination), str(source),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [shutil.which("tabix"), "-f", "-p", "vcf", str(destination)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    result = concat_vcfs_by_build(
+        output_dir=str(tmp_path),
+        gwas_outputname="study",
+        grch_version="GRCh37",
+        expected_chromosomes=["1"],
+        threads=2,
+        output_layout=output_layout,
+        executables={
+            command: shutil.which(command)
+            for command in ("bash", "bcftools", "tabix")
+        },
+        vcf_config=vcf_config,
+        policies=default_policies(),
+    )
+
+    for key, build in (
+        ("grch37", "GRCh37"),
+        ("grch38", "GRCh38"),
+        ("gwas2vcf", "GRCh37"),
+    ):
+        header = subprocess.run(
+            [shutil.which("bcftools"), "view", "--header-only", result[key]],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert [
+            line for line in header.splitlines()
+            if line.startswith("##genome_build=")
+        ] == ["##genome_build=%s" % build]

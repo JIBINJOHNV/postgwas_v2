@@ -52,6 +52,8 @@ def test_standard_clumping_prints_summary_and_logs_variant_details(
     monkeypatch.setattr(
         "postgwas.core.execution.runtime.safe_thread_count", lambda *args, **kwargs: 1
     )
+    (tmp_path / "EUR_chr1.ld.gz").write_bytes(b"ld")
+    (tmp_path / "EUR_chr1.ld.gz.tbi").write_bytes(b"index")
 
     result = ld_prune_standard.ld_clump_standard(
         vcf_path=tmp_path / "study.vcf.gz",
@@ -61,7 +63,7 @@ def test_standard_clumping_prints_summary_and_logs_variant_details(
         threads=1,
     )
 
-    assert result is None
+    assert result["status"] == "no_loci"
     screen = capsys.readouterr().out
     assert "chr1" in screen
     assert "1 significant · 1 independent · 0 lead · 0 risk loci" in screen
@@ -131,6 +133,8 @@ def test_standard_clumping_groups_chromosomes_without_significant_variants(
     monkeypatch.setattr(
         "postgwas.core.execution.runtime.safe_thread_count", lambda *args, **kwargs: 1
     )
+    (tmp_path / "EUR_chr1.ld.gz").write_bytes(b"ld")
+    (tmp_path / "EUR_chr1.ld.gz.tbi").write_bytes(b"index")
 
     result = ld_prune_standard.ld_clump_standard(
         vcf_path=tmp_path / "study.vcf.gz",
@@ -140,7 +144,7 @@ def test_standard_clumping_groups_chromosomes_without_significant_variants(
         threads=1,
     )
 
-    assert result is None
+    assert result["status"] == "no_loci"
     screen = capsys.readouterr().out
     assert screen.count("chr2") == 1
     assert screen.count("chr3") == 0

@@ -8,8 +8,10 @@ from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 import yaml
+from rich.cells import cell_len
 
 from postgwas.config import load_configuration, load_module_configuration
 from postgwas.modules.pops.cli import build_parser
@@ -19,6 +21,7 @@ from postgwas.modules.pops.service import (
     _require_pops_runtime,
     preflight_pops_pipeline,
     run_pops_direct,
+    validate_pops_configuration,
 )
 from postgwas.pipeline.registry import REGISTRY
 
@@ -29,7 +32,7 @@ def _pops_resources(tmp_path: Path, *, custom_target: bool = False) -> dict[str,
     annotation.write_text(
         "ENSGID\tCHR\tTSS\n"
         + "".join(
-            "%s\t%s\t%d\n" % (gene, 1 + index % 2, 1000 + index)
+            "%s\t%s\t%d\n" % (gene, 1 if index < 5 else 2, 1000 + index)
             for index, gene in enumerate(genes)
         ),
         encoding="utf-8",
@@ -60,7 +63,13 @@ def _pops_resources(tmp_path: Path, *, custom_target: bool = False) -> dict[str,
             encoding="utf-8",
         )
         Path(str(magma_prefix) + ".genes.raw").write_text(
-            "non-empty upstream MAGMA raw placeholder\n", encoding="utf-8",
+            "# VERSION = test\n# COVAR = NSAMP MAC\n"
+            + "".join(
+                "%s %s 1 2 1 1 100 1 0\n"
+                % (gene, 1 if index < 5 else 2)
+                for index, gene in enumerate(genes)
+            ),
+            encoding="utf-8",
         )
         resources["magma_prefix"] = magma_prefix
     return resources
@@ -150,6 +159,7 @@ def test_cli_has_no_independent_defaults():
         "feature_matrix_chunks", "pops_gene_location_file", "genome_build",
         "use_magma_covariates", "use_magma_error_covariance",
         "feature_selection_p_cutoff", "method", "save_matrix_files", "verbose",
+        "gene_universe_policy",
         "run_config", "resume", "overwrite", "dataset_id", "output_directory",
         "threads", "memory_gb", "seed",
     }
@@ -168,8 +178,34 @@ def test_missing_scikit_learn_has_actionable_error(monkeypatch):
         _require_pops_runtime()
 
 
+def test_missing_required_inputs_are_reported_together_before_runtime(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        "postgwas.modules.pops.service._require_pops_runtime",
+        lambda: pytest.fail("runtime validation must follow required arguments"),
+    )
+    args = Namespace(
+        dataset_id="STUDY",
+        output_directory=str(tmp_path / "output"),
+    )
+
+    with pytest.raises(Exception) as captured:
+        run_pops_direct(args)
+
+    message = str(captured.value)
+    assert "Required argument not provided: --genome-build." in message
+    assert "Required argument not provided: --feature-matrix-prefix." in message
+    assert "Required argument not provided: --pops-gene-location-file." in message
+    assert "--magma-association-prefix or --target-score-file" in message
+    service_log = tmp_path / "output" / "logs" / "STUDY_pops_service.log"
+    assert "Required argument not provided" in service_log.read_text(encoding="utf-8")
+    assert not (tmp_path / "output" / "STUDY_pops.preds").exists()
+
+
 def test_configuration_uses_upstream_method_names_and_validates_ranges(tmp_path):
     assert load_configuration().modules.pops.method == "ridge"
+    assert load_configuration().modules.pops.gene_universe_policy == "strict"
     invalid_method = tmp_path / "invalid_method.yaml"
     invalid_method.write_text("method: linear\n", encoding="utf-8")
     with pytest.raises(Exception, match="method"):
@@ -193,6 +229,15 @@ def test_configuration_uses_upstream_method_names_and_validates_ranges(tmp_path)
     )
     with pytest.raises(Exception, match="mutually exclusive"):
         load_module_configuration("pops", conflicting_targets)
+
+    unsupported_custom_intersection = tmp_path / "custom_intersection.yaml"
+    unsupported_custom_intersection.write_text(
+        "gene_universe_policy: intersect\n"
+        "target_score_file: targets.tsv\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(Exception, match="supported only for MAGMA targets"):
+        load_module_configuration("pops", unsupported_custom_intersection)
 
 
 def test_configuration_precedence_and_compute_seed_are_resolved_once(tmp_path):
@@ -230,6 +275,234 @@ def test_pipeline_preflight_rejects_magma_build_mismatch(tmp_path):
         preflight_pops_pipeline(args)
 
 
+def test_preflight_rejects_magma_gene_universe_mismatch_with_diagnosis(tmp_path):
+    resources = _pops_resources(tmp_path)
+    output_path = Path(str(resources["magma_prefix"]) + ".genes.out")
+    raw_path = Path(str(resources["magma_prefix"]) + ".genes.raw")
+    output_path.write_text(
+        output_path.read_text(encoding="utf-8") + "ENSG999\t1.0\n",
+        encoding="utf-8",
+    )
+    raw_path.write_text(
+        raw_path.read_text(encoding="utf-8")
+        + "ENSG999 2 1 2 1 1 100 1 0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PopsError) as captured:
+        run_pops_direct(_arguments(tmp_path, resources))
+
+    message = str(captured.value)
+    assert "PoPS input files are scientifically incompatible" in message
+    assert "MAGMA genes=11" in message
+    assert "PoPS annotation genes=10" in message
+    assert "PoPS feature-row genes=10" in message
+    assert "shared genes=10" in message
+    assert "ENSG999" in message
+    assert str(output_path) in message
+    assert not (Path(tmp_path) / "output" / "STUDY_pops.preds").exists()
+
+
+def test_intersection_policy_preserves_covariance_and_publishes_detailed_audit(
+    tmp_path, monkeypatch, capsys,
+):
+    from postgwas.modules.pops.pops import munge_magma_covariance_metadata
+
+    resources = _pops_resources(tmp_path)
+    original_genes = [
+        "ENSG001", "ENSG002", "ENSG003", "ENSG004", "ENSG999",
+        "ENSG005", "ENSG006", "ENSG007", "ENSG008", "ENSG009", "ENSG010",
+    ]
+    magma_prefix = resources["magma_prefix"]
+    Path(str(magma_prefix) + ".genes.out").write_text(
+        "GENE\tZSTAT\n"
+        + "".join(
+            "%s\t%.6f\n" % (gene, index / 10)
+            for index, gene in enumerate(original_genes)
+        ),
+        encoding="utf-8",
+    )
+    raw_lines = ["# VERSION = test", "# COVAR = NSAMP MAC"]
+    chromosome_row = {"1": 0, "2": 0}
+    for gene in original_genes:
+        chromosome = "1" if gene in {
+            "ENSG001", "ENSG002", "ENSG003", "ENSG004", "ENSG005", "ENSG999",
+        } else "2"
+        row_index = chromosome_row[chromosome]
+        correlations = [
+            0.001 * (row_index + column_index + 1)
+            for column_index in range(row_index)
+        ]
+        raw_lines.append(" ".join(
+            [gene, chromosome, "1", "2", "2", "2", "100", "10", "0"]
+            + ["%.17g" % value for value in correlations]
+        ))
+        chromosome_row[chromosome] += 1
+    original_raw = Path(str(magma_prefix) + ".genes.raw")
+    original_raw.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+    original_raw_text = original_raw.read_text(encoding="utf-8")
+    observed = {}
+
+    def fake_pops_main(config, progress_callback=None):
+        derived_prefix = Path(config["magma_prefix"])
+        observed["derived_prefix"] = str(derived_prefix)
+        observed["compatible_ids"] = pd.read_csv(
+            str(derived_prefix) + ".genes.out", sep=r"\s+",
+        )["GENE"].tolist()
+        source_sigmas, _ = munge_magma_covariance_metadata(str(original_raw))
+        derived_sigmas, _ = munge_magma_covariance_metadata(
+            str(derived_prefix) + ".genes.raw"
+        )
+        retained_by_block = ([0, 1, 2, 3, 5], [0, 1, 2, 3, 4])
+        observed["expected_covariance"] = [
+            sigma[np.ix_(indices, indices)]
+            for sigma, indices in zip(source_sigmas, retained_by_block)
+        ]
+        observed["derived_covariance"] = derived_sigmas
+        _write_upstream_outputs(config, progress_callback=progress_callback)
+
+    _mock_upstream(monkeypatch, fake_pops_main)
+    result = run_pops_direct(_arguments(
+        tmp_path, resources, gene_universe_policy="intersect",
+    ))
+
+    assert observed["compatible_ids"] == [
+        gene for gene in original_genes if gene != "ENSG999"
+    ]
+    for derived, expected in zip(
+        observed["derived_covariance"], observed["expected_covariance"],
+    ):
+        np.testing.assert_allclose(derived, expected)
+    assert original_raw.read_text(encoding="utf-8") == original_raw_text
+    published = {Path(path).name: Path(path) for path in result["published_files"]}
+    compatible_out = published["STUDY_pops.compatible.genes.out"]
+    compatible_raw = published["STUDY_pops.compatible.genes.raw"]
+    excluded_out = published["STUDY_pops.excluded.genes.out"]
+    excluded_raw = published["STUDY_pops.excluded.genes.raw"]
+    audit_path = published["STUDY_pops.gene_compatibility.tsv"]
+    report_path = published["STUDY_pops.gene_compatibility.yaml"]
+    assert all(path.is_file() for path in (
+        compatible_out, compatible_raw, excluded_out, excluded_raw,
+        audit_path, report_path,
+    ))
+    assert pd.read_csv(excluded_out, sep=r"\s+")["GENE"].tolist() == ["ENSG999"]
+    assert [
+        line.split()[0]
+        for line in excluded_raw.read_text(encoding="utf-8").splitlines()[2:]
+    ] == ["ENSG999"]
+    audit = pd.read_csv(audit_path, sep="\t")
+    excluded_audit = audit.loc[audit["gene_id"] == "ENSG999"].iloc[0]
+    assert len(audit) == 11
+    assert not bool(excluded_audit["retained_for_pops"])
+    assert excluded_audit["decision"] == "missing_annotation_and_features"
+    report = yaml.safe_load(report_path.read_text(encoding="utf-8"))
+    assert report["original_target_genes"] == 11
+    assert report["retained_target_genes"] == 10
+    assert report["excluded_target_genes"] == 1
+    assert report["absent_from_both"] == 1
+    assert report["chromosomes"]["1"] == {
+        "original": 6, "retained": 5, "excluded": 1,
+    }
+    assert report["chromosomes"]["2"] == {
+        "original": 5, "retained": 5, "excluded": 0,
+    }
+    assert report["exclusion_reason_counts"] == {
+        "retained": 10,
+        "missing_annotation": 0,
+        "missing_features": 0,
+        "missing_annotation_and_features": 1,
+    }
+    assert report["original_files_unchanged"] is True
+    assert result["summary"]["gene_compatibility"]["excluded_target_genes"] == 1
+    screen = capsys.readouterr().out
+    assert "MAGMA–PoPS gene compatibility" in screen
+    assert "Original target genes" in screen
+    assert screen.index("Original target genes") < screen.index("Started 2/7")
+    assert "Original MAGMA target genes" in screen
+    assert "Excluded target genes" in screen
+    aligned_labels = (
+        "Dataset", "Genes assigned PoPS scores", "Original MAGMA target genes",
+        "1. ENSG002", "PoPS significance cutoff", "Complete PoPS results",
+    )
+    summary_screen = screen[screen.index("PoPS gene-prioritisation summary"):]
+    colon_columns = {
+        cell_len(line.split(":", 1)[0])
+        for line in summary_screen.splitlines()
+        if any(label in line for label in aligned_labels) and ":" in line
+    }
+    assert colon_columns == {57}
+    log_text = (Path(tmp_path) / "output" / "logs" / "STUDY_pops_service.log").read_text(
+        encoding="utf-8"
+    )
+    assert "pops_gene_universe_intersection" in log_text
+    assert "pops_gene_compatibility_chromosome" in log_text
+    assert "excluded_target_genes=1" in log_text
+
+
+def test_preflight_rejects_magma_raw_gene_order_mismatch(tmp_path):
+    resources = _pops_resources(tmp_path)
+    raw_path = Path(str(resources["magma_prefix"]) + ".genes.raw")
+    lines = raw_path.read_text(encoding="utf-8").splitlines()
+    lines[2], lines[3] = lines[3], lines[2]
+    raw_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(PopsError, match=r"gene order differs at data row 1"):
+        run_pops_direct(_arguments(tmp_path, resources))
+
+
+def test_preflight_rejects_magma_annotation_chromosome_mismatch(tmp_path):
+    resources = _pops_resources(tmp_path)
+    annotation_path = resources["annotation"]
+    annotation_path.write_text(
+        annotation_path.read_text(encoding="utf-8").replace(
+            "ENSG001\t1\t1000", "ENSG001\t2\t1000",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PopsError) as captured:
+        run_pops_direct(_arguments(
+            tmp_path, resources, gene_universe_policy="intersect",
+        ))
+
+    message = str(captured.value)
+    assert "disagree on chromosome for 1 shared genes" in message
+    assert "ENSG001 (MAGMA=1, PoPS=2)" in message
+    assert "intersection cannot repair chromosome disagreement" in message
+
+
+def test_preflight_rejects_annotation_feature_gene_universe_mismatch(tmp_path):
+    resources = _pops_resources(tmp_path, custom_target=True)
+    rows_path = Path(str(resources["feature_prefix"]) + ".rows.txt")
+    rows = rows_path.read_text(encoding="utf-8").replace("ENSG010\n", "ENSG999\n")
+    rows_path.write_text(rows, encoding="utf-8")
+
+    with pytest.raises(PopsError) as captured:
+        run_pops_direct(_arguments(tmp_path, resources))
+
+    message = str(captured.value)
+    assert "feature rows contain genes absent from the gene annotation" in message
+    assert "absent from annotation=1" in message
+    assert "ENSG999" in message
+
+
+def test_preflight_allows_annotation_genes_without_feature_rows(tmp_path):
+    resources = _pops_resources(tmp_path)
+    annotation_path = resources["annotation"]
+    annotation_path.write_text(
+        annotation_path.read_text(encoding="utf-8") + "ENSG999\t1\t9999\n",
+        encoding="utf-8",
+    )
+
+    _, features, annotation, outcome = validate_pops_configuration(
+        _arguments(tmp_path, resources)
+    )
+
+    assert features["row_count"] == 10
+    assert annotation["gene_count"] == 11
+    assert outcome["gene_count"] == 10
+
+
 def test_standalone_uses_canonical_seed_and_does_not_require_context(tmp_path, monkeypatch):
     resources = _pops_resources(tmp_path)
     args = _arguments(tmp_path, resources)
@@ -259,6 +532,12 @@ def test_terminal_summary_explains_ranking_and_incomplete_target_coverage(
     magma_output = Path(str(resources["magma_prefix"]) + ".genes.out")
     magma_output.write_text(
         "GENE\tZSTAT\nENSG001\t1\nENSG002\t2\n", encoding="utf-8",
+    )
+    Path(str(resources["magma_prefix"]) + ".genes.raw").write_text(
+        "# VERSION = test\n# COVAR = NSAMP MAC\n"
+        "ENSG001 1 1 2 1 1 100 1 0\n"
+        "ENSG002 1 1 2 1 1 100 1 0\n",
+        encoding="utf-8",
     )
     args = _arguments(tmp_path, resources)
     run_config = tmp_path / "pops_warning.yaml"

@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from postgwas.core.completion import (
+    apply_completion_restart,
     configuration_digest,
-    validate_completion_manifest,
+    resolve_completion_resume,
     write_completion_manifest,
 )
 from postgwas.core.contracts import Artifact, ModuleResult
@@ -248,7 +249,7 @@ class MagmaCelltypeMethod:
             and not configuration.run.overwrite
             and paths["completion_manifest"].is_file()
         ):
-            manifest = validate_completion_manifest(
+            decision = resolve_completion_resume(
                 paths["completion_manifest"],
                 dataset_id=context.dataset,
                 module="single_cell",
@@ -256,20 +257,30 @@ class MagmaCelltypeMethod:
                 configuration_sha256=digest,
                 inputs=completion_inputs,
                 outputs=completion_outputs,
+                resume_policy=configuration.run.resume_policy,
                 error_type=SingleCellError,
             )
-            context.logger.record(
-                "SKIP",
-                self.name,
-                reason="provenance_validated_complete_outputs",
-            )
-            return _result(
-                configuration=configuration,
-                dataset=context.dataset,
-                gene_property_results=gene_property_results,
-                normalized_results=paths["results_file"],
-                metrics=dict(manifest.get("metrics", {})),
-                resumed=True,
+            if decision.action == "resume":
+                context.logger.record(
+                    "SKIP",
+                    self.name,
+                    reason="provenance_validated_complete_outputs",
+                )
+                return _result(
+                    configuration=configuration,
+                    dataset=context.dataset,
+                    gene_property_results=gene_property_results,
+                    normalized_results=paths["results_file"],
+                    metrics=dict(decision.manifest.get("metrics", {})),
+                    resumed=True,
+                )
+            apply_completion_restart(
+                decision,
+                output_root=context.output,
+                manifest=paths["completion_manifest"],
+                logger=context.logger,
+                operation=self.name,
+                error_type=SingleCellError,
             )
         if (
             paths["results_file"].exists()

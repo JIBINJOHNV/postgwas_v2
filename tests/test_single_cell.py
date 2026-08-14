@@ -920,6 +920,37 @@ def test_scdrs_direct_resumes_without_rerunning_native_cli(tmp_path, monkeypatch
     )
 
 
+def test_scdrs_restarts_when_every_declared_output_is_missing(tmp_path):
+    args = argparse.Namespace(
+        tools=["scdrs"],
+        scdrs_h5ad_file=str(_h5ad(tmp_path / "atlas.h5ad")),
+        scdrs_gene_set_file=str(_gene_sets(tmp_path / "study.gs")),
+        scdrs=str(_fake_scdrs(tmp_path / "scdrs")),
+        dataset_id="study",
+        output_directory=str(tmp_path / "results"),
+        resume=True,
+    )
+    first = run_single_cell_direct(args)
+    manifest = (
+        tmp_path
+        / "results"
+        / "run_metadata"
+        / "study_scdrs_completion.yaml"
+    )
+    recorded = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    for fingerprint in recorded["outputs"].values():
+        Path(fingerprint["path"]).unlink()
+
+    restarted = run_single_cell_direct(args)
+
+    assert restarted.metrics["resumed"] is False
+    assert restarted.artifacts["scdrs_score_1"].path.is_file()
+    log = tmp_path / "results" / "logs" / "study_single_cell.log"
+    assert "reason=incomplete_outputs" in log.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_scdrs_qc_reports_group_counts_after_cell_filtering(tmp_path):
     args = argparse.Namespace(
         tools=["scdrs"],

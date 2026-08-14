@@ -135,7 +135,8 @@ from postgwas.modules.harmonisation.resource_preflight import (
 from postgwas.modules.harmonisation.qc_results import qc_results_to_dataframe
 from postgwas.core.values import optional_text
 
-from postgwas.modules.qc_summary.assessment import run_vcf_qc_assessment
+from postgwas.config.models.modules.qc_summary import QCSummaryConfig
+from postgwas.modules.qc_summary.service import run_qc_assessment
 from postgwas.modules.harmonisation.qc_reporting import (
     harmonisation_qc_summary_lines,
     harmonisation_qc_takeaway_lines,
@@ -3036,6 +3037,9 @@ def run_harmonisation_pipeline(
     executables = default_cfg_obj["executables"]
     compression_executable = default_cfg_obj["compression_executable"]
     vcf_config = default_cfg_obj["vcf_processing"]
+    qc_configuration = QCSummaryConfig.model_validate(
+        default_cfg_obj["qc_summary"]
+    )
     population_frequency_config = default_cfg_obj["population_frequency_qc"]
     executables_prevalidated = bool(
         default_cfg_obj.get("executables_prevalidated", False)
@@ -3490,9 +3494,7 @@ def run_harmonisation_pipeline(
         # =====================================================
         # Prepare the pre-VCF counts used by the combined QC report
         # =====================================================
-        target_build = str(policies.get("qc.target_build"))
-        if target_build == "input":
-            target_build = grch_version
+        target_build = qc_configuration.target_build.value
         manifest["qc_target_build"] = target_build
 
         raw_vcf_path = configured_output_path(
@@ -3604,32 +3606,20 @@ def run_harmonisation_pipeline(
         # =====================================================
         with logger.step(
             4, POST_MERGE_STEP_TOTAL, "Assess raw VCF quality",
-            "qc_summary.assessment.run_vcf_qc_assessment",
-            policy_keys=[
-                "qc.target_build",
-                "qc.sample_size_outlier_standard_deviations",
-                "filter.maf_cutoff", "filter.af_diff_cutoff", "filter.af_missing",
-                "filter.info_cutoff", "filter.info_max", "filter.info_missing",
-                "filter.lp_cutoff", "filter.lp_missing", "filter.include_indels",
-                "filter.exclude_palindromic", "filter.palindromic_af_lower",
-                "filter.palindromic_af_upper", "filter.remove_mhc",
-                "filter.mhc_chrom", "filter.mhc_start", "filter.mhc_end",
-            ],
+            "qc_summary.service.run_qc_assessment",
         ) as ctx:
-            assessment = run_vcf_qc_assessment(
+            ctx.info(
+                "Using schema-validated modules.qc_summary rules for build %s "
+                "and reference-frequency tag INFO/%s."
+                % (target_build, comparison_cols)
+            )
+            assessment = run_qc_assessment(
                 vcf_path=raw_vcf_path,
                 output_directory=outdir,
                 dataset_id=sample_id,
                 genome_build=target_build,
                 external_af_name=comparison_cols,
-                vcf_fields=vcf_config["qc_fields"],
-                output_layout=output_layout,
-                table_delimiter=vcf_config["table_delimiter"],
-                table_null_values=vcf_config["table_null_values"],
-                table_null_output=vcf_config["table_null_output"],
-                temporary_table_suffix=vcf_config["temporary_table_suffix"],
-                io_buffer_bytes=vcf_config["io_buffer_bytes"],
-                policies=policies,
+                configuration=qc_configuration,
                 bcftools_bin=bcftools_bin,
                 logger=logger,
             )

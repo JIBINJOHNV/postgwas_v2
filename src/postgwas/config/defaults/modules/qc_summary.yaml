@@ -1,4 +1,62 @@
 enabled: false
+
+inputs:
+  vcf: null
+  dataset_id: null
+output_directory: null
+
 target_build: GRCh37
-include_plots: true
-include_rejection_reasons: true
+reference_af_column: EUR
+
+rules:
+  minimum_neglog10_p: null
+  missing_pvalue_action: remove
+  maf_min: 0.01
+  missing_af_action: remove
+  info_min: 0.7
+  info_max: 1.05
+  missing_info_action: remove
+  maximum_af_difference: 0.2
+  include_indels: false
+  remove_palindromic: true
+  palindromic_lower: 0.4
+  palindromic_upper: 0.6
+  remove_mhc: true
+  mhc_regions:
+    GRCh37:
+      chromosome: '6'
+      start: 28477797
+      end: 33448354
+    GRCh38:
+      chromosome: '6'
+      start: 28510120
+      end: 33480577
+  sample_size_outlier_standard_deviations: 5.0
+
+vcf_fields:
+  chromosome: '%CHROM'
+  position: '%POS'
+  reference_allele: '%REF'
+  alternate_allele: '%ALT'
+  study_info_af: '%INFO/AF'
+  external_info_af: '%INFO/{external_af}'
+  study_format_af: '[%AF]'
+  imputation_format: '[%SI]'
+  log_pvalue_format: '[%LP]'
+  effective_sample_size_format: '[%NEF]'
+
+table:
+  delimiter: "\t"
+  null_values: ['', '.']
+  null_output: ''
+  temporary_suffix: '.tsv'
+  io_buffer_bytes: 1048576
+
+output_layout:
+  metric_report: 'qc_summary/{dataset_id}_{build}_vcf_qc_metrics.tsv'
+  rule_report: 'qc_summary/{dataset_id}_{build}_vcf_qc_rule_results.tsv'
+  assessment_json: 'qc_summary/{dataset_id}_{build}_qc_assessment.json'
+  temporary_table_prefix: 'qc_summary/.{dataset_id}_{build}_qc_table_'
+  resolved_config_file: 'qc_summary/{dataset_id}_{build}_qc_resolved.yaml'
+  service_log_file: 'qc_summary/{dataset_id}_{build}_qc.log'
+  completion_manifest: 'qc_summary/{dataset_id}_{build}_qc_complete.yaml'

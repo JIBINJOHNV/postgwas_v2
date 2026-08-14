@@ -29,7 +29,7 @@ existing interfaces without asserting they are validated end-to-end.
 | # | Issue | Suggested fix |
 |---|---|---|
 | 6 | `docs/wiki/reference/output-structure.md` never mentions the `NN_<module>` step numbering that `pipeline/runners.py:49-69` actually creates. | Add the numbering to the wiki page (the README now documents it). |
-| 7 | Harmonisation help promises "saving each dataset's screen report", but `_DatasetScreenRouter` and `_screen_report_paths` are never instantiated: `{dataset_id}_screen_report.txt` is never written, the `screen_report` run-summary column is always blank, and `--show-screen` / `--hide-screen` have no effect. | Either wire the router in or drop the flags and the help text. Not documented in the README. |
+| 7 | Resolved: harmonisation now writes each dataset screen report, records its path, and uses the shared `--show-screen` / `--hide-screen` controls. Every analysis command also writes the configured shared screen transcript. | Keep the README and logging documentation aligned with the shared controls. |
 | 8 | `--comparison-af-source` help renders `resource_examples` such as `GRCh37_1000G_freq_chr[1..22,X,Y].vcf.gz`, omitting the `{build}/external_af/vcf_files/` prefix that `resource_layout` actually requires. | Align the examples with `resource_layout`. |
 | 9 | `examples/configs/harmonisation/run_config.yaml` sets `run.dataset_id`, `run.overwrite`, `run.resume`; harmonisation reads only `run.output_directory`. | Trim the example. |
 | 10 | `--fixed-info` is CLI-only — setting `fixed_info.value` in a run-config is a hard error, though the key exists in the config model and packaged defaults. | Documented in the README as a flag only. |
@@ -78,7 +78,7 @@ them.
 - `logging.capture_external_tools`, `logging.include_timestamps`,
   `execution.fail_fast`, `pipeline.fail_fast` have no read sites.
 
-## 4. Scientific and scope points worth an explicit decision
+## 4. Method and scope points worth an explicit decision
 
 - `ld_clump` region-based clumping hardcodes significance at `LP >= 7.3`
   (`ld_prune_region.py:198`) instead of using `--lead-p`, so the two methods in

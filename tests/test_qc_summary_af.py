@@ -6,9 +6,11 @@ import shutil
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from postgwas.config import load_configuration
-from postgwas.modules.harmonisation.policies import PolicyError, default_policies
+from postgwas.config.models.modules.qc_summary import QCSummaryConfig
+from postgwas.core.errors import ConfigurationError
 from postgwas.modules.harmonisation.qc_reporting import (
     harmonisation_qc_summary_lines,
     harmonisation_qc_takeaway_lines,
@@ -18,6 +20,12 @@ from postgwas.modules.qc_summary.assessment import (
     assess_variant_table,
     extract_vcf_assessment_table,
     run_vcf_qc_assessment,
+)
+from postgwas.modules.qc_summary.cli import build_parser
+from postgwas.modules.qc_summary.reporting import qc_summary_lines
+from postgwas.modules.qc_summary.service import (
+    resolve_qc_summary_configuration,
+    run_qc_summary_direct,
 )
 
 
@@ -38,20 +46,31 @@ def _assessment_table(path: Path) -> Path:
     return path
 
 
-def _harmonisation_config():
-    module = load_configuration().modules.harmonisation
-    return module.vcf_processing.model_dump(), dict(module.output_layout.root)
+def _qc_config(**rule_overrides) -> QCSummaryConfig:
+    module = load_configuration().modules.qc_summary
+    if not rule_overrides:
+        return module
+    document = module.model_dump()
+    document["rules"].update(rule_overrides)
+    return QCSummaryConfig.model_validate(document)
+
+
+def _assess(path: Path, configuration: QCSummaryConfig | None = None):
+    configuration = configuration or _qc_config()
+    return assess_variant_table(
+        path,
+        configuration,
+        configuration.target_build.value,
+        configuration.reference_af_column,
+        configuration.vcf_fields.model_dump(),
+        delimiter=configuration.table.delimiter,
+        null_values=configuration.table.null_values,
+    )
 
 
 def test_assessment_applies_every_rule_to_raw_data_and_combines_failures(tmp_path):
-    vcf_config, _ = _harmonisation_config()
-    assessment = assess_variant_table(
+    assessment = _assess(
         _assessment_table(tmp_path / "raw_vcf.tsv"),
-        default_policies(),
-        "EUR",
-        vcf_config["qc_fields"],
-        delimiter=vcf_config["table_delimiter"],
-        null_values=vcf_config["table_null_values"],
     )
 
     assert assessment["raw"]["num_records"] == 8
@@ -87,17 +106,10 @@ def test_assessment_applies_every_rule_to_raw_data_and_combines_failures(tmp_pat
 
 
 def test_sample_size_outliers_are_reported_before_and_after_combined_qc(tmp_path):
-    vcf_config, _ = _harmonisation_config()
-    policies = default_policies().with_overrides({
-        "qc.sample_size_outlier_standard_deviations": 1.5,
-    })
-    assessment = assess_variant_table(
+    configuration = _qc_config(sample_size_outlier_standard_deviations=1.5)
+    assessment = _assess(
         _assessment_table(tmp_path / "raw_vcf.tsv"),
-        policies,
-        "EUR",
-        vcf_config["qc_fields"],
-        delimiter=vcf_config["table_delimiter"],
-        null_values=vcf_config["table_null_values"],
+        configuration,
     )
 
     assert assessment["sample_size_outlier_standard_deviations"] == 1.5
@@ -113,16 +125,7 @@ def test_unusable_sample_sizes_are_reported_but_not_used_in_distribution(tmp_pat
     contents = table.read_text(encoding="utf-8")
     contents = contents.replace("\t100\n", "\t.\n", 1).replace("\t100\n", "\t0\n", 1)
     table.write_text(contents, encoding="utf-8")
-    vcf_config, _ = _harmonisation_config()
-
-    assessment = assess_variant_table(
-        table,
-        default_policies(),
-        "EUR",
-        vcf_config["qc_fields"],
-        delimiter=vcf_config["table_delimiter"],
-        null_values=vcf_config["table_null_values"],
-    )
+    assessment = _assess(table)
 
     assert assessment["raw"]["effective_sample_size_available"] == 6
     assert assessment["raw"]["effective_sample_size_missing_or_invalid"] == 2
@@ -134,16 +137,16 @@ def test_bcftools_extracts_all_qc_fields_in_one_data_query(tmp_path):
         pytest.skip("bcftools is not installed")
     vcf = Path(__file__).parent / "fixtures" / "qc_summary" / "mini_merged.vcf"
     table = tmp_path / "assessment.tsv"
-    vcf_config, _ = _harmonisation_config()
+    configuration = _qc_config()
 
     extract_vcf_assessment_table(
         vcf_path=vcf,
         table_path=table,
         dataset_id="study",
         external_af_name="EUR",
-        vcf_fields=vcf_config["qc_fields"],
-        table_delimiter=vcf_config["table_delimiter"],
-        io_buffer_bytes=vcf_config["io_buffer_bytes"],
+        vcf_fields=configuration.vcf_fields.model_dump(),
+        table_delimiter=configuration.table.delimiter,
+        io_buffer_bytes=configuration.table.io_buffer_bytes,
         bcftools_bin=bcftools,
     )
 
@@ -163,8 +166,8 @@ def test_qc_vcf_query_fields_are_configuration_driven(tmp_path):
     vcf = tmp_path / "study.vcf.gz"
     vcf.write_bytes(b"placeholder")
     table = tmp_path / "assessment.tsv"
-    vcf_config, _ = _harmonisation_config()
-    fields = dict(vcf_config["qc_fields"])
+    configuration = _qc_config()
+    fields = configuration.vcf_fields.model_dump()
     fields.update({
         "study_info_af": "%INFO/STUDY_AF",
         "external_info_af": "%INFO/REF_{external_af}",
@@ -183,8 +186,8 @@ def test_qc_vcf_query_fields_are_configuration_driven(tmp_path):
             dataset_id="study",
             external_af_name="EUR",
             vcf_fields=fields,
-            table_delimiter=vcf_config["table_delimiter"],
-            io_buffer_bytes=vcf_config["io_buffer_bytes"],
+            table_delimiter=configuration.table.delimiter,
+            io_buffer_bytes=configuration.table.io_buffer_bytes,
             bcftools_bin="configured-bcftools",
         )
     columns = extract.call_args.args[3]
@@ -195,34 +198,53 @@ def test_qc_vcf_query_fields_are_configuration_driven(tmp_path):
 
 
 def test_sample_size_outlier_threshold_is_validated_and_defaults_to_five():
-    assert default_policies().get(
-        "qc.sample_size_outlier_standard_deviations"
-    ) == 5.0
-    with pytest.raises(PolicyError, match="qc.sample_size_outlier_standard_deviations"):
-        default_policies().with_overrides({
-            "qc.sample_size_outlier_standard_deviations": 0,
-        })
+    assert _qc_config().rules.sample_size_outlier_standard_deviations == 5.0
+    with pytest.raises(ValidationError, match="sample_size_outlier_standard_deviations"):
+        _qc_config(sample_size_outlier_standard_deviations=0)
 
 
 def test_configuration_rejects_an_invalid_info_interval_before_analysis():
-    with pytest.raises(PolicyError) as error:
-        default_policies().with_overrides({
-            "filter": {"info_cutoff": 0.9, "info_max": 0.8},
+    with pytest.raises(ValidationError, match="info_max"):
+        _qc_config(info_min=0.9, info_max=0.8)
+
+
+def test_mhc_regions_are_build_specific_and_use_grc_coordinates():
+    configuration = _qc_config()
+    grch37 = configuration.mhc_region("GRCh37")
+    grch38 = configuration.mhc_region("GRCh38")
+
+    assert (grch37.chromosome, grch37.start, grch37.end) == (
+        "6", 28477797, 33448354,
+    )
+    assert (grch38.chromosome, grch38.start, grch38.end) == (
+        "6", 28510120, 33480577,
+    )
+
+
+def test_enabled_mhc_assessment_requires_every_configured_genome_build():
+    with pytest.raises(ConfigurationError, match="missing: GRCh38"):
+        load_configuration(cli_overrides={
+            "modules.qc_summary.rules.mhc_regions": {
+                "GRCh37": {
+                    "chromosome": "6",
+                    "start": 28477797,
+                    "end": 33448354,
+                },
+            },
         })
-    assert "filter.info_cutoff" in str(error.value)
-    assert "filter.info_max" in str(error.value)
 
 
 def test_run_writes_reports_but_never_writes_a_filtered_vcf(tmp_path):
     raw_vcf = tmp_path / "study_GRCh37_merged.vcf.gz"
     raw_vcf.write_bytes(b"placeholder")
-    vcf_config, output_layout = _harmonisation_config()
-    output_layout.update({
-        "qc_assessment_summary": "reports/{dataset_id}/{build}/metrics.tsv",
-        "qc_filter_rules": "reports/{dataset_id}/{build}/rules.tsv",
-        "qc_assessment_json": "reports/{dataset_id}/{build}/assessment.json",
-        "qc_assessment_temporary": "reports/{dataset_id}/{build}/.working_",
+    document = _qc_config().model_dump()
+    document["output_layout"].update({
+        "metric_report": "reports/{dataset_id}/{build}/metrics.tsv",
+        "rule_report": "reports/{dataset_id}/{build}/rules.tsv",
+        "assessment_json": "reports/{dataset_id}/{build}/assessment.json",
+        "temporary_table_prefix": "reports/{dataset_id}/{build}/.working_",
     })
+    configuration = QCSummaryConfig.model_validate(document)
 
     def fake_extract(**kwargs):
         _assessment_table(Path(kwargs["table_path"]))
@@ -238,14 +260,7 @@ def test_run_writes_reports_but_never_writes_a_filtered_vcf(tmp_path):
             dataset_id="study",
             genome_build="GRCh37",
             external_af_name="EUR",
-            vcf_fields=vcf_config["qc_fields"],
-            output_layout=output_layout,
-            table_delimiter=vcf_config["table_delimiter"],
-            table_null_values=vcf_config["table_null_values"],
-            table_null_output=vcf_config["table_null_output"],
-            temporary_table_suffix=vcf_config["temporary_table_suffix"],
-            io_buffer_bytes=vcf_config["io_buffer_bytes"],
-            policies=default_policies(),
+            configuration=configuration,
             bcftools_bin="configured-bcftools",
         )
 
@@ -264,14 +279,65 @@ def test_run_writes_reports_but_never_writes_a_filtered_vcf(tmp_path):
     assert "qc_passed\teffective_sample_size_mean\t100.0" in summary
 
 
-def test_screen_report_has_raw_rule_and_combined_final_sections(tmp_path):
-    vcf_config, _ = _harmonisation_config()
-    assessment = assess_variant_table(
-        _assessment_table(tmp_path / "raw.tsv"), default_policies(), "EUR",
-        vcf_config["qc_fields"],
-        delimiter=vcf_config["table_delimiter"],
-        null_values=vcf_config["table_null_values"],
+def test_direct_qc_uses_format_af_without_genotype_derived_metrics(tmp_path):
+    bcftools = shutil.which("bcftools")
+    if bcftools is None:
+        pytest.skip("bcftools is not installed")
+    vcf = Path(__file__).parent / "fixtures" / "qc_summary" / "mini_merged.vcf"
+    args = build_parser().parse_args([
+        "--vcf", str(vcf),
+        "--dataset-id", "study",
+        "--output-directory", str(tmp_path),
+        "--genome-build", "GRCh37",
+        "--bcftools", bcftools,
+        "--hide-screen",
+    ])
+
+    assessment = run_qc_summary_direct(args)
+
+    assert assessment["raw"]["num_records"] == 2
+    assert assessment["raw"]["format_af_missing"] == 0
+    assert "singletons" not in assessment["raw"]
+    report = Path(assessment["reports"]["summary"]).read_text(encoding="utf-8")
+    assert "singleton" not in report.lower()
+    assert "af=0" not in report.lower()
+    assert not Path(str(vcf) + ".stats").exists()
+
+    with patch(
+        "postgwas.modules.qc_summary.service.run_qc_assessment",
+        side_effect=AssertionError("a validated resume must not rescan the VCF"),
+    ):
+        resumed = run_qc_summary_direct(args)
+    assert resumed["raw"]["num_records"] == 2
+
+
+def test_direct_run_config_is_canonical_and_cli_only_overrides_explicit_values(
+    tmp_path,
+):
+    vcf = Path(__file__).parent / "fixtures" / "qc_summary" / "mini_merged.vcf"
+    run_config = tmp_path / "qc.yaml"
+    run_config.write_text(
+        "reference_af_column: AFR\n"
+        "rules:\n"
+        "  maximum_af_difference: 0.15\n",
+        encoding="utf-8",
     )
+    args = build_parser().parse_args([
+        "--run-config", str(run_config),
+        "--vcf", str(vcf),
+        "--dataset-id", "study",
+        "--output-directory", str(tmp_path / "out"),
+    ])
+
+    configuration = resolve_qc_summary_configuration(args)
+
+    assert configuration.modules.qc_summary.reference_af_column == "AFR"
+    assert configuration.modules.qc_summary.rules.maximum_af_difference == 0.15
+    assert configuration.modules.qc_summary.inputs.vcf == vcf
+
+
+def test_screen_report_has_raw_rule_and_combined_final_sections(tmp_path):
+    assessment = _assess(_assessment_table(tmp_path / "raw.tsv"))
     assessment["raw_vcf"] = str(tmp_path / "study_GRCh37_merged.vcf.gz")
     assessment["reports"] = {
         "summary": str(tmp_path / "study_qc_assessment.tsv"),
@@ -343,14 +409,21 @@ def test_screen_report_has_raw_rule_and_combined_final_sections(tmp_path):
     )
 
 
+def test_standalone_screen_report_uses_the_shared_qc_sections(tmp_path):
+    assessment = _assess(_assessment_table(tmp_path / "raw.tsv"))
+    assessment["raw_vcf"] = str(tmp_path / "study_GRCh37_merged.vcf.gz")
+    assessment["reports"] = {}
+
+    output = "\n".join(qc_summary_lines(assessment))
+
+    assert "Before VCF creation" not in output
+    assert "1. Raw merged VCF" in output
+    assert "2. QC conditions assessed on the raw VCF" in output
+    assert "3. Final QC-passed assessment" in output
+
+
 def test_final_takeaways_reuse_existing_counts_and_show_precise_af_percentages(tmp_path):
-    vcf_config, _ = _harmonisation_config()
-    assessment = assess_variant_table(
-        _assessment_table(tmp_path / "raw.tsv"), default_policies(), "EUR",
-        vcf_config["qc_fields"],
-        delimiter=vcf_config["table_delimiter"],
-        null_values=vcf_config["table_null_values"],
-    )
+    assessment = _assess(_assessment_table(tmp_path / "raw.tsv"))
     lines = harmonisation_qc_takeaway_lines(
         {
             "total_variant_infile": 10,

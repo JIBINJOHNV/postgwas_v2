@@ -21,10 +21,12 @@ names differ from the module name — for example `magmacovar` writes
 `NN_magma_covar`, and filtering writes `NN_filter_pre_imp` or
 `NN_filter_post_imp` depending on where it sits relative to imputation.
 
-Within a step, modules use a consistent internal layout: `results/` for
-normalised tables, `raw/` for native external-tool output, `inputs/` for prepared
-tool inputs, `logs/`, and `run_metadata/` for the resolved configuration and any
-completion manifest.
+Within a step, module-owned canonical YAML separates normalised results,
+native external-tool output, prepared inputs, logs, and run metadata. MAGMA
+numbers those classes as `00_run_metadata` through `05_logs` and places each
+mapping under its intermediate and result classes. Other modules retain their
+documented unnumbered class names; always use the resolved configuration rather
+than reconstructing a path from the class name.
 
 ## Output classes
 
@@ -59,4 +61,3 @@ Archive the original input manifest, resolved configuration, primary outputs,
 QC and rejection reports, canonical logs, software/container identity, and a
 resource manifest with checksums. Temporary external-tool files can be omitted
 only after confirming they are not required to audit or reproduce the result.
-

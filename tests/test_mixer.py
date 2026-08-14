@@ -220,8 +220,8 @@ def test_pipeline_mixer_help_hides_only_formatter_created_input():
         assert external_resource in help_text
     description_markers = (
         "Maximum number of tasks",
-        "REQUIRED. Harmonised GWAS-VCF file",
-        "REQUIRED. Short, unique name",
+        "Required: Harmonised GWAS-VCF file",
+        "Required: Short, unique name",
         "YAML file containing settings",
     )
     description_columns = {

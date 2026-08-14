@@ -3,8 +3,12 @@
 
 import argparse
 import sys
+
 from postgwas.cli.compute import get_compute_parser
-from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples
+from postgwas.core.ui import (
+    AlignedRichHelpFormatter,
+    format_cli_examples,
+)
 
 # =========================================================
 # Shared parsers
@@ -15,7 +19,7 @@ from postgwas.cli.common import (
     get_common_out_parser,
     get_common_imputation_parser,
     get_bcftools_binary_parser,
-    get_population_parser,
+    get_imputation_population_parser,
 )
 # NOTE: These modules must exist in your postgwas project
 from postgwas.core.execution.runtime import validate_path
@@ -39,6 +43,7 @@ def get_imputation_direct_inputs_parser(add_help=False):
         "--pred-ld-input-directory",
         dest="pred_ld_input_directory",
         metavar="PATH",
+        required=True,
         type=validate_path(must_exist=True, must_be_dir=True),
         help=(
             "Directory containing per-chromosome formatted summary stats "
@@ -52,7 +57,7 @@ def get_imputation_direct_inputs_parser(add_help=False):
 # MAIN CLI (DIRECT-ONLY, NO PIPELINE)
 # =========================================================
 def build_parser() -> argparse.ArgumentParser:
-    return argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         prog="postgwas imputation",
         usage="postgwas imputation --pred-ld-input-directory PATH [options]",
         description="Impute missing summary statistics with the configured PRED-LD workflow.",
@@ -79,12 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[
             get_compute_parser(),
             get_common_out_parser(),
-            get_population_parser(),
+            get_imputation_population_parser(),
             get_common_imputation_parser(),
             get_imputation_direct_inputs_parser(),
             get_bcftools_binary_parser(),
         ],
     )
+    return parser
 
 
 def main():
@@ -97,23 +103,6 @@ def main():
 
     # Parse arguments
     args = parser.parse_args()
-
-    # -----------------------------------------------------
-    # Validate required inputs
-    # -----------------------------------------------------
-    missing = []
-
-    # Check for the required 'predld_input_dir'
-    if (
-        not hasattr(args, "pred_ld_input_directory")
-        or args.pred_ld_input_directory is None
-    ):
-        missing.append("--pred-ld-input-directory")
-
-    if missing:
-        print("\n❗ Missing required arguments: " + ", ".join(missing) + "\n")
-        parser.print_help()
-        sys.exit(1)
 
     # -----------------------------------------------------
     # Run the DIRECT workflow

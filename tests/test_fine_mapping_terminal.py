@@ -49,14 +49,18 @@ def test_fine_mapping_screen_is_concise_and_decision_focused(tmp_path):
     )
 
     text = stream.getvalue()
+    normalized_text = " ".join(text.split())
     for stage in range(1, 9):
         assert f"Completed {stage}/8" in text
     assert "All 8 stages completed" in text
     assert "Fine-mapping completed" in text
     assert "Primary loci successful" in text
     assert "Final credible sets" in text
-    assert "nef relative range exceeds threshold; ld z mismatch warning" in text
-    assert "finemap timeout (1 locus)" in text
+    assert (
+        "nef relative range exceeds threshold; ld z mismatch warning"
+        in normalized_text
+    )
+    assert "finemap timeout (1 locus)" in normalized_text
     assert "final.tsv" in text
     assert "pipeline_summary.log" in text
     assert "Full detailed log" in text
@@ -108,7 +112,7 @@ def test_pipeline_runners_do_not_print_raw_fine_mapping_objects(
 
     monkeypatch.setattr(
         "postgwas.modules.ld_clumping.service.run_ld_clump_direct",
-        lambda _args: ld_result,
+        lambda _args, **_kwargs: ld_result,
     )
     assert runners.run_ld_clump_runner(args, context) == ld_result
 

@@ -12,12 +12,10 @@ from postgwas.cli.common import (
     get_magma_binary_parser,
 )
 from postgwas.cli.compute import get_compute_parser
-from postgwas.config import load_configuration
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_examples,
-    help_with_default,
 )
 from postgwas.modules.magmacovar.errors import MagmaCovarError
 
@@ -31,15 +29,13 @@ def get_magma_covar_gene_results_parser(add_help=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=(
-            "MAGMA .genes.raw file produced by a completed gene-association run. "
-            "Pipeline mode supplies this automatically."
+            "MAGMA .genes.raw file produced by a completed gene-association run."
         ),
     )
     return parser
 
 
 def _get_direct_controls_parser() -> argparse.ArgumentParser:
-    defaults = load_configuration()
     parser = argparse.ArgumentParser(add_help=False)
     group = parser.add_argument_group("Configuration and continuation")
     group.add_argument(
@@ -47,25 +43,6 @@ def _get_direct_controls_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=argparse.SUPPRESS,
         help="YAML settings; explicit command-line values override matching keys.",
-    )
-    group.add_argument(
-        "--resume",
-        action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Reuse a completed MAGMAcovar result only after input, configuration, "
-            "and output fingerprints match",
-            defaults.run.resume,
-        ),
-    )
-    group.add_argument(
-        "--overwrite",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Replace output owned by this configured MAGMAcovar prefix",
-            defaults.run.overwrite,
-        ),
     )
     return parser
 

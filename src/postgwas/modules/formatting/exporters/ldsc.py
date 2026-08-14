@@ -5,13 +5,13 @@ from postgwas.core.io.tables import write_dataframe_table
 from postgwas.core.paths import configured_output_path
 
 from postgwas.modules.formatting.table import (
+    FormattingError,
     complete_rows,
     count_bounded_negative_log10_values,
     infer_study_design,
     mapped_table,
     transformation_source,
     validation_expression,
-    FormattingError,
 )
 
 
@@ -43,19 +43,58 @@ def export_ldsc(
     )
 
     sample_prevalence = None
+    sample_prevalence_aggregation = None
+    sample_prevalence_variants = 0
+    sample_prevalence_minimum = None
+    sample_prevalence_maximum = None
+    sample_prevalence_case_count_minimum = None
+    sample_prevalence_case_count_maximum = None
+    sample_prevalence_control_count_minimum = None
+    sample_prevalence_control_count_maximum = None
     if case_control:
         case_column = config.study_design.case_count_column
         control_column = config.study_design.control_count_column
-        sizes = usable.select(
-            pl.col(case_column).filter(pl.col(case_column) > 0).median().alias("cases"),
-            pl.col(control_column)
-            .filter(pl.col(control_column) > 0)
-            .median()
-            .alias("controls"),
+        prevalence = (
+            pl.col(case_column)
+            / (pl.col(case_column) + pl.col(control_column))
+        )
+        sample_prevalence_aggregation = (
+            config.ldsc_sample_prevalence.aggregation
+        )
+        if sample_prevalence_aggregation == "median":
+            aggregate = prevalence.median()
+        elif sample_prevalence_aggregation == "mean":
+            aggregate = prevalence.mean()
+        else:  # Retain an actionable boundary error if validation is bypassed.
+            raise FormattingError(
+                "Unsupported LDSC sample-prevalence aggregation: %s"
+                % sample_prevalence_aggregation
+            )
+        summary = usable.select(
+            aggregate.alias("value"),
+            prevalence.min().alias("minimum"),
+            prevalence.max().alias("maximum"),
+            pl.col(case_column).min().alias("case_count_minimum"),
+            pl.col(case_column).max().alias("case_count_maximum"),
+            pl.col(control_column).min().alias("control_count_minimum"),
+            pl.col(control_column).max().alias("control_count_maximum"),
         ).to_dicts()[0]
-        cases, controls = sizes["cases"], sizes["controls"]
-        if cases and controls:
-            sample_prevalence = float(cases / (cases + controls))
+        sample_prevalence = float(summary["value"])
+        sample_prevalence_variants = usable.height
+        sample_prevalence_minimum = float(summary["minimum"])
+        sample_prevalence_maximum = float(summary["maximum"])
+        sample_prevalence_case_count_minimum = float(
+            summary["case_count_minimum"]
+        )
+        sample_prevalence_case_count_maximum = float(
+            summary["case_count_maximum"]
+        )
+        sample_prevalence_control_count_minimum = float(
+            summary["control_count_minimum"]
+        )
+        sample_prevalence_control_count_maximum = float(
+            summary["control_count_maximum"]
+        )
 
     mapping = dict(schema.columns)
     mapping.update(schema.trait_columns[design.trait_type])
@@ -79,6 +118,22 @@ def export_ldsc(
     return {
         "ldsc_file": path,
         "sample_prev": sample_prevalence,
+        "sample_prevalence_aggregation": sample_prevalence_aggregation,
+        "sample_prevalence_variants": sample_prevalence_variants,
+        "sample_prevalence_minimum": sample_prevalence_minimum,
+        "sample_prevalence_maximum": sample_prevalence_maximum,
+        "sample_prevalence_case_count_minimum": (
+            sample_prevalence_case_count_minimum
+        ),
+        "sample_prevalence_case_count_maximum": (
+            sample_prevalence_case_count_maximum
+        ),
+        "sample_prevalence_control_count_minimum": (
+            sample_prevalence_control_count_minimum
+        ),
+        "sample_prevalence_control_count_maximum": (
+            sample_prevalence_control_count_maximum
+        ),
         "trait_type": design.trait_type,
         "sample_size_mode": sample_size_mode,
         "columns": output.columns,

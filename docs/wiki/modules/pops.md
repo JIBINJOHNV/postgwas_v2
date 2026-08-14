@@ -21,12 +21,31 @@ available and gene identifiers and genome context match across all resources.
 
 ## Input requirements
 
-The MAGMA results, PoPS gene annotation, and feature matrices must describe the
-same gene identifiers and genome build. PostGWAS requires the build to be
+The MAGMA results, PoPS gene annotation, and feature matrices must use compatible
+gene identifiers and the same genome build. PostGWAS requires the build to be
 declared explicitly because these files do not carry enough metadata to infer it
 safely. The service validates gene overlap, duplicate identifiers, finite scores,
 feature-chunk dimensions, feature-name uniqueness, chromosome selections, and
 optional target covariance before starting PoPS.
+
+For MAGMA targets, preflight also requires `.genes.out` and `.genes.raw` to
+contain the same unique genes in the same order, because the raw file supplies
+gene covariates and covariance metadata in that order. Every feature-row gene
+must occur in the PoPS annotation because it can receive a prediction, and every
+target-scored gene must occur in both the annotation and feature rows. Extra
+annotation genes are harmless and are allowed. Incompatibility is a hard failure
+reported with counts, example identifiers, and source paths under the default
+`strict` policy; PostGWAS never silently intersects or discards target genes.
+Shared MAGMA and annotation genes must also have identical chromosome labels;
+intersection cannot safely repair a chromosome disagreement.
+
+For MAGMA inputs only, `--gene-universe-policy intersect` explicitly restricts
+the target universe to genes present in both the PoPS annotation and feature
+rows. This is an opt-in scientific transformation. Original MAGMA files remain
+unchanged. PostGWAS reconstructs covariance-preserving principal submatrices and
+publishes separate compatible and excluded `.genes.out`/`.genes.raw` pairs, a
+gene-level audit table, and a structured compatibility report. Custom target
+files must be aligned by the user and do not support this policy.
 
 PoPS scores rank genes by learned feature similarity to genome-wide association
 patterns. They are not calibrated probabilities that a gene is causal.
@@ -110,6 +129,22 @@ postgwas pops \
   --output-directory results
 ```
 
+### Optional MAGMA gene-universe intersection
+
+Use this only after reviewing why the MAGMA and PoPS gene releases differ:
+
+```console
+postgwas pops \
+  --magma-association-prefix magma/STUDY \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 116 \
+  --pops-gene-location-file reference/pops/gene_annot.tsv \
+  --gene-universe-policy intersect \
+  --genome-build GRCh37 \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
 ## Parameters
 
 Export the canonical YAML and edit it for reusable runs:
@@ -143,6 +178,18 @@ files are `.preds`, `.coefs`, `.marginals`, and `.log`. Optional `.traindata` an
 writes a structured service log, resolved configuration, and completion manifest.
 The prediction table contains `ENSGID` and `PoPS_Score`.
 
+With `gene_universe_policy: intersect`, six additional owned outputs are
+published:
+
+- `.compatible.genes.out` and `.compatible.genes.raw`: the aligned MAGMA pair
+  used by PoPS;
+- `.excluded.genes.out` and `.excluded.genes.raw`: excluded genes and their
+  covariance-preserving principal submatrix;
+- `.gene_compatibility.tsv`: one decision row per original MAGMA gene;
+- `.gene_compatibility.yaml`: total and per-chromosome counts, percentages,
+  exclusion reasons, input/output paths, covariance handling, and the scientific
+  effect of filtering.
+
 NumPy `.npy` and SciPy sparse `.npz` custom covariance inputs are validated.
 NumPy covariance is converted in the staging directory to the sparse container
 expected by upstream PoPS; scientific values and ordering are unchanged.
@@ -151,7 +198,9 @@ expected by upstream PoPS; scientific values and ordering are unchanged.
 
 Review the declared genome build, shared-gene counts, feature chunk dimensions,
 feature count, chromosome/HLA policies, method and seed, upstream log, structured
-service log, resolved configuration, and completion manifest.
+service log, resolved configuration, and completion manifest. For intersection
+runs, also review retained/excluded counts and percentages, missing-resource
+categories, every gene-level decision, and per-chromosome statistics.
 
 ## Interpretation
 

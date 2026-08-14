@@ -58,11 +58,12 @@ postgwas manhattan \
 
 ## Parameters
 
-The direct CLI defaults to 22 autosomes, minimum AF 0, minimum LP 2, log-log
-switch at LP 10, cytoband ratio 25, chromosome spacing 20, width 7 inches, and
-font size 12; height and maximum plot height are optional. When no phenotype is
-given, the first VCF sample is used; if detection fails, PostGWAS passes
-`unknown_sample`. When neither image option is given, it writes
+The canonical `modules.manhattan` YAML supplies 22 autosomes, minimum AF 0,
+minimum LP 2, log-log switch at LP 10, cytoband ratio 25, chromosome spacing
+20, width 7 inches, and font size 12; height and maximum plot height are unset.
+CLI options override those values. When no phenotype is given, the first VCF
+sample is used; if detection fails, PostGWAS passes `unknown_sample`. When
+neither image option is given, it writes
 `<output>/<dataset>_manhattanplots.pdf`.
 
 ## Processing steps
@@ -93,8 +94,8 @@ build mismatch, or writing to an unwritable image directory.
 
 ## Limitations
 
-The standalone command does not load the packaged Manhattan YAML. If both
-`--png` and `--pdf` are supplied, PNG wins; choose only one image format.
+If both `--png` and `--pdf` are supplied, PNG wins; choose only one image
+format.
 
 ## Scientific references
 

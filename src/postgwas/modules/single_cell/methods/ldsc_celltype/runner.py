@@ -10,8 +10,9 @@ import re
 from typing import Any, Mapping
 
 from postgwas.core.completion import (
+    apply_completion_restart,
     configuration_digest,
-    validate_completion_manifest,
+    resolve_completion_resume,
     write_completion_manifest,
 )
 from postgwas.core.io.reports import write_yaml_report
@@ -449,7 +450,7 @@ def run_ldsc_celltype(
         and not configuration.run.overwrite
         and manifest_path.is_file()
     ):
-        manifest = validate_completion_manifest(
+        decision = resolve_completion_resume(
             manifest_path,
             dataset_id=dataset,
             module="single_cell.ldsc_celltype",
@@ -457,13 +458,33 @@ def run_ldsc_celltype(
             configuration_sha256=digest,
             inputs=completion_inputs,
             outputs=outputs,
+            resume_policy=configuration.run.resume_policy,
             error_type=SingleCellError,
         )
-        return LdscCelltypeExecution(
-            outputs=outputs,
-            metrics=dict(manifest.get("metrics", {})),
-            resumed=True,
+        if decision.action == "resume":
+            return LdscCelltypeExecution(
+                outputs=outputs,
+                metrics=dict(decision.manifest.get("metrics", {})),
+                resumed=True,
+            )
+        apply_completion_restart(
+            decision,
+            output_root=output,
+            manifest=manifest_path,
+            logger=logger,
+            operation="ldsc_celltype_resume",
+            error_type=SingleCellError,
         )
+        if engine.is_dir() and not any(
+            path.is_file() or path.is_symlink()
+            for path in engine.rglob("*")
+        ):
+            remove_owned_directory(
+                engine,
+                output,
+                "empty stale LDSC cell-type engine directory",
+                error_type=SingleCellError,
+            )
     if (
         engine.exists()
         or outputs["normalized_results"].exists()
@@ -535,6 +556,9 @@ def run_ldsc_celltype(
                 merge_alleles=preflight.merge_alleles_file,
                 minimum_info=ldsc_config.minimum_info,
                 minimum_maf=ldsc_config.minimum_maf,
+                minimum_n=ldsc_config.minimum_n,
+                chunksize=ldsc_config.chunksize,
+                keep_maf=ldsc_config.keep_maf,
             ),
             "Munge formatter output for LDSC cell-type analysis",
             logger=logger,

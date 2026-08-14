@@ -1,9 +1,24 @@
+import argparse
+import errno
 import subprocess
 import stat
 import sys
 from pathlib import Path
 
+import pytest
+import polars as pl
 import yaml
+
+from postgwas.config import load_configuration
+from postgwas.core.resource_preparation import ResourcePreparationError
+from postgwas.modules.gcta_gene import pathway_sets
+from postgwas.modules.gcta_gene.pathway_sets import (
+    ChromosomeMappingTask,
+    GeneInterval,
+    _map_bim_variants,
+    _mapping_worker_plan,
+    prepare_resource,
+)
 
 
 SCRIPT = (
@@ -57,6 +72,66 @@ def _gmt_command(gmt: Path, genes: Path, bim: Path, output: Path) -> list[str]:
         "--unmapped-gene-policy", "report",
         "--empty-pathway-policy", "omit",
     ]
+
+
+def _prepare_pathway_resource(
+    gmt: Path,
+    genes: Path,
+    bim: Path,
+    output: Path,
+    *,
+    audit_level: str = "normalized",
+    analyzable_variant_ids: set[str] | None = None,
+    analysis_variant_source: Path | None = None,
+    maximum_set_variants: int | None = None,
+    minimum_free_disk_gb: float = 0,
+):
+    configuration = load_configuration()
+    set_annotation = configuration.modules.gcta_gene.set_annotation
+    conversion = set_annotation.conversion
+    names = conversion.output_names
+    return prepare_resource(
+        argparse.Namespace(
+            gmt=gmt,
+            gene_list=genes,
+            bim=bim,
+            output_directory=output,
+            output_name="pathways.set",
+            resource_name="Test fastBAT pathways",
+            genome_build="GRCh37",
+            gene_window_kb=0,
+            allowed_chromosomes=["1", "X"],
+            chromosome_label_policy="exact",
+            duplicate_gene_policy="deduplicate",
+            unmapped_gene_policy="report",
+            empty_pathway_policy="omit",
+            pathway_mapping_name=names.pathway_mapping,
+            pathway_gene_mapping_name=names.pathway_gene_mapping,
+            gene_variant_mapping_name=names.gene_variant_mapping,
+            expanded_mapping_name=names.expanded_mapping,
+            unmapped_genes_name=names.unmapped_genes,
+            manifest_name=names.manifest,
+            readme_name=names.readme,
+            checksums_name=names.checksums,
+        ),
+        mapping_workers=1,
+        mapping_memory_gb=1,
+        worker_memory_multiplier=conversion.parallelism.worker_memory_multiplier,
+        analyzable_variant_ids=analyzable_variant_ids,
+        analysis_variant_source=analysis_variant_source,
+        maximum_set_variants=(
+            maximum_set_variants
+            if maximum_set_variants is not None
+            else set_annotation.maximum_set_variants
+        ),
+        oversized_set_policy=set_annotation.oversized_set_policy,
+        audit_level=audit_level,
+        audit_format=conversion.audit.format,
+        audit_compression=conversion.audit.compression,
+        audit_batch_rows=2,
+        minimum_free_disk_gb=minimum_free_disk_gb,
+        disk_estimation_safety_factor=1,
+    )
 
 
 def test_resource_script_writes_exact_headerless_projection_and_provenance(tmp_path):
@@ -174,10 +249,15 @@ def test_gmt_converter_copies_exact_bim_ids_and_reports_mapping(tmp_path):
         "PATH_A\nrs1\n1:190:A:G\ncustom_id\nEND\n\n"
         "PATH_B\n1:190:A:G\ncustom_id\nEND\n\n"
     )
-    mapping = (output / "gene_variant_mapping.tsv").read_text(encoding="utf-8")
-    assert "PATH_A\tGENE1\t1:190:A:G" in mapping
-    assert "PATH_A\tGENE2\t1:190:A:G" in mapping
-    assert "PATH_B\tGENE2\tcustom_id" in mapping
+    pathway_gene = pl.read_parquet(output / "pathway_gene_mapping.parquet")
+    gene_variant = pl.read_parquet(output / "gene_variant_mapping.parquet")
+    assert ("PATH_A", "GENE1") in set(pathway_gene.iter_rows())
+    assert ("PATH_A", "GENE2") in set(pathway_gene.iter_rows())
+    assert ("PATH_B", "GENE2") in set(pathway_gene.iter_rows())
+    assert ("GENE1", "1:190:A:G") in set(gene_variant.iter_rows())
+    assert ("GENE2", "1:190:A:G") in set(gene_variant.iter_rows())
+    assert ("GENE2", "custom_id") in set(gene_variant.iter_rows())
+    assert not (output / "pathway_gene_variant_mapping.parquet").exists()
     assert "PATH_EMPTY\tMISSING" in (
         output / "unmapped_genes.tsv"
     ).read_text(encoding="utf-8")
@@ -193,6 +273,349 @@ def test_gmt_converter_copies_exact_bim_ids_and_reports_mapping(tmp_path):
     assert manifest["validation"][
         "overlapping_gene_variant_memberships_collapsed"
     ] == 1
+    assert manifest["generation"]["mapping_algorithm"] == (
+        "chromosome_bisect_compact_variant_index_cache"
+    )
+    assert manifest["policies"]["audit"]["level"] == "normalized"
+    assert manifest["policies"]["maximum_set_variants_applied"] is False
+    assert manifest["validation"]["expanded_audit_rows"] == 0
+    assert manifest["disk_preflight"]["passed"] is True
+
+
+def test_analyzable_intersection_precedes_pathway_size_validation(tmp_path):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text("PATH_A\tdescription\tGENE1\n", encoding="utf-8")
+    genes = tmp_path / "genes.txt"
+    genes.write_text("1\t100\t200\tGENE1\n", encoding="utf-8")
+    bim = tmp_path / "reference.bim"
+    bim.write_text(
+        "1\tused\t0\t150\tA\tG\n"
+        "1\treference_only\t0\t160\tC\tT\n",
+        encoding="utf-8",
+    )
+    analysis_source = tmp_path / "input.ma"
+    analysis_source.write_text("used\n", encoding="utf-8")
+    output = tmp_path / "sets"
+
+    manifest = _prepare_pathway_resource(
+        gmt,
+        genes,
+        bim,
+        output,
+        analyzable_variant_ids={"used"},
+        analysis_variant_source=analysis_source,
+        maximum_set_variants=1,
+    )
+
+    assert (output / "pathways.set").read_text(encoding="utf-8").split() == [
+        "PATH_A", "used", "END",
+    ]
+    assert manifest["validation"]["pathways_omitted_oversized"] == 0
+    assert manifest["validation"]["analyzable_bim_variants_cached"] == 1
+    assert manifest["policies"]["variant_universe"] == "gwas_bim_intersection"
+    assert manifest["policies"]["maximum_set_variants_applied"] is True
+
+
+def test_standalone_reference_resource_defers_gwas_specific_set_limit(tmp_path):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text("PATH_A\tdescription\tGENE1\n", encoding="utf-8")
+    genes = tmp_path / "genes.txt"
+    genes.write_text("1\t100\t200\tGENE1\n", encoding="utf-8")
+    bim = tmp_path / "reference.bim"
+    bim.write_text(
+        "1\trs1\t0\t150\tA\tG\n1\trs2\t0\t160\tC\tT\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "sets"
+
+    manifest = _prepare_pathway_resource(
+        gmt, genes, bim, output, maximum_set_variants=1,
+    )
+
+    assert (output / "pathways.set").read_text(encoding="utf-8").split() == [
+        "PATH_A", "rs1", "rs2", "END",
+    ]
+    assert manifest["validation"]["pathways_omitted_oversized"] == 0
+    assert manifest["policies"]["variant_universe"] == "plink_bim_reference"
+    assert manifest["policies"]["maximum_set_variants_applied"] is False
+
+
+def test_summary_audit_omits_relationship_tables(tmp_path):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text("PATH_A\tdescription\tGENE1\n", encoding="utf-8")
+    genes = tmp_path / "genes.txt"
+    genes.write_text("1\t100\t200\tGENE1\n", encoding="utf-8")
+    bim = tmp_path / "reference.bim"
+    bim.write_text("1\trs1\t0\t150\tA\tG\n", encoding="utf-8")
+    output = tmp_path / "sets"
+
+    manifest = _prepare_pathway_resource(
+        gmt, genes, bim, output, audit_level="summary",
+    )
+
+    assert manifest["outputs"]["pathway_gene_mapping"] is None
+    assert manifest["outputs"]["gene_variant_mapping"] is None
+    assert manifest["outputs"]["expanded_mapping"] is None
+    assert not list(output.glob("*.parquet"))
+
+
+def test_expanded_audit_is_explicit_bounded_parquet_output(tmp_path):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text(
+        "PATH_A\tdescription\tGENE1\tGENE2\n",
+        encoding="utf-8",
+    )
+    genes = tmp_path / "genes.txt"
+    genes.write_text(
+        "1\t100\t200\tGENE1\n1\t150\t250\tGENE2\n",
+        encoding="utf-8",
+    )
+    bim = tmp_path / "reference.bim"
+    bim.write_text(
+        "1\trs1\t0\t175\tA\tG\n1\trs2\t0\t225\tC\tT\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "sets"
+
+    manifest = _prepare_pathway_resource(
+        gmt, genes, bim, output, audit_level="expanded",
+    )
+
+    expanded = pl.read_parquet(output / "pathway_gene_variant_mapping.parquet")
+    assert set(expanded.iter_rows()) == {
+        ("PATH_A", "GENE1", "rs1"),
+        ("PATH_A", "GENE2", "rs1"),
+        ("PATH_A", "GENE2", "rs2"),
+    }
+    assert manifest["validation"]["expanded_audit_rows"] == 3
+    assert (output / "pathway_gene_mapping.parquet").is_file()
+    assert (output / "gene_variant_mapping.parquet").is_file()
+
+
+def test_disk_preflight_fails_before_output_writing(tmp_path, monkeypatch):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text("PATH_A\tdescription\tGENE1\n", encoding="utf-8")
+    genes = tmp_path / "genes.txt"
+    genes.write_text("1\t100\t200\tGENE1\n", encoding="utf-8")
+    bim = tmp_path / "reference.bim"
+    bim.write_text("1\trs1\t0\t150\tA\tG\n", encoding="utf-8")
+    output = tmp_path / "sets"
+    monkeypatch.setattr(
+        pathway_sets.shutil,
+        "disk_usage",
+        lambda _path: argparse.Namespace(total=1, used=0, free=1),
+    )
+
+    with pytest.raises(ResourcePreparationError, match="insufficient disk space"):
+        _prepare_pathway_resource(gmt, genes, bim, output)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".sets.*"))
+
+
+def test_disk_full_error_reports_failed_file_and_safe_restart(tmp_path, monkeypatch):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text("PATH_A\tdescription\tGENE1\n", encoding="utf-8")
+    genes = tmp_path / "genes.txt"
+    genes.write_text("1\t100\t200\tGENE1\n", encoding="utf-8")
+    bim = tmp_path / "reference.bim"
+    bim.write_text("1\trs1\t0\t150\tA\tG\n", encoding="utf-8")
+    output = tmp_path / "sets"
+
+    def disk_full(_self, *_values):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(pathway_sets._ParquetRowWriter, "append", disk_full)
+
+    with pytest.raises(ResourcePreparationError) as error:
+        _prepare_pathway_resource(gmt, genes, bim, output)
+
+    message = str(error.value)
+    assert "failed output=" in message
+    assert "bytes written=" in message
+    assert "audit level=normalized" in message
+    assert "restart from the safe preparation boundary" in message
+    assert not output.exists()
+    assert not list(tmp_path.glob(".sets.*"))
+
+
+def test_gmt_converter_uses_bounded_parallel_chromosome_caches(
+    tmp_path, monkeypatch,
+):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text(
+        "PATH_A\tdescription\tGENE1\tGENEX\n", encoding="utf-8",
+    )
+    genes = tmp_path / "genes.txt"
+    genes.write_text(
+        "1\t100\t200\tGENE1\nX\t10\t20\tGENEX\n", encoding="utf-8",
+    )
+    bim = tmp_path / "reference.bim"
+    bim.write_text(
+        "1\trs1\t0\t150\tA\tG\nX\trsX\t0\t15\tA\tC\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "sets"
+    names = (
+        load_configuration()
+        .modules.gcta_gene.set_annotation.conversion.output_names
+        .model_dump(mode="python")
+    )
+    defaults = load_configuration()
+    set_annotation = defaults.modules.gcta_gene.set_annotation
+    conversion = set_annotation.conversion
+
+    class SynchronousExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def map(function, tasks):
+            return map(function, tasks)
+
+    monkeypatch.setattr(pathway_sets, "ProcessPoolExecutor", SynchronousExecutor)
+    manifest = prepare_resource(
+        argparse.Namespace(
+            gmt=gmt,
+            gene_list=genes,
+            bim=bim,
+            output_directory=output,
+            output_name="pathways.set",
+            resource_name="Test fastBAT pathways",
+            genome_build="GRCh37",
+            gene_window_kb=0,
+            allowed_chromosomes=["1", "X"],
+            chromosome_label_policy="exact",
+            duplicate_gene_policy="deduplicate",
+            unmapped_gene_policy="report",
+            empty_pathway_policy="omit",
+            pathway_mapping_name=names["pathway_mapping"],
+            pathway_gene_mapping_name=names["pathway_gene_mapping"],
+            gene_variant_mapping_name=names["gene_variant_mapping"],
+            expanded_mapping_name=names["expanded_mapping"],
+            unmapped_genes_name=names["unmapped_genes"],
+            manifest_name=names["manifest"],
+            readme_name=names["readme"],
+            checksums_name=names["checksums"],
+        ),
+        mapping_workers=2,
+        mapping_memory_gb=1,
+        worker_memory_multiplier=8,
+        maximum_set_variants=set_annotation.maximum_set_variants,
+        oversized_set_policy=set_annotation.oversized_set_policy,
+        audit_level=conversion.audit.level,
+        audit_format=conversion.audit.format,
+        audit_compression=conversion.audit.compression,
+        audit_batch_rows=conversion.audit.batch_rows,
+        minimum_free_disk_gb=0,
+        disk_estimation_safety_factor=1,
+    )
+
+    assert (output / "pathways.set").read_text(encoding="utf-8") == (
+        "PATH_A\nrs1\nrsX\nEND\n\n"
+    )
+    assert manifest["generation"]["requested_mapping_workers"] == 2
+    assert manifest["generation"]["mapping_workers"] == 2
+
+
+def test_mapping_worker_plan_respects_thread_and_memory_limits(tmp_path):
+    tasks = []
+    for chromosome in ("1", "2", "3"):
+        cache = tmp_path / (chromosome + ".cache")
+        cache.write_bytes(b"x" * 1024)
+        tasks.append(ChromosomeMappingTask(
+            chromosome=chromosome,
+            bim_cache=cache,
+            intervals=(),
+            result_cache=tmp_path / (chromosome + ".result"),
+        ))
+    two_worker_memory_gb = (2 * 1024 * 8) / float(1024**3)
+
+    workers, metrics = _mapping_worker_plan(
+        tasks,
+        requested_workers=3,
+        memory_gb=two_worker_memory_gb,
+        worker_memory_multiplier=8,
+    )
+
+    assert workers == 2
+    assert metrics["requested_mapping_workers"] == 3
+    assert metrics["mapping_workers"] == 2
+    assert metrics["estimated_worker_memory_bytes"] == 8192
+
+
+def test_mapping_worker_plan_rejects_insufficient_memory(tmp_path):
+    cache = tmp_path / "1.cache"
+    cache.write_bytes(b"x" * 1024)
+    task = ChromosomeMappingTask(
+        chromosome="1",
+        bim_cache=cache,
+        intervals=(),
+        result_cache=tmp_path / "1.result",
+    )
+
+    with pytest.raises(
+        ResourcePreparationError,
+        match="configured mapping memory is insufficient",
+    ):
+        _mapping_worker_plan(
+            [task],
+            requested_workers=1,
+            memory_gb=1024 / float(1024**3),
+            worker_memory_multiplier=8,
+        )
+
+
+def test_parallel_mapping_reports_worker_failure(tmp_path, monkeypatch):
+    bim = tmp_path / "reference.bim"
+    bim.write_text(
+        "1\trs1\t0\t100\tA\tG\n2\trs2\t0\t100\tC\tT\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "mapping"
+    workspace.mkdir()
+
+    class FailingExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def map(_function, _tasks):
+            raise RuntimeError("worker crashed")
+
+    monkeypatch.setattr(pathway_sets, "ProcessPoolExecutor", FailingExecutor)
+
+    with pytest.raises(
+        ResourcePreparationError,
+        match=r"BIM chromosome mapping failed with 2 worker\(s\): worker crashed",
+    ):
+        _map_bim_variants(
+            bim,
+            {
+                "1": [GeneInterval("1", 50, 150, "GENE1")],
+                "2": [GeneInterval("2", 50, 150, "GENE2")],
+            },
+            {"1", "2"},
+            "exact",
+            workspace,
+            expected_variant_total=2,
+            requested_workers=2,
+            memory_gb=1,
+            worker_memory_multiplier=8,
+            bim_ids_prevalidated=False,
+        )
 
 
 def test_gmt_converter_rejects_duplicate_bim_ids_without_published_output(tmp_path):

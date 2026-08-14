@@ -1,6 +1,7 @@
 enabled: false
 genome_build: null
 minimum_gene_count: 10
+gene_universe_policy: strict
 magma_association_prefix: null
 feature_matrix_prefix: null
 feature_matrix_chunks: 2
@@ -58,3 +59,9 @@ output_layout:
   upstream_log_suffix: .log
   training_data_suffix: .traindata
   matrix_data_suffix: .matdata
+  compatible_genes_out_suffix: .compatible.genes.out
+  compatible_genes_raw_suffix: .compatible.genes.raw
+  excluded_genes_out_suffix: .excluded.genes.out
+  excluded_genes_raw_suffix: .excluded.genes.raw
+  gene_compatibility_table_suffix: .gene_compatibility.tsv
+  gene_compatibility_report_suffix: .gene_compatibility.yaml

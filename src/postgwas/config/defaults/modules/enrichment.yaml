@@ -4,3 +4,4 @@ organism: hsapiens
 significance_threshold: 0.05
 correction_method: fdr
 minimum_genes: 2
+reference_set: genome_protein-coding

@@ -1,8 +1,13 @@
 # Reference Resources
 
-PostGWAS does not ship a universal scientific resource bundle. Analyses require
-method-specific references, and compatibility is part of the analysis—not an
-installation detail.
+**All reference and resource files must be downloaded.** PostGWAS ships none of
+them. Analyses require method-specific references, and compatibility is part of
+the analysis—not an installation detail.
+
+**Download link:** _to be added._
+
+See [Resource Setup](../getting-started/resource-setup.md) for the directory
+structure to create in the meantime.
 
 ## Record for every resource
 

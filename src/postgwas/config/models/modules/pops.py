@@ -18,6 +18,7 @@ from postgwas.config.models.common import (
 
 
 PopsMethod = Literal["ridge", "lasso", "linreg"]
+PopsGeneUniversePolicy = Literal["strict", "intersect"]
 
 
 def _optional_nonempty(value: str | None) -> str | None:
@@ -110,6 +111,12 @@ class PopsOutputLayout(StrictModel):
     upstream_log_suffix: str
     training_data_suffix: str
     matrix_data_suffix: str
+    compatible_genes_out_suffix: str
+    compatible_genes_raw_suffix: str
+    excluded_genes_out_suffix: str
+    excluded_genes_raw_suffix: str
+    gene_compatibility_table_suffix: str
+    gene_compatibility_report_suffix: str
 
     @field_validator("output_prefix", "staging_directory", "service_log_file")
     @classmethod
@@ -130,6 +137,9 @@ class PopsOutputLayout(StrictModel):
     @field_validator(
         "predictions_suffix", "coefficients_suffix", "marginals_suffix",
         "upstream_log_suffix", "training_data_suffix", "matrix_data_suffix",
+        "compatible_genes_out_suffix", "compatible_genes_raw_suffix",
+        "excluded_genes_out_suffix", "excluded_genes_raw_suffix",
+        "gene_compatibility_table_suffix", "gene_compatibility_report_suffix",
     )
     @classmethod
     def safe_output_suffix(cls, value: str) -> str:
@@ -143,6 +153,10 @@ class PopsOutputLayout(StrictModel):
             self.predictions_suffix, self.coefficients_suffix,
             self.marginals_suffix, self.upstream_log_suffix,
             self.training_data_suffix, self.matrix_data_suffix,
+            self.compatible_genes_out_suffix, self.compatible_genes_raw_suffix,
+            self.excluded_genes_out_suffix, self.excluded_genes_raw_suffix,
+            self.gene_compatibility_table_suffix,
+            self.gene_compatibility_report_suffix,
         ]
         if len(suffixes) != len(set(suffixes)):
             raise ValueError("output suffixes must be unique")
@@ -155,6 +169,7 @@ PopsReporting = GeneRankingReportingConfig
 class PopsConfig(ModuleConfig):
     genome_build: GenomeBuild | None = None
     minimum_gene_count: int = Field(ge=1)
+    gene_universe_policy: PopsGeneUniversePolicy
     magma_association_prefix: str | None = None
     feature_matrix_prefix: str | None = None
     feature_matrix_chunks: int = Field(ge=1)
@@ -219,7 +234,45 @@ class PopsConfig(ModuleConfig):
             raise ValueError(
                 "target covariates and covariance require target_score_file"
             )
+        if (
+            self.gene_universe_policy == "intersect"
+            and self.target_score_file is not None
+        ):
+            raise ValueError(
+                "gene_universe_policy=intersect is supported only for MAGMA "
+                "targets; custom targets must already be aligned"
+            )
+        for label, output_suffix, raw_suffix in (
+            (
+                "compatible",
+                self.output_layout.compatible_genes_out_suffix,
+                self.output_layout.compatible_genes_raw_suffix,
+            ),
+            (
+                "excluded",
+                self.output_layout.excluded_genes_out_suffix,
+                self.output_layout.excluded_genes_raw_suffix,
+            ),
+        ):
+            genes_out_suffix = self.input_schema.magma_genes_out_suffix
+            genes_raw_suffix = self.input_schema.magma_genes_raw_suffix
+            if not output_suffix.endswith(genes_out_suffix):
+                raise ValueError(
+                    "%s derived MAGMA output suffix must end with %s"
+                    % (label, genes_out_suffix)
+                )
+            prefix = output_suffix[:-len(genes_out_suffix)]
+            if raw_suffix != prefix + genes_raw_suffix:
+                raise ValueError(
+                    "%s derived MAGMA output suffixes must share one prefix"
+                    % label
+                )
         return self
 
 
-__all__ = ["PopsConfig", "PopsMethod", "PopsReporting"]
+__all__ = [
+    "PopsConfig",
+    "PopsGeneUniversePolicy",
+    "PopsMethod",
+    "PopsReporting",
+]

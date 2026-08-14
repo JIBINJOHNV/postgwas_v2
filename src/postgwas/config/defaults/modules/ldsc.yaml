@@ -1,6 +1,48 @@
+# Defaults match the CBIIT LDSC 3.0.1 source pinned by the PostGWAS Dockerfile
+# (commit 6c673952cee74bd5c57aef1555a03b1c015399a0). Null settings are omitted
+# from upstream commands so LDSC retains its own data-dependent behaviour.
 enabled: false
-population: EUR
+
+# Optional PostGWAS provenance plus the pinned chromosome-split invariant.
+# Standard LDSC files do not encode ancestry or genome build, so neither is
+# inferred or silently labelled.
+population: null
+genome_build: null
+chromosomes: 22
+
+# ldsc.py --h2 defaults
 intercept: null
+two_step: null
+chisq_max: null
+n_blocks: 200
+# Use common-SNP .l2.M_5_50 files unless --not-M-5-50 explicitly selects .l2.M.
+use_m_5_50: true
+print_covariance: false
+print_delete_values: false
+sample_prevalence: null
+population_prevalence: null
+
+# munge_sumstats.py defaults
 minimum_info: 0.9
 minimum_maf: 0.01
-chromosomes: 22
+minimum_n: null
+chunksize: 5000000
+keep_maf: false
+
+reference_layout:
+  ld_score_suffix: .l2.ldscore.gz
+  m_suffix: .l2.M
+  m_5_50_suffix: .l2.M_5_50
+
+output_layout:
+  output_prefix: '{dataset_id}'
+  staging_directory: '.partial/{dataset_id}_ldsc'
+  resolved_config_file: run_metadata/resolved_config.yaml
+  service_log_file: 'logs/{dataset_id}_ldsc_service.log'
+  munged_sumstats_suffix: .sumstats.gz
+  upstream_log_suffix: .log
+  observed_prefix_suffix: _h2
+  liability_prefix_suffix: _liability_h2
+  covariance_suffix: .cov
+  delete_values_suffix: .delete
+  partitioned_delete_values_suffix: .part_delete

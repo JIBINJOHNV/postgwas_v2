@@ -24,6 +24,9 @@ Variant-ID selection is a general formatter feature, not MAGMA-specific code:
 variant_identifiers:
   default_type: rsid
   target_types: {}
+  default_duplicate_policy: exclude_all
+  target_duplicate_policies: {}
+  duplicate_rank_tolerance: 1.0e-12
   rsid_pattern: '(?i)^rs[0-9]+$'
   rsid_extraction_pattern: '(?i)(?:^|;)(rs[0-9]+)(?:;|$)'
   unique_id_template: '{chromosome}_{position}_{reference_allele}_{alternate_allele}'
@@ -35,6 +38,10 @@ fields. `target_types` may choose a different convention for each formatter
 target, so selecting MAGMA-compatible IDs does not alter LDSC, MiXeR, or another
 export. Standalone formatter runs can override the common choice with
 `--variant-id-type {rsid,unique}`.
+They can override the duplicate fallback for every selected target with
+`--duplicate-id-policy {exclude_all,error,most_significant,highest_maf,highest_info}`.
+MAGMA uses the same shared policy as every formatter target; P-value ranking is
+available only when explicitly requested and is not the packaged default.
 
 In a MAGMA pipeline, PostGWAS scans every row of BIM field 2 before formatting.
 A homogeneous rsID reference selects `rsid` for the MAGMA target; a homogeneous
@@ -74,8 +81,15 @@ required fractions and the mismatch counts. This operation is deliberately an
 intersection only: it does not construct IDs, read synonym files, or rescue an
 incompatible record.
 
-In either mode, duplicate formatter IDs are consolidated by the configured
-`lowest_p` policy and counted. MAGMA is then run with `duplicate=error`, so a
+With the packaged `exclude_all` formatter policy, every row belonging to a
+conflicting duplicated selected-ID group is excluded and counted before either
+MAGMA table is written. An explicit ranked policy may instead retain its single
+untied winner; `error` stops on a conflict. The paired location and p-value
+tables always contain the same resolved unique IDs in the same order. Pipeline
+mode passes those exact two artifacts into MAGMA preparation.
+The MAGMA module's configured `lowest_p` consolidation remains a safety policy
+for independently prepared direct-module inputs; it is normally inactive for
+formatter-produced inputs. MAGMA is then run with `duplicate=error`, so a
 remaining duplicate cannot be silently discarded by the external tool.
 
 The configured overlap fraction is a PostGWAS safety threshold, not a MAGMA
@@ -103,6 +117,23 @@ described in the
 Gene sets may use standard GMT records (`name`, `description`, then tab-separated
 gene IDs), native MAGMA set-annotation records (`name`, then space-separated
 gene IDs), or a configured two-column set/gene membership table.
+For positional and nMAGMA mappings, PostGWAS validates the configured gene-location
+record as primary gene ID, chromosome, integer start, integer end, and `+`/`-`
+strand, followed by an optional alternate gene ID. It compares gene-set members
+with the primary ID first and does not relabel a compatible file. Otherwise,
+column-six matches are translated to column-one IDs; one alternate ID mapping to
+multiple primary IDs is expanded rather than selected arbitrarily. Unmatched
+members remain visible for MAGMA to ignore, and the translation mode and counts
+are logged. The annotated report keeps both `source_input_genes` from the input
+and the effective `input_genes` submitted to MAGMA. Analysis stops when combined
+column-one/column-six overlap remains
+below the configured threshold. The overlap denominator is the smaller of the
+reference and effective gene-set universes, so a comprehensive GMT is not
+penalised for containing genes absent from a protein-coding location reference.
+This keeps set members compatible with the gene
+analysis while treating column six only as PostGWAS metadata. MAGMA itself
+documents four required location columns and an optional fifth strand column in
+the [MAGMA manual](https://ibg.colorado.edu/cdrom2021/Day10-posthuma/magma_session/manual_v1.09a.pdf).
 `gene_sets.input_format` can require a format or use the logged `auto` detection
 for GMT/native inputs. PostGWAS writes one validated native MAGMA set file before
 calling the external tool. Native MAGMA and membership files do not carry
@@ -130,8 +161,8 @@ metadata, users must still ensure the files themselves match those declarations.
 
 `mapping.selected` accepts any configured mapping-definition names, and
 `mapping.primary` chooses the one passed to downstream modules. Each selected
-mapping is run independently and
-written below `mappings/<mapping-name>/`. The combined mapping table is a
+mapping is run independently and written below mapping-specific subdirectories
+in `02_intermediates/` and `03_results/`. The combined mapping table is a
 provenance-rich result catalogue; p-values from different annotations are not
 pooled or treated as exchangeable.
 
@@ -204,12 +235,20 @@ the canonical log.
 
 All analysis files are first written below the configured `.partial` staging
 directory. They are published only after every required output has been
-validated. A failure leaves the isolated partial directory for diagnosis and
-finalizes the canonical log; it does not expose a partial gene result as a
-completed result.
+validated. The SNP-location and p-value inputs, LD-reference companions,
+executable/version, and configured gene-set files are validated before that
+staging directory is created. A preflight failure therefore finalizes the
+canonical log without leaving a false partial-run marker. If a later run finds
+a stale staging tree containing only empty directories, it records and removes
+that tree, then starts normally without `--overwrite`. A failure after analysis
+output has started leaves the non-empty isolated partial directory for
+diagnosis and requires `--overwrite`; it does not expose a partial gene result
+as completed.
 
 The human-readable MAGMA gene table is retained unchanged as the raw
-`.genes.out` result. PostGWAS also writes the configured
+`.genes.out` result beside its paired `.genes.raw` file under the selected
+mapping's `native_outputs/` directory. Keeping this pair together preserves
+MAGMA's prefix-based downstream interface. PostGWAS also writes the configured
 `corrected_genes` TSV, preserving every gene row and original column and adding
 Bonferroni and Benjamini–Hochberg adjusted p-values across the complete family
 of valid gene p-values. Missing, non-finite, or out-of-range gene p-values fail
@@ -225,6 +264,36 @@ The mapping catalogue adds configured columns identifying the mapping name,
 method, biological context, gene-ID system, annotation source/version, statistic
 type, and statistical interpretation. This prevents chromMAGMA's minimum linked
 element p-value from being confused with a calibrated MAGMA gene p-value.
+
+### Output structure
+
+The numbered directories are defined only by `output_layout` in the canonical
+MAGMA YAML:
+
+```text
+02_magma/
+├── 00_run_metadata/
+├── 01_inputs/
+├── 02_intermediates/
+│   └── <mapping_name>/
+│       ├── prepared_gene_sets/
+│       ├── annotations/
+│       ├── batches/
+│       └── native_outputs/
+├── 03_results/
+│   └── <mapping_name>/
+├── 04_comparisons/
+├── 05_logs/
+└── .partial/
+```
+
+`01_inputs` contains the validated paired MAGMA tables. Tool-native annotations,
+batch files, `.genes.raw`/`.genes.out`, and `.gsa.out` remain traceable under
+`02_intermediates`. Corrected and annotated tables intended for interpretation
+are under `03_results`; the cross-mapping catalogue is under `04_comparisons`.
+The resolved configuration and checksum-validated completion manifest are under
+`00_run_metadata`; the canonical log is under `05_logs`. Resume requires that
+manifest's configuration, input, software, and output fingerprints to match.
 
 Lines beginning with `#` in MAGMA's human-readable result files are tool
 metadata rather than result rows. PostGWAS treats that prefix as part of the

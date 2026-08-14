@@ -114,6 +114,7 @@ def main():
             biogrid_access_key=args.biogrid_key,
             david_email=args.david_email,
             dsigdb_gmt=args.dsigdb_gmt,
+            reference_set=args.reference_set,
             score_threshold=getattr(args, 'string_score', 400),
             fdr_thr=getattr(args, 'fdr_thr', 0.05),
         )

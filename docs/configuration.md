@@ -8,7 +8,7 @@ PostGWAS resolves configuration in this order:
 4. Explicit CLI overrides.
 
 Module help uses the shared Rich formatter for defaults: the default label is
-shown in bold green and the resolved value in cyan. This is presentation only;
+shown in bold green and the resolved value in green. This is presentation only;
 configuration-connected CLI parsers keep configurable defaults suppressed so
 YAML remains the runtime source of truth. This is the required convention for
 every module migrated to the canonical configuration service; legacy parsers
@@ -21,22 +21,78 @@ steps remain hidden because the pipeline supplies them automatically. Standalone
 module help additionally shows the module-specific input artifacts that the user
 must provide directly.
 
-Resume is enabled by the single canonical `run.resume` default.
-Resume-aware direct modules and pipeline steps therefore reuse only outputs that
-pass their completion checks; `--no-resume` disables continuation for one run.
-After a formatter step completes, PostGWAS atomically records the input VCF
-checksum, resolved formatter-configuration checksum, output checksums, and
-reusable result contract. A repeated pipeline validates that completion manifest
-and continues with the remaining steps. Changed, missing, empty, or
-checksum-mismatched inputs and outputs are rejected rather than silently reused.
+Terminal display is enabled by the canonical `logging.show_screen: true`
+default. Every scientific module and pipeline accepts `--show-screen` and
+`--hide-screen`; the explicit flag overrides YAML for that run. Both settings
+append the complete standard-output and standard-error stream to
+`<run.output_directory>/<logging.screen_log_file>`. The packaged transcript
+path is `run_metadata/screen.log`, and schema validation requires it to remain
+relative to the output directory. `--hide-screen` changes display only and does
+not disable the transcript or the module's canonical scientific logs.
+Measured external-tool progress is refreshed from append-only native output at
+the schema-validated `logging.progress_refresh_seconds` interval (default: one
+second). The monitor reads only newly appended bytes: it can count completed
+result rows when the upstream tool writes them during computation, or consume
+the tool's native measured counter when results are written only at the end.
+
+Resume is enabled globally by `run.resume: true`. Every scientific direct
+command and every pipeline stage uses `run.resume_policy`; there is no separate
+module-specific default. PostGWAS atomically records the resolved-configuration
+digest, tracked input and output SHA-256 checksums, software identity,
+scientific completion status, and upstream checkpoint dependencies. A completed
+boundary is reused only when all of that evidence still matches.
+
+The packaged policy is:
+
+```yaml
+run:
+  resume: true
+  overwrite: false
+  resume_policy:
+    checkpoint_validation: sha256
+    checkpoint_directory: run_metadata/checkpoints
+    direct_manifest: '{command}_direct.yaml'
+    pipeline_stage_manifest: '{stage_number}_{module}.yaml'
+    audit_log: checkpoint_events.log
+    partial_results: resume_validated_stages
+    changed_parameters: warn_and_restart
+    changed_inputs: warn_and_restart
+    unvalidated_outputs: warn_and_restart
+```
+
+On a real partial run, completed pipeline stages and validated native-module
+sub-stages are resumed. The incomplete stage restarts from its earliest safe
+boundary; a direct module without a validated internal sub-stage restarts the
+whole module. If resolved parameters, software, tracked inputs, or an upstream
+checkpoint changed, PostGWAS prints and logs a warning, invalidates affected
+downstream checkpoints, removes only checksum-matching PostGWAS-owned files
+inside the run output directory, and reruns automatically. A missing or
+externally modified tracked input, a modified output, a symlink, an unknown
+artifact, or a path outside the output root is not automatically replaced
+because ownership and scientific integrity cannot be proved.
+
+`--no-resume` disables checkpoint reuse for one invocation while retaining
+normal collision protection. `run.overwrite: true` or `--overwrite` explicitly
+forces replacement and takes precedence over resume. Automatic policy restart
+does not silently change the resolved overwrite setting. Decisions and warnings
+are appended to the configured checkpoint audit log.
+
+Resume and overwrite are execution controls, not result-defining parameters, so
+they are excluded from the checkpoint content digest and are never restored from
+an earlier pipeline stage. This means a successful `--overwrite` run is reused
+normally by the next default-resume invocation. Scientific/module parameters,
+resources, tracked inputs, software identity, and upstream checkpoints remain
+content determining and invalidate reuse when changed.
+
+Formatter and native module manifests can record more detailed scientific
+contracts than the global command boundary. For example, a formatter checkpoint
+also records content-determining external inputs such as an active LDSC
+merge-alleles table and its reusable result contract.
 When a completed formatter run directory is copied, resume resolves artifacts
 from the current output directory, requires their relative paths to match the
 current configured filenames, validates their checksums there, and rewrites the
 copied manifest with current absolute paths. It never returns an artifact from
 the manifest's former output directory.
-Use `--no-resume` or set `run.resume: false` to force collision-protecting
-non-resume behaviour. Set `run.overwrite: true` or pass `--overwrite` to rerun a
-step and replace its outputs; overwrite takes precedence over resume.
 For MAGMA and GCTA formatter outputs created before completion manifests were
 introduced, PostGWAS requires a completed canonical log, the same recorded VCF
 path, an unchanged resolved formatter configuration, older-than-output VCF
@@ -136,6 +192,10 @@ postgwas config export --module harmonisation --style minimal > harmonisation.ya
 # Key-value pairs only; the global shorthand is equivalent
 postgwas --config --module harmonisation --style values > harmonisation.yaml
 
+# LDSC formatter settings without unrelated formatter target schemas
+postgwas config export --module formatting --format ldsc \
+  --style minimal --output formatting.yaml
+
 # Fine-mapping plus every required preceding module, in execution order
 postgwas config export --pipeline finemap > finemap_pipeline.yaml
 
@@ -145,6 +205,10 @@ postgwas config export --pipeline finemap magma > analysis_pipeline.yaml
 
 Use `--output PATH` instead of shell redirection when preferred. Pipeline
 export can also resolve values from an existing run file with `--run-config PATH`.
+For `--module formatting`, `--format FORMAT [FORMAT ...]` writes shared
+formatter settings plus only the selected target-specific sections. Omit it to
+retain the complete formatter configuration. The option is rejected with
+`--pipeline` and with modules other than `formatting`.
 The dependency planner determines all preceding modules; no profile selection
 is required. Method-dispatched modules also retain non-executable configuration
 they consume. For example, an LDSC cell-type pipeline exports `formatting`, the

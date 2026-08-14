@@ -443,10 +443,6 @@ module:
     run_manifest: '{dataset_id}_run_manifest.json'
     qc_summary: 'qc_summary/{dataset_id}_chromosomewise_harmonisation_metrics.tsv'
     gwas2vcf_summary: 'qc_summary/{dataset_id}_pre_vcf_column_statistics.tsv'
-    qc_assessment_summary: 'qc_summary/{dataset_id}_{build}_vcf_qc_metrics.tsv'
-    qc_filter_rules: 'qc_summary/{dataset_id}_{build}_vcf_qc_rule_results.tsv'
-    qc_assessment_json: 'qc_summary/{dataset_id}_{build}_qc_assessment.json'
-    qc_assessment_temporary: 'qc_summary/.{dataset_id}_{build}_qc_table_'
     population_frequency_qc: 'qc_summary/{dataset_id}_{build}_population_frequency_qc.json'
     population_frequency_temporary: 'qc_summary/.{dataset_id}_{build}_population_frequency_'
     # Plain-text stdout transcript at the dataset harmonisation root.
@@ -481,19 +477,9 @@ module:
   vcf_processing:
     external_frequency_columns: [CHROM, POS, REF, ALT, INFO/AFR, INFO/EAS, INFO/EUR, INFO/SAS]
     missing_id_format: '+%CHROM\_%POS\_%REF\_%ALT'
+    genome_build_header: '##genome_build={build}'
     target_builds: {GRCh37: GRCh38, GRCh38: GRCh37}
     required_merge_groups: [input_build, target_build, raw_gwas2vcf]
-    qc_fields:
-      chromosome: '%CHROM'
-      position: '%POS'
-      reference_allele: '%REF'
-      alternate_allele: '%ALT'
-      study_info_af: '%INFO/AF'
-      external_info_af: '%INFO/{external_af}'
-      study_format_af: '[%AF]'
-      imputation_format: '[%SI]'
-      log_pvalue_format: '[%LP]'
-      effective_sample_size_format: '[%NEF]'
     concordance_fields:
       CHROM: '%CHROM'
       POS: '%POS'
@@ -534,9 +520,6 @@ module:
     on_error: warn
 
   runtime:
-    # --show-screen/--hide-screen override terminal display only. The required
-    # per-dataset screen report is written for both settings.
-    display_screen: true
     metadata_directory: '{dataset_id}/run_metadata'
     top_metadata_directory: run_metadata
     resolved_config_file: resolved_config.yaml
@@ -605,15 +588,6 @@ common:
   - strand.enabled
   - strand.consensus_threshold
   - strand.unmatched_action
-  - filter.maf_cutoff
-  - filter.info_cutoff
-  - filter.af_diff_cutoff
-  - filter.lp_cutoff
-  - filter.remove_mhc
-  - filter.exclude_palindromic
-  - filter.include_indels
-  - qc.target_build
-  - qc.sample_size_outlier_standard_deviations
   - execution.threads_per_chromosome
   - execution.max_retry_rounds
   - execution.fail_dataset_on_chr_error
@@ -960,34 +934,8 @@ group_order:
       - concat_max_workers
       - concat_max_attempts
       - on_merge_failure
-  - group: filter
-    order: 18
-    stage: post-merge 03   sequential QC assessment on the raw-VCF table
-    keys:
-      - lp_cutoff
-      - lp_missing
-      - maf_cutoff
-      - af_missing
-      - info_cutoff
-      - info_max
-      - info_missing
-      - af_diff_cutoff
-      - include_indels
-      - exclude_palindromic
-      - palindromic_af_lower
-      - palindromic_af_upper
-      - remove_mhc
-      - mhc_chrom
-      - mhc_start
-      - mhc_end
-  - group: qc
-    order: 19
-    stage: post-merge 03   raw and virtual QC-passed summaries
-    keys:
-      - target_build
-      - sample_size_outlier_standard_deviations
   - group: execution
-    order: 20
+    order: 18
     stage: throughout      threads, retries, memory
     keys:
       - threads_per_chromosome
@@ -997,7 +945,7 @@ group_order:
       - retry_requires_progress
       - fail_dataset_on_chr_error
   - group: logging
-    order: 21
+    order: 19
     stage: throughout      logging and screen output
     keys:
       - append_across_retries
@@ -1005,7 +953,7 @@ group_order:
       - level
       - screen_level
   - group: rejects
-    order: 22
+    order: 20
     stage: throughout      the rejected-variant file
     keys:
       - enabled
@@ -1259,7 +1207,6 @@ policies:
       type: bool
       validator:
         kind: flag
-
   # =================================================================
   # 02  dataset 03      which columns a variant must have
   # =================================================================
@@ -3818,7 +3765,7 @@ policies:
         Example: with the shipped 0.0-1.0 and tolerance 1.05, a score of 37.4 - the usual sign of an
           INFO column that holds something else, such as a sample size - becomes 1.0 under 'clip'.
         Note: mirrors eaf.out_of_range. 'clip' hides the mistake it corrects - a column of 37.4s
-          becomes 1.0s that pass every later filter. On an unfamiliar study prefer 'reject' or 'fail'.
+          becomes 1.0s that pass the later QC assessment. On an unfamiliar study prefer 'reject' or 'fail'.
       origin: new
       recommendation: null
       type: enum
@@ -3846,7 +3793,7 @@ policies:
           file with the reason 'info_out_of_range'.
         Note: there is deliberately no equivalent of the frequency step's "degenerate" check here.
           A score of exactly 0 is meaningless but not fatal, so it is kept and only removed later
-          by filter.info_cutoff (0.7 by default) in the post-merge filter.
+          by modules.qc_summary.rules.info_min (0.7 by default) in the post-merge QC assessment.
       origin: new
       recommendation: null
       type: float
@@ -3924,9 +3871,9 @@ policies:
           the "good" one; a lower threshold does the reverse. Same units as the score.
         Example: with 0.3, a variant scoring 0.25 is added to the poorly-imputed count in the step
           log and the QC summary, but keeps its score and stays in the data. It disappears only
-          later, if filter.info_cutoff (0.7 by default) drops it in the post-merge filter.
+          later, if modules.qc_summary.rules.info_min (0.7 by default) drops it in the post-merge QC assessment.
         Note: this is not the removal cutoff, and the two shipped values disagree - 0.3 here
-          against filter.info_cutoff 0.7 - so the count reported at step 11 is far smaller than
+          against modules.qc_summary.rules.info_min 0.7 - so the count reported at step 11 is far smaller than
           the number of variants actually thrown away later. Set it to 0.7 if you want the
           harmonisation report to predict what the filter will do.
       origin: new
@@ -3949,17 +3896,17 @@ policies:
           that info.out_of_range blanked out with 'null' is counted as missing here as well.
         Values:
           keep - the variant stays with an empty score; the log records the count and says the
-            removal happens later at filter.info_missing, which is 'remove' by default.
+            removal happens later at modules.qc_summary.rules.missing_info_action, which is 'remove' by default.
           reject - the variant is removed now and written to the rejected-variants file with the
             reason 'info_missing'.
           fail - the chromosome stops with an error giving the number of variants affected.
         Example: a study with no INFO column, matched against a reference that covers 96% of its
           variants, leaves 4% with an empty score. Under 'keep' all of them go through to the VCF
-          and are dropped later by filter.info_missing; under 'reject' they leave here and appear
+          and are dropped later by modules.qc_summary.rules.missing_info_action; under 'reject' they leave here and appear
           by name in the rejected-variants file, so you can see which ones went.
         Note: imputation quality is deliberately left out of the final completeness gate at step
           14, so 'keep' really does carry an empty score through the rest of harmonisation - it
-          is not caught anywhere before the post-merge filter.
+          is not caught anywhere before the post-merge QC assessment.
       origin: new
       recommendation: null
       type: enum
@@ -4436,418 +4383,7 @@ policies:
         - fail
 
   # =================================================================
-  # 16  post-merge 03   sequential QC assessment (no filtered VCF is written)
-  # =================================================================
-  filter:
-    af_diff_cutoff:
-      default: 0.2
-      help: |-
-        What it does: Sets the largest accepted absolute difference between the study allele
-          frequency (INFO/AF) and the configured reference-panel frequency (INFO/<panel>).
-        When it applies: post-merge step 03, to the temporary analysis table extracted once from the
-          raw merged VCF. It changes QC assessment counts only; the VCF is never filtered or changed.
-        Values:
-          An absolute difference in allele-frequency units. Larger is more forgiving, smaller
-          stricter; 0 keeps only exact agreement, 1 removes nothing on these grounds.
-        Example: the panel column is whichever default_comparison_af_column names, e.g. EUR. At 0.2,
-          study 0.35 against EUR 0.60 differs by 0.25 and fails this QC level; 0.35 against 0.50 passes.
-        Note: a variant the panel has no frequency for is decided by filter.af_missing (default
-          'remove'), not here. The filter reads INFO/AF and the QC count FORMAT/AF; same number.
-      origin: main.py:967
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 1.0
-        minimum: 0.0
-        number_kind: float
-    af_missing:
-      default: remove
-      help: |-
-        What it does: Decides whether a variant with a missing required frequency passes or fails QC.
-        When it applies: post-merge step 03, governing both the minor-allele
-          window (filter.maf_cutoff), which needs the study's own frequency, and the panel-concordance
-          test (filter.af_diff_cutoff), which needs both; only while one of the two is active.
-        Values:
-          remove - a variant with no study frequency, or one absent from the panel, fails the virtual
-            QC level; counted separately as 'missing FORMAT/AF (MAF filter)' and 'missing
-            INFO/<panel> (external AF concordance filter)'.
-          keep - a missing frequency does not fail the applicable QC level.
-        Example: a variant the study reports but EUR lacks has no INFO/EUR - under remove it goes and is
-          counted on the 'missing INFO/EUR' line; under keep it is still judged by filter.maf_cutoff.
-        Note: the setting never removes a VCF record; it changes membership of the reported virtual
-          QC-passed subset.
-      origin: implicit
-      recommendation: null
-      type: enum
-      validator:
-        allow_none: false
-        kind: enum
-        members:
-        - remove
-        - keep
-    maf_cutoff:
-      default: 0.01
-      help: |-
-        What it does: Sets the accepted minor-allele-frequency range for the QC assessment.
-        When it applies: post-merge step 03 as a two-sided window on the study's own frequency
-          FORMAT/AF: a variant passes when between the cutoff and one minus the cutoff.
-        Values:
-          A frequency between 0 and 0.5. Larger drops more low-frequency variants, smaller keeps them.
-          0.01 keeps 0.01 to 0.99; 0.05 keeps 0.05 to 0.95.
-        Example: at 0.01 a variant at AF 0.004 is removed and one at 0.02 is kept; one at 0.997 is
-          fails too, because that is the same 0.3% minor allele seen from the other side.
-        Note: the test cannot be switched off from policy - the value may not be null - so even 0
-          leaves it in place, and under filter.af_missing = 'remove' that still fails every variant
-          with no frequency at all. Set filter.af_missing to 'keep' if that is not what you want.
-      origin: main.py:966
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 0.5
-        minimum: 0.0
-        number_kind: float
-    info_cutoff:
-      default: 0.7
-      help: |-
-        What it does: Sets the lowest imputation quality score accepted by the QC assessment.
-        When it applies: post-merge step 03, read from FORMAT/SI - the score the study supplied or
-          that was filled in from the reference file. It is the lower end of a window whose upper end
-          is filter.info_max.
-        Values:
-          A score on the usual 0-1 imputation-quality scale. Larger is stricter and leaves fewer,
-          better-imputed variants; smaller keeps more poorly imputed ones. 0 removes nothing at the
-          bottom, but filter.info_max still rejects impossibly large scores.
-        Example: at 0.7 with info_max 1.05, SI 0.68 fails, 0.71 passes and 1.10 fails.
-        Note: filter.info_cutoff must not be greater than filter.info_max; an invalid interval stops
-          with an actionable configuration error.
-      origin: main.py:968
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 1.0
-        minimum: 0.0
-        number_kind: float
-    info_max:
-      default: 1.05
-      help: |-
-        What it does: Sets the highest imputation quality score accepted by the QC assessment.
-        When it applies: post-merge step 03 together with filter.info_cutoff; the two form one window
-          on FORMAT/SI in the temporary analysis table.
-        Values:
-          A score on the same 0-1 scale; anything above 1 is already out of range. Larger tolerates
-          more overshoot, smaller is stricter. 1.05 covers usual rounding overshoot; validator max 100.
-        Example: at 1.05, SI 1.02 is kept as a rounding artefact while SI 2.4 or 37.4 - the signature
-          of a column that is not really an imputation score - fails.
-      origin: main.py:969
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 100.0
-        minimum: 0.0
-        number_kind: float
-    info_missing:
-      default: remove
-      help: |-
-        What it does: Decides whether a missing imputation quality score passes or fails QC.
-        When it applies: post-merge step 03 at the imputation-quality level.
-        Values:
-          remove - the test becomes 'SI inside the window AND SI is not missing'; the failure is counted
-            as 'missing FORMAT/SI (imputation quality filter)'.
-          keep - the test gains 'OR SI is missing', so a scoreless variant passes it.
-        Example: a study with no INFO column, harmonised against a reference covering 8,900,000 of
-          its 9,500,000 variants, loses the other 600,000 under remove.
-        Note: this controls only virtual QC membership. The raw merged VCF remains unchanged.
-      origin: main.py:970
-      recommendation: null
-      type: enum
-      validator:
-        allow_none: false
-        kind: enum
-        members:
-        - remove
-        - keep
-    include_indels:
-      default: false
-      help: |-
-        What it does: Decides whether indels and other non-SNP variants can enter the virtual
-          QC-passed subset.
-        When it applies: post-merge step 03 on the extracted analysis table.
-        Values:
-          true - every variant type is carried through and judged on frequency and quality like SNPs.
-          false - only A/C/G/T single-nucleotide substitutions pass this level.
-        Example: of 9,400,000 SNPs and 600,000 indels in the merged VCF, false leaves about 9,400,000
-          rows for the remaining filters; true sends the indels through FORMAT/AF and FORMAT/SI too.
-        Note: variant type is assessed from REF and ALT. No VCF is written at this level.
-      origin: main.py:972
-      recommendation: null
-      type: bool
-      validator:
-        kind: flag
-    lp_cutoff:
-      default: null
-      help: |-
-        What it does: Optionally adds a significance level using -log10(p).
-        When it applies: post-merge step 03, compared against FORMAT/LP in the extracted table.
-        Values:
-          null switches the filter off and every variant passes regardless of p-value, which is what a
-          harmonisation run normally wants. Larger keeps only stronger associations: 7.30103 is
-          genome-wide significance (p <= 5e-8), 5 is p <= 1e-5, 2 is p <= 0.01.
-        Example: at 7.30103 a variant with LP 9.1 (p = 8e-10) is kept and one with LP 3.0 (p = 0.001)
-          fails this QC level.
-        Note: this is NOT a raw p-value - 5e-8 here means LP >= 0.00000005, i.e. p <= 0.9999999, which
-          excludes almost nothing. Use 7.30103 for p <= 5e-8. Missing values are controlled separately
-          by filter.lp_missing.
-      origin: main.py:965
-      recommendation: null
-      type: float
-      validator:
-        allow_none: true
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: null
-        minimum: 0.0
-        number_kind: float
-    lp_missing:
-      default: remove
-      help: |-
-        What it does: Decides whether a missing FORMAT/LP value fails the optional significance level.
-        When it applies: only when filter.lp_cutoff is not null. It affects the virtual QC-passed
-          count and does not alter or create a VCF.
-        Values:
-          remove - missing LP fails the significance level.
-          keep - missing LP passes this level; non-missing LP must still meet filter.lp_cutoff.
-      origin: implicit
-      recommendation: null
-      type: enum
-      validator:
-        allow_none: false
-        kind: enum
-        members:
-        - remove
-        - keep
-    exclude_palindromic:
-      default: true
-      help: |-
-        What it does: Flags strand-ambiguous variants (A/T and C/G) whose allele frequency sits
-          near one half, where the strand cannot be resolved from the frequency.
-        When it applies: post-merge step 03 after earlier QC levels. The band edges are
-          filter.palindromic_af_lower and filter.palindromic_af_upper.
-        Values:
-          true - a variant fails when REF/ALT is exactly A/T, T/A, C/G or G/C and its FORMAT/AF
-            lies inside the band.
-          false - no variant fails for being palindromic, whatever its frequency.
-        Example: with the default band 0.4-0.6, an A/T variant at AF 0.47 is removed and one at 0.12
-          is kept; an A/G variant is never touched by this rule.
-        Note: a palindromic variant with no FORMAT/AF cannot satisfy this rule, so filter.af_missing
-          decides it at the earlier allele-frequency level.
-      origin: main.py:974
-      recommendation: null
-      type: bool
-      validator:
-        kind: flag
-    palindromic_af_lower:
-      default: 0.4
-      help: |-
-        What it does: Sets the lower edge of the frequency band inside which a palindromic variant is
-          treated as strand-ambiguous.
-        When it applies: post-merge step 03, and only when
-          filter.exclude_palindromic is true. It pairs with filter.palindromic_af_upper to form one
-          band on the study frequency FORMAT/AF.
-        Values:
-          A study allele frequency, at most 0.5. Smaller widens the band downwards and removes more
-          A/T and C/G variants; larger narrows it and keeps more. At 0.5 with the upper edge also at
-          0.5, only variants at exactly 0.5 fail.
-        Example: with the band 0.4-0.6, an A/T variant at frequency 0.38 is kept and one at 0.41 is
-          removed. Move this edge down to 0.3 and the 0.38 variant is removed as well.
-      origin: main.py:975
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 0.5
-        minimum: 0.0
-        number_kind: float
-    palindromic_af_upper:
-      default: 0.6
-      help: |-
-        What it does: Sets the upper edge of the frequency band inside which a palindromic variant is
-          treated as strand-ambiguous.
-        When it applies: post-merge step 03, and only when
-          filter.exclude_palindromic is true. It pairs with filter.palindromic_af_lower to form one
-          band on the study frequency FORMAT/AF.
-        Values:
-          A study allele frequency, at least 0.5. Larger widens the band upwards and removes more A/T
-          and C/G variants; smaller narrows it and keeps more.
-        Example: with the band 0.4-0.6, a C/G variant at frequency 0.62 is kept and one at 0.59 is
-          removed. Move this edge up to 0.7 and the 0.62 variant is removed as well.
-      origin: main.py:976
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: false
-        kind: num
-        maximum: 1.0
-        minimum: 0.5
-        number_kind: float
-    remove_mhc:
-      default: true
-      help: |-
-        What it does: Excludes the major histocompatibility complex from the virtual QC-passed subset
-          because its long-range linkage disequilibrium can distort many downstream assessments.
-        When it applies: post-merge step 03 after preceding levels. The region comes from
-          filter.mhc_chrom, filter.mhc_start and filter.mhc_end.
-        Values:
-          true - variants inside the inclusive region fail this QC level.
-          false - the MHC level is not applied.
-        Example: with the defaults, chr6:31,300,000 fails this level. The raw VCF record is retained.
-      origin: main.py:977
-      recommendation: null
-      type: bool
-      validator:
-        kind: flag
-    mhc_chrom:
-      default: '6'
-      help: |-
-        What it does: Names the chromosome carrying the major histocompatibility complex, so the MHC
-          assessment knows which contig to evaluate.
-        When it applies: post-merge step 03, and only when filter.remove_mhc
-          is true.
-        Values:
-          '6' or 'chr6'. Comparison is case-insensitive and accepts either presence or absence of the
-          'chr' prefix in the raw VCF.
-      origin: main.py:977
-      recommendation: null
-      type: str
-      validator:
-        allow_none: false
-        kind: text
-    mhc_end:
-      default: 34000000
-      help: |-
-        What it does: Sets the last base position of the MHC assessment interval.
-        When it applies: post-merge step 03, and only when filter.remove_mhc is true.
-        Values:
-          A base position on the chromosome named by filter.mhc_chrom. Larger extends the excised
-          window and excludes more variants; smaller stops the assessment interval earlier. The
-          position named is included.
-        Example: at 34,000,000 with mhc_start 25,000,000, chr6:33,999,900 fails and
-          chr6:34,000,001 passes.
-        Note: 25,000,000-34,000,000 is the generous GRCh37 extended-MHC window, not adjusted for
-          genome build, while qc.target_build decides which raw VCF is assessed.
-      origin: main.py:979
-      recommendation: null
-      type: int
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: true
-        kind: num
-        maximum: null
-        minimum: 0
-        number_kind: int
-    mhc_start:
-      default: 25000000
-      help: |-
-        What it does: Sets the first base position of the MHC region that gets cut out.
-        When it applies: post-merge step 03, and only when filter.remove_mhc is true. The value is a
-          1-based inclusive position in the raw VCF coordinate system.
-        Values:
-          A base position on the chromosome named by filter.mhc_chrom. Smaller starts the cut earlier
-          and excludes more variants; larger starts it later and excludes fewer.
-        Example: at 25,000,000, chr6:25,000,000 fails and chr6:24,999,999 passes.
-      origin: main.py:978
-      recommendation: null
-      type: int
-      validator:
-        allow_none: false
-        exclusive_minimum: false
-        integer: true
-        kind: num
-        maximum: null
-        minimum: 0
-        number_kind: int
-  # =================================================================
-  # 17  post-merge 03   raw and virtual QC-passed summaries
-  # =================================================================
-  qc:
-    target_build:
-      default: GRCh37
-      help: |-
-        What it does: Chooses which genome build's raw merged VCF is assessed.
-        When it applies: post-merge step 03. The VCF is extracted once to a temporary table used for
-          the raw summary, sequential QC levels and final virtual QC-passed summary. No filtered VCF
-          is created. The resolved build is recorded in the manifest and report names.
-        Values:
-          GRCh37 - always assess <sample>_GRCh37_merged.vcf.gz, whether supplied or lifted over.
-          GRCh38 - always assess <sample>_GRCh38_merged.vcf.gz, on the same terms.
-          input - assess whichever build the study supplied, as decided by the build-detection step.
-        Example: for a GRCh38 study lifted over to GRCh37, 'GRCh37' makes the counts and the Ts/Tv ratio
-          describe the lifted file, hiding liftover losses; 'input' the file the study handed you.
-        Note: recommended input, the build the study actually supplied. The build you name must have a
-          merged VCF; if liftover produced none, QC stops with an explicit error rather than falling back.
-      origin: main.py:892,901
-      recommendation: input
-      type: enum
-      validator:
-        allow_none: false
-        kind: enum
-        members:
-        - GRCh37
-        - GRCh38
-        - input
-    sample_size_outlier_standard_deviations:
-      default: 5.0
-      help: |-
-        What it does: Reports variants whose effective sample size is strictly greater than the stage mean
-          plus this many sample standard deviations. It is descriptive QC only and does not remove
-          a variant or change the raw merged VCF.
-        When it applies: post-merge step 03, independently for the raw merged-VCF records and for the
-          final virtual QC-passed subset. Each stage uses its own usable FORMAT/NEF values, mean and
-          sample standard deviation; missing, non-numeric, non-finite and non-positive values are
-          reported but excluded from the distribution calculation.
-        Values: A positive number of standard deviations. Larger flags only more extreme upper-tail
-          sample sizes; smaller flags more records. The packaged value 5 matches MungeSumstats N_std.
-        Example: with mean Neff 100,000 and sample SD 2,000, the default threshold is 110,000 and a
-          value of 112,000 is reported as an outlier. It remains in the VCF because this is not a
-          filtering policy.
-        Note: A variant-level Neff can legitimately vary after cohort or imputation missingness. This
-          check highlights an unusually large upper tail that may indicate a mixed analysis or an
-          incorrectly mapped sample-size field; it does not prove that a value is scientifically wrong.
-      origin: qc_summary/assessment.py
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: true
-        integer: false
-        kind: num
-        maximum: null
-        minimum: 0.0
-        number_kind: float
-  # =================================================================
-  # 18  throughout      threads, retries, memory
+  # 16  throughout      threads, retries, memory
   # =================================================================
   execution:
     threads_per_chromosome:
@@ -4865,7 +4401,7 @@ policies:
           threads each - about 40 busy cores - and each bcftools sort gets 5 x 512 = 2,560 MB.
         Note: 5 was hardcoded before this setting existed, so the default reproduces the old
           five-times-what-you-asked-for behaviour. To cap it, set execution.total_cpu_budget, which
-          shrinks this number until workers x threads fits the budget. The post-merge filter and QC
+          shrinks this number until workers x threads fits the budget. The post-merge QC assessment and QC
           steps are handed --threads directly and ignore this setting entirely.
       origin: main.py:625
       recommendation: null
@@ -4997,7 +4533,7 @@ policies:
       validator:
         kind: flag
   # =================================================================
-  # 19  throughout      logging and screen output
+  # 17  throughout      logging and screen output
   # =================================================================
   logging:
     append_across_retries:
@@ -5116,7 +4652,7 @@ policies:
         - ERROR
 
   # =================================================================
-  # 20  throughout      the rejected-variant file
+  # 18  throughout      the rejected-variant file
   # =================================================================
   rejects:
     enabled:

@@ -17,8 +17,9 @@ from postgwas.config import (
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.config.models.modules.gcta_cojo import GctaCojoMode
 from postgwas.core.completion import (
+    apply_completion_restart,
     configuration_digest,
-    validate_completion_manifest,
+    resolve_completion_resume,
     write_completion_manifest,
 )
 from postgwas.core.contracts import Artifact, ModuleResult
@@ -853,7 +854,7 @@ def run_gcta_cojo_direct(args, ctx=None) -> ModuleResult:
             and not configuration.run.overwrite
             and completion.is_file()
         ):
-            manifest = validate_completion_manifest(
+            decision = resolve_completion_resume(
                 completion,
                 dataset_id=dataset,
                 module="gcta_cojo",
@@ -861,15 +862,26 @@ def run_gcta_cojo_direct(args, ctx=None) -> ModuleResult:
                 configuration_sha256=digest,
                 inputs=manifest_inputs,
                 outputs=expected_outputs,
+                resume_policy=configuration.run.resume_policy,
                 error_type=GctaCojoError,
             )
-            result_metrics = dict(manifest.get("metrics") or {})
-            resumed = True
-            logger.record(
-                "SKIP", "gcta_cojo_execution", reason="validated_resume",
-                manifest=str(completion),
-            )
-        else:
+            if decision.action == "resume":
+                result_metrics = dict(decision.manifest.get("metrics") or {})
+                resumed = True
+                logger.record(
+                    "SKIP", "gcta_cojo_execution", reason="validated_resume",
+                    manifest=str(completion),
+                )
+            else:
+                apply_completion_restart(
+                    decision,
+                    output_root=output,
+                    manifest=completion,
+                    logger=logger,
+                    operation="gcta_cojo_resume",
+                    error_type=GctaCojoError,
+                )
+        if not resumed:
             existing = [
                 str(path) for path in expected_outputs.values() if path.exists()
             ]

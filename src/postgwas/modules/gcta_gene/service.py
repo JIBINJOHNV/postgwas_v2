@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import sqlite3
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -28,7 +27,13 @@ from postgwas.core.io.tables import write_dataframe_table
 from postgwas.core.io.reports import write_yaml_report
 from postgwas.core.paths import configured_output_path, resolve_executable
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
+from postgwas.core.required_arguments import (
+    RequiredAlternative,
+    RequiredArgument,
+    require_resolved_arguments,
+)
 from postgwas.core.resource_preparation import ResourcePreparationError, sha256
+from postgwas.core.ui import StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.core.vcf import extract_vcf_table
 from postgwas.modules.gcta_gene.adapters import (
@@ -38,6 +43,10 @@ from postgwas.modules.gcta_gene.adapters import (
 )
 from postgwas.modules.gcta_gene.errors import GctaGeneError
 from postgwas.modules.gcta_gene.pathway_sets import prepare_resource
+from postgwas.modules.gcta_gene.progress import (
+    GctaResultProgress,
+    gcta_native_log_path,
+)
 from postgwas.modules.gcta_gene.reporting import (
     build_gcta_scientific_summary,
     record_gcta_scientific_summary,
@@ -51,9 +60,6 @@ from postgwas.modules.gcta_gene.results import (
 
 _DNA_COMPLEMENT = str.maketrans("ACGT", "TGCA")
 _COMPLETION_SCHEMA_VERSION = 1
-# GCTA 1.94.1 and 1.95.3 ignore custom fastBAT sets above this compiled limit.
-# PostGWAS enforces it before execution so omitted sets are explicit and auditable.
-_GCTA_MAXIMUM_SET_VARIANTS = 20_000
 
 
 def _resolved_configuration(args):
@@ -129,6 +135,57 @@ def _resolved_configuration(args):
         values["gmt_file"] = gmt_override if has_gmt else None
         module.set_annotation = type(module.set_annotation).model_validate(values)
     return configuration
+
+
+def _require_gcta_gene_arguments(configuration, input_file) -> None:
+    """Validate all requirements for the resolved GCTA method together."""
+    module = configuration.modules.gcta_gene
+    requirements = [
+        RequiredArgument(
+            "--gcta-input-file", "modules.gcta_gene.input_file", input_file,
+        ),
+        RequiredArgument(
+            "--gcta-reference-prefix",
+            "modules.gcta_gene.reference.prefix",
+            module.reference.prefix,
+        ),
+        RequiredArgument(
+            "--genome-build",
+            "modules.gcta_gene.genome_build",
+            module.genome_build,
+        ),
+        RequiredArgument(
+            "--gcta-reference-population",
+            "modules.gcta_gene.reference.population",
+            module.reference.population,
+        ),
+    ]
+    if module.method in {"fastbat_gene", "mbat_combo"} or (
+        module.method == "fastbat_set"
+        and module.set_annotation.gmt_file is not None
+    ):
+        requirements.append(RequiredArgument(
+            "--gene-list",
+            "modules.gcta_gene.gene_annotation.file",
+            module.gene_annotation.file,
+        ))
+    alternatives = ()
+    if module.method == "fastbat_set":
+        alternatives = (
+            RequiredAlternative((
+                RequiredArgument(
+                    "--fastbat-set-list",
+                    "modules.gcta_gene.set_annotation.file",
+                    module.set_annotation.file,
+                ),
+                RequiredArgument(
+                    "--gmt",
+                    "modules.gcta_gene.set_annotation.gmt_file",
+                    module.set_annotation.gmt_file,
+                ),
+            )),
+        )
+    require_resolved_arguments(requirements, alternatives=alternatives)
 
 
 def _required_path(value: str | None, label: str) -> Path:
@@ -400,7 +457,12 @@ def _validate_reference(
     variant_locations: dict[str, tuple[str, int, tuple[str, str]]] | None,
     *,
     retain_variant_ids: bool,
+    direct_input_mode: bool,
 ) -> tuple[dict, set[str], dict[str, str]]:
+    if direct_input_mode and variant_locations is not None:
+        raise GctaGeneError(
+            "Direct exact-ID validation cannot use coordinate reconciliation."
+        )
     required_paths = [Path(str(prefix) + suffix) for suffix in module.reference.required_extensions]
     missing = [str(path) for path in required_paths if not path.is_file() or path.stat().st_size <= 0]
     if missing:
@@ -536,11 +598,22 @@ def _validate_reference(
         target_owners[target] = source
     overlap = len(mapping)
     if overlap == 0:
+        if direct_input_mode:
+            raise GctaGeneError(
+                "No direct GCTA summary-statistic SNP IDs occur exactly in "
+                "PLINK BIM column 2. Direct mode does not rewrite identifiers. "
+                "Provide --gcta-input-file containing BIM-compatible IDs, or "
+                "use postgwas pipeline --modules gcta_gene --vcf PATH for "
+                "coordinate-and-allele reconciliation."
+            )
         raise GctaGeneError(
             "No GCTA input variant identifiers occur in the PLINK BIM reference."
         )
     overlap_fraction = overlap / len(identifiers)
-    if overlap_fraction < policy.minimum_overlap_fraction:
+    if (
+        not direct_input_mode
+        and overlap_fraction < policy.minimum_overlap_fraction
+    ):
         raise GctaGeneError(
             "Only %d/%d unique GCTA input variants (%.2f%%) resolved to exact "
             "PLINK BIM IDs; the configured minimum is %.2f%%. Supply the "
@@ -569,6 +642,8 @@ def _validate_reference(
         "reference_variants": len(reference_ids),
         "overlapping_variants": overlap,
         "overlap_fraction": overlap_fraction,
+        "input_variants_absent_from_reference": len(identifiers) - overlap,
+        "reference_variants_absent_from_input": len(reference_ids) - overlap,
         "direct_id_matches": len(direct_matches),
         "coordinate_and_allele_matches": overlap - len(direct_matches),
         "ambiguous_input_coordinate_keys": len(duplicate_input_locations),
@@ -578,8 +653,12 @@ def _validate_reference(
         "compatible_allele_pairs": compatible_alleles,
         "incompatible_allele_pairs": incompatible_alleles,
         "reference_chromosomes": sorted(reference_chromosomes),
+        "variant_id_match_policy": (
+            "report_exact_bim_overlap_without_rewriting"
+            if direct_input_mode else "allow_pipeline_reconciliation"
+        ),
     }
-    return metrics, reference_ids if retain_variant_ids else set(), mapping
+    return metrics, set(mapping.values()) if retain_variant_ids else set(), mapping
 
 
 def _harmonise_formatted_input(
@@ -684,6 +763,8 @@ def _prepared_resource_is_current(
     gmt: Path,
     gene_list: Path,
     bim: Path,
+    analysis_source: Path,
+    analyzable_variant_count: int,
 ) -> Path:
     conversion = module.set_annotation.conversion
     names = conversion.output_names
@@ -706,10 +787,35 @@ def _prepared_resource_is_current(
         "duplicate_gene_policy": conversion.duplicate_gene_policy,
         "unmapped_gene_policy": conversion.unmapped_gene_policy,
         "empty_pathway_policy": conversion.empty_pathway_policy,
+        "oversized_set_policy": module.set_annotation.oversized_set_policy,
+        "maximum_set_variants": module.set_annotation.maximum_set_variants,
+        "maximum_set_variants_applied": True,
+        "variant_universe": "gwas_bim_intersection",
+        "audit": conversion.audit.model_dump(mode="json"),
+        "disk": conversion.disk.model_dump(mode="json"),
+    }
+    expected_outputs = {
+        "pathway_mapping": names.pathway_mapping,
+        "pathway_gene_mapping": (
+            names.pathway_gene_mapping
+            if conversion.audit.level in {"normalized", "expanded"} else None
+        ),
+        "gene_variant_mapping": (
+            names.gene_variant_mapping
+            if conversion.audit.level in {"normalized", "expanded"} else None
+        ),
+        "expanded_mapping": (
+            names.expanded_mapping
+            if conversion.audit.level == "expanded" else None
+        ),
+        "unmapped_genes": names.unmapped_genes,
+        "manifest": names.manifest,
+        "readme": names.readme,
+        "checksums": names.checksums,
     }
     try:
         current = (
-            manifest["schema_version"] == "gcta_fastbat_pathway_resource.v1"
+            manifest["schema_version"] == "gcta_fastbat_pathway_resource.v2"
             and manifest["resource"]["genome_build"] == module.genome_build
             and manifest["resource"]["gene_window_kb"] == module.gene_window_kb
             and all(
@@ -721,23 +827,38 @@ def _prepared_resource_is_current(
                 manifest["policies"][key] == value
                 for key, value in expected_policies.items()
             )
-            and manifest["outputs"] == {
-                "pathway_mapping": names.pathway_mapping,
-                "gene_variant_mapping": names.gene_variant_mapping,
-                "unmapped_genes": names.unmapped_genes,
-                "manifest": names.manifest,
-                "readme": names.readme,
-                "checksums": names.checksums,
+            and manifest["sources"]["analysis_variants"] == {
+                "path": str(analysis_source),
+                "sha256": sha256(analysis_source),
+                "analyzable_unique_variants": analyzable_variant_count,
             }
+            and manifest["outputs"] == expected_outputs
         )
         set_path = directory / manifest["resource"]["file"]
+        checksum_lines = (
+            directory / names.checksums
+        ).read_text(encoding="utf-8").splitlines()
+        recorded_checksums = {
+            filename: digest
+            for line in checksum_lines
+            for digest, filename in [line.split(maxsplit=1)]
+        }
+        tracked_outputs = [
+            value for key, value in expected_outputs.items()
+            if value is not None and key != "checksums"
+        ]
         current = (
             current
             and set_path.name == names.set_list
             and set_path.is_file()
             and manifest["resource"]["sha256"] == sha256(set_path)
+            and all(
+                (directory / name).is_file()
+                and recorded_checksums.get(name) == sha256(directory / name)
+                for name in tracked_outputs
+            )
         )
-    except (KeyError, TypeError, OSError):
+    except (KeyError, TypeError, ValueError, OSError):
         current = False
         set_path = directory / names.set_list
     if not current:
@@ -756,6 +877,9 @@ def _prepare_gmt_set(
     module,
     configuration,
     logger: PipelineLogger,
+    bim_variant_total: int,
+    analyzable_variant_ids: set[str],
+    analysis_variant_source: Path,
 ) -> tuple[Path, dict, Path]:
     gmt = _required_path(module.set_annotation.gmt_file, "GMT pathway file")
     gene_list = _required_path(
@@ -777,7 +901,13 @@ def _prepare_gmt_set(
             shutil.rmtree(prepared_directory)
         elif configuration.run.resume:
             set_path = _prepared_resource_is_current(
-                prepared_directory, module, gmt, gene_list, bim,
+                prepared_directory,
+                module,
+                gmt,
+                gene_list,
+                bim,
+                analysis_variant_source,
+                len(analyzable_variant_ids),
             )
             logger.record(
                 "SKIP", "gmt_to_fastbat_set", reason="validated_resume",
@@ -800,7 +930,9 @@ def _prepare_gmt_set(
         output_directory=prepared_directory,
         output_name=names.set_list,
         pathway_mapping_name=names.pathway_mapping,
+        pathway_gene_mapping_name=names.pathway_gene_mapping,
         gene_variant_mapping_name=names.gene_variant_mapping,
+        expanded_mapping_name=names.expanded_mapping,
         unmapped_genes_name=names.unmapped_genes,
         manifest_name=names.manifest,
         readme_name=names.readme,
@@ -816,8 +948,37 @@ def _prepare_gmt_set(
         generation_command=shlex.join(sys.argv),
     )
     try:
-        manifest = prepare_resource(arguments)
-    except (OSError, ResourcePreparationError, sqlite3.Error, yaml.YAMLError) as exc:
+        conversion_progress = StageProgress(
+            "GMT-to-fastBAT preparation",
+            enabled=configuration.logging.show_progress,
+        )
+        manifest = prepare_resource(
+            arguments,
+            stage_progress=conversion_progress,
+            bim_variant_total=bim_variant_total,
+            progress_refresh_seconds=(
+                configuration.logging.progress_refresh_seconds
+            ),
+            mapping_workers=configuration.execution.threads,
+            mapping_memory_gb=configuration.execution.memory_gb,
+            worker_memory_multiplier=(
+                conversion.parallelism.worker_memory_multiplier
+            ),
+            bim_ids_prevalidated=True,
+            analyzable_variant_ids=analyzable_variant_ids,
+            analysis_variant_source=analysis_variant_source,
+            maximum_set_variants=module.set_annotation.maximum_set_variants,
+            oversized_set_policy=module.set_annotation.oversized_set_policy,
+            audit_level=conversion.audit.level,
+            audit_format=conversion.audit.format,
+            audit_compression=conversion.audit.compression,
+            audit_batch_rows=conversion.audit.batch_rows,
+            minimum_free_disk_gb=conversion.disk.minimum_free_gb,
+            disk_estimation_safety_factor=(
+                conversion.disk.estimation_safety_factor
+            ),
+        )
+    except (OSError, ResourcePreparationError, yaml.YAMLError) as exc:
         raise GctaGeneError("GMT-to-fastBAT conversion failed: %s" % exc) from exc
     set_path = prepared_directory / names.set_list
     logger.record(
@@ -826,6 +987,16 @@ def _prepare_gmt_set(
         input_pathways=manifest["validation"]["input_pathways"],
         pathways_written=manifest["validation"]["pathways_written"],
         unique_variants_written=manifest["validation"]["unique_variants_written"],
+        pathways_omitted_empty=manifest["validation"]["pathways_omitted_empty"],
+        pathways_omitted_oversized=(
+            manifest["validation"]["pathways_omitted_oversized"]
+        ),
+        audit_level=manifest["policies"]["audit"]["level"],
+        estimated_output_bytes=manifest["disk_preflight"][
+            "estimated_output_bytes"
+        ],
+        mapping_workers=manifest["generation"]["mapping_workers"],
+        mapping_algorithm=manifest["generation"]["mapping_algorithm"],
         output=str(set_path),
     )
     return set_path, manifest, prepared_directory
@@ -887,6 +1058,7 @@ def _prepare_analysis_set_list(
     reference_ids: set[str],
     empty_set_policy: str,
     oversized_set_policy: str,
+    maximum_set_variants: int,
 ) -> tuple[Path, dict]:
     """Validate and atomically write sets restricted to analyzable variants.
 
@@ -948,7 +1120,7 @@ def _prepare_analysis_set_list(
                                 "fastBAT set %s contains no variant IDs."
                                 % current_set
                             )
-                        if len(current_matched) > _GCTA_MAXIMUM_SET_VARIANTS:
+                        if len(current_matched) > maximum_set_variants:
                             oversized_sets.append(
                                 (current_set, len(current_matched))
                             )
@@ -995,7 +1167,7 @@ def _prepare_analysis_set_list(
                 "examples: %s"
                 % (
                     len(oversized_sets),
-                    format(_GCTA_MAXIMUM_SET_VARIANTS, ","),
+                    format(maximum_set_variants, ","),
                     ", ".join(
                         "%s (%d)" % item for item in oversized_sets[:10]
                     ),
@@ -1020,7 +1192,7 @@ def _prepare_analysis_set_list(
         "omitted_oversized_set_examples": [
             "%s (%d)" % item for item in oversized_sets[:10]
         ],
-        "maximum_set_variants": _GCTA_MAXIMUM_SET_VARIANTS,
+        "maximum_set_variants": maximum_set_variants,
         "requested_set_variants": requested_variants,
         "matched_set_variants": matched_variants,
         "analysis_set_variants": analysis_variants,
@@ -1048,9 +1220,14 @@ def _completion_manifest_path(
 
 def _gcta_configuration_digest(configuration) -> str:
     module = configuration.modules.gcta_gene.model_dump(mode="json")
-    # Reporting changes only derived terminal/log summaries. Excluding them
-    # preserves validated analysis reuse when no GCTA input or command changes.
+    # Reporting and converter worker scheduling do not determine the GCTA
+    # scientific result. Excluding them preserves validated analysis reuse when
+    # no GCTA input or command changes.
     module.pop("reporting", None)
+    conversion = module["set_annotation"]["conversion"]
+    conversion.pop("parallelism", None)
+    conversion.pop("audit", None)
+    conversion.pop("disk", None)
     module["results"].pop("normalized_schema_version", None)
     payload = {
         "module": module,
@@ -1229,113 +1406,241 @@ def run_gcta_gene(
     logger: PipelineLogger,
     *,
     harmonised_vcf: str | Path | None = None,
+    reconcile_variant_ids: bool = False,
     dry_run: bool = False,
 ) -> ModuleResult:
-    module = configuration.modules.gcta_gene
-    _validate_build_and_population(module, configuration)
-    source = _required_path(str(input_file), "GCTA summary-statistics input")
-    output = Path(output_directory).expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    layout = module.output_layout
-    annotation_file = None
-    prepared_manifest = None
-    prepared_directory = None
-    analysis_set_path = None
-    harmonised_input_path = None
-    if module.method in {"fastbat_gene", "mbat_combo"}:
-        if module.set_annotation.gmt_file is not None:
-            raise GctaGeneError(
-                "--gmt is valid only with --method fastbat_set; the analysis "
-                "method is never inferred from an input filename."
-            )
-        annotation_file = _required_path(
-            module.gene_annotation.file, "GCTA gene list",
+    if harmonised_vcf is not None and not reconcile_variant_ids:
+        raise GctaGeneError(
+            "Direct GCTA input cannot use a harmonised VCF for ID rewriting."
         )
-    elif module.method == "fastbat_set":
-        if module.set_annotation.file is None and module.set_annotation.gmt_file is None:
-            raise GctaGeneError(
-                "fastbat_set requires exactly one of --gmt or --fastbat-set-list."
-            )
-    elif module.set_annotation.gmt_file is not None:
-        raise GctaGeneError("--gmt is valid only with --method fastbat_set.")
-    if module.reference.prefix is None:
-        raise GctaGeneError("--gcta-reference-prefix is required.")
-    reference_prefix = Path(module.reference.prefix).expanduser().resolve()
-    (
-        input_metrics,
-        input_frame,
-        identifier_column,
-        identifiers,
-        alleles,
-    ) = _validate_formatted_input(
-        source, configuration, module.method,
+    module = configuration.modules.gcta_gene
+    stage_total = (
+        5
+        + int(reconcile_variant_ids)
+        + int(harmonised_vcf is not None)
     )
+    if module.method in {"fastbat_gene", "mbat_combo"}:
+        stage_total += 1
+    elif module.method == "fastbat_set":
+        stage_total += 2
+    if dry_run:
+        stage_total -= 1
+    stage_number = 0
+
+    def stage(title: str, function_name: str):
+        nonlocal stage_number
+        stage_number += 1
+        return logger.step(
+            stage_number, stage_total, title, function_name,
+        )
+
+    with stage(
+        "Validate method and formatted GWAS input",
+        "validate_gcta_input",
+    ):
+        _validate_build_and_population(module, configuration)
+        source = _required_path(str(input_file), "GCTA summary-statistics input")
+        output = Path(output_directory).expanduser().resolve()
+        output.mkdir(parents=True, exist_ok=True)
+        layout = module.output_layout
+        annotation_file = None
+        prepared_manifest = None
+        prepared_directory = None
+        analysis_set_path = None
+        harmonised_input_path = None
+        if module.method in {"fastbat_gene", "mbat_combo"}:
+            if module.set_annotation.gmt_file is not None:
+                raise GctaGeneError(
+                    "--gmt is valid only with --method fastbat_set; the analysis "
+                    "method is never inferred from an input filename."
+                )
+            annotation_file = _required_path(
+                module.gene_annotation.file, "GCTA gene list",
+            )
+        elif module.method == "fastbat_set":
+            if (
+                module.set_annotation.file is None
+                and module.set_annotation.gmt_file is None
+            ):
+                raise GctaGeneError(
+                    "fastbat_set requires exactly one of --gmt or "
+                    "--fastbat-set-list."
+                )
+        elif module.set_annotation.gmt_file is not None:
+            raise GctaGeneError("--gmt is valid only with --method fastbat_set.")
+        if module.reference.prefix is None:
+            raise GctaGeneError("--gcta-reference-prefix is required.")
+        reference_prefix = Path(module.reference.prefix).expanduser().resolve()
+        (
+            input_metrics,
+            input_frame,
+            identifier_column,
+            identifiers,
+            alleles,
+        ) = _validate_formatted_input(
+            source, configuration, module.method,
+        )
     variant_locations = None
     location_metrics = {}
     if harmonised_vcf is not None:
-        variant_locations, location_metrics = _variant_locations_from_vcf(
-            harmonised_vcf,
+        with stage(
+            "Resolve GWAS variant coordinates",
+            "variant_locations_from_vcf",
+        ):
+            variant_locations, location_metrics = _variant_locations_from_vcf(
+                harmonised_vcf,
+                identifiers,
+                alleles,
+                output,
+                dataset_id,
+                configuration,
+                logger,
+            )
+    reference_stage_title = (
+        "Validate and match the PLINK LD reference"
+        if reconcile_variant_ids
+        else "Compare GWAS and PLINK BIM variant IDs"
+    )
+    with stage(
+        reference_stage_title,
+        "validate_gcta_reference",
+    ) as reference_stage:
+        reference_metrics, reference_ids, identifier_mapping = _validate_reference(
+            reference_prefix,
+            module,
             identifiers,
             alleles,
-            output,
-            dataset_id,
-            configuration,
-            logger,
+            variant_locations,
+            retain_variant_ids=module.method == "fastbat_set",
+            direct_input_mode=not reconcile_variant_ids,
         )
-    reference_metrics, reference_ids, identifier_mapping = _validate_reference(
-        reference_prefix,
-        module,
-        identifiers,
-        alleles,
-        variant_locations,
-        retain_variant_ids=module.method == "fastbat_set",
-    )
-    source, harmonisation_metrics, harmonised_input_path = _harmonise_formatted_input(
-        input_frame,
-        identifier_column,
-        identifier_mapping,
-        source,
-        output,
-        dataset_id,
-        configuration,
-    )
-    identifiers = set(identifier_mapping.values())
+        if not reconcile_variant_ids:
+            absent_from_reference = reference_metrics[
+                "input_variants_absent_from_reference"
+            ]
+            reference_stage.outcome(
+                "Compared exact IDs without rewriting the direct GCTA input.",
+                fields=(
+                    ("count", "Summary-statistic unique IDs", len(identifiers)),
+                    (
+                        "count",
+                        "PLINK BIM unique IDs",
+                        reference_metrics["reference_variants"],
+                    ),
+                    (
+                        "success",
+                        "Exact IDs shared",
+                        reference_metrics["overlapping_variants"],
+                    ),
+                    (
+                        "warning" if absent_from_reference else "success",
+                        "Summary IDs absent from BIM",
+                        (
+                            "%s; will not be used by GCTA"
+                            % format(absent_from_reference, ",")
+                            if absent_from_reference else "0"
+                        ),
+                    ),
+                    (
+                        "count",
+                        "BIM IDs absent from summary",
+                        reference_metrics["reference_variants_absent_from_input"],
+                    ),
+                ),
+                input_unique_variant_ids=len(identifiers),
+                reference_unique_variant_ids=reference_metrics[
+                    "reference_variants"
+                ],
+                exact_ids_shared=reference_metrics["overlapping_variants"],
+                input_ids_absent_from_reference=absent_from_reference,
+                reference_ids_absent_from_input=reference_metrics[
+                    "reference_variants_absent_from_input"
+                ],
+                input_rewritten=False,
+            )
+    if reconcile_variant_ids:
+        with stage(
+            "Harmonise GWAS variants to reference IDs",
+            "harmonise_gcta_input",
+        ):
+            (
+                source,
+                harmonisation_metrics,
+                harmonised_input_path,
+            ) = _harmonise_formatted_input(
+                input_frame,
+                identifier_column,
+                identifier_mapping,
+                source,
+                output,
+                dataset_id,
+                configuration,
+            )
+        identifiers = set(identifier_mapping.values())
+    else:
+        harmonisation_metrics = {
+            "harmonised_input_variants": input_frame.height,
+            "variant_ids_replaced": 0,
+            "unresolved_variants_removed": 0,
+            "harmonised_input_resumed": False,
+            "direct_input_unmodified": True,
+        }
     input_metrics.update(location_metrics)
     input_metrics.update(harmonisation_metrics)
     annotation_metrics = {}
     if module.method in {"fastbat_gene", "mbat_combo"}:
-        annotation_metrics = _validate_gene_list(
-            annotation_file, module,
-            set(reference_metrics["reference_chromosomes"]),
-        )
+        with stage(
+            "Validate gene-coordinate annotation",
+            "validate_gcta_gene_list",
+        ):
+            annotation_metrics = _validate_gene_list(
+                annotation_file, module,
+                set(reference_metrics["reference_chromosomes"]),
+            )
     elif module.method == "fastbat_set":
-        if module.set_annotation.gmt_file is not None:
-            annotation_file, prepared_manifest, prepared_directory = _prepare_gmt_set(
+        with stage(
+            "Prepare the fastBAT set source",
+            "prepare_fastbat_set_source",
+        ):
+            if module.set_annotation.gmt_file is not None:
+                (
+                    annotation_file,
+                    prepared_manifest,
+                    prepared_directory,
+                ) = _prepare_gmt_set(
+                    output,
+                    dataset_id,
+                    reference_prefix,
+                    module,
+                    configuration,
+                    logger,
+                    reference_metrics["reference_variants"],
+                    reference_ids,
+                    source,
+                )
+            else:
+                annotation_file = _required_path(
+                    module.set_annotation.file, "GCTA fastBAT set list",
+                )
+        with stage(
+            "Restrict fastBAT sets to analyzable variants",
+            "prepare_fastbat_analysis_sets",
+        ):
+            analysis_set_path = configured_output_path(
                 output,
-                dataset_id,
-                reference_prefix,
-                module,
-                configuration,
-                logger,
+                layout.analysis_set_list,
+                error_type=GctaGeneError,
+                dataset_id=dataset_id,
             )
-        else:
-            annotation_file = _required_path(
-                module.set_annotation.file, "GCTA fastBAT set list",
+            annotation_file, annotation_metrics = _prepare_analysis_set_list(
+                annotation_file,
+                analysis_set_path,
+                identifiers,
+                reference_ids,
+                module.set_annotation.conversion.empty_pathway_policy,
+                module.set_annotation.oversized_set_policy,
+                module.set_annotation.maximum_set_variants,
             )
-        analysis_set_path = configured_output_path(
-            output,
-            layout.analysis_set_list,
-            error_type=GctaGeneError,
-            dataset_id=dataset_id,
-        )
-        annotation_file, annotation_metrics = _prepare_analysis_set_list(
-            annotation_file,
-            analysis_set_path,
-            identifiers,
-            reference_ids,
-            module.set_annotation.conversion.empty_pathway_policy,
-            module.set_annotation.oversized_set_policy,
-        )
     del reference_ids
     logger.record("OBSERVED", "gcta_input", **input_metrics)
     logger.record("OBSERVED", "gcta_reference", **reference_metrics)
@@ -1378,14 +1683,18 @@ def run_gcta_gene(
             output=str(analysis_set_path),
         )
 
-    executable = resolve_executable(
-        configuration.resources.executables.gcta,
-        "GCTA executable",
-        error_type=GctaGeneError,
-    )
-    version = require_supported_gcta(
-        executable, module, logger, configuration.execution.timeout_seconds,
-    )
+    with stage(
+        "Validate the GCTA executable and version",
+        "validate_gcta_software",
+    ):
+        executable = resolve_executable(
+            configuration.resources.executables.gcta,
+            "GCTA executable",
+            error_type=GctaGeneError,
+        )
+        version = require_supported_gcta(
+            executable, module, logger, configuration.execution.timeout_seconds,
+        )
     final_prefix = configured_output_path(
         output, layout.output_prefix, error_type=GctaGeneError, dataset_id=dataset_id,
     )
@@ -1404,65 +1713,69 @@ def run_gcta_gene(
         and configuration.run.resume
         and not configuration.run.overwrite
     ):
-        result_metrics = _validate_gcta_completion_manifest(
-            completion_manifest,
-            dataset_id=dataset_id,
-            version=version,
-            configuration=configuration,
-            source=source,
-            annotation_file=annotation_file,
-            reference_prefix=reference_prefix,
-            final_result=final_result,
-            normalized=normalized,
-        )
-        logger.record(
-            "SKIP", "gcta_execution", reason="validated_resume",
-            output=str(final_result), manifest=str(completion_manifest),
-        )
-        recorded_correction = result_metrics.get("multiple_testing", {}).get(
-            "configuration"
-        )
-        current_correction = multiple_testing_configuration(module)
-        if recorded_correction != current_correction:
-            backup_handle = tempfile.NamedTemporaryFile(
-                dir=normalized.parent,
-                prefix=".%s.pre_correction." % normalized.name,
-                delete=False,
+        with stage(
+            "Validate and reuse completed GCTA results",
+            "resume_gcta_results",
+        ):
+            result_metrics = _validate_gcta_completion_manifest(
+                completion_manifest,
+                dataset_id=dataset_id,
+                version=version,
+                configuration=configuration,
+                source=source,
+                annotation_file=annotation_file,
+                reference_prefix=reference_prefix,
+                final_result=final_result,
+                normalized=normalized,
             )
-            backup = Path(backup_handle.name)
-            backup_handle.close()
-            shutil.copy2(normalized, backup)
-            try:
-                result_metrics = normalize_gcta_results(
-                    final_result,
-                    normalized,
-                    module,
-                )
-                _write_gcta_completion_manifest(
-                    completion_manifest,
-                    dataset_id=dataset_id,
-                    version=version,
-                    configuration=configuration,
-                    source=source,
-                    annotation_file=annotation_file,
-                    reference_prefix=reference_prefix,
-                    final_result=final_result,
-                    normalized=normalized,
-                    result_metrics=result_metrics,
-                )
-            except BaseException:
-                backup.replace(normalized)
-                raise
-            finally:
-                backup.unlink(missing_ok=True)
             logger.record(
-                "TRANSFORM",
-                "gcta_multiple_testing_corrections",
-                source=str(final_result),
-                output=str(normalized),
-                **result_metrics["multiple_testing"],
+                "SKIP", "gcta_execution", reason="validated_resume",
+                output=str(final_result), manifest=str(completion_manifest),
             )
-        resumed = True
+            recorded_correction = result_metrics.get("multiple_testing", {}).get(
+                "configuration"
+            )
+            current_correction = multiple_testing_configuration(module)
+            if recorded_correction != current_correction:
+                backup_handle = tempfile.NamedTemporaryFile(
+                    dir=normalized.parent,
+                    prefix=".%s.pre_correction." % normalized.name,
+                    delete=False,
+                )
+                backup = Path(backup_handle.name)
+                backup_handle.close()
+                shutil.copy2(normalized, backup)
+                try:
+                    result_metrics = normalize_gcta_results(
+                        final_result,
+                        normalized,
+                        module,
+                    )
+                    _write_gcta_completion_manifest(
+                        completion_manifest,
+                        dataset_id=dataset_id,
+                        version=version,
+                        configuration=configuration,
+                        source=source,
+                        annotation_file=annotation_file,
+                        reference_prefix=reference_prefix,
+                        final_result=final_result,
+                        normalized=normalized,
+                        result_metrics=result_metrics,
+                    )
+                except BaseException:
+                    backup.replace(normalized)
+                    raise
+                finally:
+                    backup.unlink(missing_ok=True)
+                logger.record(
+                    "TRANSFORM",
+                    "gcta_multiple_testing_corrections",
+                    source=str(final_result),
+                    output=str(normalized),
+                    **result_metrics["multiple_testing"],
+                )
+            resumed = True
     else:
         existing = [path for path in (final_result, normalized) if path.exists()]
         if existing and not configuration.run.overwrite:
@@ -1493,15 +1806,48 @@ def run_gcta_gene(
             configuration.execution.threads,
             module,
         )
-        with logger.step(1, 1, "Run GCTA %s" % module.method, "run_gcta_command") as step:
+        with stage(
+            "Run GCTA %s and validate results" % module.method,
+            "run_gcta_command",
+        ) as step:
             step.input(
                 "summary_statistics",
                 path=str(source),
                 rows=input_metrics["harmonised_input_variants"],
             )
-            run_gcta_command(
-                command, staged_result, configuration, logger, dry_run=dry_run,
-            )
+            measured_progress = None
+            if not dry_run:
+                result_schema = module.results.schemas[module.method]
+                measured_progress = GctaResultProgress(
+                    method=module.method,
+                    unit_label=result_schema.unit_label,
+                    native_log=gcta_native_log_path(staged_prefix),
+                    result_file=staged_result,
+                    logger=logger,
+                    enabled=configuration.logging.show_progress,
+                    total_hint=(
+                        annotation_metrics.get("sets")
+                        if module.method == "fastbat_set" else None
+                    ),
+                )
+                measured_progress.start()
+            try:
+                run_gcta_command(
+                    command,
+                    staged_result,
+                    configuration,
+                    logger,
+                    dry_run=dry_run,
+                    progress_callback=(
+                        measured_progress.refresh
+                        if measured_progress is not None
+                        and measured_progress.enabled else None
+                    ),
+                )
+            except BaseException:
+                if measured_progress is not None:
+                    measured_progress.fail()
+                raise
             if dry_run:
                 step.output("validated_command", output_prefix=str(final_prefix))
                 shutil.rmtree(staging)
@@ -1552,9 +1898,16 @@ def run_gcta_gene(
                     },
                 )
             stage_normalized = staging / "normalized" / normalized.name
-            result_metrics = normalize_gcta_results(
-                staged_result, stage_normalized, module,
-            )
+            try:
+                result_metrics = normalize_gcta_results(
+                    staged_result, stage_normalized, module,
+                )
+            except BaseException:
+                if measured_progress is not None:
+                    measured_progress.fail()
+                raise
+            if measured_progress is not None:
+                measured_progress.complete(result_metrics["tested_units"])
             published = _publish_staged_outputs(
                 staged_prefix, final_prefix, configuration.run.overwrite,
             )
@@ -1566,19 +1919,19 @@ def run_gcta_gene(
             step.set_rows(result_metrics["tested_units"], removed=0)
             step.output("gcta_results", files=[str(path) for path in published])
             step.output("normalized_results", path=str(normalized))
-        shutil.rmtree(staging)
-        _write_gcta_completion_manifest(
-            completion_manifest,
-            dataset_id=dataset_id,
-            version=version,
-            configuration=configuration,
-            source=source,
-            annotation_file=annotation_file,
-            reference_prefix=reference_prefix,
-            final_result=final_result,
-            normalized=normalized,
-            result_metrics=result_metrics,
-        )
+            shutil.rmtree(staging)
+            _write_gcta_completion_manifest(
+                completion_manifest,
+                dataset_id=dataset_id,
+                version=version,
+                configuration=configuration,
+                source=source,
+                annotation_file=annotation_file,
+                reference_prefix=reference_prefix,
+                final_result=final_result,
+                normalized=normalized,
+                result_metrics=result_metrics,
+            )
 
     metadata = {
         "dataset_id": dataset_id,
@@ -1654,11 +2007,20 @@ def run_gcta_gene(
         **annotation_metrics,
         **result_metrics,
     }
-    metrics["scientific_summary"] = build_gcta_scientific_summary(
-        normalized,
-        module,
-        metrics,
-    )
+    if stage_number != stage_total - 1:
+        raise GctaGeneError(
+            "Internal GCTA progress plan mismatch before summary: completed "
+            "%d of %d planned stages." % (stage_number, stage_total)
+        )
+    with stage(
+        "Build the scientific result summary",
+        "build_gcta_scientific_summary",
+    ):
+        metrics["scientific_summary"] = build_gcta_scientific_summary(
+            normalized,
+            module,
+            metrics,
+        )
     return ModuleResult(
         "gcta_gene",
         artifacts=artifacts,
@@ -1717,6 +2079,10 @@ def run_gcta_gene_direct(args, ctx=None) -> ModuleResult:
         level=configuration.logging.file_level,
         screen_level=configuration.logging.console_level,
         log_path=str(log_path),
+        stage_progress=StageProgress(
+            "GCTA %s stages" % module.method.replace("_", " "),
+            enabled=configuration.logging.show_progress,
+        ),
     )
     try:
         input_file = getattr(args, "gcta_input_file", None) or module.input_file
@@ -1725,13 +2091,21 @@ def run_gcta_gene_direct(args, ctx=None) -> ModuleResult:
             input_file = ctx.get("formatter", {}).get("gcta_gene", {}).get(
                 input_key
             )
-        if input_file is None:
+        pipeline_mode = ctx is not None
+        supplied_vcf = getattr(args, "vcf", None)
+        if not pipeline_mode and supplied_vcf is not None:
             raise GctaGeneError(
-                "Provide --gcta-input-file, modules.gcta_gene.input_file, or "
-                "formatter artifact %r." % input_key
+                "Direct gcta_gene does not accept --vcf because direct input "
+                "mode compares exact SNP IDs without coordinate-based "
+                "rewriting. Remove --vcf; summary-statistic IDs absent from "
+                "the BIM will be reported and ignored by GCTA. Use postgwas "
+                "pipeline --modules gcta_gene --vcf PATH when coordinate-and-"
+                "allele reconciliation is required."
             )
+        harmonised_vcf = supplied_vcf if pipeline_mode else None
+        _require_gcta_gene_arguments(configuration, input_file)
         resource_paths = ["executables.gcta"]
-        if getattr(args, "vcf", None) is not None:
+        if harmonised_vcf is not None:
             resource_paths.append("executables.bcftools")
         if module.genome_build is not None:
             resource_paths.append("genomes.%s" % module.genome_build)
@@ -1797,8 +2171,11 @@ def run_gcta_gene_direct(args, ctx=None) -> ModuleResult:
                 mode="json"
             ),
             harmonised_vcf=(
-                str(getattr(args, "vcf"))
-                if getattr(args, "vcf", None) is not None else None
+                str(harmonised_vcf) if harmonised_vcf is not None else None
+            ),
+            variant_id_match_policy=(
+                "allow_pipeline_reconciliation"
+                if pipeline_mode else "report_exact_bim_overlap_without_rewriting"
             ),
             threads=configuration.execution.threads,
         )
@@ -1808,7 +2185,8 @@ def run_gcta_gene_direct(args, ctx=None) -> ModuleResult:
             dataset,
             configuration,
             logger,
-            harmonised_vcf=getattr(args, "vcf", None),
+            harmonised_vcf=harmonised_vcf,
+            reconcile_variant_ids=pipeline_mode,
             dry_run=bool(getattr(args, "dry_run", False)),
         )
         if ctx is not None:

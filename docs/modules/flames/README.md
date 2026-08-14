@@ -36,7 +36,7 @@ columns, every referenced file, the configured credible-set and probability
 columns (`cred1` and `prob1`), parseable `CHR:BP:A1_A2` variant identifiers,
 unique variants, and
 finite probabilities between zero and one. Missing or invalid handoff data stop
-the workflow before FLAMES can create scientifically misleading annotations.
+the workflow before FLAMES can create misleading biological annotations.
 
 ## Running FLAMES on example data:
 To run FLAMES on the provided example data navigate to the example_data folder in the downloaded FLAMES folder from this GitHub.

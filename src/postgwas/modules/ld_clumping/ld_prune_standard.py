@@ -1,15 +1,16 @@
 
 import math
-import os
 import subprocess
-import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from pathlib import Path
 
 import polars as pl
 
+from postgwas.config import load_configuration
+from postgwas.core.paths import configured_output_path
 from postgwas.core.ui import screen_field, screen_line
+from postgwas.core.vcf import extract_vcf_table
 
 
 class PipelineStageError(RuntimeError):
@@ -36,6 +37,36 @@ def function_error(stage, function, error, **context):
         f"{type(error).__name__}: {error}",
         **context,
     )
+
+
+def _resolve_standard_options(*, application=None, **provided):
+    """Resolve omitted helper options once without reloading configured calls."""
+    if all(value is not None for value in provided.values()):
+        return provided
+    application = application or load_configuration()
+    module = application.modules.ld_clumping
+    defaults = {
+        "candidate_p_threshold": module.candidate_pvalue,
+        "candidate_p": module.candidate_pvalue,
+        "tabix_bin": application.resources.executables.tabix,
+        "window_kb": module.window_kb,
+        "missing_index_action": module.missing_index_action,
+        "reference_file_pattern": module.reference.file_pattern,
+        "reference_index_suffix": module.reference.index_suffix,
+        "summary_pvalue_thresholds": module.summary_pvalue_thresholds,
+        "bcftools_bin": application.resources.executables.bcftools,
+        "threads": application.execution.threads,
+        "memory_gb": application.execution.memory_gb,
+    }
+    unknown = sorted(set(provided).difference(defaults))
+    if unknown:
+        raise RuntimeError(
+            "Unknown LD-clumping runtime option(s): %s" % ", ".join(unknown)
+        )
+    return {
+        name: defaults[name] if value is None else value
+        for name, value in provided.items()
+    }
 
 
 def canonical_variant_id(chrom, pos, allele_1, allele_2):
@@ -78,14 +109,24 @@ def add_canonical_ids(gwas):
             f"Missing required columns: {', '.join(missing)}",
         )
 
-    chrom = pl.col("chrcol").cast(pl.Utf8).str.to_uppercase().str.replace(r"^CHR", "")
+    chromosome_text = (
+        pl.col("chrcol").cast(pl.Utf8).str.to_uppercase().str.replace(r"^CHR", "")
+    )
+    chrom = (
+        pl.when(chromosome_text.str.contains(r"^\d+$"))
+        .then(chromosome_text.cast(pl.Int64, strict=False).cast(pl.Utf8))
+        .otherwise(chromosome_text)
+    )
     ea = pl.col("eacol").cast(pl.Utf8).str.to_uppercase()
     nea = pl.col("neacol").cast(pl.Utf8).str.to_uppercase()
     allele_1 = pl.when(ea <= nea).then(ea).otherwise(nea)
     allele_2 = pl.when(ea <= nea).then(nea).otherwise(ea)
     gwas = gwas.with_row_index("_input_order").with_columns(
+        chrom.alias("chrcol"),
         pl.col("rsIDcol").cast(pl.Utf8).alias("input_id"),
         pl.col("pcol").cast(pl.Float64, strict=False).alias("pcol"),
+        ea.alias("_effect_allele_orientation"),
+        nea.alias("_non_effect_allele_orientation"),
         pl.concat_str(
             [
                 chrom,
@@ -121,6 +162,26 @@ def add_canonical_ids(gwas):
 
     duplicates = gwas.group_by("uniq_id").len().filter(pl.col("len") > 1)
     if not duplicates.is_empty():
+        orientation_conflicts = (
+            gwas.group_by("uniq_id")
+            .agg(
+                pl.struct(
+                    "_effect_allele_orientation",
+                    "_non_effect_allele_orientation",
+                ).n_unique().alias("orientation_count")
+            )
+            .filter(pl.col("orientation_count") > 1)
+        )
+        if not orientation_conflicts.is_empty():
+            examples = orientation_conflicts["uniq_id"].head(5).to_list()
+            raise PipelineStageError(
+                "03 canonical ID preparation",
+                "add_canonical_ids",
+                "Duplicate canonical variants have conflicting effect-allele "
+                "orientation; automatic allele flipping is prohibited "
+                f"| conflicting_variants={orientation_conflicts.height} "
+                f"| examples={examples}",
+            )
         examples = duplicates["uniq_id"].head(5).to_list()
         rows_removed = duplicates.select((pl.col("len") - 1).sum()).item()
         print(
@@ -133,7 +194,11 @@ def add_canonical_ids(gwas):
     return (
         gwas.sort(["chrcol", "poscol", "pcol", "_input_order"])
         .unique("uniq_id", keep="first", maintain_order=True)
-        .drop("_input_order")
+        .drop(
+            "_input_order",
+            "_effect_allele_orientation",
+            "_non_effect_allele_orientation",
+        )
     )
 
 
@@ -156,11 +221,26 @@ def build_id_aliases(gwas):
     return aliases
 
 
-def _standard_conversion_paths(output_folder, sample_name):
-    output_dir = Path(output_folder)
+def _standard_conversion_paths(output_folder, sample_name, configuration=None):
+    configuration = configuration or load_configuration().modules.ld_clumping
+    output_dir = Path(output_folder).expanduser().resolve()
+    values = {
+        "dataset_id": sample_name,
+        "population": configuration.population.value,
+    }
     return (
-        output_dir / f"{sample_name}_formatted.tsv",
-        output_dir / f"{sample_name}_vcf_to_standard_ldclump_conversion.log",
+        configured_output_path(
+            output_dir,
+            configuration.output_layout.standard_formatted_table,
+            error_type=RuntimeError,
+            **values,
+        ),
+        configured_output_path(
+            output_dir,
+            configuration.output_layout.standard_log,
+            error_type=RuntimeError,
+            **values,
+        ),
     )
 
 
@@ -168,18 +248,34 @@ def vcf_to_standard_ldclump(
     sumstat_vcf: str,
     output_folder: str,
     sample_name: str,
-    bcftools_path="bcftools",
-    threads=4,
+    bcftools_path=None,
+    threads=None,
+    *,
+    configuration=None,
+    logger=None,
 ):
-    """
-    Converts VCF to TSV using specified bcftools path with multithreading support
-    and detailed command logging.
-    """
+    """Extract and validate the configured GWAS-VCF projection without a shell."""
+    del threads
+    application = None
+    if configuration is None or bcftools_path is None:
+        application = load_configuration()
+    configuration = configuration or application.modules.ld_clumping
+    bcftools_path = bcftools_path or application.resources.executables.bcftools
     vcf_path = Path(sumstat_vcf)
-    output_dir = Path(output_folder)
-    output_file, log_file = _standard_conversion_paths(output_dir, sample_name)
+    output_dir = Path(output_folder).expanduser().resolve()
+    output_file, log_file = _standard_conversion_paths(
+        output_dir, sample_name, configuration,
+    )
+    working_file = configured_output_path(
+        output_dir,
+        configuration.output_layout.standard_working_table,
+        error_type=RuntimeError,
+        dataset_id=sample_name,
+        population=configuration.population.value,
+    )
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
+        for path in (output_file, log_file, working_file):
+            path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise function_error(
             "01 VCF conversion",
@@ -189,94 +285,103 @@ def vcf_to_standard_ldclump(
             input_vcf=vcf_path,
             output_folder=output_dir,
         ) from error
-    # Constructing the bash command
-    cmd = textwrap.dedent(f"""
-        set -o pipefail
-        {{
-            printf "chrcol\\tposcol\\tneacol\\teacol\\trsIDcol\\tpcol\\tbecol\\tsecol\\teafcol\\n"
-            {bcftools_path} view --threads {threads} --min-alleles 2 --max-alleles 2 "{vcf_path}" | \
-            {bcftools_path} query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%ID\\t[%LP]\\t[%ES]\\t[%SE]\\t[%AF]\\n' | \
-            sed 's|:|_|g' | \
-            awk -F '\\t' 'BEGIN {{ OFS="\\t" }} {{
-                raw_p = exp(-$6 * log(10))
-                $6 = sprintf("%.6g", raw_p)
-                if ($7 == "" || $7 == ".") $7 = "NA"
-                if ($8 == "" || $8 == ".") $8 = "NA"
-                print
-            }}'
-        }} > "{output_file}"
-    """)
+    fields = configuration.vcf_fields
+    columns = {
+        "chrcol": fields.chromosome,
+        "poscol": fields.position,
+        "neacol": fields.reference_allele,
+        "eacol": fields.alternate_allele,
+        "rsIDcol": fields.variant_id,
+        "lpcol": fields.log_pvalue,
+        "becol": fields.effect,
+        "secol": fields.standard_error,
+        "eafcol": fields.allele_frequency,
+    }
     try:
-        with open(log_file, "w") as lf:
-            # Writing metadata and the exact command to the log
-            lf.write("--- VCF Conversion Log ---\n")
-            lf.write(f"Sample: {sample_name}\n")
-            lf.write(f"Threads: {threads}\n")
-            lf.write(f"Command used:\n{cmd}\n")
-            lf.write("--- Execution Output ---\n")
-            lf.flush()  # Ensure the command is written before the process starts
-            # Execute the command
-            subprocess.run(
-                cmd,
-                shell=True,
-                executable="/bin/bash",
-                check=True,
-                stdout=lf,
-                stderr=lf,
-            )
-            lf.write("\n[STAMP] Conversion completed successfully.\n")
-    except subprocess.CalledProcessError as error:
-        try:
-            log_tail = "\n".join(log_file.read_text().splitlines()[-20:])
-        except OSError:
-            log_tail = "The conversion log could not be read."
-        raise PipelineStageError(
-            "01 VCF conversion",
-            "vcf_to_standard_ldclump",
-            f"bcftools conversion returned exit code {error.returncode}; "
-            f"log_tail={log_tail}",
-            sample=sample_name,
-            input_vcf=vcf_path,
-            output_file=output_file,
-            log_file=log_file,
-        ) from error
-    except OSError as error:
-        raise function_error(
-            "01 VCF conversion",
-            "vcf_to_standard_ldclump",
-            error,
-            sample=sample_name,
-            input_vcf=vcf_path,
-            output_file=output_file,
-            log_file=log_file,
-        ) from error
-    try:
-        output_missing = not output_file.exists() or output_file.stat().st_size == 0
-    except OSError as error:
-        raise function_error(
-            "01 VCF conversion",
-            "vcf_to_standard_ldclump",
-            error,
-            sample=sample_name,
-            input_vcf=vcf_path,
-            output_file=output_file,
-            log_file=log_file,
-        ) from error
-    if output_missing:
-        raise PipelineStageError(
-            "01 VCF conversion",
-            "vcf_to_standard_ldclump",
-            "Conversion command completed but produced no output",
-            sample=sample_name,
-            input_vcf=vcf_path,
-            output_file=output_file,
-            log_file=log_file,
+        extract_vcf_table(
+            vcf_path,
+            working_file,
+            sample_name,
+            columns,
+            bcftools_path,
+            delimiter=configuration.table.delimiter,
+            io_buffer_bytes=configuration.table.io_buffer_bytes,
+            include_expression=configuration.table.biallelic_include_expression,
+            logger=logger,
+            error_type=RuntimeError,
+            purpose="Extracting the standard LD-clumping table",
         )
+        extracted = pl.read_csv(
+            working_file,
+            separator=configuration.table.delimiter,
+            null_values=configuration.table.null_values,
+            infer_schema_length=configuration.table.infer_schema_length,
+        ).with_columns(
+            pl.col("poscol").cast(pl.Int64, strict=False),
+            pl.col("lpcol").cast(pl.Float64, strict=False),
+            pl.col("becol").cast(pl.Float64, strict=False),
+            pl.col("secol").cast(pl.Float64, strict=False),
+            pl.col("eafcol").cast(pl.Float64, strict=False),
+        )
+    except (OSError, RuntimeError, pl.exceptions.PolarsError) as error:
+        raise function_error(
+            "01 VCF conversion",
+            "vcf_to_standard_ldclump",
+            error,
+            sample=sample_name,
+            input_vcf=vcf_path,
+            output_file=output_file,
+            log_file=log_file,
+        ) from error
+    invalid = extracted.filter(
+        pl.col("poscol").is_null()
+        | pl.col("lpcol").is_null()
+        | pl.col("lpcol").is_nan()
+        | (pl.col("lpcol") < 0)
+    )
+    if not invalid.is_empty():
+        raise PipelineStageError(
+            "01 VCF conversion",
+            "vcf_to_standard_ldclump",
+            "Extracted VCF contains %d invalid position or LP values"
+            % invalid.height,
+            sample=sample_name,
+            input_vcf=vcf_path,
+        )
+    formatted = (
+        extracted.with_columns((10.0 ** (-pl.col("lpcol"))).alias("pcol"))
+        .drop("lpcol")
+        .select(
+            "chrcol",
+            "poscol",
+            "neacol",
+            "eacol",
+            "rsIDcol",
+            "pcol",
+            "becol",
+            "secol",
+            "eafcol",
+        )
+    )
+    try:
+        formatted.write_csv(output_file, separator=configuration.table.delimiter)
+        with log_file.open("w", encoding="utf-8") as handle:
+            handle.write("Standard LD-clumping VCF extraction completed\n")
+            handle.write("input_vcf=%s\n" % vcf_path)
+            handle.write("output_table=%s\n" % output_file)
+            handle.write("variants=%d\n" % formatted.height)
+            handle.write("allele_orientation=REF to neacol; ALT to eacol; unchanged\n")
+    except OSError as error:
+        raise function_error(
+            "01 VCF conversion", "vcf_to_standard_ldclump", error,
+            sample=sample_name, output_file=output_file, log_file=log_file,
+        ) from error
+    working_file.unlink(missing_ok=True)
+    try:
+        working_file.parent.rmdir()
+    except OSError:
+        pass
     return str(output_file)
-
-
-# Backward compatibility for callers using the original misspelled API name.
-vcf_to_standered_ldclump = vcf_to_standard_ldclump
 
 
 def get_ld_partners(
@@ -287,7 +392,20 @@ def get_ld_partners(
     r2_threshold,
     id_aliases=None,
     log=None,
+    *,
+    tabix_bin=None,
+    window_kb=None,
+    missing_index_action=None,
 ):
+    """Return LD partners from a symmetric first-endpoint tabix reference."""
+    resolved = _resolve_standard_options(
+        tabix_bin=tabix_bin,
+        window_kb=window_kb,
+        missing_index_action=missing_index_action,
+    )
+    tabix_bin = resolved["tabix_bin"]
+    window_kb = resolved["window_kb"]
+    missing_index_action = resolved["missing_index_action"]
     id_aliases = id_aliases or {}
     emit = log or print
     region = None
@@ -303,19 +421,34 @@ def get_ld_partners(
         )
         region = f"{chrom}:{pos}-{pos}"
         result = subprocess.run(
-            ["tabix", ld_file_path, region], capture_output=True, text=True, check=True
+            [tabix_bin, ld_file_path, region],
+            capture_output=True,
+            text=True,
+            check=True,
         )
         if not result.stdout.strip():
-            emit(
-                "[WARNING] [STAGE: 04 LD retrieval] "
-                "[FUNCTION: get_ld_partners] No LD rows were returned for the "
-                "exact index-SNP position "
+            message = (
+                "No LD rows were returned for the exact index-SNP position "
                 f"| chromosome={chrom} | position={pos} "
                 f"| expected_id={canonical_id} | ld_rows_returned=0 "
-                "| action=self-only | consequence=no LD partners assigned "
                 f"| ld_file={ld_file_path} | region={region}"
             )
-            return self_snp
+            if missing_index_action == "self_only":
+                emit(
+                    "[WARNING] [STAGE: 04 LD retrieval] "
+                    "[FUNCTION: get_ld_partners] %s | action=self-only "
+                    "| consequence=independence assumed explicitly" % message
+                )
+                return self_snp
+            raise PipelineStageError(
+                "04 LD retrieval",
+                "get_ld_partners",
+                message + " | action=error",
+                chromosome=chrom,
+                variant=canonical_id,
+                ld_file=ld_file_path,
+                region=region,
+            )
         ld_df = pl.read_csv(
             StringIO(result.stdout),
             separator="\t",
@@ -337,25 +470,39 @@ def get_ld_partners(
             pl.Series("match_a", [resolve_id(x) for x in ld_df["snp_a"]]),
             pl.Series("match_b", [resolve_id(x) for x in ld_df["snp_b"]]),
         )
-        matched = ld_df.filter(
-            (pl.col("match_a") == canonical_id)
-            | (pl.col("match_b") == canonical_id)
-        )
+        matched = ld_df.filter(pl.col("match_a") == canonical_id)
         if matched.is_empty():
             observed_index_ids = (
                 ld_df["snp_a"].unique(maintain_order=True).head(5).to_list()
             )
-            emit(
-                "[WARNING] [STAGE: 04 LD retrieval] "
-                "[FUNCTION: get_ld_partners] Reference ID/allele mismatch at "
-                "the queried index-SNP position "
+            message = (
+                "Reference ID/allele mismatch at the queried index-SNP position "
                 f"| chromosome={chrom} | position={pos} "
                 f"| expected_id={canonical_id} | ld_rows_returned={ld_df.height} "
-                f"| observed_index_ids={observed_index_ids} | action=self-only "
-                "| consequence=no LD partners assigned "
+                f"| observed_index_ids={observed_index_ids} "
                 f"| ld_file={ld_file_path} | region={region}"
             )
-        filtered = matched.filter(pl.col("r2") >= r2_threshold)
+            if missing_index_action == "self_only":
+                emit(
+                    "[WARNING] [STAGE: 04 LD retrieval] "
+                    "[FUNCTION: get_ld_partners] %s | action=self-only "
+                    "| consequence=independence assumed explicitly" % message
+                )
+                return self_snp
+            raise PipelineStageError(
+                "04 LD retrieval",
+                "get_ld_partners",
+                message + " | action=error",
+                chromosome=chrom,
+                variant=canonical_id,
+                ld_file=ld_file_path,
+                region=region,
+            )
+        window_bp = int(window_kb) * 1000
+        filtered = matched.filter(
+            (pl.col("r2") >= r2_threshold)
+            & ((pl.col("pos_b") - int(pos)).abs() <= window_bp)
+        )
         if not matched.is_empty() and filtered.is_empty():
             emit(
                 "[INFO] [STAGE: 04 LD retrieval] "
@@ -369,19 +516,10 @@ def get_ld_partners(
             )
         partners = filtered.select(
             [
-                pl.when(pl.col("match_a") == canonical_id)
-                .then(pl.col("match_b"))
-                .otherwise(pl.col("match_a"))
-                .alias("uniq_id"),
-                pl.when(pl.col("match_a") == canonical_id)
-                .then(pl.col("snp_b"))
-                .otherwise(pl.col("snp_a"))
-                .alias("ld_id"),
+                pl.col("match_b").alias("uniq_id"),
+                pl.col("snp_b").alias("ld_id"),
                 pl.lit(chrom).alias("ref_chr"),
-                pl.when(pl.col("match_a") == canonical_id)
-                .then(pl.col("pos_b"))
-                .otherwise(pl.col("pos_a"))
-                .alias("ref_pos"),
+                pl.col("pos_b").alias("ref_pos"),
                 pl.col("r2"),
             ]
         )
@@ -433,9 +571,25 @@ def find_ind_sig_snps(
     ld_path,
     lead_p_threshold,
     r2_clump_threshold,
-    threads=1,
+    threads=None,
     log=None,
+    *,
+    candidate_p_threshold=None,
+    tabix_bin=None,
+    window_kb=None,
+    missing_index_action=None,
 ):
+    del threads
+    resolved = _resolve_standard_options(
+        candidate_p_threshold=candidate_p_threshold,
+        tabix_bin=tabix_bin,
+        window_kb=window_kb,
+        missing_index_action=missing_index_action,
+    )
+    candidate_p_threshold = resolved["candidate_p_threshold"]
+    tabix_bin = resolved["tabix_bin"]
+    window_kb = resolved["window_kb"]
+    missing_index_action = resolved["missing_index_action"]
     emit = log or print
     remaining_leads = chr_df.filter(pl.col("pcol") <= lead_p_threshold).sort("pcol")
     ind_sig_clumps = []
@@ -459,6 +613,9 @@ def find_ind_sig_snps(
             r2_clump_threshold,
             id_aliases,
             log=emit,
+            tabix_bin=tabix_bin,
+            window_kb=window_kb,
+            missing_index_action=missing_index_action,
         )
         members = (
             partners.join(chr_df, on="uniq_id", how="left")
@@ -469,7 +626,7 @@ def find_ind_sig_snps(
             )
             .filter(
                 (~pl.col("is_gwas_tagged"))
-                | (pl.col("pcol") < 0.05)
+                | (pl.col("pcol") <= candidate_p_threshold)
                 | (pl.col("uniq_id") == sid)
             )
             .with_columns(
@@ -506,10 +663,27 @@ def find_ind_sig_snps(
 
 
 def find_lead_snps(
-    ind_sig_df, ld_path, r2_lead_threshold, threads=1, log=None
+    ind_sig_df,
+    ld_path,
+    r2_lead_threshold,
+    threads=None,
+    log=None,
+    *,
+    tabix_bin=None,
+    window_kb=None,
+    missing_index_action=None,
 ):
+    del threads
     if ind_sig_df.is_empty():
         return pl.DataFrame()
+    resolved = _resolve_standard_options(
+        tabix_bin=tabix_bin,
+        window_kb=window_kb,
+        missing_index_action=missing_index_action,
+    )
+    tabix_bin = resolved["tabix_bin"]
+    window_kb = resolved["window_kb"]
+    missing_index_action = resolved["missing_index_action"]
     emit = log or print
     ind_sig_heads = ind_sig_df.filter(
         pl.col("uniq_id") == pl.col("ind_sig_SNP_id")
@@ -535,6 +709,9 @@ def find_lead_snps(
             r2_lead_threshold,
             id_aliases,
             log=emit,
+            tabix_bin=tabix_bin,
+            window_kb=window_kb,
+            missing_index_action=missing_index_action,
         ).select("uniq_id", pl.col("r2").alias("r2_with_Lead"))
         members = remaining.join(partners, on="uniq_id", how="inner").with_columns(
             pl.lit(lid).alias("lead_SNP_id")
@@ -557,7 +734,14 @@ def find_lead_snps(
     return pl.concat(lead_clusters) if lead_clusters else pl.DataFrame()
 
 
-def define_genomic_risk_loci(ind_sig_df, leads_df, merge_dist, global_locus_start=1):
+def define_genomic_risk_loci(
+    ind_sig_df,
+    leads_df,
+    merge_dist,
+    global_locus_start=1,
+    *,
+    summary_pvalue_thresholds=None,
+):
     if leads_df.is_empty():
         return (
             pl.DataFrame(),
@@ -567,6 +751,9 @@ def define_genomic_risk_loci(ind_sig_df, leads_df, merge_dist, global_locus_star
             global_locus_start,
         )
 
+    summary_pvalue_thresholds = summary_pvalue_thresholds or (
+        load_configuration().modules.ld_clumping.summary_pvalue_thresholds
+    )
     candidate_p = {
         row["uniq_id"]: row["pcol"]
         for row in ind_sig_df.filter(pl.col("is_gwas_tagged"))
@@ -796,9 +983,10 @@ def define_genomic_risk_loci(ind_sig_df, leads_df, merge_dist, global_locus_star
                 "SE": m["l_se"],
                 "n_refsnps": len(m["all_candidates"]),
                 "n_members": len(m["all_gwas_candidates"]),
-                "n_5e_8": sum(p < 5e-8 for p in p_values),
-                "n_5e_5": sum(p < 5e-5 for p in p_values),
-                "n_0_05": sum(p < 0.05 for p in p_values),
+                **{
+                    name: sum(p <= threshold for p in p_values)
+                    for name, threshold in summary_pvalue_thresholds.items()
+                },
                 "nIndSigSNPs": len(m["all_is"]),
                 "nLeadSNPs": len(m["all_l"]),
                 "IndSig_LD_Groups": " | ".join(sorted(m["all_is_g"])),
@@ -852,30 +1040,95 @@ def process_chromosome(
     r2_clump,
     r2_lead,
     merge_dist,
-    threads=1,
+    threads=None,
+    *,
+    candidate_p=None,
+    tabix_bin=None,
+    window_kb=None,
+    missing_index_action=None,
+    reference_file_pattern=None,
+    reference_index_suffix=None,
+    summary_pvalue_thresholds=None,
 ):
     """
     Worker function to process a single chromosome.
     Accepts the canonical thread budget for sub-functions.
     """
+    resolved = _resolve_standard_options(
+        candidate_p=candidate_p,
+        tabix_bin=tabix_bin,
+        window_kb=window_kb,
+        missing_index_action=missing_index_action,
+        reference_file_pattern=reference_file_pattern,
+        reference_index_suffix=reference_index_suffix,
+        summary_pvalue_thresholds=summary_pvalue_thresholds,
+    )
+    candidate_p = resolved["candidate_p"]
+    tabix_bin = resolved["tabix_bin"]
+    window_kb = resolved["window_kb"]
+    missing_index_action = resolved["missing_index_action"]
+    reference_file_pattern = resolved["reference_file_pattern"]
+    reference_index_suffix = resolved["reference_index_suffix"]
+    summary_pvalue_thresholds = resolved["summary_pvalue_thresholds"]
     messages = []
     emit = messages.append
     significant_variants = gwas_subset.filter(pl.col("pcol") <= lead_p).height
-    ld_path = os.path.join(ld_folder, f"{pop}_chr{chrom}.ld.gz")
-    if not os.path.exists(ld_path):
+    if significant_variants == 0:
+        emit(
+            "[INFO] [STAGE: 04 LD reference validation] "
+            "[FUNCTION: process_chromosome] Chromosome has no variants at the "
+            "configured lead threshold; no LD resource was required "
+            f"| chromosome={chrom} | significance_threshold={lead_p}"
+        )
+        return {
+            "chrom": chrom,
+            "logs": messages,
+            "progress": {
+                "status": "no_significant_variants",
+                "significant": 0,
+                "independent": 0,
+                "lead": 0,
+                "loci": 0,
+            },
+        }
+    ld_path = Path(ld_folder) / reference_file_pattern.format(
+        population=pop,
+        chromosome=chrom,
+    )
+    if not ld_path.is_file() or ld_path.stat().st_size <= 0:
         error = PipelineStageError(
             "04 LD reference validation",
             "process_chromosome",
             "LD reference file was not found",
             chromosome=chrom,
-            ld_file=ld_path,
+            ld_file=str(ld_path),
+        )
+        error.chromosome_logs = messages
+        raise error
+    index_path = Path(str(ld_path) + reference_index_suffix)
+    if not index_path.is_file() or index_path.stat().st_size <= 0:
+        error = PipelineStageError(
+            "04 LD reference validation",
+            "process_chromosome",
+            "LD reference tabix index was not found or is empty",
+            chromosome=chrom,
+            ld_file=str(ld_path),
+            index_file=str(index_path),
         )
         error.chromosome_logs = messages
         raise error
     # Step A: Find independent significant SNPs.
     try:
         ind_sig = find_ind_sig_snps(
-            gwas_subset, ld_path, lead_p, r2_clump, log=emit
+            gwas_subset,
+            str(ld_path),
+            lead_p,
+            r2_clump,
+            log=emit,
+            candidate_p_threshold=candidate_p,
+            tabix_bin=tabix_bin,
+            window_kb=window_kb,
+            missing_index_action=missing_index_action,
         )
     except PipelineStageError as error:
         error.chromosome_logs = messages
@@ -912,7 +1165,14 @@ def process_chromosome(
     # Step B: Find lead SNPs.
     try:
         leads = find_lead_snps(
-            ind_sig, ld_path, r2_lead, threads, log=emit
+            ind_sig,
+            str(ld_path),
+            r2_lead,
+            threads,
+            log=emit,
+            tabix_bin=tabix_bin,
+            window_kb=window_kb,
+            missing_index_action=missing_index_action,
         )
     except PipelineStageError as error:
         error.chromosome_logs = messages
@@ -955,7 +1215,11 @@ def process_chromosome(
     )
     try:
         summ, hier, is_c, l_un, _ = define_genomic_risk_loci(
-            ind_sig, leads, merge_dist, 1
+            ind_sig,
+            leads,
+            merge_dist,
+            1,
+            summary_pvalue_thresholds=summary_pvalue_thresholds,
         )
     except PipelineStageError as error:
         error.chromosome_logs = messages
@@ -1184,30 +1448,56 @@ def ld_clump_standard(
     ld_folder,
     dataset_id,
     output_directory,
-    pop="EUR",
-    lead_p=5e-8,
-    r2_clump=0.6,
-    r2_lead=0.1,
-    merge_dist=250000,
-    bcftools_bin="bcftools",
-    threads=5,
+    pop=None,
+    lead_p=None,
+    r2_clump=None,
+    r2_lead=None,
+    merge_dist=None,
+    bcftools_bin=None,
+    threads=None,
+    *,
+    tabix_bin=None,
+    memory_gb=None,
+    configuration=None,
+    logger=None,
 ):
-    try:
-        from postgwas.core.execution.runtime import auto_detect_workers, safe_thread_count
-    except (ImportError, ModuleNotFoundError) as error:
-        raise function_error(
-            "00 setup",
-            "ld_clump_standard",
-            error,
-            dependency="postgwas.core.execution.runtime",
-        ) from error
+    application = None
+    if configuration is None:
+        application = load_configuration()
+        configuration = application.modules.ld_clumping
+    pop = pop or configuration.population.value
+    lead_p = configuration.lead_pvalue if lead_p is None else lead_p
+    r2_clump = configuration.clump_r2 if r2_clump is None else r2_clump
+    r2_lead = configuration.lead_r2 if r2_lead is None else r2_lead
+    merge_dist = (
+        configuration.merge_distance_bp if merge_dist is None else merge_dist
+    )
+    resolved = _resolve_standard_options(
+        application=application,
+        bcftools_bin=bcftools_bin,
+        tabix_bin=tabix_bin,
+        threads=threads,
+        memory_gb=memory_gb,
+    )
+    bcftools_bin = resolved["bcftools_bin"]
+    tabix_bin = resolved["tabix_bin"]
+    threads = resolved["threads"]
+    memory_gb = resolved["memory_gb"]
 
     # 1. Conversion
     try:
         tsv_path = vcf_to_standard_ldclump(
-            vcf_path, output_directory, dataset_id, bcftools_bin, threads=threads
+            vcf_path,
+            output_directory,
+            dataset_id,
+            bcftools_bin,
+            threads=threads,
+            configuration=configuration,
+            logger=logger,
         )
-        _, detailed_log = _standard_conversion_paths(output_directory, dataset_id)
+        _, detailed_log = _standard_conversion_paths(
+            output_directory, dataset_id, configuration,
+        )
     except PipelineStageError:
         raise
     except Exception as error:
@@ -1220,7 +1510,9 @@ def ld_clump_standard(
         ) from error
     # 2. Load Data
     try:
-        gwas = pl.read_csv(tsv_path, separator="\t")
+        gwas = pl.read_csv(
+            tsv_path, separator=configuration.table.delimiter,
+        )
     except Exception as error:
         raise function_error(
             "02 summary loading",
@@ -1239,6 +1531,66 @@ def ld_clump_standard(
             error,
             input_file=tsv_path,
         ) from error
+    before_mhc = gwas.height
+    if configuration.remove_mhc:
+        mhc = configuration.mhc_regions[configuration.genome_build]
+        normalized_chromosome = (
+            pl.col("chrcol")
+            .cast(pl.Utf8)
+            .str.to_uppercase()
+            .str.replace(r"^CHR", "")
+        )
+        mhc_chromosome = str(mhc.chromosome).upper().removeprefix("CHR")
+        gwas = gwas.filter(
+            ~(
+                (normalized_chromosome == mhc_chromosome)
+                & pl.col("poscol").is_between(mhc.start, mhc.end, closed="both")
+            )
+        )
+    Path(detailed_log).parent.mkdir(parents=True, exist_ok=True)
+    with Path(detailed_log).open("a", encoding="utf-8") as handle:
+        handle.write(
+            "MHC exclusion: enabled=%s genome_build=%s rows_in=%d rows_out=%d "
+            "removed=%d\n"
+            % (
+                configuration.remove_mhc,
+                configuration.genome_build.value,
+                before_mhc,
+                gwas.height,
+                before_mhc - gwas.height,
+            )
+        )
+    if logger is not None:
+        logger.record(
+            "ACTION",
+            "standard_mhc_exclusion",
+            enabled=configuration.remove_mhc,
+            rows_in=before_mhc,
+            rows_out=gwas.height,
+            removed=before_mhc - gwas.height,
+        )
+    significant_chromosomes = (
+        gwas.filter(pl.col("pcol") <= lead_p)["chrcol"].unique().to_list()
+    )
+    missing_resources = []
+    for chromosome in significant_chromosomes:
+        reference_path = Path(ld_folder) / configuration.reference.file_pattern.format(
+            population=pop,
+            chromosome=chromosome,
+        )
+        index_path = Path(str(reference_path) + configuration.reference.index_suffix)
+        if not reference_path.is_file() or reference_path.stat().st_size <= 0:
+            missing_resources.append(str(reference_path))
+        if not index_path.is_file() or index_path.stat().st_size <= 0:
+            missing_resources.append(str(index_path))
+    if missing_resources:
+        raise PipelineStageError(
+            "04 LD reference validation",
+            "ld_clump_standard",
+            "Missing or empty LD resources for chromosomes containing significant "
+            "variants: %s" % ", ".join(missing_resources),
+            sample=dataset_id,
+        )
     # --- BALANCED SCHEDULING ---
     try:
         chrom_stats = gwas.group_by("chrcol").len().sort("len", descending=True)
@@ -1248,20 +1600,15 @@ def ld_clump_standard(
             balanced_chroms.append(big_to_small.pop(0))
             if big_to_small:
                 balanced_chroms.append(big_to_small.pop(-1))
-        # In Docker/Threads, we can usually afford more workers than processes
-        # as long as the external tools (tabix) don't max out CPU.
-        # The worker pool cannot exceed the requested thread budget.
-        # Use your functions for memory safety
         gwas_mem_gb = gwas.estimated_size() / (1024**3)
-        dynamic_gb_per_thread = max(1.0, gwas_mem_gb * 1.1)
+        memory_per_worker_gb = max(
+            configuration.compute.minimum_worker_memory_gb,
+            gwas_mem_gb * configuration.compute.input_memory_multiplier,
+        )
+        memory_adjusted_workers = max(1, int(memory_gb // memory_per_worker_gb))
         n_workers = max(
             1,
-            min(
-                threads,
-                safe_thread_count(
-                    auto_detect_workers(), gb_per_thread=dynamic_gb_per_thread
-                ),
-            ),
+            min(threads, memory_adjusted_workers),
         )
     except Exception as error:
         raise function_error(
@@ -1308,7 +1655,16 @@ def ld_clump_standard(
                     lead_p,
                     r2_clump,
                     r2_lead,
-                    merge_dist,  # internal tool threads set to 1
+                    merge_dist,
+                    candidate_p=configuration.candidate_pvalue,
+                    tabix_bin=tabix_bin,
+                    window_kb=configuration.window_kb,
+                    missing_index_action=configuration.missing_index_action,
+                    reference_file_pattern=configuration.reference.file_pattern,
+                    reference_index_suffix=configuration.reference.index_suffix,
+                    summary_pvalue_thresholds=(
+                        configuration.summary_pvalue_thresholds
+                    ),
                 )
                 for chrom in balanced_chroms
             }
@@ -1388,7 +1744,7 @@ def ld_clump_standard(
     if res_list:
         def chr_key(x):
             c = str(x["chrom"]).lower().replace("chr", "")
-            return int(c) if c.isdigit() else 99
+            return (0, int(c)) if c.isdigit() else (1, c)
 
         try:
             res_list.sort(key=chr_key)
@@ -1410,13 +1766,20 @@ def ld_clump_standard(
                 error,
                 dataset=dataset_id,
             ) from error
-        for key, suffix in {
-            "summ": "GenomicRiskLoci_Summary.txt",
-            "hier": "GenomicRiskLoci_Hierarchy.txt",
-            "is_c": "IndSig_Clusters_Boundaries.txt",
-            "l_un": "Lead_Clusters_LD_Only.txt",
+        for key, pattern in {
+            "summ": configuration.output_layout.standard_summary,
+            "hier": configuration.output_layout.standard_hierarchy,
+            "is_c": configuration.output_layout.standard_independent_clusters,
+            "l_un": configuration.output_layout.standard_lead_clusters,
         }.items():
-            output_file = Path(output_directory) / f"{dataset_id}_{suffix}"
+            output_file = configured_output_path(
+                output_directory,
+                pattern,
+                error_type=RuntimeError,
+                dataset_id=dataset_id,
+                population=pop,
+            )
+            output_file.parent.mkdir(parents=True, exist_ok=True)
             try:
                 df = pl.concat(final_res[key])
                 # Ensure list types are converted to strings before CSV write
@@ -1433,7 +1796,9 @@ def ld_clump_standard(
                     output_file=output_file,
                 ) from error
             try:
-                df.write_csv(output_file, separator="\t")
+                df.write_csv(
+                    output_file, separator=configuration.table.delimiter,
+                )
             except Exception as error:
                 raise function_error(
                     "10 output writing",
@@ -1443,11 +1808,40 @@ def ld_clump_standard(
                     output_file=output_file,
                 ) from error
         _print_clumping_summary(chromosome_progress, detailed_log)
-        return {
-            "ldpruned_sig_file": str(
-                Path(output_directory) / f"{dataset_id}_GenomicRiskLoci_Summary.txt"
-            ),
+        summary_path = configured_output_path(
+            output_directory,
+            configuration.output_layout.standard_summary,
+            error_type=RuntimeError,
+            dataset_id=dataset_id,
+            population=pop,
+        )
+        result = {
+            "status": "completed",
+            "ldpruned_sig_file": str(summary_path),
             "log_file": str(detailed_log),
+            "significant_variants": sum(
+                item["significant"] for item in chromosome_progress
+            ),
+            "genomic_risk_loci": sum(item["loci"] for item in chromosome_progress),
         }
+        if logger is not None:
+            logger.record(
+                "OUTPUT", "standard_clumping", **result,
+                allele_orientation=(
+                    "REF/ALT retained; canonical matching ID is allele-order-independent"
+                ),
+            )
+        return result
     _print_clumping_summary(chromosome_progress, detailed_log)
-    return None
+    result = {
+        "status": "no_loci",
+        "ldpruned_sig_file": None,
+        "log_file": str(detailed_log),
+        "significant_variants": sum(
+            item["significant"] for item in chromosome_progress
+        ),
+        "genomic_risk_loci": 0,
+    }
+    if logger is not None:
+        logger.record("RESULT", "standard_clumping_no_loci", **result)
+    return result

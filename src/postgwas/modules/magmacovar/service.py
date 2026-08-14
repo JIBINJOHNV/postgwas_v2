@@ -14,8 +14,9 @@ from postgwas.config import (
 )
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.core.completion import (
+    apply_completion_restart,
     configuration_digest,
-    validate_completion_manifest,
+    resolve_completion_resume,
     write_completion_manifest,
 )
 from postgwas.core.paths import (
@@ -325,28 +326,39 @@ def run_magma_covar_direct(
             existing_artifacts = _recorded_artifact_paths(
                 paths["completion_manifest"], configured_artifacts,
             )
-            validate_completion_manifest(
+            decision = resolve_completion_resume(
                 paths["completion_manifest"],
                 dataset_id=dataset,
                 module="magmacovar",
                 genome_build="not_applicable",
                 configuration_sha256=completion_digest,
                 inputs=completion_inputs,
-                outputs=existing_artifacts,
+                outputs=configured_artifacts,
+                resume_policy=configuration.run.resume_policy,
                 error_type=MagmaCovarError,
             )
-            summary = validate_magma_covariate_output(
-                paths["results_file"], minimum_genes=module.minimum_genes,
+            if decision.action == "resume":
+                summary = validate_magma_covariate_output(
+                    paths["results_file"], minimum_genes=module.minimum_genes,
+                )
+                logger.record(
+                    "SKIP", "magmacovar_run",
+                    reason="provenance_validated_complete_outputs",
+                    **summary,
+                )
+                result = str(paths["results_file"])
+                if ctx is not None:
+                    ctx["magma_covar"] = result
+                return result
+            existing_artifacts = {}
+            apply_completion_restart(
+                decision,
+                output_root=output,
+                manifest=paths["completion_manifest"],
+                logger=logger,
+                operation="magmacovar_resume",
+                error_type=MagmaCovarError,
             )
-            logger.record(
-                "SKIP", "magmacovar_run",
-                reason="provenance_validated_complete_outputs",
-                **summary,
-            )
-            result = str(paths["results_file"])
-            if ctx is not None:
-                ctx["magma_covar"] = result
-            return result
 
         if (
             (existing_artifacts or paths["completion_manifest"].exists())

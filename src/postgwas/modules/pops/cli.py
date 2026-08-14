@@ -11,6 +11,7 @@ from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_examples,
     help_with_default,
+    mark_cli_required_help,
 )
 from postgwas.modules.pops.errors import PopsError
 
@@ -32,14 +33,18 @@ def get_pops_direct_parser(add_help=False):
     defaults = load_configuration()
     module = defaults.modules.pops
     parser = argparse.ArgumentParser(add_help=add_help)
-    group = parser.add_argument_group("PoPS input")
+    group = parser.add_argument_group(
+        "PoPS input",
+        "Direct analysis requires exactly one target source: "
+        "--magma-association-prefix or --target-score-file.",
+    )
     group.add_argument(
         "--magma-association-prefix",
         metavar="PREFIX",
         default=argparse.SUPPRESS,
         help=(
-            "Prefix shared by MAGMA .genes.out and .genes.raw files. Provide this "
-            "or configure a custom target-score file."
+            "Prefix shared by MAGMA .genes.out and .genes.raw files. Mutually "
+            "exclusive with --target-score-file."
         ),
     )
     group.add_argument(
@@ -51,7 +56,6 @@ def get_pops_direct_parser(add_help=False):
             "Declared genome build shared by MAGMA and the PoPS gene annotation; "
             "PostGWAS does not infer it",
             module.genome_build,
-            label="Configured default",
         ),
     )
     controls = parser.add_argument_group("Configuration")
@@ -61,21 +65,6 @@ def get_pops_direct_parser(add_help=False):
         default=argparse.SUPPRESS,
         help="YAML settings; explicit command-line values override matching keys.",
     )
-    controls.add_argument(
-        "--resume",
-        action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Reuse a complete, validated set of PoPS outputs",
-            defaults.run.resume,
-        ),
-    )
-    controls.add_argument(
-        "--overwrite",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Replace an existing complete PoPS result.",
-    )
     group.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
@@ -83,7 +72,6 @@ def get_pops_direct_parser(add_help=False):
         help=help_with_default(
             "Enable verbose messages from upstream PoPS",
             module.verbose,
-            label="Configured default",
         ),
     )
     return parser
@@ -94,7 +82,7 @@ def get_pops_pipeline_parser(add_help=False):
     defaults = load_configuration()
     module = defaults.modules.pops
     parser = argparse.ArgumentParser(add_help=add_help)
-    group = parser.add_argument_group("PoPS scientific compatibility")
+    group = parser.add_argument_group("PoPS input compatibility")
     group.add_argument(
         "--pops-genome-build",
         dest="pops_genome_build",
@@ -104,7 +92,6 @@ def get_pops_pipeline_parser(add_help=False):
         help=help_with_default(
             "Genome build shared by MAGMA and PoPS resources",
             module.genome_build,
-            label="Configured default",
         ),
     )
     return parser
@@ -136,6 +123,30 @@ def get_pops_pipeline_examples():
                 "--output-directory results",
             ),
         ),
+        (
+            "Run MAGMA and explicitly intersect incompatible PoPS target genes:",
+            "postgwas pipeline",
+            (
+                "--modules pops",
+                "--vcf study.vcf.gz",
+                "--magma-ld-reference reference/1000G_EUR",
+                "--gene-location-file reference/FUMA/ENSGv102.coding.genes.txt",
+                "--feature-matrix-prefix "
+                "reference/FLAMES/pops_features_full_FUMA_compatible/"
+                "features_munged/pops_features",
+                "--feature-matrix-chunks 116",
+                "--pops-gene-location-file "
+                "reference/FLAMES/pops_features_full_FUMA_compatible/"
+                "gene_annots.txt",
+                "--control-features-file "
+                "reference/FLAMES/pops_features_full_FUMA_compatible/"
+                "control.features",
+                "--pops-genome-build GRCh37",
+                "--gene-universe-policy intersect",
+                "--dataset-id STUDY",
+                "--output-directory results",
+            ),
+        ),
     )
 
 
@@ -146,7 +157,10 @@ def get_pops_pipeline_examples():
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="postgwas pops",
-        usage="postgwas pops --magma-association-prefix PREFIX [options]",
+        usage=(
+            "postgwas pops (--magma-association-prefix PREFIX | "
+            "--target-score-file PATH) [options]"
+        ),
         description="Prioritise genes with PoPS using existing MAGMA results and feature matrices.",
         epilog=format_cli_examples(
             (
@@ -159,6 +173,35 @@ def build_parser() -> argparse.ArgumentParser:
                     "--feature-matrix-chunks 2",
                     "--pops-gene-location-file reference/pops/gene_annot.tsv",
                     "--control-features-file reference/pops/control.features",
+                    "--genome-build GRCh37",
+                    "--dataset-id STUDY",
+                    "--output-directory results",
+                ),
+            ),
+            (
+                "Explicitly intersect incompatible MAGMA target genes:",
+                "postgwas pops",
+                (
+                    "--magma-association-prefix magma/STUDY",
+                    "--feature-matrix-prefix "
+                    "reference/pops/features_munged/pops_features",
+                    "--feature-matrix-chunks 2",
+                    "--pops-gene-location-file reference/pops/gene_annot.tsv",
+                    "--gene-universe-policy intersect",
+                    "--genome-build GRCh37",
+                    "--dataset-id STUDY",
+                    "--output-directory results",
+                ),
+            ),
+            (
+                "Run PoPS with a custom target-score table:",
+                "postgwas pops",
+                (
+                    "--target-score-file target_scores.tsv",
+                    "--feature-matrix-prefix "
+                    "reference/pops/features_munged/pops_features",
+                    "--feature-matrix-chunks 2",
+                    "--pops-gene-location-file reference/pops/gene_annot.tsv",
                     "--genome-build GRCh37",
                     "--dataset-id STUDY",
                     "--output-directory results",
@@ -196,6 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
         }:
             action.default = argparse.SUPPRESS
             action.type = None
+    mark_cli_required_help(parser, ("genome_build",))
     return parser
 
 

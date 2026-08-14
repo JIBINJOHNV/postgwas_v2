@@ -18,7 +18,6 @@ MODULE_CLI_OVERRIDES = {
     "vcf": "inputs.vcf",
     "dataset_id": "inputs.dataset_id",
     "output_directory": "output_directory",
-    "genome_build": "genome_build",
     "minimum_neglog10_p": "minimum_neglog10_p",
     "minimum_maf": "maf_min",
     "reference_af_column": "reference_population_tag",
@@ -31,9 +30,6 @@ MODULE_CLI_OVERRIDES = {
     "palindromic_af_lower": "palindromic_lower",
     "palindromic_af_upper": "palindromic_upper",
     "remove_mhc": "remove_mhc",
-    "mhc_chrom": "mhc.chromosome",
-    "mhc_start": "mhc.start",
-    "mhc_end": "mhc.end",
 }
 
 GLOBAL_CLI_OVERRIDES = {
@@ -108,9 +104,8 @@ def run_sumstat_filter_direct(
     except BaseException as exc:
         log_path = configured_output_path(
             output_directory,
-            module.output_layout.log_file,
+            module.output_layout.preflight_log,
             dataset_id=dataset_id,
-            genome_build=module.genome_build.value,
         )
         write_log_record(
             log_path,
@@ -127,11 +122,10 @@ def run_sumstat_filter_direct(
         vcf_path=str(vcf),
         output_folder=str(output_directory),
         output_prefix=dataset_id,
-        genome_build=module.genome_build.value,
-        genome_build_header_tokens={
-            build.value: tokens
-            for build, tokens in module.genome_build_header_tokens.items()
-        },
+        genome_build_header=(
+            configuration.modules.harmonisation.vcf_processing.genome_build_header
+        ),
+        supported_genome_builds=list(configuration.resources.genomes),
         pval_cutoff=module.minimum_neglog10_p,
         maf_cutoff=module.maf_min,
         allelefreq_diff_cutoff=module.frequency_difference_max,
@@ -144,9 +138,10 @@ def run_sumstat_filter_direct(
         palindromic_af_lower=module.palindromic_lower,
         palindromic_af_upper=module.palindromic_upper,
         remove_mhc=module.remove_mhc,
-        mhc_chrom=module.mhc.chromosome,
-        mhc_start=module.mhc.start,
-        mhc_end=module.mhc.end,
+        mhc_regions={
+            build.value: region.model_dump()
+            for build, region in module.mhc_regions.items()
+        },
         threads=configuration.execution.threads,
         max_mem=memory_limit(configuration.execution.memory_gb),
         lp_missing=module.missing_pvalue_action,
@@ -160,6 +155,12 @@ def run_sumstat_filter_direct(
         bash_bin=bash,
         resolved_configuration={
             "filtering": module.model_dump(mode="json"),
+            "vcf_contract": {
+                "genome_build_header": (
+                    configuration.modules.harmonisation.vcf_processing.genome_build_header
+                ),
+                "supported_genome_builds": list(configuration.resources.genomes),
+            },
             "execution": {
                 "threads": configuration.execution.threads,
                 "memory_gb": configuration.execution.memory_gb,
@@ -171,6 +172,7 @@ def run_sumstat_filter_direct(
             },
         },
         report_missing_counts=module.report_missing_counts,
+        terminal_label_width=configuration.logging.terminal_label_width,
     )
     if ctx is not None:
         ctx["sumstat_filter"] = outputs

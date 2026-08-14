@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from importlib.util import find_spec
+from itertools import groupby
 import logging
 from pathlib import Path
 import tempfile
@@ -20,6 +21,11 @@ from postgwas.config import (
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.core.paths import configured_output_path, validate_filename_component
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
+from postgwas.core.required_arguments import (
+    RequiredAlternative,
+    RequiredArgument,
+    require_resolved_arguments,
+)
 from postgwas.core.io.reports import write_yaml_report
 from postgwas.core.ui.progress import StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
@@ -117,6 +123,7 @@ def _resolved_configuration(args: argparse.Namespace):
         "magma_association_prefix": "magma_association_prefix",
         "feature_matrix_prefix": "feature_matrix_prefix",
         "feature_matrix_chunks": "feature_matrix_chunks",
+        "gene_universe_policy": "gene_universe_policy",
         "pops_gene_location_file": "gene_location_file",
         "control_features_file": "control_features_file",
         "target_score_file": "target_score_file",
@@ -248,6 +255,7 @@ def _validate_feature_resources(module) -> dict:
                 )
     return {
         "rows": rows,
+        "rows_path": rows_path,
         "row_count": len(rows),
         "feature_count": len(all_columns),
         "chunks": chunk_metrics,
@@ -327,12 +335,105 @@ def _validate_magma(module) -> dict:
         raise PopsError("MAGMA gene results contain duplicate gene identifiers.")
     if scores.isna().any() or not np.isfinite(scores.to_numpy()).all():
         raise PopsError("MAGMA gene Z statistics must all be finite.")
+    result_identifiers = identifiers.tolist()
+    _, raw_records = _read_magma_raw_records(raw_path)
+    raw_identifiers = [record[0] for record in raw_records]
+    if raw_identifiers != result_identifiers:
+        result_set = set(result_identifiers)
+        raw_set = set(raw_identifiers)
+        example_count = module.reporting.top_gene_count
+        absent_from_raw = sorted(result_set - raw_set)
+        absent_from_results = sorted(raw_set - result_set)
+        if absent_from_raw or absent_from_results:
+            raise PopsError(
+                "MAGMA .genes.out and .genes.raw contain different gene sets "
+                "(.genes.out=%d, .genes.raw=%d, absent from .genes.raw=%d, "
+                "absent from .genes.out=%d). Example genes absent from .genes.raw: "
+                "%s. Example genes absent from .genes.out: %s. Files: %s; %s"
+                % (
+                    len(result_identifiers), len(raw_identifiers),
+                    len(absent_from_raw), len(absent_from_results),
+                    _example_ids(absent_from_raw, example_count),
+                    _example_ids(absent_from_results, example_count),
+                    output_path, raw_path,
+                )
+            )
+        mismatch = next(
+            index
+            for index, (result_id, raw_id) in enumerate(
+                zip(result_identifiers, raw_identifiers), 1,
+            )
+            if result_id != raw_id
+        )
+        raise PopsError(
+            "MAGMA .genes.out and .genes.raw gene order differs at data row %d "
+            "(.genes.out=%s, .genes.raw=%s). PoPS covariance metadata requires "
+            "identical gene order. Files: %s; %s"
+            % (
+                mismatch, result_identifiers[mismatch - 1],
+                raw_identifiers[mismatch - 1], output_path, raw_path,
+            )
+        )
     return {
         "genes": set(identifiers),
+        "gene_ids": result_identifiers,
         "gene_count": len(identifiers),
+        "label": "MAGMA",
         "output_path": output_path,
         "raw_path": raw_path,
+        "gene_chromosomes": {
+            record[0]: record[1] for record in raw_records
+        },
     }
+
+
+def _read_magma_raw_records(path: Path) -> tuple[list[str], list[list[str]]]:
+    """Read the two MAGMA headers and validated raw records."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise PopsError("Cannot read MAGMA raw gene results %s: %s" % (path, exc)) from exc
+    if len(lines) < 3:
+        raise PopsError("MAGMA raw gene results contain no gene records: %s" % path)
+    headers = lines[:2]
+    records = []
+    for row_number, line in enumerate(lines[2:], 1):
+        if not line.strip():
+            raise PopsError(
+                "MAGMA raw gene results contain a blank data row at row %d: %s"
+                % (row_number, path)
+            )
+        fields = line.split()
+        if len(fields) < 9:
+            raise PopsError(
+                "MAGMA raw gene results data row %d has %d fields; at least 9 "
+                "metadata fields are required: %s"
+                % (row_number, len(fields), path)
+            )
+        records.append(fields)
+    identifiers = [record[0] for record in records]
+    if len(identifiers) != len(set(identifiers)):
+        raise PopsError(
+            "MAGMA raw gene results contain duplicate gene identifiers: %s" % path
+        )
+    chromosomes = [record[1] for record in records]
+    chromosome_blocks = [chromosome for chromosome, _ in groupby(chromosomes)]
+    if len(chromosome_blocks) != len(set(chromosome_blocks)):
+        raise PopsError(
+            "MAGMA raw chromosomes must occur in contiguous blocks: %s" % path
+        )
+    return headers, records
+
+
+def _read_magma_raw_gene_ids(path: Path) -> list[str]:
+    """Read MAGMA raw gene IDs without materialising its covariance matrices."""
+    _, records = _read_magma_raw_records(path)
+    return [record[0] for record in records]
+
+
+def _example_ids(identifiers, limit: int) -> str:
+    values = list(identifiers)[:limit]
+    return ", ".join(values) if values else "none"
 
 
 def _validate_target(module) -> dict:
@@ -380,7 +481,400 @@ def _validate_target(module) -> dict:
             or not np.isfinite(numeric.to_numpy()).all()
         ):
             raise PopsError("Target covariates must contain finite numeric columns.")
-    return {"genes": set(identifiers), "gene_count": len(identifiers), "path": path}
+    return {
+        "genes": set(identifiers),
+        "gene_ids": identifiers.tolist(),
+        "gene_count": len(identifiers),
+        "label": "Custom target",
+        "path": path,
+    }
+
+
+def _validate_gene_universes(module, features: dict, annotation: dict, outcome) -> dict:
+    """Require target, annotation, and feature IDs to satisfy upstream indexing."""
+    annotation_genes = annotation["genes"]
+    feature_genes = set(features["rows"])
+    feature_only = sorted(feature_genes - annotation_genes)
+    example_count = module.reporting.top_gene_count
+    if feature_only:
+        raise PopsError(
+            "PoPS feature rows contain genes absent from the gene annotation "
+            "(annotation=%d, feature rows=%d, absent from annotation=%d). "
+            "Example genes absent from annotation: %s. Every feature-row gene "
+            "can receive a PoPS prediction and therefore must be annotated. "
+            "Files: annotation=%s; feature rows=%s"
+            % (
+                len(annotation_genes), len(feature_genes), len(feature_only),
+                _example_ids(feature_only, example_count), annotation["path"],
+                features["rows_path"],
+            )
+        )
+    if len(feature_genes) < module.minimum_gene_count:
+        raise PopsError(
+            "The PoPS feature matrix contains only %d genes; the configured "
+            "minimum is %d."
+            % (len(feature_genes), module.minimum_gene_count)
+        )
+    if outcome is None:
+        return {
+            "reference_genes": len(feature_genes),
+            "shared_target_genes": None,
+        }
+
+    missing_annotation = sorted(outcome["genes"] - annotation_genes)
+    missing_features = sorted(outcome["genes"] - feature_genes)
+    shared = outcome["genes"] & annotation_genes & feature_genes
+    if outcome["label"] == "MAGMA":
+        chromosome_mismatches = sorted(
+            gene
+            for gene in shared
+            if outcome["gene_chromosomes"][gene]
+            != annotation["gene_chromosomes"][gene]
+        )
+        if chromosome_mismatches:
+            examples = ", ".join(
+                "%s (MAGMA=%s, PoPS=%s)" % (
+                    gene,
+                    outcome["gene_chromosomes"][gene],
+                    annotation["gene_chromosomes"][gene],
+                )
+                for gene in chromosome_mismatches[:example_count]
+            )
+            raise PopsError(
+                "MAGMA raw metadata and the PoPS annotation disagree on "
+                "chromosome for %d shared genes. Examples: %s. Gene-universe "
+                "intersection cannot repair chromosome disagreement. Files: "
+                "MAGMA raw=%s; annotation=%s"
+                % (
+                    len(chromosome_mismatches), examples, outcome["raw_path"],
+                    annotation["path"],
+                )
+            )
+    missing_annotation_set = set(missing_annotation)
+    missing_features_set = set(missing_features)
+    absent_from_both = missing_annotation_set & missing_features_set
+    compatibility = {
+        "policy": module.gene_universe_policy,
+        "original_target_genes": outcome["gene_count"],
+        "retained_target_genes": len(shared),
+        "excluded_target_genes": outcome["gene_count"] - len(shared),
+        "retained_percent": 100 * len(shared) / outcome["gene_count"],
+        "excluded_percent": (
+            100 * (outcome["gene_count"] - len(shared)) / outcome["gene_count"]
+        ),
+        "absent_from_annotation": len(missing_annotation),
+        "absent_from_features": len(missing_features),
+        "absent_from_both": len(absent_from_both),
+        "absent_only_from_annotation": len(
+            missing_annotation_set - missing_features_set
+        ),
+        "absent_only_from_features": len(
+            missing_features_set - missing_annotation_set
+        ),
+        "retained_gene_ids": [
+            gene for gene in outcome["gene_ids"] if gene in shared
+        ],
+        "excluded_gene_ids": [
+            gene for gene in outcome["gene_ids"] if gene not in shared
+        ],
+        "missing_annotation_gene_ids": missing_annotation,
+        "missing_feature_gene_ids": missing_features,
+    }
+    outcome["compatibility"] = compatibility
+    incompatible = bool(missing_annotation or missing_features)
+    unsupported_intersection = (
+        module.gene_universe_policy == "intersect"
+        and outcome["label"] != "MAGMA"
+    )
+    if len(shared) < module.minimum_gene_count or unsupported_intersection or (
+        incompatible and module.gene_universe_policy == "strict"
+    ):
+        outcome_path = outcome.get("output_path", outcome.get("path"))
+        policy_guidance = (
+            "Custom target intersection is not supported; provide target, "
+            "covariate, and covariance files already aligned to the PoPS gene "
+            "universe."
+            if unsupported_intersection
+            else "Use matching resources or explicitly select "
+            "--gene-universe-policy intersect to derive aligned MAGMA inputs."
+        )
+        raise PopsError(
+            "PoPS input files are scientifically incompatible. %s genes=%d; "
+            "PoPS annotation genes=%d; PoPS feature-row genes=%d; shared genes=%d; "
+            "%s genes absent from annotation=%d; %s genes absent from feature "
+            "rows=%d. Example genes absent from annotation: %s. Example genes "
+            "absent from feature rows: %s. This usually indicates different gene "
+            "annotation releases. %s Files: outcome=%s; annotation=%s; feature "
+            "rows=%s"
+            % (
+                outcome["label"], outcome["gene_count"], len(annotation_genes),
+                len(feature_genes), len(shared), outcome["label"],
+                len(missing_annotation), outcome["label"], len(missing_features),
+                _example_ids(missing_annotation, example_count),
+                _example_ids(missing_features, example_count), policy_guidance,
+                outcome_path, annotation["path"], features["rows_path"],
+            )
+        )
+    return {
+        "reference_genes": len(feature_genes),
+        "shared_target_genes": len(shared),
+    }
+
+
+def _load_magma_covariance_parser():
+    """Load the published MAGMA raw parser after dependency preflight."""
+    _require_pops_runtime()
+    try:
+        from postgwas.modules.pops.pops import munge_magma_covariance_metadata
+    except ModuleNotFoundError as exc:
+        raise PopsError(
+            "Cannot import the PoPS MAGMA parser because Python package %r is "
+            "missing." % exc.name
+        ) from exc
+    return munge_magma_covariance_metadata
+
+
+def _magma_covariance_blocks(path: Path, expected_gene_ids: list[str]):
+    """Parse and validate MAGMA chromosome covariance blocks using upstream code."""
+    parser = _load_magma_covariance_parser()
+    try:
+        sigmas, metadata = parser(str(path))
+    except (AssertionError, IndexError, OSError, TypeError, ValueError) as exc:
+        raise PopsError(
+            "Cannot reconstruct MAGMA covariance metadata from %s: %s"
+            % (path, exc)
+        ) from exc
+    parsed_ids = metadata["GENE"].astype(str).tolist()
+    if parsed_ids != expected_gene_ids:
+        raise PopsError(
+            "Published PoPS MAGMA parsing changed gene identity or order in %s."
+            % path
+        )
+    for block_number, sigma in enumerate(sigmas, 1):
+        if (
+            sigma.ndim != 2
+            or sigma.shape[0] != sigma.shape[1]
+            or not np.isfinite(sigma).all()
+            or not np.allclose(sigma, sigma.T)
+        ):
+            raise PopsError(
+                "MAGMA covariance block %d is not a finite symmetric matrix: %s"
+                % (block_number, path)
+            )
+    return sigmas
+
+
+def _raw_record_blocks(records: list[list[str]]) -> list[list[int]]:
+    """Return original row indices grouped by contiguous chromosome blocks."""
+    return [
+        [index for index, _ in rows]
+        for _, rows in groupby(
+            enumerate(records), key=lambda item: item[1][1],
+        )
+    ]
+
+
+def _write_magma_raw_subset(
+    headers: list[str],
+    records: list[list[str]],
+    sigmas,
+    selected_genes: set[str],
+    path: Path,
+) -> None:
+    """Write a covariance-preserving principal subset in MAGMA raw format."""
+    blocks = _raw_record_blocks(records)
+    if len(blocks) != len(sigmas):
+        raise PopsError(
+            "MAGMA raw chromosome blocks (%d) do not match covariance blocks (%d)."
+            % (len(blocks), len(sigmas))
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write("\n".join(headers) + "\n")
+            for block_indices, sigma in zip(blocks, sigmas):
+                if sigma.shape != (len(block_indices), len(block_indices)):
+                    raise PopsError(
+                        "MAGMA covariance block shape %s does not match its %d "
+                        "raw rows." % (sigma.shape, len(block_indices))
+                    )
+                selected_local = [
+                    local_index
+                    for local_index, record_index in enumerate(block_indices)
+                    if records[record_index][0] in selected_genes
+                ]
+                if not selected_local:
+                    continue
+                subset = sigma[np.ix_(selected_local, selected_local)]
+                for subset_index, local_index in enumerate(selected_local):
+                    record = records[block_indices[local_index]]
+                    fields = list(record[:9])
+                    correlations = subset[subset_index, :subset_index]
+                    nonzero = np.flatnonzero(correlations)
+                    if nonzero.size:
+                        fields.extend(
+                            "%.17g" % value
+                            for value in correlations[int(nonzero[0]):]
+                        )
+                    handle.write(" ".join(fields) + "\n")
+    except OSError as exc:
+        raise PopsError("Cannot write derived MAGMA raw file %s: %s" % (path, exc)) from exc
+
+
+def _derived_magma_prefix(module, genes_out: Path, genes_raw: Path) -> str:
+    """Validate paired configured suffixes and return their shared prefix."""
+    schema = module.input_schema
+    output_text = str(genes_out)
+    if not output_text.endswith(schema.magma_genes_out_suffix):
+        raise PopsError(
+            "Configured derived MAGMA output does not end with %s: %s"
+            % (schema.magma_genes_out_suffix, genes_out)
+        )
+    prefix = output_text[:-len(schema.magma_genes_out_suffix)]
+    if str(genes_raw) != prefix + schema.magma_genes_raw_suffix:
+        raise PopsError(
+            "Configured derived MAGMA .genes.out and .genes.raw paths do not "
+            "share one prefix: %s; %s" % (genes_out, genes_raw)
+        )
+    return prefix
+
+
+def _prepare_intersected_magma(
+    module,
+    annotation: dict,
+    features: dict,
+    outcome: dict,
+    paths: dict[str, Path],
+    published_paths: dict[str, Path],
+) -> tuple[str, dict]:
+    """Create aligned retained/excluded MAGMA pairs and complete provenance."""
+    compatibility = outcome["compatibility"]
+    retained = set(compatibility["retained_gene_ids"])
+    excluded = set(compatibility["excluded_gene_ids"])
+    output_table = _read_table(
+        outcome["output_path"],
+        module.input_schema.table_delimiter_pattern,
+        "MAGMA gene results",
+    )
+    gene_column = module.input_schema.magma_gene_id_column
+    output_ids = output_table[gene_column].astype(str)
+    if output_ids.tolist() != outcome["gene_ids"]:
+        raise PopsError("MAGMA gene-result order changed after input preflight.")
+
+    retained_out = paths["compatible_genes_out"]
+    retained_raw = paths["compatible_genes_raw"]
+    excluded_out = paths["excluded_genes_out"]
+    excluded_raw = paths["excluded_genes_raw"]
+    output_table.loc[output_ids.isin(retained)].to_csv(
+        retained_out, sep="\t", index=False,
+    )
+    output_table.loc[output_ids.isin(excluded)].to_csv(
+        excluded_out, sep="\t", index=False,
+    )
+
+    headers, records = _read_magma_raw_records(outcome["raw_path"])
+    raw_ids = [record[0] for record in records]
+    sigmas = _magma_covariance_blocks(outcome["raw_path"], raw_ids)
+    _write_magma_raw_subset(headers, records, sigmas, retained, retained_raw)
+    _write_magma_raw_subset(headers, records, sigmas, excluded, excluded_raw)
+    retained_prefix = _derived_magma_prefix(module, retained_out, retained_raw)
+    _derived_magma_prefix(module, excluded_out, excluded_raw)
+
+    retained_ids = _read_magma_raw_gene_ids(retained_raw)
+    if retained_ids != compatibility["retained_gene_ids"]:
+        raise PopsError(
+            "Derived compatible MAGMA raw file failed gene-order validation: %s"
+            % retained_raw
+        )
+    if excluded and _read_magma_raw_gene_ids(excluded_raw) != compatibility[
+        "excluded_gene_ids"
+    ]:
+        raise PopsError(
+            "Derived excluded MAGMA raw file failed gene-order validation: %s"
+            % excluded_raw
+        )
+
+    annotation_genes = annotation["genes"]
+    feature_genes = set(features["rows"])
+    audit_rows = []
+    chromosome_statistics = {}
+    for row_number, record in enumerate(records, 1):
+        gene, chromosome = record[0], record[1]
+        in_annotation = gene in annotation_genes
+        in_features = gene in feature_genes
+        is_retained = gene in retained
+        if is_retained:
+            reason = "retained"
+        elif not in_annotation and not in_features:
+            reason = "missing_annotation_and_features"
+        elif not in_annotation:
+            reason = "missing_annotation"
+        else:
+            reason = "missing_features"
+        audit_rows.append({
+            "magma_row": row_number,
+            "gene_id": gene,
+            "chromosome": chromosome,
+            "present_in_pops_annotation": in_annotation,
+            "present_in_feature_rows": in_features,
+            "retained_for_pops": is_retained,
+            "decision": reason,
+        })
+        counts = chromosome_statistics.setdefault(
+            chromosome, {"original": 0, "retained": 0, "excluded": 0},
+        )
+        counts["original"] += 1
+        counts["retained" if is_retained else "excluded"] += 1
+    pd.DataFrame(audit_rows).to_csv(
+        paths["gene_compatibility_table"], sep="\t", index=False,
+    )
+
+    report = {
+        key: value
+        for key, value in compatibility.items()
+        if not key.endswith("_gene_ids")
+    }
+    report.update({
+        "decision": (
+            "MAGMA targets were restricted to genes present in both the PoPS "
+            "annotation and feature rows."
+        ),
+        "scientific_effect": (
+            "Feature selection and model fitting use the retained target genes; "
+            "the resulting PoPS scores may differ from a run using a matched "
+            "MAGMA gene annotation."
+        ),
+        "covariance_handling": (
+            "Retained and excluded .genes.raw files contain covariance-preserving "
+            "principal submatrices reconstructed from the original MAGMA blocks."
+        ),
+        "original_files_unchanged": True,
+        "excluded_gene_examples": compatibility["excluded_gene_ids"][
+            :module.reporting.top_gene_count
+        ],
+        "exclusion_reason_counts": {
+            reason: sum(row["decision"] == reason for row in audit_rows)
+            for reason in (
+                "retained", "missing_annotation", "missing_features",
+                "missing_annotation_and_features",
+            )
+        },
+        "chromosomes": chromosome_statistics,
+        "files": {
+            "original_genes_out": str(outcome["output_path"]),
+            "original_genes_raw": str(outcome["raw_path"]),
+            "compatible_genes_out": str(published_paths["compatible_genes_out"]),
+            "compatible_genes_raw": str(published_paths["compatible_genes_raw"]),
+            "excluded_genes_out": str(published_paths["excluded_genes_out"]),
+            "excluded_genes_raw": str(published_paths["excluded_genes_raw"]),
+            "gene_audit_table": str(published_paths["gene_compatibility_table"]),
+            "compatibility_report": str(
+                published_paths["gene_compatibility_report"]
+            ),
+        },
+    })
+    write_yaml_report(report, paths["gene_compatibility_report"])
+    return retained_prefix, report
 
 
 def _load_target_covariance(path: Path, expected_size: int) -> tuple[np.ndarray, bool]:
@@ -424,13 +918,40 @@ def _validate_resolved_pops_configuration(
     args: argparse.Namespace, configuration, *, pipeline: bool = False,
 ):
     """Preflight resources for one already resolved PoPS configuration."""
-    _require_pops_runtime()
     module = configuration.modules.pops
-    if module.genome_build is None:
-        raise PopsError(
-            "Declare the shared PoPS genome build with --genome-build or "
-            "modules.pops.genome_build; PostGWAS will not infer it."
-        )
+    target_alternatives = () if pipeline else (
+        RequiredAlternative((
+            RequiredArgument(
+                "--magma-association-prefix",
+                "modules.pops.magma_association_prefix",
+                module.magma_association_prefix,
+            ),
+            RequiredArgument(
+                "--target-score-file",
+                "modules.pops.target_score_file",
+                module.target_score_file,
+            ),
+        )),
+    )
+    require_resolved_arguments(
+        (
+            RequiredArgument(
+                "--genome-build", "modules.pops.genome_build", module.genome_build,
+            ),
+            RequiredArgument(
+                "--feature-matrix-prefix",
+                "modules.pops.feature_matrix_prefix",
+                module.feature_matrix_prefix,
+            ),
+            RequiredArgument(
+                "--pops-gene-location-file",
+                "modules.pops.gene_location_file",
+                module.gene_location_file,
+            ),
+        ),
+        alternatives=target_alternatives,
+    )
+    _require_pops_runtime()
     signature = _resource_signature(module)
     cached = getattr(args, "_pops_resource_preflight", None)
     if cached is not None and cached[0] == signature:
@@ -438,13 +959,6 @@ def _validate_resolved_pops_configuration(
     else:
         features = _validate_feature_resources(module)
         annotation = _validate_gene_annotation(module)
-    reference_common = annotation["genes"] & set(features["rows"])
-    if len(reference_common) < module.minimum_gene_count:
-        raise PopsError(
-            "Only %d genes are shared by the PoPS annotation and feature rows; "
-            "the configured minimum is %d."
-            % (len(reference_common), module.minimum_gene_count)
-        )
     if pipeline:
         magma_build = configuration.modules.magma.genome_build
         if module.genome_build != magma_build:
@@ -461,22 +975,8 @@ def _validate_resolved_pops_configuration(
         raise PopsError(
             "Provide a MAGMA association prefix or a custom target-score file."
         )
+    _validate_gene_universes(module, features, annotation, outcome)
     if outcome is not None:
-        common = outcome["genes"] & annotation["genes"] & set(features["rows"])
-        if len(common) < module.minimum_gene_count:
-            raise PopsError(
-                "Only %d genes are shared by outcomes, annotation and features; "
-                "the configured minimum is %d."
-                % (len(common), module.minimum_gene_count)
-            )
-        missing_annotation = outcome["genes"] - annotation["genes"]
-        missing_features = outcome["genes"] - set(features["rows"])
-        if missing_annotation or missing_features:
-            raise PopsError(
-                "Every outcome gene must be present in both the PoPS annotation "
-                "and feature rows (missing annotation=%d, missing features=%d)."
-                % (len(missing_annotation), len(missing_features))
-            )
         if module.target_error_covariance_file is not None:
             covariance_path = _required_file(
                 module.target_error_covariance_file, "PoPS target covariance",
@@ -508,15 +1008,22 @@ def _flag(arguments: list[str], condition: bool, enabled: str, disabled: str) ->
     arguments.append(enabled if condition else disabled)
 
 
-def _build_upstream_arguments(module, seed: int, output_prefix: Path, covariance_path=None):
+def _build_upstream_arguments(
+    module,
+    seed: int,
+    output_prefix: Path,
+    covariance_path=None,
+    magma_prefix: str | None = None,
+):
     arguments = [
         "--gene_annot_path", module.gene_location_file,
         "--feature_mat_prefix", module.feature_matrix_prefix,
         "--num_feature_chunks", str(module.feature_matrix_chunks),
         "--out_prefix", str(output_prefix),
     ]
-    if module.magma_association_prefix is not None:
-        arguments += ["--magma_prefix", module.magma_association_prefix]
+    effective_magma_prefix = magma_prefix or module.magma_association_prefix
+    if effective_magma_prefix is not None:
+        arguments += ["--magma_prefix", effective_magma_prefix]
     if module.control_features_file is not None:
         arguments += ["--control_features_path", module.control_features_file]
     _flag(
@@ -613,6 +1120,15 @@ def _output_paths(output: Path, dataset: str, module) -> tuple[Path, dict[str, P
     if module.save_matrix_files:
         suffixes["training_data_file"] = layout.training_data_suffix
         suffixes["matrix_data_file"] = layout.matrix_data_suffix
+    if module.gene_universe_policy == "intersect":
+        suffixes.update({
+            "compatible_genes_out": layout.compatible_genes_out_suffix,
+            "compatible_genes_raw": layout.compatible_genes_raw_suffix,
+            "excluded_genes_out": layout.excluded_genes_out_suffix,
+            "excluded_genes_raw": layout.excluded_genes_raw_suffix,
+            "gene_compatibility_table": layout.gene_compatibility_table_suffix,
+            "gene_compatibility_report": layout.gene_compatibility_report_suffix,
+        })
     return prefix, {name: Path(str(prefix) + suffix) for name, suffix in suffixes.items()}
 
 
@@ -635,7 +1151,9 @@ def _true_count(values: pd.Series) -> int:
     return int(values.astype(str).str.strip().str.lower().eq("true").sum())
 
 
-def _summarise_outputs(paths, module, annotation, outcome, features) -> dict:
+def _summarise_outputs(
+    paths, module, annotation, outcome, features, *, published_paths=None,
+) -> dict:
     """Validate published scientific results and build the terminal summary."""
     schema = module.input_schema
     predictions = _read_table(
@@ -708,6 +1226,31 @@ def _summarise_outputs(paths, module, annotation, outcome, features) -> dict:
             "No target-scored genes were available on chromosome(s): %s."
             % ", ".join(missing_chromosomes)
         )
+    compatibility = {
+        key: value
+        for key, value in outcome.get("compatibility", {}).items()
+        if not key.endswith("_gene_ids")
+    }
+    if compatibility.get("excluded_target_genes", 0):
+        warnings.append(
+            "Gene-universe intersection excluded %d of %d MAGMA target genes "
+            "(%.1f%% retained). Feature selection and fitting used the retained "
+            "target universe; review the compatibility audit before interpreting "
+            "rankings."
+            % (
+                compatibility["excluded_target_genes"],
+                compatibility["original_target_genes"],
+                compatibility["retained_percent"],
+            )
+        )
+    if module.gene_universe_policy == "intersect":
+        reported = published_paths or paths
+        compatibility["audit_table"] = str(reported["gene_compatibility_table"])
+        compatibility["report"] = str(reported["gene_compatibility_report"])
+        compatibility["compatible_genes_out"] = str(reported["compatible_genes_out"])
+        compatibility["compatible_genes_raw"] = str(reported["compatible_genes_raw"])
+        compatibility["excluded_genes_out"] = str(reported["excluded_genes_out"])
+        compatibility["excluded_genes_raw"] = str(reported["excluded_genes_raw"])
     return {
         "genes_scored": len(predictions),
         "target_genes": len(target_genes),
@@ -715,6 +1258,7 @@ def _summarise_outputs(paths, module, annotation, outcome, features) -> dict:
         "training_genes": training_count,
         "selected_features": selected_features,
         "top_genes": top_genes,
+        "gene_compatibility": compatibility,
         "warnings": warnings,
     }
 
@@ -723,14 +1267,15 @@ def _render_summary(
     summary: dict, dataset: str, module, paths, log_path: Path, label_width: int,
 ) -> str:
     width = label_width
+    outer_width = width + 4
     status = "COMPLETED WITH SCIENTIFIC WARNINGS" if summary["warnings"] else "COMPLETED"
     lines = [
         "",
         screen_line("analysis", "PoPS gene-prioritisation summary", indent=2),
-        screen_field("info", "Dataset", dataset, indent=6, label_width=width),
+        screen_field("info", "Dataset", dataset, indent=6, label_width=outer_width),
         screen_field(
             "warning" if summary["warnings"] else "success",
-            "Analysis status", status, indent=6, label_width=width,
+            "Analysis status", status, indent=6, label_width=outer_width,
         ),
         "",
         screen_line("genetic", "Scientific findings", indent=6),
@@ -755,6 +1300,56 @@ def _render_summary(
             "count", "Features selected", f'{summary["selected_features"]:,}',
             indent=10, label_width=width,
         ))
+    compatibility = summary.get("gene_compatibility", {})
+    if compatibility.get("policy") == "intersect":
+        lines.extend([
+            "",
+            screen_line("warning", "MAGMA–PoPS gene compatibility", indent=6),
+            screen_field(
+                "count", "Original MAGMA target genes",
+                f'{compatibility["original_target_genes"]:,}',
+                indent=10, label_width=width,
+            ),
+            screen_field(
+                "success", "Retained target genes",
+                "%s (%.1f%%)" % (
+                    f'{compatibility["retained_target_genes"]:,}',
+                    compatibility["retained_percent"],
+                ),
+                indent=10, label_width=width,
+            ),
+            screen_field(
+                "warning", "Excluded target genes",
+                "%s (%.1f%%)" % (
+                    f'{compatibility["excluded_target_genes"]:,}',
+                    compatibility["excluded_percent"],
+                ),
+                indent=10, label_width=width,
+            ),
+            screen_field(
+                "warning", "Absent from annotation",
+                f'{compatibility["absent_from_annotation"]:,}',
+                indent=10, label_width=width,
+            ),
+            screen_field(
+                "warning", "Absent from feature rows",
+                f'{compatibility["absent_from_features"]:,}',
+                indent=10, label_width=width,
+            ),
+            screen_field(
+                "warning", "Absent from both resources",
+                f'{compatibility["absent_from_both"]:,}',
+                indent=10, label_width=width,
+            ),
+            screen_field(
+                "info", "Gene-level audit", compatibility["audit_table"],
+                indent=10, label_width=width, break_long_values=True,
+            ),
+            screen_field(
+                "info", "Compatibility report", compatibility["report"],
+                indent=10, label_width=width, break_long_values=True,
+            ),
+        ])
     lines.extend(["", screen_line(
         "decision", "Top prioritized genes", indent=6,
     )])
@@ -800,9 +1395,12 @@ def _render_summary(
         "",
         screen_field(
             "success", "Complete PoPS results", paths["pops_file"],
-            indent=6, label_width=width,
+            indent=6, label_width=outer_width, break_long_values=True,
         ),
-        screen_field("info", "Full log", log_path, indent=6, label_width=width),
+        screen_field(
+            "info", "Full log", log_path, indent=6,
+            label_width=outer_width, break_long_values=True,
+        ),
         "",
     ])
     return "\n".join(lines)
@@ -847,10 +1445,24 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
             _POPS_PROGRESS_STAGES[active_progress_step - 1],
             outcome_fields=[
                 ("genetic", "Declared genome build", configuration.modules.pops.genome_build.value),
+                (
+                    "decision", "Gene-universe policy",
+                    configuration.modules.pops.gene_universe_policy,
+                ),
                 ("count", "Annotation genes", annotation["gene_count"]),
                 ("count", "Feature-matrix genes", features["row_count"]),
                 ("count", "Available features", features["feature_count"]),
+                (
+                    "count", "Original target genes",
+                    outcome["compatibility"]["original_target_genes"],
+                ),
                 ("success", "Compatible target genes", compatible_target_genes),
+                (
+                    "warning" if outcome["compatibility"]["excluded_target_genes"]
+                    else "success",
+                    "Excluded target genes",
+                    outcome["compatibility"]["excluded_target_genes"],
+                ),
             ],
         )
     except BaseException as exc:
@@ -942,6 +1554,7 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
             feature_matrix_chunks=module.feature_matrix_chunks,
             feature_selection_p_cutoff=module.feature_selection_p_cutoff,
             minimum_gene_count=module.minimum_gene_count,
+            gene_universe_policy=module.gene_universe_policy,
         )
         logger.record(
             "OBSERVED", "pops_inputs",
@@ -949,6 +1562,22 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
             outcome_genes=outcome["gene_count"],
             feature_genes=features["row_count"],
             features=features["feature_count"],
+        )
+        compatibility = outcome["compatibility"]
+        logger.record(
+            "OBSERVED", "pops_gene_compatibility",
+            policy=compatibility["policy"],
+            original_target_genes=compatibility["original_target_genes"],
+            retained_target_genes=compatibility["retained_target_genes"],
+            excluded_target_genes=compatibility["excluded_target_genes"],
+            retained_percent=compatibility["retained_percent"],
+            absent_from_annotation=compatibility["absent_from_annotation"],
+            absent_from_features=compatibility["absent_from_features"],
+            absent_from_both=compatibility["absent_from_both"],
+            absent_only_from_annotation=(
+                compatibility["absent_only_from_annotation"]
+            ),
+            absent_only_from_features=compatibility["absent_only_from_features"],
         )
         resolved_path = configured_output_path(
             output,
@@ -1013,6 +1642,47 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
         staging_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="run_", dir=staging_root) as directory:
             staging_prefix = Path(directory) / prefix.name
+            staged_paths = {
+                name: Path(str(staging_prefix) + path.name.removeprefix(prefix.name))
+                for name, path in final_paths.items()
+            }
+            effective_magma_prefix = None
+            if module.gene_universe_policy == "intersect":
+                effective_magma_prefix, compatibility_report = (
+                    _prepare_intersected_magma(
+                        module, annotation, features, outcome, staged_paths,
+                        final_paths,
+                    )
+                )
+                logger.record(
+                    "ACTION", "pops_gene_universe_intersection",
+                    **{
+                        key: value
+                        for key, value in compatibility_report.items()
+                        if key not in {"chromosomes", "files"}
+                    },
+                )
+                for chromosome, counts in compatibility_report["chromosomes"].items():
+                    logger.record(
+                        "OBSERVED", "pops_gene_compatibility_chromosome",
+                        chromosome=chromosome, **counts,
+                    )
+                logger.record(
+                    "OUTPUT", "pops_gene_compatibility_files",
+                    **compatibility_report["files"],
+                )
+                if compatibility_report["excluded_target_genes"]:
+                    logger.warning(
+                        "PoPS gene-universe intersection retained %d of %d MAGMA "
+                        "target genes (%.1f%%) and excluded %d; originals were "
+                        "not modified."
+                        % (
+                            compatibility_report["retained_target_genes"],
+                            compatibility_report["original_target_genes"],
+                            compatibility_report["retained_percent"],
+                            compatibility_report["excluded_target_genes"],
+                        )
+                    )
             covariance_path = None
             if module.target_error_covariance_file is not None:
                 source = _required_file(
@@ -1031,6 +1701,7 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
                 configuration.execution.random_seed,
                 staging_prefix,
                 covariance_path=covariance_path,
+                magma_prefix=effective_magma_prefix,
             )
             upstream_handlers = list(logging.getLogger().handlers)
             upstream_level = logging.getLogger().level
@@ -1051,21 +1722,18 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
             finally:
                 _restore_root_logging(upstream_handlers, upstream_level)
 
-            staged_paths = {
-                name: Path(str(staging_prefix) + path.name.removeprefix(prefix.name))
-                for name, path in final_paths.items()
-            }
             missing = [
                 path for path in staged_paths.values()
                 if not path.is_file() or path.stat().st_size <= 0
             ]
             if missing:
                 raise PopsError(
-                    "Upstream PoPS did not create required non-empty outputs: %s"
+                    "PoPS staging did not create required non-empty outputs: %s"
                     % ", ".join(str(path) for path in missing)
                 )
             summary = _summarise_outputs(
                 staged_paths, module, annotation, outcome, features,
+                published_paths=final_paths,
             )
             all_known_suffixes = {
                 module.output_layout.predictions_suffix,
@@ -1074,6 +1742,12 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
                 module.output_layout.upstream_log_suffix,
                 module.output_layout.training_data_suffix,
                 module.output_layout.matrix_data_suffix,
+                module.output_layout.compatible_genes_out_suffix,
+                module.output_layout.compatible_genes_raw_suffix,
+                module.output_layout.excluded_genes_out_suffix,
+                module.output_layout.excluded_genes_raw_suffix,
+                module.output_layout.gene_compatibility_table_suffix,
+                module.output_layout.gene_compatibility_report_suffix,
             }
             if configuration.run.overwrite:
                 completion_manifest.unlink(missing_ok=True)

@@ -12,13 +12,23 @@ from postgwas.config import (
     write_resolved_configuration,
 )
 from postgwas.config.cli_overrides import explicit_overrides
-from postgwas.core.paths import configured_output_path, validate_filename_component
+from postgwas.core.checkpointing import (
+    ExecutionCheckpoint,
+    decode_checkpoint_value,
+    discover_input_files,
+    software_identity,
+)
+from postgwas.core.paths import (
+    configured_output_path,
+    remove_owned_directory,
+    validate_filename_component,
+)
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
 from postgwas.core.ui import StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.modules.magma.errors import MagmaError
 from postgwas.modules.magma.analysis import (
-    correct_gene_p_values,
+    preflight_magma_analysis,
     resolve_magma_output_paths,
     run_magma_analysis,
 )
@@ -150,83 +160,6 @@ def _expected_magma_artifacts(output: Path, dataset_id: str, module) -> dict[str
     return expected
 
 
-def _completed(path: Path) -> bool:
-    return path.is_file() and path.stat().st_size > 0
-
-
-def _completed_run_recorded(log_path: Path) -> bool:
-    if not log_path.is_file():
-        return False
-    try:
-        return any(
-            "magma_run status=COMPLETED" in line
-            for line in log_path.read_text(encoding="utf-8").splitlines()
-        )
-    except OSError as exc:
-        raise MagmaError(
-            "Cannot read the canonical MAGMA log required for resume: %s" % exc
-        ) from exc
-
-
-def _resume_result(
-    output: Path,
-    dataset_id: str,
-    module,
-    log_path: Path,
-    logger,
-) -> dict | None:
-    expected = _expected_magma_artifacts(output, dataset_id, module)
-    required = {
-        name: path
-        for name, path in expected.items()
-        if name != "magma_genes_prefix"
-    }
-    if not required or not _completed_run_recorded(log_path):
-        return None
-
-    missing = {name for name, path in required.items() if not _completed(path)}
-    backfilled = []
-    if missing == {"magma_genes_corrected"}:
-        corrected = correct_gene_p_values(
-            expected["magma_genes_out"],
-            expected["magma_genes_corrected"],
-            module,
-            logger,
-        )
-        backfilled.append(str(expected["magma_genes_corrected"]))
-        logger.record(
-            "ACTION",
-            "magma_resume_upgrade",
-            reason="completed_run_predates_corrected_gene_report",
-            rows=corrected.height,
-            output=backfilled[0],
-        )
-    elif missing:
-        return None
-
-    result = {name: str(path) for name, path in expected.items()}
-    result["primary_mapping"] = module.mapping.primary
-    result["mapping_analyses"] = {
-        name: {
-            "mapping_method": module.mapping.definitions[name].method,
-            "gene_id_type": module.mapping.definitions[name].gene_id_type,
-            "result_statistic_type": (
-                module.mapping.definitions[name].result_statistic_type
-            ),
-        }
-        for name in module.mapping.selected
-    }
-    result["magma_gene_results"] = result.get(
-        "magma_genes_corrected", result.get("chrom_magma_gene_report"),
-    )
-    result["resumed"] = True
-    result["resume_mode"] = (
-        "derived_output_backfill" if backfilled else "completed_outputs"
-    )
-    result["backfilled_outputs"] = backfilled
-    return result
-
-
 def _relative_to_directory(path: Path, directory: Path) -> Path | None:
     try:
         return path.expanduser().resolve().relative_to(directory.expanduser().resolve())
@@ -275,6 +208,16 @@ def _published_value(value: Any, staging: Path, output: Path) -> Any:
             return value
         return str((output / relative).resolve())
     return value
+
+
+def _staging_has_material_entries(staging: Path) -> bool:
+    """Return whether staging contains anything beyond empty directories."""
+    if staging.is_symlink() or not staging.is_dir():
+        return True
+    return any(
+        path.is_symlink() or not path.is_dir()
+        for path in staging.rglob("*")
+    )
 
 
 def run_magma_direct(args, ctx=None):
@@ -329,6 +272,9 @@ def run_magma_direct(args, ctx=None):
             outcome_label_width=configuration.logging.terminal_label_width,
         ),
     )
+    checkpoint = None
+    analysis_started = False
+    staging = None
     try:
         output.mkdir(parents=True, exist_ok=True)
         resolved_config_path = configured_output_path(
@@ -364,52 +310,107 @@ def run_magma_direct(args, ctx=None):
             resume=configuration.run.resume,
         )
 
-        if configuration.run.resume and not configuration.run.overwrite:
-            resumed = _resume_result(
-                output, dataset, module, log_path, logger,
+        completion_manifest = configured_output_path(
+            output,
+            module.output_layout.completion_manifest,
+            error_type=MagmaError,
+            dataset_id=dataset,
+        )
+        staging = configured_output_path(
+            output,
+            module.output_layout.staging_directory,
+            error_type=MagmaError,
+            dataset_id=dataset,
+        )
+        if (
+            (staging.exists() or staging.is_symlink())
+            and _staging_has_material_entries(staging)
+            and not completion_manifest.is_file()
+            and not configuration.run.overwrite
+        ):
+            raise MagmaError(
+                "An isolated incomplete MAGMA run exists at %s without a valid "
+                "completion checkpoint. Review it and use --overwrite to replace "
+                "it." % staging
             )
-            if resumed is not None:
-                write_resolved_configuration(
-                    configuration,
-                    resolved_config_path,
-                    modules=("magma",),
-                    resource_paths=("executables.magma",),
-                    module_paths={
-                        "magma": _resolved_magma_metadata_paths(module),
-                    },
+
+        preflight = preflight_magma_analysis(
+            dataset, configuration, logger,
+        )
+        selected_definitions = [
+            module.mapping.definitions[name]
+            for name in module.mapping.selected
+        ]
+        checkpoint = ExecutionCheckpoint(
+            manifest_path=completion_manifest,
+            output_root=output,
+            artifact_root=output,
+            identity={
+                "scope": "direct_module",
+                "stage": "magma",
+                "dataset_id": dataset,
+            },
+            configuration={
+                "module": module.model_dump(mode="json"),
+                "execution": configuration.execution.model_dump(mode="json"),
+                "magma_executable": preflight.executable,
+            },
+            inputs=discover_input_files(
+                module.input,
+                selected_definitions,
+                preflight.executable,
+                excluded_roots=(output,),
+            ),
+            policy=configuration.run.resume_policy,
+            resume=configuration.run.resume,
+            overwrite=configuration.run.overwrite,
+            logger=logger,
+            software=software_identity(preflight.executable),
+            error_type=MagmaError,
+        )
+        checkpoint_decision = checkpoint.prepare()
+        if checkpoint_decision.action == "resume":
+            resumed = decode_checkpoint_value(
+                checkpoint_decision.document.get("state")
+            )
+            if not isinstance(resumed, dict):
+                raise MagmaError(
+                    "MAGMA completion checkpoint contains invalid result state"
                 )
-                logger.record(
-                    "SKIP",
-                    "magma_analysis",
-                    reason=resumed["resume_mode"],
-                    outputs=resumed,
+            resumed["resumed"] = True
+            resumed["resume_mode"] = "validated_checkpoint"
+            args.magma = resumed["magma_executable"]
+            if ctx is not None:
+                ctx["magma"] = resumed
+            logger.record(
+                "SKIP",
+                "magma_analysis",
+                reason="validated_checkpoint",
+                outputs=resumed,
+            )
+            logger.record(
+                "STATUS",
+                "magma_run",
+                status="COMPLETED",
+                resumed=True,
+                resume_mode="validated_checkpoint",
+            )
+            print(
+                "\n%s\n"
+                % screen_line(
+                    "success",
+                    "MAGMA: validated completed outputs reused",
+                    indent=2,
                 )
-                logger.record(
-                    "STATUS",
-                    "magma_run",
-                    status="COMPLETED",
-                    resumed=True,
-                    resume_mode=resumed["resume_mode"],
-                )
-                if ctx is not None:
-                    ctx["magma"] = resumed
-                detail = (
-                    "completed run upgraded with corrected gene results"
-                    if resumed["backfilled_outputs"]
-                    else "completed outputs reused"
-                )
-                print(
-                    "\n%s\n"
-                    % screen_line(
-                        "success", "MAGMA: %s" % detail, indent=2,
-                    )
-                )
-                return resumed
+            )
+            return resumed
+
         existing = _existing_primary_outputs(output, dataset, module)
         if existing and not configuration.run.overwrite:
             raise MagmaError(
-                "Existing or incomplete MAGMA results were found: %s. Use --resume "
-                "for a complete run or --overwrite to replace them."
+                "Existing or incomplete MAGMA results were found without a "
+                "valid completion checkpoint: %s. Use --overwrite to replace "
+                "them or choose another output directory."
                 % ", ".join(str(path) for path in existing)
             )
 
@@ -421,22 +422,39 @@ def run_magma_direct(args, ctx=None):
             module_paths={"magma": _resolved_magma_metadata_paths(module)},
         )
 
-        staging = configured_output_path(
-            output,
-            module.output_layout.staging_directory,
-            error_type=MagmaError,
-            dataset_id=dataset,
-        )
-        if staging.exists():
-            if not configuration.run.overwrite:
+        if staging.exists() or staging.is_symlink():
+            if (
+                not configuration.run.overwrite
+                and _staging_has_material_entries(staging)
+            ):
                 raise MagmaError(
-                    "An isolated incomplete MAGMA run exists at %s. Review it and "
-                    "use --overwrite to replace it." % staging
+                    "An isolated incomplete MAGMA run exists at %s without a "
+                    "valid completion checkpoint. Review it and use --overwrite "
+                    "to replace it." % staging
                 )
-            shutil.rmtree(staging)
+            remove_owned_directory(
+                staging,
+                output,
+                "MAGMA staging directory",
+                error_type=MagmaError,
+            )
+            if not configuration.run.overwrite:
+                logger.record(
+                    "ACTION",
+                    "magma_empty_staging_removed",
+                    path=str(staging),
+                    reason="no_partial_files",
+                )
         staging.mkdir(parents=True)
+        analysis_started = True
 
-        staged_result = run_magma_analysis(staging, dataset, configuration, logger)
+        staged_result = run_magma_analysis(
+            staging,
+            dataset,
+            configuration,
+            logger,
+            preflight=preflight,
+        )
         published = _publish_staged_files(
             staging, output, configuration.run.overwrite,
         )
@@ -444,6 +462,20 @@ def run_magma_direct(args, ctx=None):
         result["published_files"] = [str(path) for path in published]
         logger.record("OUTPUT", "magma_outputs", files=result["published_files"])
         logger.record("STATUS", "magma_run", status="COMPLETED")
+        checkpoint.write(
+            status="COMPLETED",
+            declared_values={
+                "result": result,
+                "resolved_configuration": resolved_config_path,
+            },
+            state=result,
+            metrics={
+                "mapping_count": len(result["mapping_analyses"]),
+                "retained_variants": result["variant_preparation"]["qc"][
+                    "retained_rows"
+                ],
+            },
+        )
         # Downstream pipeline steps reuse the same validated executable.
         args.magma = result["magma_executable"]
         if ctx is not None:
@@ -497,6 +529,18 @@ def run_magma_direct(args, ctx=None):
         print("\n".join(lines))
         return result
     except BaseException as exc:
+        if checkpoint is not None and analysis_started:
+            try:
+                checkpoint.write(
+                    status="PARTIAL",
+                    declared_values=staging,
+                    state={"error_type": type(exc).__name__, "message": str(exc)},
+                )
+            except BaseException as checkpoint_exc:
+                logger.error(
+                    "MAGMA partial checkpoint failed: %s: %s"
+                    % (type(checkpoint_exc).__name__, checkpoint_exc)
+                )
         if not logger.summary()["failed"]:
             logger.error("MAGMA analysis failed: %s: %s" % (type(exc).__name__, exc))
         raise

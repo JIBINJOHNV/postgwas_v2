@@ -58,7 +58,8 @@ postgwas pathway_enrichment \
 
 The API key and DAVID email are required. DSigDB cannot run without a usable
 GMT file. The command uses STRING score 400 and FDR 0.05 fallbacks.
-`--reference-set` is currently ignored.
+The `--reference-set` default comes from canonical
+`modules.enrichment.reference_set` YAML and is passed to DSigDB/WebGestaltR.
 
 ## Processing steps
 
@@ -94,8 +95,8 @@ environment, unmapped symbols, or one provider failing while others continue.
 ## Limitations
 
 The workflow is fixed, failure-tolerant, online, and lacks a unified manifest.
-`--reference-set` and YAML provider selection are not implemented. Confirm that
-each required provider returned results before treating the run as complete.
+YAML provider selection is not implemented. Confirm that each required provider
+returned results before treating the run as complete.
 
 ## Scientific references
 

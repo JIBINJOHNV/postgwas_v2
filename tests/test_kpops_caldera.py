@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from argparse import Namespace
 from pathlib import Path
+import re
 import shutil
 
 import numpy as np
@@ -19,6 +20,7 @@ from postgwas.modules.caldera.service import (
     run_caldera_direct,
     validate_caldera_configuration,
 )
+from postgwas.modules.kpops import cli as kpops_cli
 from postgwas.modules.kpops.cli import build_parser as build_kpops_parser
 from postgwas.modules.kpops.errors import KPopsError
 from postgwas.modules.kpops.service import run_kpops_direct, validate_kpops_configuration
@@ -32,7 +34,8 @@ def _kpops_resources(tmp_path: Path, *, kernel_bytes: int | None = None):
     annotation.write_text(
         "ENSGID\tNAME\tCHR\tTSS\n"
         + "".join(
-            "%s\tGENE%d\t%d\t%d\n" % (gene, index, 1 + index % 2, 1000 + index)
+            "%s\tGENE%d\t%d\t%d\n"
+            % (gene, index, 1 if index < 5 else 2, 1000 + index)
             for index, gene in enumerate(genes)
         ),
         encoding="utf-8",
@@ -134,6 +137,7 @@ def test_kpops_data_paths_have_no_defaults_and_software_path_accepts_cli(tmp_pat
     assert defaults.modules.kpops.script_path == "k-pops.py"
     assert defaults.modules.kpops.gene_annotation_file is None
     assert defaults.modules.kpops.kernel_matrix_prefix is None
+    assert defaults.modules.kpops.gene_universe_policy == "intersect"
 
     resources = _kpops_resources(tmp_path)
     configuration, _ = validate_kpops_configuration(
@@ -144,6 +148,75 @@ def test_kpops_data_paths_have_no_defaults_and_software_path_accepts_cli(tmp_pat
     assert configuration.modules.kpops.kernel_matrix_prefix == str(
         resources["kernel_prefix"]
     )
+
+
+def test_kpops_required_inputs_may_be_supplied_by_run_configuration(tmp_path):
+    resources = _kpops_resources(tmp_path)
+    run_config = tmp_path / "kpops.yaml"
+    run_config.write_text(
+        "genome_build: GRCh37\n"
+        "script_path: %s\n"
+        "gene_annotation_file: %s\n"
+        "kernel_matrix_prefix: %s\n"
+        "magma_association_prefix: %s\n"
+        % (
+            resources["script"],
+            resources["annotation"],
+            resources["kernel_prefix"],
+            resources["magma_prefix"],
+        ),
+        encoding="utf-8",
+    )
+
+    configuration, observed = validate_kpops_configuration(
+        Namespace(run_config=str(run_config))
+    )
+
+    assert configuration.modules.kpops.genome_build.value == "GRCh37"
+    assert observed["kernel_gene_count"] == len(resources["genes"])
+
+
+def test_kpops_missing_inputs_are_reported_together_logged_and_show_help(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "postgwas.modules.kpops.service.resolve_executable",
+        lambda *args, **kwargs: pytest.fail(
+            "runtime validation must follow required arguments"
+        ),
+    )
+
+    assert kpops_cli.main([]) == 1
+
+    captured = capsys.readouterr()
+    terminal = captured.out + captured.err
+    for option in (
+        "--kpops-genome-build",
+        "--kpops-gene-annotation-file",
+        "--kernel-matrix-prefix",
+        "--magma-association-prefix",
+    ):
+        assert "Required argument not provided: %s." % option in terminal
+    assert "usage: postgwas kpops" in terminal.lower()
+    assert "Run K-POPS directly:" in terminal
+    service_log = tmp_path / "results/logs/postgwas_kpops.log"
+    log_text = service_log.read_text(encoding="utf-8")
+    log_message = " ".join(
+        re.sub(
+            r"(?:^|\n)\[[^]]+\]\s+RUN\s+(?:FAILED\s+)?",
+            " ",
+            log_text,
+        ).split()
+    )
+    for option in (
+        "--kpops-genome-build",
+        "--kpops-gene-annotation-file",
+        "--kernel-matrix-prefix",
+        "--magma-association-prefix",
+    ):
+        assert "Required argument not provided: %s." % option in log_message
+    assert not (tmp_path / "results/postgwas_kpops.preds").exists()
 
 
 def test_kpops_infers_installed_command_when_script_override_is_omitted(
@@ -192,12 +265,133 @@ def test_kpops_validates_exact_kernel_dimensions_and_gene_overlap(tmp_path):
         validate_kpops_configuration(_kpops_args(tmp_path, resources))
 
 
+def test_kpops_intersects_incompatible_magma_genes_with_complete_audit(
+    tmp_path, monkeypatch, capsys,
+):
+    resources = _kpops_resources(tmp_path)
+    genes_out = Path(str(resources["magma_prefix"]) + ".genes.out")
+    genes_raw = Path(str(resources["magma_prefix"]) + ".genes.raw")
+    genes_out.write_text(
+        genes_out.read_text(encoding="utf-8") + "ENSG999\t1.250\n",
+        encoding="utf-8",
+    )
+    genes_raw.write_text(
+        genes_raw.read_text(encoding="utf-8")
+        + "ENSG999 2 0 0 10 5 0 100 0\n",
+        encoding="utf-8",
+    )
+    original_out = genes_out.read_text(encoding="utf-8")
+    original_raw = genes_raw.read_text(encoding="utf-8")
+
+    with pytest.raises(KPopsError, match="gene universes are incompatible"):
+        validate_kpops_configuration(
+            _kpops_args(
+                tmp_path, resources, gene_universe_policy="strict",
+            )
+        )
+
+    effective_prefixes = []
+
+    def fake_run(command, purpose, **kwargs):
+        effective_prefix = Path(command[command.index("--magma_prefix") + 1])
+        effective_prefixes.append(effective_prefix)
+        compatible_out = pd.read_csv(
+            str(effective_prefix) + ".genes.out", sep=r"\s+",
+        )
+        compatible_raw = Path(
+            str(effective_prefix) + ".genes.raw"
+        ).read_text(encoding="utf-8").splitlines()[2:]
+        assert compatible_out["GENE"].tolist() == resources["genes"]
+        assert [line.split()[0] for line in compatible_raw] == resources["genes"]
+
+        prefix = Path(command[command.index("--out_prefix") + 1])
+        pd.DataFrame(
+            {
+                "NAME": ["GENE%d" % index for index in range(10)],
+                "PoPS_Score": np.linspace(-1, 1, 10),
+            },
+            index=resources["genes"],
+        ).to_csv(str(prefix) + ".preds", sep="\t")
+        Path(str(prefix) + ".coefs").write_text(
+            "NAME\ttraining-1\nGENE1\t1\n", encoding="utf-8",
+        )
+        return ""
+
+    monkeypatch.setattr(
+        "postgwas.modules.kpops.service.run_checked_command", fake_run,
+    )
+    result = run_kpops_direct(_kpops_args(tmp_path, resources))
+
+    assert result["summary"]["original_target_genes"] == 11
+    assert result["summary"]["target_genes"] == 10
+    assert result["summary"]["excluded_target_genes"] == 1
+    audit = pd.read_csv(
+        result["summary"]["gene_compatibility"]["audit_table"], sep="\t",
+    )
+    excluded = audit.loc[audit["gene_id"] == "ENSG999"].iloc[0]
+    assert excluded["decision"] == "missing_kernel_and_annotation"
+    assert not bool(excluded["retained_for_kpops"])
+    report = Path(
+        result["summary"]["gene_compatibility"]["report"]
+    ).read_text(encoding="utf-8")
+    assert "original_files_unchanged: true" in report
+    assert "excluded_target_genes: 1" in report
+    assert genes_out.read_text(encoding="utf-8") == original_out
+    assert genes_raw.read_text(encoding="utf-8") == original_raw
+    assert not Path(str(effective_prefixes[0]) + ".genes.out").exists()
+    assert not Path(str(effective_prefixes[0]) + ".genes.raw").exists()
+    terminal = capsys.readouterr().out
+    assert "excluded 1 of 11 MAGMA target genes" in terminal
+    assert "Gene-universe audit" in terminal
+
+
+def test_kpops_intersection_rejects_shared_gene_chromosome_disagreement(
+    tmp_path,
+):
+    resources = _kpops_resources(tmp_path)
+    genes_raw = Path(str(resources["magma_prefix"]) + ".genes.raw")
+    genes_raw.write_text(
+        genes_raw.read_text(encoding="utf-8").replace(
+            "ENSG001 1 0 0", "ENSG001 3 0 0", 1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        KPopsError, match="intersection cannot repair a chromosome disagreement",
+    ):
+        validate_kpops_configuration(_kpops_args(tmp_path, resources))
+
+
 def test_kpops_rejects_unknown_anchor_genes(tmp_path):
     resources = _kpops_resources(tmp_path)
     with pytest.raises(KPopsError, match="anchor genes"):
         validate_kpops_configuration(
             _kpops_args(tmp_path, resources, anchor_genes=["NOT_A_GENE"])
         )
+
+
+def test_kpops_rejects_anchor_absent_from_retained_magma_targets(tmp_path):
+    resources = _kpops_resources(tmp_path)
+    genes_out = Path(str(resources["magma_prefix"]) + ".genes.out")
+    genes_raw = Path(str(resources["magma_prefix"]) + ".genes.raw")
+    genes_out.write_text(
+        "\n".join(genes_out.read_text(encoding="utf-8").splitlines()[:-1])
+        + "\n",
+        encoding="utf-8",
+    )
+    genes_raw.write_text(
+        "\n".join(genes_raw.read_text(encoding="utf-8").splitlines()[:-1])
+        + "\n",
+        encoding="utf-8",
+    )
+    run_config = tmp_path / "minimum.yaml"
+    run_config.write_text("minimum_gene_count: 2\n", encoding="utf-8")
+    args = _kpops_args(tmp_path, resources, anchor_genes=["ENSG010"])
+    args.run_config = str(run_config)
+
+    with pytest.raises(KPopsError, match="absent from the retained MAGMA"):
+        validate_kpops_configuration(args)
 
 
 def test_kpops_allows_duplicate_symbols_but_rejects_ambiguous_name_anchor(tmp_path):
@@ -250,6 +444,13 @@ def test_kpops_runs_in_staging_normalizes_gene_id_and_reports_findings(
     assert result["summary"]["genes_scored"] == 10
     assert result["summary"]["top_genes"][0]["gene_id"] == "ENSG010"
     assert "K-POPS gene-prioritisation summary" in screen
+    assert "K-POPS analysis progress" in screen
+    assert "Completed 1/4 · Validate K-POPS inputs and reference resources" in screen
+    assert "Completed 2/4 · Resolve the compatible MAGMA gene universe" in screen
+    assert "Completed 3/4 · Fit K-POPS models and calculate gene scores" in screen
+    assert "Completed 4/4 · Validate and publish K-POPS results" in screen
+    assert "All 4 stages completed" in screen
+    assert "Kpops progress" not in screen
     assert "Genes with finite K-POPS scores" in screen
     assert "None. K-POPS scores are relative rankings, not p-values." in screen
     assert "Complete K-POPS results" in screen
@@ -261,13 +462,31 @@ def test_kpops_runs_in_staging_normalizes_gene_id_and_reports_findings(
     assert resumed["summary"] == result["summary"]
     assert "K-POPS gene-prioritisation summary" in resumed_screen
 
+    for path in result["published_files"]:
+        Path(path).unlink()
+    restarted = run_kpops_direct(_kpops_args(tmp_path, resources))
+    assert all(Path(path).is_file() for path in restarted["published_files"])
+    log = (
+        Path(_kpops_args(tmp_path, resources).output_directory)
+        / "logs"
+        / "STUDY_kpops.log"
+    )
+    assert "reason=incomplete_outputs" in log.read_text(
+        encoding="utf-8"
+    )
+
     genes_out = Path(str(resources["magma_prefix"]) + ".genes.out")
     genes_out.write_text(
         genes_out.read_text(encoding="utf-8").replace("0.000", "0.001", 1),
         encoding="utf-8",
     )
-    with pytest.raises(KPopsError, match="input magma_genes_out changed"):
-        run_kpops_direct(_kpops_args(tmp_path, resources))
+    changed_input_run = run_kpops_direct(_kpops_args(tmp_path, resources))
+    assert all(
+        Path(path).is_file() for path in changed_input_run["published_files"]
+    )
+    changed_input_log = log.read_text(encoding="utf-8")
+    assert "Input magma_genes_out changed since this checkpoint" in changed_input_log
+    assert "reason=changed_inputs" in changed_input_log
 
 
 def test_kpops_summary_warns_about_incomplete_gene_and_chromosome_coverage(
@@ -277,7 +496,7 @@ def test_kpops_summary_warns_about_incomplete_gene_and_chromosome_coverage(
     annotation = resources["annotation"]
     annotation.write_text(
         annotation.read_text(encoding="utf-8")
-        .replace("ENSG009\tGENE8\t1\t1008", "ENSG009\tGENE8\t3\t1008")
+        .replace("ENSG009\tGENE8\t2\t1008", "ENSG009\tGENE8\t3\t1008")
         .replace("ENSG010\tGENE9\t2\t1009", "ENSG010\tGENE9\t3\t1009"),
         encoding="utf-8",
     )
@@ -293,7 +512,7 @@ def test_kpops_summary_warns_about_incomplete_gene_and_chromosome_coverage(
         "header\nheader2\n"
         + "".join(
             "%s %d 0 0 10 5 0 100 0\n"
-            % (gene, 1 if index < 4 else 2)
+            % (gene, 1 if index < 5 else 2)
             for index, gene in enumerate(resources["genes"][:8])
         ),
         encoding="utf-8",
@@ -448,6 +667,18 @@ def test_caldera_direct_publishes_only_validated_results(tmp_path, monkeypatch):
     result = run_caldera_direct(_caldera_args(tmp_path, resources))
     assert Path(result["caldera_file"]).is_file()
     assert Path(result["completion_manifest"]).is_file()
+
+    Path(result["caldera_file"]).unlink()
+    restarted = run_caldera_direct(_caldera_args(tmp_path, resources))
+    assert Path(restarted["caldera_file"]).is_file()
+    log = (
+        Path(_caldera_args(tmp_path, resources).output_directory)
+        / "logs"
+        / "STUDY_caldera.log"
+    )
+    assert "reason=incomplete_outputs" in log.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_docker_pins_upstream_commits_and_uses_main_environment():

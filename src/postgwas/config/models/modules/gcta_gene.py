@@ -7,9 +7,8 @@ from typing import get_args, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from postgwas.config.models.common import StrictModel
+from postgwas.config.models.common import DelimitedTableReadConfig, StrictModel
 from postgwas.config.models.gcta import GctaBackedModuleConfig, GctaReferenceConfig
-from postgwas.core.io.delimiters import NAMED_DELIMITERS
 
 
 GctaGeneMethod = Literal[
@@ -20,6 +19,9 @@ GctaDuplicateGenePolicy = Literal["error", "deduplicate"]
 GctaUnmappedGenePolicy = Literal["error", "report"]
 GctaEmptyPathwayPolicy = Literal["error", "omit"]
 GctaOversizedSetPolicy = Literal["error", "omit"]
+GctaPathwayAuditLevel = Literal["summary", "normalized", "expanded"]
+GctaPathwayAuditFormat = Literal["parquet"]
+GctaPathwayAuditCompression = Literal["zstd", "snappy", "gzip", "none"]
 
 
 def _validate_output_filenames(model: StrictModel, label: str) -> None:
@@ -82,7 +84,9 @@ class GctaGeneAnnotationConfig(StrictModel):
 class GctaPathwayOutputNames(StrictModel):
     set_list: str
     pathway_mapping: str
+    pathway_gene_mapping: str
     gene_variant_mapping: str
+    expanded_mapping: str
     unmapped_genes: str
     manifest: str
     readme: str
@@ -94,12 +98,33 @@ class GctaPathwayOutputNames(StrictModel):
         return self
 
 
+class GctaPathwayParallelismConfig(StrictModel):
+    worker_memory_multiplier: float = Field(
+        gt=1, allow_inf_nan=False,
+    )
+
+
+class GctaPathwayAuditConfig(StrictModel):
+    level: GctaPathwayAuditLevel
+    format: GctaPathwayAuditFormat
+    compression: GctaPathwayAuditCompression
+    batch_rows: int = Field(gt=0)
+
+
+class GctaPathwayDiskConfig(StrictModel):
+    minimum_free_gb: float = Field(ge=0, allow_inf_nan=False)
+    estimation_safety_factor: float = Field(ge=1, allow_inf_nan=False)
+
+
 class GctaPathwayConversionConfig(StrictModel):
     allowed_chromosomes: list[str]
     chromosome_label_policy: GctaChromosomeLabelPolicy
     duplicate_gene_policy: GctaDuplicateGenePolicy
     unmapped_gene_policy: GctaUnmappedGenePolicy
     empty_pathway_policy: GctaEmptyPathwayPolicy
+    parallelism: GctaPathwayParallelismConfig
+    audit: GctaPathwayAuditConfig
+    disk: GctaPathwayDiskConfig
     output_names: GctaPathwayOutputNames
 
     @field_validator("allowed_chromosomes")
@@ -115,6 +140,7 @@ class GctaPathwayConversionConfig(StrictModel):
 class GctaSetAnnotationConfig(StrictModel):
     file: str | None = None
     gmt_file: str | None = None
+    maximum_set_variants: int = Field(gt=0)
     oversized_set_policy: GctaOversizedSetPolicy
     conversion: GctaPathwayConversionConfig
 
@@ -228,14 +254,8 @@ class GctaResultSchema(StrictModel):
         return self
 
 
-class GctaGeneResultConfig(StrictModel):
+class GctaGeneResultConfig(DelimitedTableReadConfig):
     normalized_schema_version: str
-    delimiter: str
-    delimiter_candidates: list[str]
-    sample_lines: int = Field(ge=1)
-    infer_schema_length: int = Field(ge=1)
-    maximum_columns: int = Field(ge=1)
-    null_values: list[str]
     normalized_delimiter: str
     normalized_null_value: str
     schemas: dict[GctaGeneMethod, GctaResultSchema]
@@ -247,28 +267,12 @@ class GctaGeneResultConfig(StrictModel):
             raise ValueError("must not be empty")
         return value
 
-    @field_validator("delimiter")
-    @classmethod
-    def known_delimiter(cls, value: str) -> str:
-        if value != "auto" and value not in NAMED_DELIMITERS:
-            raise ValueError("is not a supported delimiter name")
-        return value
-
     @field_validator("normalized_delimiter")
     @classmethod
     def one_character_delimiter(cls, value: str) -> str:
         if len(value) != 1:
             raise ValueError("must contain exactly one character")
         return value
-
-    @field_validator(
-        "delimiter_candidates", "null_values",
-    )
-    @classmethod
-    def unique_values(cls, values: list[str]) -> list[str]:
-        if not values or len(values) != len(set(values)):
-            raise ValueError("must contain one or more unique values")
-        return values
 
     @model_validator(mode="after")
     def every_method_has_a_schema(self):

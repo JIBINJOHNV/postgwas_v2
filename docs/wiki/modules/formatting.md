@@ -13,6 +13,8 @@ variant IDs independently for each target, infers quantitative versus binary des
 applies each target's required-field and numeric checks, transforms statistics,
 and writes outputs atomically. It can produce MAGMA, GCTA gene, SuSiE, FINEMAP,
 PRED-LD, LDSC, and MiXeR inputs and an optional custom table in one run.
+For LDSC, an optional HapMap3 merge-alleles table can select variants by both
+rsID and allele pair before identifier uniqueness is enforced.
 
 ## When to use it
 
@@ -25,13 +27,20 @@ it after imputation.
 A harmonised, biallelic GWAS-VCF; dataset ID; output directory; `bcftools`; and
 at least one built-in format from CLI/YAML or `--custom-output` with `--id`.
 Required VCF fields depend on the chosen target and requested custom columns.
+`--merge-alleles` is optional for a direct LDSC formatter run and required when
+the formatter is planned for the `heritability` workflow.
 
 ## Command
 
 ```console
-postgwas formatter --vcf PATH \
+postgwas formatter --vcf PATH --output-directory PATH \
   [--format FORMAT [FORMAT ...]] [--custom-output FILE] [options]
 ```
+
+Standalone formatter runs require an explicit `--output-directory`; the
+formatter does not silently select a destination. Pipeline runs continue to
+use the pipeline's required output directory and create a formatter step
+subdirectory within it.
 
 ## Minimal example
 
@@ -40,8 +49,26 @@ postgwas formatter \
   --vcf STUDY_GRCh37_merged.vcf.gz \
   --dataset-id STUDY \
   --output-directory results \
-  --format magma ldsc
+  --format ldsc \
+  --merge-alleles reference/w_hm3.snplist
 ```
+
+Create an editable formatter YAML containing only shared settings and the LDSC
+target-specific sections:
+
+```console
+postgwas config export \
+  --module formatting \
+  --format ldsc \
+  --style minimal \
+  --output formatting.yaml
+```
+
+Multiple target names are accepted after `--format` and are written in the
+configured formatter order. Without `--format`, configuration export retains
+all formatter target schemas. The selector is for `--module formatting` only;
+pipeline export continues to derive required formatter targets from the
+pipeline plan.
 
 ### Custom CLI output example
 
@@ -77,6 +104,7 @@ postgwas formatter \
   --dataset-id STUDY \
   --output-directory results \
   --format magma gcta_gene susie finemap pred_ld ldsc mixer \
+  --duplicate-id-policy exclude_all \
   --run-config formatting.yaml \
   --resume \
   --bcftools bcftools
@@ -92,6 +120,38 @@ omitted, formats come from YAML.
 identifier. `variant_identifiers.target_types` can set different conventions
 for different outputs. MAGMA pipeline mode inspects BIM field 2 and sets only
 the MAGMA target automatically.
+
+Duplicate-ID handling is shared by every built-in format and the custom table.
+`--duplicate-id-policy` accepts `exclude_all`, `error`, `most_significant`,
+`highest_maf`, or `highest_info`. Argparse owns no default: when the option is
+omitted, each target uses `variant_identifiers.target_duplicate_policies` and
+then the canonical `variant_identifiers.default_duplicate_policy`. The packaged
+default is `exclude_all` for every target.
+
+Exact repeated records are collapsed first. Supported formatter-side reference
+matching—currently LDSC `--merge-alleles`—runs next when supplied. Other modules
+retain their own downstream reference reconciliation. The resolved policy then
+handles only conflicting duplicate-ID groups that remain. `exclude_all` removes the
+complete group, and `error` stops. Ranked policies retain a row only when it has
+one strictly greatest valid ranking value: largest configured `-log10(P)`,
+largest `min(EAF, 1-EAF)`, or largest configured INFO value. A tied maximum or
+missing ranking value excludes the complete group; the schema-validated
+`duplicate_rank_tolerance` treats numerically equivalent floating-point ranks
+as ties, and input order is never a fallback. `most_significant` is an explicit
+user choice rather than the default
+because selecting association results by P value can introduce ascertainment
+bias. Every target records the policy and its exact resolution counts.
+
+`--merge-alleles PATH` is an optional LDSC-formatting reference, normally
+`w_hm3.snplist`. When supplied, the formatter retains only records whose rsID
+and strand-unambiguous allele pair match one reference row. Allele order and
+strand complement are recognized. This resolves a duplicated rsID when exactly
+one input record is allele-compatible. Zero matches are excluded; multiple
+compatible records are passed to the shared configured duplicate policy.
+Without this option, direct LDSC formatting applies the same shared policy
+directly. It never keeps the first duplicated row arbitrarily. The
+heritability pipeline requires this option and passes the same file to both the
+formatter and `munge_sumstats.py`.
 
 `--custom-output FILE` activates the additional custom table. `--id NAME` is
 mandatory and uses the same `--variant-id-type rsid|unique` policy. Each other
@@ -126,6 +186,12 @@ freshness validation. If a completed run directory is copied, resume validates
 the copied files at the currently configured destinations, rebases every
 returned artifact and manifest path to that directory, and rejects a recorded
 artifact whose relative filename does not match the current configuration.
+When LDSC reference selection is active, the completion manifest also validates
+the merge-alleles path, size, and SHA-256 digest.
+If every formatter artifact declared by a matching manifest is absent, formatter
+logs the stale completion record and regenerates all selected formats. If only
+some artifacts are missing, or any surviving artifact has changed, formatter
+stops and requires explicit `--overwrite` after review.
 `--overwrite` takes precedence. Output schemas,
 filenames, chromosomes, minimum representable P value, and MiXeR QC come from
 the generated [Configuration Defaults](../reference/configuration-defaults.md).
@@ -137,9 +203,11 @@ and rejects filename collisions before VCF extraction. This preflight includes
 named outputs and every configured chromosome partition. It then optionally
 validates a completion manifest, extracts `N_ALT=1` records once, types numeric
 fields, selects each target's configured ID convention, and runs each exporter
-in canonical order. The custom exporter reuses the same one-pass extraction and
-does not trigger study-design inference. Study design is inferred only when
-LDSC or MiXeR is selected,
+in canonical order. Before an LDSC export with `--merge-alleles`, it joins the
+selected rsIDs to the configured reference columns and applies the
+strand-unambiguous allele check. The custom exporter reuses the same one-pass
+extraction and does not trigger study-design inference. Study design is inferred
+only when LDSC or MiXeR is selected,
 because only those formatter contracts interpret sample size differently for
 binary and quantitative traits. MAGMA, SuSiE, and FINEMAP validate only their
 own configured fields and do not require case/control columns. Rows missing or
@@ -147,6 +215,66 @@ violating a target's required fields are excluded for that target and counted.
 Before PRED-LD field validation, rows whose normalized chromosome is absent
 from the configured `chromosomes` list are excluded and counted by chromosome
 label.
+
+For a MAGMA pipeline, the subsequent MAGMA runner receives the exact filtered
+`snp_loc_file` and `pval_file` returned by this formatter step. MAGMA preparation
+validates them again and the external command uses `duplicate=error`; therefore
+formatter-produced duplicates cannot be silently reconsidered later. The
+MAGMA module's lowest-P consolidation applies only to independently prepared
+direct-module inputs that repeat one coordinate/allele-consistent variant.
+
+For a binary LDSC export, each valid written variant contributes
+`N_CASE / (N_CASE + N_CONTROL)`. The formatter reduces those per-variant case
+fractions using `ldsc_sample_prevalence.aggregation`: `median` is the default
+and `mean` is the only alternative. `sum` is rejected because variant rows are
+not independent participant groups. The result, method, number of variants,
+and observed minimum/maximum are recorded in the completion manifest and
+canonical log. The same value, aggregation formula, contributing variant count,
+observed prevalence range, `N_CASE` range, and `N_CONTROL` range are printed in
+the terminal completion summary for both a fresh export and a validated resume.
+All three ranges use the exact valid variants written to the LDSC table rather
+than all input VCF records. Quantitative traits explicitly report that sample
+prevalence is not applicable. A completion manifest created before count ranges
+were recorded continues to resume safely and reports that a one-time
+`--overwrite` rerun is required to populate the missing range metadata.
+
+### Runtime column report
+
+Every formatter execution, including a validated resume, prints one row per
+selected output. The report is generated from the resolved YAML schema and
+shows:
+
+- the exact resolved variant-ID type for that target (`rsID` or `unique`, where
+  `unique` is the configured coordinate-and-allele identifier);
+- every canonical source column and its saved output header (`source → saved`);
+- whether P values are absent, retained as `-log10(P)`, or converted to raw
+  `P = 10^-LP`;
+- the exact frequency source and saved header, with either EAF retained
+  unchanged or `MAF = min(EAF, 1-EAF)` applied; and
+- every exact GWAS-VCF sample-size source and saved header, its total/effective/
+  case/control meaning, any trait-specific formula, and how the downstream tool
+  uses it. `copied` means no numerical transformation occurs in the formatter.
+
+The same structured report is written to the canonical formatter log under
+`formatter_saved_schema`. Therefore custom YAML column names, CLI custom-column
+names, and binary or quantitative LDSC sample-size columns are reported as
+actually resolved for that run rather than described using fixed defaults.
+
+With the default configuration, the identifier and statistical representations
+are:
+
+| Output | Variant ID type | P value saved | Frequency saved | Sample size saved |
+|---|---|---|---|---|
+| MAGMA | `rsID` | `LP → P` as raw P | Not saved | Total N: `FORMAT/SS → N_COL`, copied per variant |
+| GCTA gene | `rsID` | `LP → P` as raw P | `EAF → freq` unchanged | Total N: `FORMAT/SS → N`, copied per variant |
+| SuSiE | `rsID` | `LP → LP` unchanged | Not saved | `FORMAT/NEF → NEF`; the locus median is used as SuSiE `n` |
+| FINEMAP | `rsID` | Not saved | `EAF → maf` using `min(EAF, 1-EAF)` | `FORMAT/NEF → NEF`; the rounded locus median is used as `n_samples` |
+| PRED-LD | `rsID` | `LP → LP` unchanged | `EAF → AF` unchanged | `FORMAT/NCO → NC` and `FORMAT/SS → SS`; carried for re-harmonisation, not consumed by PRED-LD |
+| LDSC binary | `rsID` | `LP → P` as raw P | `EAF → FRQ` unchanged | Cases: `FORMAT/NC → N_CAS`; controls: `FORMAT/NCO → N_CON` |
+| LDSC quantitative | `rsID` | `LP → P` as raw P | `EAF → FRQ` unchanged | Total N: `FORMAT/NCO → N` |
+| MiXeR binary | `rsID` | Not saved | Not saved | Effective N: `FORMAT/NEF → N`, where `NEF = 4/(1/NC + 1/NCO)` |
+| MiXeR quantitative | `rsID` | Not saved | Not saved | Total N: `FORMAT/NEF → N`, where `NEF = NCO` |
+| Custom CLI table | `rsID` | Exact `--p`/`--lp` source and requested header | Exact `--eaf`/`--maf` source and requested header | Exact requested sample-size source and header |
 
 ## Outputs
 
@@ -170,23 +298,34 @@ P values bounded at the configured numeric minimum, written schema, inferred
 study design when required, sample-size mode, and output fingerprints. PRED-LD additionally
 records `rows_excluded_unconfigured_chromosome` in its result and lists each
 excluded normalized chromosome with its row count in the canonical log.
+Every format records duplicate selected-ID groups, the resolved policy, and the
+number of exact, ranked, ambiguous, and excluded rows; the same exclusion count
+appears in the terminal completion summary. LDSC reference selection additionally
+records unmatched rsIDs, allele mismatches, groups resolved uniquely by alleles,
+and groups still ambiguous after reference matching.
 The custom result additionally records its ordered field roles, output headers,
 identifier convention, and missing/invalid requested-field exclusions.
 
 ## Interpretation
 
 Allele direction is preserved: GWAS-VCF ALT is the effect allele. FINEMAP gets
-minor allele frequency; MAGMA and GCTA mBAT receive total sample size; SuSiE
-uses effective N; LDSC uses case/control counts for binary traits or N from NCO
-for quantitative traits; MiXeR receives effective N.
+minor allele frequency; MAGMA and GCTA mBAT receive total sample size. SuSiE and
+FINEMAP use locus-median `NEF`, which is effective N for binary traits and total
+N for quantitative traits. LDSC uses case/control counts for binary traits or N
+from NCO for quantitative traits; MiXeR likewise uses binary effective N or
+quantitative total N from `NEF`.
 
 ## Common problems
 
 No format selected, colliding resolved output filenames, no usable IDs of the
-selected type, duplicate selected IDs, missing VCF fields, incomplete
+selected type, duplicated IDs for a target requiring strict uniqueness, every
+LDSC rsID belonging to a duplicate group, missing VCF fields, incomplete
 per-variant case/control counts, stale outputs, a changed resolved config,
 manifest artifact paths that do not match the current configured filenames, or
-zero rows satisfying one target's scientific contract.
+zero rows satisfying one target's scientific contract. With
+`--merge-alleles`, duplicated reference rsIDs and invalid or strand-ambiguous
+reference allele pairs are also fatal. Multiple compatible VCF records for one
+reference rsID are handled by the configured duplicate-ID policy.
 
 ## Limitations
 

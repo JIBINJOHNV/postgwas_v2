@@ -18,8 +18,9 @@ from postgwas.config import (
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.config.models.common import GenomeBuild
 from postgwas.core.completion import (
+    apply_completion_restart,
     configuration_digest,
-    validate_completion_manifest,
+    resolve_completion_resume,
     write_completion_manifest,
 )
 from postgwas.core.paths import (
@@ -436,22 +437,36 @@ def run_caldera_direct(args: argparse.Namespace, ctx=None):
         expected = {"results": results_path}
         if pipeline_directory is not None:
             expected["pipeline_credible_sets"] = converted_path
-        if configuration.run.resume and not configuration.run.overwrite and completion.is_file() and all(path.is_file() for path in expected.values()):
-            validate_completion_manifest(
+        if (
+            configuration.run.resume
+            and not configuration.run.overwrite
+            and completion.is_file()
+        ):
+            decision = resolve_completion_resume(
                 completion, dataset_id=dataset, module="caldera",
                 genome_build=module.genome_build.value,
                 configuration_sha256=completion_digest,
                 inputs=completion_inputs, outputs=expected,
+                resume_policy=configuration.run.resume_policy,
                 error_type=CalderaError,
             )
-            if pipeline_directory is not None:
-                _validate_credible_sets(converted_path, module)
-            metrics = _validate_results(results_path, module)
-            result = {"status": "success", "caldera_file": str(results_path), "completion_manifest": str(completion), "published_files": [str(path) for path in expected.values()]}
-            if ctx is not None:
-                ctx["caldera"] = result
-            logger.record("SKIP", "caldera_run", reason="validated_complete_outputs")
-            return result
+            if decision.action == "resume":
+                if pipeline_directory is not None:
+                    _validate_credible_sets(converted_path, module)
+                metrics = _validate_results(results_path, module)
+                result = {"status": "success", "caldera_file": str(results_path), "completion_manifest": str(completion), "published_files": [str(path) for path in expected.values()]}
+                if ctx is not None:
+                    ctx["caldera"] = result
+                logger.record("SKIP", "caldera_run", reason="validated_complete_outputs")
+                return result
+            apply_completion_restart(
+                decision,
+                output_root=output,
+                manifest=completion,
+                logger=logger,
+                operation="caldera_resume",
+                error_type=CalderaError,
+            )
         existing = [path for path in expected.values() if path.exists()]
         if existing and not configuration.run.overwrite:
             raise CalderaError("Existing CALDERA outputs require --overwrite: %s" % ", ".join(map(str, existing)))

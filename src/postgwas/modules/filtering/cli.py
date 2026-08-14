@@ -7,17 +7,11 @@ from postgwas.cli.common import (
     get_bcftools_binary_parser,
     get_common_out_parser,
     get_common_sumstat_filter_parser,
-    get_genome_build_parser,
     get_inputvcf_parser,
 )
 from postgwas.cli.compute import get_compute_parser
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples
-
-
-def get_filtering_genome_build_parser() -> argparse.ArgumentParser:
-    """Expose genome build without an argparse default overriding YAML."""
-    return get_genome_build_parser(suppress_default=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,7 +46,6 @@ def build_parser() -> argparse.ArgumentParser:
             get_compute_parser(),
             get_inputvcf_parser(),
             get_common_out_parser(),
-            get_filtering_genome_build_parser(),
             get_common_sumstat_filter_parser(add_help=False),
             get_bcftools_binary_parser(add_help=False),
         ],

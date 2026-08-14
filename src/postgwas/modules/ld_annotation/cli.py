@@ -7,7 +7,7 @@ from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples
 # --- IMPORTANT IMPORTS FROM STEP 1 (HARMONISATION) ---
 from postgwas.cli.common import (
         get_inputvcf_parser,
-        get_genome_build_parser,
+        get_ld_annotation_genome_build_parser,
         get_annot_ldblock_parser,
         get_common_out_parser)
 
@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[
             get_compute_parser(),
             get_inputvcf_parser(),
-            get_genome_build_parser(),
+            get_ld_annotation_genome_build_parser(),
             get_annot_ldblock_parser(add_help=False),
             get_common_out_parser()
         ],

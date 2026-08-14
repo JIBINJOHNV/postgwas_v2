@@ -3,14 +3,14 @@
 This is the only place where module descriptions, dependencies, parser
 components, runner entry points, and required CLI inputs are declared.
 References are strings so listing or planning modules does not import optional
-scientific dependencies.
+analysis dependencies.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 import argparse
 
 from postgwas.core.errors import PipelinePlanningError
@@ -20,6 +20,7 @@ from postgwas.core.errors import PipelinePlanningError
 class RequiredOption:
     dest: str
     flag: str
+    config_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class ModuleSpec:
     command_name: str | None = None
     dependencies: tuple[str, ...] = ()
     parser_factories: tuple[str, ...] = ()
+    genome_build_config_path: str | None = None
     pipeline_example_factory: str | None = None
     pipeline_supplied_options: tuple[str, ...] = ()
     required_options: tuple[RequiredOption, ...] = ()
@@ -39,6 +41,12 @@ class ModuleSpec:
     unavailable_reason: str | None = None
     internal: bool = False
     pipeline_target: bool = True
+    owns_top_level_progress: bool = False
+    owns_direct_progress: bool = False
+    pipeline_output_name: str | None = None
+    direct_checkpoint: Literal[
+        "orchestrated", "native", "not_applicable"
+    ] = "orchestrated"
 
 
 def _options(*names: str) -> tuple[RequiredOption, ...]:
@@ -63,13 +71,38 @@ COMMON = (
 )
 
 PIPELINE_REQUIRED_OPTIONS = _options("vcf", "dataset_id", "output_directory")
-
-
-def get_qc_parser():
-    parser = argparse.ArgumentParser(add_help=False)
-    group = parser.add_argument_group("QC Summary Arguments")
-    group.add_argument("--qc-output-prefix")
-    return parser
+HERITABILITY_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + _options(
+    "merge_alleles", "ref_ld_chr", "w_ld_chr",
+)
+MAGMA_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "magma_ld_reference",
+        "--magma-ld-reference",
+        "modules.magma.input.ld_reference_prefix",
+    ),
+    RequiredOption(
+        "gene_location_file",
+        "--gene-location-file",
+        "modules.magma.input.gene_location_file",
+    ),
+)
+KPOPS_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "kpops_gene_annotation_file",
+        "--kpops-gene-annotation-file",
+        "modules.kpops.gene_annotation_file",
+    ),
+    RequiredOption(
+        "kernel_matrix_prefix",
+        "--kernel-matrix-prefix",
+        "modules.kpops.kernel_matrix_prefix",
+    ),
+    RequiredOption(
+        "kpops_genome_build",
+        "--kpops-genome-build",
+        "modules.kpops.genome_build",
+    ),
+)
 
 
 MODULES = (
@@ -79,15 +112,17 @@ MODULES = (
         cli_entrypoint="postgwas.config.cli:main",
         pipeline_enabled=False,
         pipeline_target=False,
-        unavailable_reason="configuration inspection is not a scientific pipeline step",
+        unavailable_reason="configuration inspection is not an analysis pipeline step",
+        direct_checkpoint="not_applicable",
     ),
     ModuleSpec(
         "resources",
-        "Install and validate pinned scientific reference bundles.",
+        "Install and validate pinned reference bundles.",
         cli_entrypoint="postgwas.resources.cli:main",
         pipeline_enabled=False,
         pipeline_target=False,
-        unavailable_reason="resource installation is not a scientific pipeline step",
+        unavailable_reason="resource installation is not an analysis pipeline step",
+        direct_checkpoint="not_applicable",
     ),
     ModuleSpec(
         "harmonisation",
@@ -101,34 +136,35 @@ MODULES = (
         "Filter summary statistics using explicit QC policies.",
         cli_entrypoint="postgwas.modules.filtering.cli:main",
         parser_factories=COMMON + (
-            "postgwas.modules.filtering.cli:get_filtering_genome_build_parser",
             "postgwas.cli.common:get_common_sumstat_filter_parser",
             "postgwas.cli.common:get_bcftools_binary_parser",
         ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
         runner="postgwas.pipeline.runners:run_sumstat_filter_runner",
+        pipeline_output_name="filter_pre_imp",
     ),
     ModuleSpec(
         "post_imputation_filter",
         "Apply the configured QC policy after imputation.",
         dependencies=("imputation",),
         parser_factories=COMMON + (
-            "postgwas.modules.filtering.cli:get_filtering_genome_build_parser",
             "postgwas.cli.common:get_common_sumstat_filter_parser",
             "postgwas.cli.common:get_bcftools_binary_parser",
         ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
         runner="postgwas.pipeline.runners:run_sumstat_filter_runner",
         internal=True,
+        pipeline_output_name="filter_post_imp",
     ),
     ModuleSpec(
         "annot_ldblock",
         "Annotate variants with population-specific LD blocks.",
         cli_entrypoint="postgwas.modules.ld_annotation.cli:main",
         parser_factories=COMMON + (
-            "postgwas.cli.common:get_genome_build_parser",
+            "postgwas.cli.common:get_pipeline_genome_build_parser",
             "postgwas.cli.common:get_annot_ldblock_parser",
         ),
+        genome_build_config_path="modules.ld_annotation.genome_build",
         required_options=PIPELINE_REQUIRED_OPTIONS,
         runner="postgwas.pipeline.runners:run_annot_ldblock_runner",
     ),
@@ -150,7 +186,7 @@ MODULES = (
         dependencies=("formatter",),
         parser_factories=COMMON + (
             "postgwas.cli.common:get_common_imputation_parser",
-            "postgwas.cli.common:get_population_parser",
+            "postgwas.cli.common:get_imputation_population_parser",
             "postgwas.cli.common:get_bcftools_binary_parser",
         ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
@@ -162,13 +198,15 @@ MODULES = (
         cli_entrypoint="postgwas.modules.ld_clumping.cli:main",
         dependencies=("annot_ldblock",),
         parser_factories=COMMON + (
-            "postgwas.cli.common:get_genome_build_parser",
-            "postgwas.cli.common:get_plink_binary_parser",
+            "postgwas.cli.common:get_pipeline_genome_build_parser",
             "postgwas.cli.common:get_bcftools_binary_parser",
-            "postgwas.cli.common:get_population_parser",
+            "postgwas.cli.common:get_tabix_binary_parser",
+            "postgwas.cli.common:get_ld_clumping_population_parser",
             "postgwas.cli.common:get_ld_clump_parser",
         ),
+        genome_build_config_path="modules.ld_clumping.genome_build",
         required_options=PIPELINE_REQUIRED_OPTIONS,
+        preflight="postgwas.modules.ld_clumping.service:preflight_ld_clumping",
         runner="postgwas.pipeline.runners:run_ld_clump_runner",
     ),
     ModuleSpec(
@@ -204,8 +242,9 @@ MODULES = (
         pipeline_supplied_options=(
             "snp_location_file", "p_value_file", "variant_id_type",
         ),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        required_options=MAGMA_REQUIRED_OPTIONS,
         runner="postgwas.pipeline.runners:run_magma_runner",
+        direct_checkpoint="native",
     ),
     ModuleSpec(
         "gcta_cojo",
@@ -221,6 +260,7 @@ MODULES = (
         pipeline_supplied_options=("gcta_cojo_input_file", "variant_id_type"),
         required_options=PIPELINE_REQUIRED_OPTIONS,
         runner="postgwas.pipeline.runners:run_gcta_cojo_runner",
+        direct_checkpoint="native",
     ),
     ModuleSpec(
         "gcta_gene",
@@ -251,6 +291,8 @@ MODULES = (
             "postgwas.modules.magmacovar.service:preflight_magmacovar_pipeline"
         ),
         runner="postgwas.pipeline.runners:run_magmacovar_runner",
+        pipeline_output_name="magma_covar",
+        direct_checkpoint="native",
     ),
     ModuleSpec(
         "single_cell",
@@ -273,6 +315,7 @@ MODULES = (
             "postgwas.modules.single_cell.service:preflight_single_cell_pipeline"
         ),
         runner="postgwas.pipeline.runners:run_single_cell_runner",
+        direct_checkpoint="native",
     ),
     ModuleSpec(
         "pops",
@@ -303,9 +346,11 @@ MODULES = (
             "postgwas.modules.kpops.cli:get_kpops_pipeline_examples"
         ),
         pipeline_supplied_options=("magma_association_prefix",),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        required_options=KPOPS_REQUIRED_OPTIONS,
         preflight="postgwas.modules.kpops.service:preflight_kpops_pipeline",
         runner="postgwas.pipeline.runners:run_kpops_runner",
+        direct_checkpoint="native",
+        owns_direct_progress=True,
     ),
     ModuleSpec(
         "caldera",
@@ -322,6 +367,7 @@ MODULES = (
         required_options=PIPELINE_REQUIRED_OPTIONS,
         preflight="postgwas.modules.caldera.service:preflight_caldera_pipeline",
         runner="postgwas.pipeline.runners:run_caldera_runner",
+        direct_checkpoint="native",
     ),
     ModuleSpec(
         "flames",
@@ -330,6 +376,7 @@ MODULES = (
         dependencies=("finemap", "magmacovar", "pops"),
         parser_factories=COMMON + (
             "postgwas.cli.common:get_flames_common_parser",
+            "postgwas.cli.common:get_tabix_binary_parser",
         ),
         pipeline_example_factory=(
             "postgwas.modules.flames.cli:get_flames_pipeline_examples"
@@ -337,14 +384,17 @@ MODULES = (
         required_options=PIPELINE_REQUIRED_OPTIONS,
         preflight="postgwas.modules.flames.service:preflight_flames_pipeline",
         runner="postgwas.pipeline.runners:run_flames_runner",
+        direct_checkpoint="native",
     ),
     ModuleSpec(
         "heritability",
         "Estimate SNP heritability with LDSC.",
         cli_entrypoint="postgwas.modules.ldsc.cli:main",
         dependencies=("formatter",),
-        parser_factories=COMMON + ("postgwas.cli.common:get_ldsc_common_parser",),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        parser_factories=COMMON + (
+            "postgwas.cli.common:get_ldsc_pipeline_parser",
+        ),
+        required_options=HERITABILITY_REQUIRED_OPTIONS,
         runner="postgwas.pipeline.runners:run_heritability_runner",
     ),
     ModuleSpec(
@@ -361,12 +411,14 @@ MODULES = (
         cli_entrypoint="postgwas.modules.qc_summary.cli:main",
         command_name="qc",
         parser_factories=COMMON + (
-            "postgwas.pipeline.registry:get_qc_parser",
+            "postgwas.cli.common:get_pipeline_genome_build_parser",
             "postgwas.cli.common:sumstat_summary_arg_parser",
             "postgwas.cli.common:get_bcftools_binary_parser",
         ),
+        genome_build_config_path="modules.qc_summary.target_build",
         required_options=PIPELINE_REQUIRED_OPTIONS,
         runner="postgwas.pipeline.runners:run_qc_summary_runner",
+        direct_checkpoint="native",
     ),
     ModuleSpec(
         "mixer",
@@ -374,9 +426,10 @@ MODULES = (
         cli_entrypoint="postgwas.modules.mixer.cli:main",
         dependencies=("formatter",),
         parser_factories=COMMON + (
-            "postgwas.cli.common:get_genome_build_parser",
+            "postgwas.cli.common:get_pipeline_genome_build_parser",
             "postgwas.modules.mixer.cli:get_mixer_parser",
         ),
+        genome_build_config_path="modules.mixer.genome_build",
         pipeline_supplied_options=("mixer_input_file",),
         required_options=PIPELINE_REQUIRED_OPTIONS,
         runner="postgwas.pipeline.runners:run_mixer_runner",
@@ -385,7 +438,7 @@ MODULES = (
         "allele_orientation",
         "Audit and repair allele orientation against a compatible reference.",
         pipeline_enabled=False,
-        unavailable_reason="the prototype is not scientifically safe for pipeline use",
+        unavailable_reason="the prototype is not validated for pipeline use",
     ),
     ModuleSpec(
         "enrichment",
@@ -402,6 +455,8 @@ MODULES = (
         pipeline_enabled=False,
         pipeline_target=False,
         unavailable_reason="the pipeline orchestrator cannot be selected as its own target",
+        owns_top_level_progress=True,
+        direct_checkpoint="not_applicable",
     ),
 )
 

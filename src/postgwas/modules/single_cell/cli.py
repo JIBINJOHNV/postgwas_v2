@@ -48,7 +48,6 @@ def get_single_cell_parser(add_help=False, *, direct_controls=False):
         help=help_with_default(
             "One or more single-cell integration tools to run",
             " ".join(module.tools),
-            label="Configured default",
         ),
     )
     add_magma_celltype_arguments(parser, defaults)
@@ -61,24 +60,6 @@ def get_single_cell_parser(add_help=False, *, direct_controls=False):
             metavar="PATH",
             default=argparse.SUPPRESS,
             help="YAML settings; explicit command-line values override matching keys.",
-        )
-        controls.add_argument(
-            "--resume",
-            action=argparse.BooleanOptionalAction,
-            default=argparse.SUPPRESS,
-            help=help_with_default(
-                "Reuse provenance-matched MAGMA and cell-type results",
-                defaults.run.resume,
-            ),
-        )
-        controls.add_argument(
-            "--overwrite",
-            action="store_true",
-            default=argparse.SUPPRESS,
-            help=help_with_default(
-                "Replace outputs owned by this configured single-cell run",
-                defaults.run.overwrite,
-            ),
         )
     return parser
 
@@ -160,6 +141,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "%s Native scDRS 1.0.3 does not consume this option and uses "
                 "its fixed internal seed 0." % action.help
             )
+    for group in parser._action_groups:
+        if group.title == "MAGMA gene-property input":
+            group.title = "MAGMA gene-results input"
     return parser
 
 

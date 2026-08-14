@@ -3,7 +3,9 @@
 from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from postgwas.core.io.delimiters import NAMED_DELIMITERS
 
 
 class StrictModel(BaseModel):
@@ -25,6 +27,41 @@ class Population(str, Enum):
 
 class ModuleConfig(StrictModel):
     enabled: bool = False
+
+
+class DelimitedTableReadConfig(StrictModel):
+    """Shared schema for configuration-driven headed-table readers."""
+
+    delimiter: str
+    delimiter_candidates: list[str]
+    sample_lines: int = Field(ge=1)
+    infer_schema_length: int = Field(ge=1)
+    maximum_columns: int = Field(ge=1)
+    null_values: list[str]
+
+    @field_validator("delimiter")
+    @classmethod
+    def known_delimiter(cls, value: str) -> str:
+        if value != "auto" and value not in NAMED_DELIMITERS:
+            raise ValueError("is not a supported delimiter name")
+        return value
+
+    @field_validator("delimiter_candidates", "null_values")
+    @classmethod
+    def unique_values(cls, values: list[str]) -> list[str]:
+        if not values or len(values) != len(set(values)):
+            raise ValueError("must contain one or more unique values")
+        return values
+
+    @field_validator("delimiter_candidates")
+    @classmethod
+    def known_delimiter_candidates(cls, values: list[str]) -> list[str]:
+        unknown = [value for value in values if value not in NAMED_DELIMITERS]
+        if unknown:
+            raise ValueError(
+                "contains unsupported delimiter names: %s" % ", ".join(unknown)
+            )
+        return values
 
 
 class GeneRankingReportingConfig(StrictModel):

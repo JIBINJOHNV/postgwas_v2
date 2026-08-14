@@ -13,14 +13,17 @@ from postgwas.config import (
     resolved_configuration_values,
     select_configuration_values,
 )
-from postgwas.core.io.delimiters import open_text
+from postgwas.core.completion import (
+    CompletionResumeDecision,
+    apply_completion_restart,
+    completion_restart_decision,
+)
 from postgwas.core.io.reports import write_yaml_report
 from postgwas.core.paths import configured_output_path
 from postgwas.core.resource_preparation import sha256
 
 from .contracts import (
     CUSTOM_OUTPUT_TARGET,
-    GCTA_SAMPLE_SIZE_MODE,
     NAMED_OUTPUT_RESULT_KEYS,
     PARTITIONED_OUTPUT_RESULT_KEYS,
     SINGLE_OUTPUT_RESULT_KEYS,
@@ -33,8 +36,13 @@ _MANIFEST_SCHEMA_VERSION = 1
 _NON_PATH_RESULT_KEYS = frozenset({"columns", "field_roles"})
 
 
-def formatter_resolved_paths(configuration, selected: list[str]) -> list[str]:
-    """Return YAML-configured metadata paths for the selected targets."""
+def _formatter_scoped_paths(
+    configuration,
+    selected: list[str],
+    *,
+    include_reporting: bool,
+) -> list[str]:
+    """Return validated target-scoped formatter configuration paths."""
     metadata = configuration.modules.formatting.resolved_config
     missing = sorted(set(selected) - set(metadata.format_fields))
     if missing:
@@ -44,11 +52,26 @@ def formatter_resolved_paths(configuration, selected: list[str]) -> list[str]:
         )
     paths = [
         *metadata.common_fields,
+        *(metadata.reporting_fields if include_reporting else ()),
         *(path for target in selected for path in metadata.format_fields[target]),
     ]
     if configuration.modules.formatting.custom_output.active:
         paths.extend(metadata.custom_fields)
     return list(dict.fromkeys(paths))
+
+
+def formatter_resolved_paths(configuration, selected: list[str]) -> list[str]:
+    """Return metadata paths, including non-content reporting configuration."""
+    return _formatter_scoped_paths(
+        configuration, selected, include_reporting=True,
+    )
+
+
+def formatter_content_paths(configuration, selected: list[str]) -> list[str]:
+    """Return only parameters capable of changing formatter artifacts."""
+    return _formatter_scoped_paths(
+        configuration, selected, include_reporting=False,
+    )
 
 
 def formatter_output_paths(
@@ -118,6 +141,26 @@ def _file_fingerprint(path: Path) -> dict[str, Any]:
     }
 
 
+def _input_resource_paths(configuration, selected: list[str]) -> dict[str, Path]:
+    """Return external resources whose content determines formatter outputs."""
+    formatting = configuration.modules.formatting
+    merge_alleles = formatting.ldsc_reference.merge_alleles_file
+    if "ldsc" not in selected or merge_alleles is None:
+        return {}
+    return {
+        "ldsc_merge_alleles": Path(merge_alleles).expanduser().resolve(),
+    }
+
+
+def _input_resource_fingerprints(
+    configuration, selected: list[str],
+) -> dict[str, dict[str, Any]]:
+    return {
+        name: _file_fingerprint(path)
+        for name, path in _input_resource_paths(configuration, selected).items()
+    }
+
+
 def _configuration_values_digest(
     formatting: Mapping[str, Any], bcftools: object, selected: list[str],
 ) -> str:
@@ -137,7 +180,7 @@ def _configuration_digest(configuration, selected: list[str]) -> str:
         configuration,
         modules=("formatting",),
         module_paths={
-            "formatting": formatter_resolved_paths(configuration, selected),
+            "formatting": formatter_content_paths(configuration, selected),
         },
     )["modules"]["formatting"]
     return _configuration_values_digest(
@@ -175,6 +218,9 @@ def write_formatter_completion_manifest(
         "status": "COMPLETED",
         "dataset_id": dataset_id,
         "input_vcf": _file_fingerprint(vcf),
+        "input_resources": _input_resource_fingerprints(
+            configuration, selected,
+        ),
         "configuration_sha256": _configuration_digest(configuration, selected),
         "configuration_scope": "selected_formatter_targets",
         "formats": selected,
@@ -202,6 +248,17 @@ def _validate_fingerprint(
                 % (expected_path, field, current["path"])
             )
     return current
+
+
+def _fingerprint_mismatch(
+    record: Mapping[str, Any], expected_path: Path,
+) -> str | None:
+    """Return the first tracked fingerprint mismatch without weakening errors."""
+    current = _file_fingerprint(expected_path)
+    for field in ("path", "size", "sha256"):
+        if current[field] != record.get(field):
+            return field
+    return None
 
 
 def _required_result_path(
@@ -382,11 +439,16 @@ def _rebase_manifest_results(
     results: Mapping[str, Any],
     outputs: list[Any],
     *,
+    manifest: Mapping[str, Any],
     output_directory: Path,
     dataset_id: str,
     selected: list[str],
-    module,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    configuration,
+) -> (
+    tuple[dict[str, Any], list[dict[str, Any]]]
+    | CompletionResumeDecision
+):
+    module = configuration.modules.formatting
     expected = formatter_output_paths(
         output_directory, dataset_id, selected, module,
     )
@@ -468,6 +530,33 @@ def _rebase_manifest_results(
             "Formatter completion manifest output fingerprints do not match its "
             "result artifacts."
         )
+    missing = tuple(
+        label
+        for label, path in expected.items()
+        if not path.is_file() or path.is_symlink()
+    )
+    if missing:
+        restart_manifest = dict(manifest)
+        restart_manifest["outputs"] = [
+            {
+                **records_by_path[prior],
+                "path": str(expected[label].resolve()),
+            }
+            for label, prior in recorded.items()
+        ]
+        return completion_restart_decision(
+            restart_manifest,
+            policy=configuration.run.resume_policy,
+            policy_field="unvalidated_outputs",
+            reason="incomplete_outputs",
+            warning=(
+                "The formatter checkpoint output set is incomplete (missing: %s); "
+                "PostGWAS will restart formatting and replace only its verified "
+                "owned outputs." % ", ".join(missing)
+            ),
+            missing_outputs=missing,
+            error_type=FormattingError,
+        )
     validated_outputs = [
         _validate_fingerprint(
             records_by_path[prior], expected[label], validate_path=False,
@@ -500,132 +589,21 @@ def _load_manifest(path: Path) -> Mapping[str, Any]:
     return value
 
 
-def _validate_manifest(
-    manifest: Mapping[str, Any], *, output_directory: Path,
-    dataset_id: str, vcf: Path,
-    selected: list[str], configuration,
-) -> dict[str, Any]:
-    if manifest.get("schema_version") != _MANIFEST_SCHEMA_VERSION:
-        raise FormattingError("Unsupported formatter completion manifest schema.")
-    if manifest.get("status") != "COMPLETED":
-        raise FormattingError("Formatter completion manifest is not complete.")
-    if manifest.get("dataset_id") != dataset_id:
-        raise FormattingError("Formatter completion manifest dataset does not match.")
-    if manifest.get("formats") != selected:
-        raise FormattingError("Formatter completion manifest formats do not match.")
-    recorded_targets = manifest.get("selected_targets")
-    current_targets = formatter_result_targets(
-        configuration.modules.formatting, selected,
-    )
-    if recorded_targets is not None and recorded_targets != current_targets:
-        raise FormattingError(
-            "Formatter completion manifest selected outputs do not match."
-        )
-    recorded_digest = manifest.get("configuration_sha256")
-    current_digest = _configuration_digest(configuration, selected)
-    migrated_digest = recorded_digest != current_digest
-    if migrated_digest:
-        _matching_recorded_configuration(
-            output_directory,
-            dataset_id,
-            selected,
-            configuration,
-            expected_digest=recorded_digest,
-        )
-    input_record = manifest.get("input_vcf")
-    if not isinstance(input_record, Mapping):
-        raise FormattingError("Formatter completion manifest has no input fingerprint.")
-    _validate_fingerprint(input_record, vcf)
-    outputs = manifest.get("outputs")
-    if not isinstance(outputs, list) or not outputs:
-        raise FormattingError("Formatter completion manifest has no output fingerprints.")
-    results = manifest.get("results")
-    if not isinstance(results, dict):
-        raise FormattingError("Formatter completion manifest has no reusable results.")
-    rebased, rebased_outputs = _rebase_manifest_results(
-        results,
-        outputs,
-        output_directory=output_directory,
-        dataset_id=dataset_id,
-        selected=selected,
-        module=configuration.modules.formatting,
-    )
-    resumed = {
-        target: dict(rebased[target])
-        for target in formatter_result_targets(
-            configuration.modules.formatting, selected,
-        )
-    }
-    for result in resumed.values():
-        result["resumed"] = True
-    migrated = dict(manifest)
-    migrated["configuration_sha256"] = current_digest
-    migrated["configuration_scope"] = "selected_formatter_targets"
-    migrated["selected_targets"] = current_targets
-    migrated["results"] = rebased
-    migrated["outputs"] = rebased_outputs
-    write_yaml_report(
-        migrated,
-        _manifest_path(
-            output_directory,
-            dataset_id,
-            configuration.modules.formatting,
-        ),
-    )
-    return resumed
-
-
-def _completed_log_block(log_path: Path, vcf: Path) -> bool:
-    if not log_path.is_file():
-        return False
-    lines = log_path.read_text(encoding="utf-8").splitlines()
-    completed = [
-        index for index, line in enumerate(lines)
-        if "formatter_run status=COMPLETED" in line
-    ]
-    if not completed:
-        return False
-    end = completed[-1]
-    starts = [
-        index for index, line in enumerate(lines[: end + 1])
-        if "INPUT    formatter_run" in line
-    ]
-    if not starts:
-        return False
-    block = "\n".join(lines[starts[-1] : end + 1])
-    return "vcf=%s" % vcf.expanduser().resolve() in block
-
-
-def _table_rows_and_header(
-    path: Path, expected: list[str], delimiter: str,
-) -> tuple[int, list[str]]:
-    with open_text(path) as handle:
-        header = handle.readline().rstrip("\r\n").split(delimiter)
-        rows = 0
-        for line_number, line in enumerate(handle, 2):
-            if not line.strip():
-                continue
-            if len(line.rstrip("\r\n").split(delimiter)) != len(header):
-                raise FormattingError(
-                    "Existing formatter output has an incomplete record at line "
-                    "%s: %s" % (line_number, path)
-                )
-            rows += 1
-    if header != expected or rows < 1:
-        raise FormattingError(
-            "Existing formatter output failed schema validation: %s" % path
-        )
-    return rows, header
-
-
-def _matching_recorded_configuration(
-    output_directory: Path, dataset_id: str, selected: list[str], configuration,
-    *, expected_digest: object = None,
+def _matches_historical_configuration(
+    output_directory: Path,
+    dataset_id: str,
+    selected: list[str],
+    configuration,
+    *,
+    expected_digest: object,
 ) -> bool:
+    """Validate a prior full-scope digest before migrating it to current scope."""
     module = configuration.modules.formatting
     resolved_path = configured_output_path(
-        output_directory, module.runtime.resolved_config_file,
-        error_type=FormattingError, dataset_id=dataset_id,
+        output_directory,
+        module.runtime.resolved_config_file,
+        error_type=FormattingError,
+        dataset_id=dataset_id,
     )
     if not resolved_path.is_file():
         return False
@@ -640,7 +618,7 @@ def _matching_recorded_configuration(
         raise FormattingError(
             "The prior resolved configuration has no formatter section."
         )
-    paths = formatter_resolved_paths(configuration, selected)
+    paths = formatter_content_paths(configuration, selected)
     recorded_values = select_configuration_values(recorded_module, paths)
     current_module = resolved_configuration_values(
         configuration,
@@ -650,130 +628,242 @@ def _matching_recorded_configuration(
     recorded_values.get("runtime", {}).pop("completion_manifest_file", None)
     current_module.get("runtime", {}).pop("completion_manifest_file", None)
     if recorded_values != current_module:
+        return False
+    try:
+        recorded_bcftools = resolved["resources"]["executables"]["bcftools"]
+    except (KeyError, TypeError) as exc:
         raise FormattingError(
-            "Existing formatter outputs use a different resolved configuration."
+            "The prior resolved configuration has no bcftools resource."
+        ) from exc
+    digest_values = dict(recorded_module)
+    digest_without_projection = dict(digest_values)
+    digest_without_projection.pop("resolved_config", None)
+    compatible_digests = {
+        _configuration_values_digest(digest_values, recorded_bcftools, selected),
+        _configuration_values_digest(
+            digest_without_projection, recorded_bcftools, selected,
+        ),
+    }
+    if str(expected_digest or "") not in compatible_digests:
+        raise FormattingError(
+            "Formatter completion metadata does not match its recorded resolved "
+            "configuration."
         )
-    if expected_digest is not None:
-        try:
-            recorded_bcftools = resolved["resources"]["executables"]["bcftools"]
-        except (KeyError, TypeError) as exc:
-            raise FormattingError(
-                "The prior resolved configuration has no bcftools resource."
-            ) from exc
-        digest_values = dict(recorded_module)
-        digest_without_projection = dict(digest_values)
-        digest_without_projection.pop("resolved_config", None)
-        compatible_digests = {
-            _configuration_values_digest(
-                digest_values, recorded_bcftools, selected,
-            ),
-            _configuration_values_digest(
-                digest_without_projection, recorded_bcftools, selected,
-            ),
-        }
-        recorded_digest = str(expected_digest or "")
-        if recorded_digest not in compatible_digests:
-            raise FormattingError(
-                "Formatter completion metadata does not match its recorded "
-                "resolved configuration."
-            )
     return True
 
 
-def _adopt_existing_named_outputs(
-    *, output_directory: Path, dataset_id: str, vcf: Path,
-    selected: list[str], configuration, log_path: Path,
-) -> dict[str, Any] | None:
+def _validate_manifest(
+    manifest: Mapping[str, Any], *, output_directory: Path,
+    dataset_id: str, vcf: Path,
+    selected: list[str], configuration,
+) -> dict[str, Any] | CompletionResumeDecision:
+    if manifest.get("schema_version") != _MANIFEST_SCHEMA_VERSION:
+        raise FormattingError("Unsupported formatter completion manifest schema.")
+    if manifest.get("status") != "COMPLETED":
+        raise FormattingError("Formatter completion manifest is not complete.")
+    if manifest.get("dataset_id") != dataset_id:
+        raise FormattingError("Formatter completion manifest dataset does not match.")
+    if manifest.get("formats") != selected:
+        return completion_restart_decision(
+            manifest,
+            policy=configuration.run.resume_policy,
+            policy_field="changed_parameters",
+            reason="changed_parameters",
+            warning=(
+                "The selected formatter targets changed since this checkpoint; "
+                "PostGWAS will replace its prior formatter outputs and restart."
+            ),
+            error_type=FormattingError,
+        )
+    recorded_targets = manifest.get("selected_targets")
+    current_targets = formatter_result_targets(
+        configuration.modules.formatting, selected,
+    )
+    if recorded_targets is not None and recorded_targets != current_targets:
+        return completion_restart_decision(
+            manifest,
+            policy=configuration.run.resume_policy,
+            policy_field="changed_parameters",
+            reason="changed_parameters",
+            warning=(
+                "The configured formatter output selection changed since this "
+                "checkpoint; PostGWAS will replace its prior formatter outputs "
+                "and restart."
+            ),
+            error_type=FormattingError,
+        )
+    recorded_digest = manifest.get("configuration_sha256")
+    current_digest = _configuration_digest(configuration, selected)
     if (
-        configuration.modules.formatting.custom_output.active
-        or len(selected) != 1
-        or selected[0] not in NAMED_OUTPUT_RESULT_KEYS
-        or not _completed_log_block(log_path, vcf)
-        or not _matching_recorded_configuration(
-            output_directory, dataset_id, selected, configuration,
+        recorded_digest != current_digest
+        and not _matches_historical_configuration(
+            output_directory,
+            dataset_id,
+            selected,
+            configuration,
+            expected_digest=recorded_digest,
         )
     ):
-        return None
-    target = selected[0]
-    result_keys = NAMED_OUTPUT_RESULT_KEYS[target]
-    module = configuration.modules.formatting
-    schema = module.exports[target]
-    outputs = {
-        name: configured_output_path(
-            output_directory, output_schema.output_file,
-            error_type=FormattingError, dataset_id=dataset_id,
+        return completion_restart_decision(
+            manifest,
+            policy=configuration.run.resume_policy,
+            policy_field="changed_parameters",
+            reason="changed_parameters",
+            warning=(
+                "Resolved formatter parameters changed since this checkpoint; "
+                "PostGWAS will replace its prior formatter outputs and restart."
+            ),
+            error_type=FormattingError,
         )
-        for name, output_schema in schema.outputs.items()
-    }
-    if not all(path.is_file() for path in outputs.values()):
-        return None
-    if vcf.stat().st_mtime_ns > min(
-        path.stat().st_mtime_ns for path in outputs.values()
-    ):
-        raise FormattingError("Input VCF is newer than existing formatter outputs.")
-    validated = {
-        name: _table_rows_and_header(
-            path,
-            list(schema.outputs[name].columns.values()),
-            module.runtime.table_delimiter,
+    input_record = manifest.get("input_vcf")
+    if not isinstance(input_record, Mapping):
+        raise FormattingError("Formatter completion manifest has no input fingerprint.")
+    input_mismatch = _fingerprint_mismatch(input_record, vcf)
+    if input_mismatch is not None:
+        return completion_restart_decision(
+            manifest,
+            policy=configuration.run.resume_policy,
+            policy_field="changed_inputs",
+            reason="changed_inputs",
+            warning=(
+                "The formatter input VCF changed since this checkpoint (%s "
+                "mismatch); PostGWAS will replace its prior formatter outputs "
+                "and restart." % input_mismatch
+            ),
+            error_type=FormattingError,
         )
-        for name, path in outputs.items()
-    }
-    row_counts = [value[0] for value in validated.values()]
-    if schema.validation.required_columns and len(set(row_counts)) != 1:
+    expected_resources = _input_resource_paths(configuration, selected)
+    recorded_resources = manifest.get("input_resources", {})
+    if not isinstance(recorded_resources, Mapping):
         raise FormattingError(
-            "Existing %s formatter outputs contain different variant counts."
-            % target
+            "Formatter completion manifest has invalid input-resource fingerprints."
         )
-    result = {
-        target: {
-            **{
-                result_keys[name]: str(path)
-                for name, path in outputs.items()
-            },
-            "rows_in": max(row_counts),
-            "rows_out": min(row_counts),
-            "rows_excluded": None,
-            "p_values_bounded": None,
-            "columns": {name: value[1] for name, value in validated.items()},
-            "log_file": str(log_path),
-            "resumed": True,
-            "adopted_existing_outputs": True,
-        }
-    }
-    if target == "gcta_gene":
-        result[target]["sample_size_mode"] = GCTA_SAMPLE_SIZE_MODE
-    write_formatter_completion_manifest(
+    if set(recorded_resources) != set(expected_resources):
+        return completion_restart_decision(
+            manifest,
+            policy=configuration.run.resume_policy,
+            policy_field="changed_inputs",
+            reason="changed_inputs",
+            warning=(
+                "The formatter input-resource set changed since this checkpoint; "
+                "PostGWAS will replace its prior formatter outputs and restart."
+            ),
+            error_type=FormattingError,
+        )
+    for name, expected_path in expected_resources.items():
+        record = recorded_resources[name]
+        if not isinstance(record, Mapping):
+            raise FormattingError(
+                "Formatter completion manifest has an invalid fingerprint for %s."
+                % name
+            )
+        resource_mismatch = _fingerprint_mismatch(record, expected_path)
+        if resource_mismatch is not None:
+            return completion_restart_decision(
+                manifest,
+                policy=configuration.run.resume_policy,
+                policy_field="changed_inputs",
+                reason="changed_inputs",
+                warning=(
+                    "Formatter input resource %s changed since this checkpoint "
+                    "(%s mismatch); PostGWAS will replace its prior formatter "
+                    "outputs and restart." % (name, resource_mismatch)
+                ),
+                error_type=FormattingError,
+            )
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        raise FormattingError("Formatter completion manifest has no output fingerprints.")
+    results = manifest.get("results")
+    if not isinstance(results, dict):
+        raise FormattingError("Formatter completion manifest has no reusable results.")
+    rebased_result = _rebase_manifest_results(
+        results,
+        outputs,
+        manifest=manifest,
         output_directory=output_directory,
         dataset_id=dataset_id,
-        vcf=vcf,
         selected=selected,
         configuration=configuration,
-        results=result,
     )
-    return result
+    if isinstance(rebased_result, CompletionResumeDecision):
+        return rebased_result
+    rebased, rebased_outputs = rebased_result
+    resumed = {
+        target: dict(rebased[target])
+        for target in formatter_result_targets(
+            configuration.modules.formatting, selected,
+        )
+    }
+    for result in resumed.values():
+        result["resumed"] = True
+    migrated = dict(manifest)
+    migrated["configuration_sha256"] = current_digest
+    migrated["configuration_scope"] = "selected_formatter_targets"
+    migrated["selected_targets"] = current_targets
+    migrated["input_resources"] = _input_resource_fingerprints(
+        configuration, selected,
+    )
+    migrated["results"] = rebased
+    migrated["outputs"] = rebased_outputs
+    write_yaml_report(
+        migrated,
+        _manifest_path(
+            output_directory,
+            dataset_id,
+            configuration.modules.formatting,
+        ),
+    )
+    return resumed
 
 
 def resume_formatter_outputs(
     *, output_directory: Path, dataset_id: str, vcf: Path,
-    selected: list[str], configuration, log_path: Path,
+    selected: list[str], configuration, log_path: Path, logger=None,
 ) -> dict[str, Any] | None:
     """Return validated prior formatter results, or ``None`` when none exist."""
     module = configuration.modules.formatting
     path = _manifest_path(output_directory, dataset_id, module)
     if path.is_file():
-        return _validate_manifest(
+        resumed = _validate_manifest(
             _load_manifest(path), output_directory=output_directory,
             dataset_id=dataset_id, vcf=vcf,
             selected=selected, configuration=configuration,
         )
-    return _adopt_existing_named_outputs(
-        output_directory=output_directory, dataset_id=dataset_id, vcf=vcf,
-        selected=selected, configuration=configuration, log_path=log_path,
-    )
+        if isinstance(resumed, CompletionResumeDecision):
+            if logger is None:
+                raise FormattingError(
+                    "Formatter restart requires the canonical run logger."
+                )
+            apply_completion_restart(
+                resumed,
+                output_root=output_directory,
+                manifest=path,
+                logger=logger,
+                operation="formatter_resume",
+                error_type=FormattingError,
+            )
+            return None
+        return resumed
+    existing = [
+        path
+        for path in formatter_output_paths(
+            output_directory, dataset_id, selected, module,
+        ).values()
+        if path.exists() or path.is_symlink()
+    ]
+    if existing:
+        raise FormattingError(
+            "Existing formatter outputs have no checksum-validated completion "
+            "manifest and cannot be resumed safely. Review them and use "
+            "--overwrite to replace them: %s"
+            % ", ".join(str(path) for path in existing)
+        )
+    return None
 
 
 __all__ = [
+    "formatter_content_paths",
     "formatter_output_paths",
     "formatter_resolved_paths",
     "resume_formatter_outputs",

@@ -9,9 +9,18 @@ Changes:
 
 import argparse
 import sys
+
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+
+from postgwas.cli.compute import get_compute_parser, resolve_compute_args
+from postgwas.config import load_configuration
+from postgwas.config.cli_overrides import get_dotted
+from postgwas.config.models.modules.single_cell import (
+    SINGLE_CELL_TOOLS,
+    single_cell_pipeline_dependencies,
+)
 from postgwas.core.errors import (
     ConfigurationError,
     ModuleExecutionError,
@@ -20,16 +29,10 @@ from postgwas.core.errors import (
 from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_examples,
-    help_with_default,
-)
-from postgwas.config import load_configuration
-from postgwas.config.models.modules.single_cell import (
-    SINGLE_CELL_TOOLS,
-    single_cell_pipeline_dependencies,
+    mark_cli_required_help,
 )
 from postgwas.pipeline.planner import build_pipeline_plan
 from postgwas.pipeline.registry import REGISTRY, resolve_reference
-from postgwas.cli.compute import resolve_compute_args
 
 # Initialize Rich Console Globally
 console = Console()
@@ -43,6 +46,31 @@ def _print_error(label, error, *, leading_newline=False):
         % (prefix, label, escape(str(error)))
     )
 
+
+def _resolve_pipeline_genome_build(args, modules, configuration):
+    """Resolve one build for every selected module sharing --genome-build."""
+    if hasattr(args, "genome_build"):
+        return
+    configured = {}
+    for module_name in modules:
+        path = REGISTRY.get(module_name).genome_build_config_path
+        if path is None:
+            continue
+        value = get_dotted(configuration, path)
+        configured[path] = getattr(value, "value", value)
+    distinct = set(configured.values())
+    if len(distinct) > 1:
+        details = ", ".join(
+            "%s=%s" % item for item in sorted(configured.items())
+        )
+        raise ConfigurationError(
+            "Selected pipeline modules configure incompatible genome builds: "
+            "%s. Set the listed canonical module keys to one build or provide "
+            "--genome-build BUILD to override them for this pipeline." % details
+        )
+    if distinct:
+        args.genome_build = distinct.pop()
+
 # =====================================================================
 # IMPORT ORCHESTRATOR
 # =====================================================================
@@ -55,6 +83,38 @@ from postgwas.pipeline.executor import execute_pipeline
 class HelpOnErrorArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         raise ValueError(message)
+
+
+def _add_pipeline_selection_arguments(container):
+    """Add the canonical workflow selectors to a parser or argument group."""
+    container.add_argument(
+        "--modules",
+        nargs="*",
+        choices=REGISTRY.names(),
+        metavar="MODULE",
+        help="One or more final analyses to run, for example finemap magma pops.",
+    )
+    container.add_argument(
+        "--apply-filter",
+        action="store_true",
+        help="Run quality-control filtering before downstream analyses.",
+    )
+    container.add_argument(
+        "--apply-imputation",
+        action="store_true",
+        help="Impute missing summary statistics before downstream analyses.",
+    )
+    container.add_argument(
+        "--apply-manhattan",
+        action="store_true",
+        help="Create Manhattan and QQ plots.",
+    )
+    container.add_argument(
+        "--heritability",
+        action="store_true",
+        help="Estimate SNP heritability with LDSC.",
+    )
+
 
 def print_full_pipeline_help(modules, parser, *, error=False):
     if error:
@@ -76,15 +136,29 @@ def print_full_pipeline_help(modules, parser, *, error=False):
 def main():
 
     # 1. Minimal Parse
-    mini = argparse.ArgumentParser(add_help=False)
-    mini.add_argument("--modules", nargs="*", choices=REGISTRY.names())
-    mini.add_argument("--apply-filter", action="store_true")
-    mini.add_argument("--apply-imputation", action="store_true")
-    mini.add_argument("--apply-manhattan", action="store_true")
-    mini.add_argument("--heritability", action="store_true")
-    mini.add_argument("--tools", nargs="+", choices=SINGLE_CELL_TOOLS)
-    mini.add_argument("--run-config")
-    mini.add_argument("-h", "--help", action="store_true")
+    mini = argparse.ArgumentParser(
+        prog="postgwas pipeline",
+        add_help=False,
+        formatter_class=AlignedRichHelpFormatter,
+        parents=[get_compute_parser()],
+    )
+    _add_pipeline_selection_arguments(mini)
+    mini.add_argument(
+        "--tools",
+        nargs="+",
+        choices=SINGLE_CELL_TOOLS,
+        metavar="TOOL",
+        help="Single-cell integration tools used when selecting single_cell.",
+    )
+    mini.add_argument(
+        "--run-config",
+        metavar="PATH",
+        help="YAML file containing pipeline and module settings.",
+    )
+    mini.add_argument(
+        "-h", "--help", action="store_true",
+        help="Show this help message and exit.",
+    )
 
     a1, _ = mini.parse_known_args()
 
@@ -123,6 +197,9 @@ def main():
                 ),
             )
         )
+        if a1.help:
+            console.print("\n[bold cyan]Shared pipeline options[/bold cyan]\n")
+            mini.print_help()
         sys.exit(0)
 
     # 3. Validate targets and build the execution plan exactly once.
@@ -233,26 +310,6 @@ def main():
                 "selected module."
             ),
         )
-    pipeline_controls = parser.add_argument_group("Pipeline continuation")
-    pipeline_controls.add_argument(
-        "--resume",
-        action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Continue after provenance-validated completed steps",
-            load_configuration().run.resume,
-        ),
-    )
-    pipeline_controls.add_argument(
-        "--overwrite",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Rerun steps and replace their existing outputs; this takes precedence "
-            "over resume",
-            load_configuration().run.overwrite,
-        ),
-    )
     # -------------------------------------------------------------
     # Context-Sensitive Arguments
     # -------------------------------------------------------------
@@ -265,34 +322,18 @@ def main():
             action.required = False
             action.help = argparse.SUPPRESS
 
+    mark_cli_required_help(
+        parser,
+        (
+            option.dest
+            for module_name in parser_modules
+            for option in REGISTRY.get(module_name).required_options
+        ),
+    )
+
     # Re-add CLI Flags
     workflow = parser.add_argument_group("Choose analyses")
-    workflow.add_argument(
-        "--modules",
-        nargs="*",
-        metavar="MODULE",
-        help="One or more final analyses to run, for example finemap magma pops.",
-    )
-    workflow.add_argument(
-        "--apply-filter",
-        action="store_true",
-        help="Run quality-control filtering before downstream analyses.",
-    )
-    workflow.add_argument(
-        "--apply-imputation",
-        action="store_true",
-        help="Impute missing summary statistics before downstream analyses.",
-    )
-    workflow.add_argument(
-        "--apply-manhattan",
-        action="store_true",
-        help="Create Manhattan and QQ plots.",
-    )
-    workflow.add_argument(
-        "--heritability",
-        action="store_true",
-        help="Estimate SNP heritability with LDSC.",
-    )
+    _add_pipeline_selection_arguments(workflow)
 
     if a1.help:
         print_full_pipeline_help(execution_modules, parser)
@@ -306,10 +347,21 @@ def main():
         print_full_pipeline_help(execution_modules, parser, error=True)
         sys.exit(2)
 
-    if not hasattr(args, "resume"):
-        args.resume = load_configuration(
+    try:
+        resolved_configuration = load_configuration(
             getattr(args, "run_config", None)
-        ).run.resume
+        )
+        _resolve_pipeline_genome_build(
+            args, parser_modules, resolved_configuration,
+        )
+    except ConfigurationError as exc:
+        _print_error("❌ Configuration Error:", exc, leading_newline=True)
+        sys.exit(2)
+    run_defaults = resolved_configuration.run
+    if not hasattr(args, "resume"):
+        args.resume = run_defaults.resume
+    if not hasattr(args, "overwrite"):
+        args.overwrite = run_defaults.overwrite
 
     # -----------------------------------------------------------
     # NEW LOGIC: Deduplicate Error Messages
@@ -323,6 +375,8 @@ def main():
     for m in check_list:
         for option in REGISTRY.get(m).required_options:
             val = getattr(args, option.dest, None)
+            if not val and option.config_path is not None:
+                val = get_dotted(resolved_configuration, option.config_path)
             if not val:
                 if option.flag not in missing_args_map:
                     missing_args_map[option.flag] = []
@@ -337,6 +391,7 @@ def main():
         print_full_pipeline_help(execution_modules, parser, error=True)
         sys.exit(2)
 
+    args.modules = parser_modules
     try:
         for module_name in parser_modules:
             preflight = REGISTRY.get(module_name).preflight
@@ -348,9 +403,8 @@ def main():
 
     # 6. Execute
     try:
-        args.modules = parser_modules
         resolve_compute_args(args)
-        execute_pipeline(args, plan)
+        execute_pipeline(args, plan, resolved_configuration)
 
     # ✅ CASE 1: Clean Stop (sys.exit from within the pipeline)
     except SystemExit as e:

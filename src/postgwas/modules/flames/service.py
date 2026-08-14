@@ -17,8 +17,9 @@ from postgwas.config import (
 )
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.core.completion import (
+    apply_completion_restart,
     configuration_digest,
-    validate_completion_manifest,
+    resolve_completion_resume,
     write_completion_manifest,
 )
 from postgwas.core.paths import (
@@ -941,9 +942,8 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
             configuration.run.resume
             and not configuration.run.overwrite
             and completion.is_file()
-            and all(path.is_file() for path in expected.values())
         ):
-            validate_completion_manifest(
+            decision = resolve_completion_resume(
                 completion,
                 dataset_id=dataset,
                 module="flames",
@@ -951,26 +951,36 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                 configuration_sha256=digest,
                 inputs=completion_inputs,
                 outputs=expected,
+                resume_policy=configuration.run.resume_policy,
                 error_type=FlamesError,
             )
-            annotation_metrics = _validate_annotations(
-                final_annotations, resources, module,
+            if decision.action == "resume":
+                annotation_metrics = _validate_annotations(
+                    final_annotations, resources, module,
+                )
+                score_metrics = _validate_scores(raw_path, prediction_path, module)
+                result = {
+                    "status": "success",
+                    "flames_raw_file": str(raw_path),
+                    "flames_predictions_file": str(prediction_path),
+                    "flames_index": str(final_index),
+                    "annotations": [str(path) for path in final_annotations],
+                    "completion_manifest": str(completion),
+                    "published_files": [str(path) for path in expected.values()],
+                    "metrics": {"annotations": annotation_metrics, "scores": score_metrics},
+                }
+                logger.record("SKIP", "flames_run", reason="validated_complete_outputs")
+                if ctx is not None:
+                    ctx["flames"] = result
+                return result
+            apply_completion_restart(
+                decision,
+                output_root=output,
+                manifest=completion,
+                logger=logger,
+                operation="flames_resume",
+                error_type=FlamesError,
             )
-            score_metrics = _validate_scores(raw_path, prediction_path, module)
-            result = {
-                "status": "success",
-                "flames_raw_file": str(raw_path),
-                "flames_predictions_file": str(prediction_path),
-                "flames_index": str(final_index),
-                "annotations": [str(path) for path in final_annotations],
-                "completion_manifest": str(completion),
-                "published_files": [str(path) for path in expected.values()],
-                "metrics": {"annotations": annotation_metrics, "scores": score_metrics},
-            }
-            logger.record("SKIP", "flames_run", reason="validated_complete_outputs")
-            if ctx is not None:
-                ctx["flames"] = result
-            return result
         existing = [path for path in expected.values() if path.exists()]
         if existing and not configuration.run.overwrite:
             raise FlamesError(

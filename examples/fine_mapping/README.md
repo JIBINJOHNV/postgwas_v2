@@ -89,4 +89,4 @@ Successful runs finish with `overall status: success`. Inspect
 `quality_control/`, and the resolved configuration under `run_metadata/`
 before downstream analysis. The authoritative FLAMES handoff is
 `downstream_inputs/flames/`. A converged run with no credible set is a valid
-scientific outcome, not a successful FLAMES handoff.
+analysis outcome, not a successful FLAMES handoff.

@@ -28,6 +28,7 @@ from postgwas.modules.magma.analysis import (
     correct_gene_set_p_values,
     parse_gene_set_file,
     prepare_magma_variant_inputs,
+    resolve_gene_set_identifiers,
 )
 from postgwas.modules.magma.annotations import (
     map_regulatory_elements_to_genes,
@@ -745,6 +746,7 @@ def test_gene_set_report_schema_and_corrections_are_configuration_driven(tmp_pat
     assert observed.loc[0, "VARIABLE"] == "GO_SET"
     assert observed.loc[0, "FULL_NAME"] == "GO_SET"
     assert observed.loc[0, "set_description"] == "description"
+    assert observed.loc[0, "source_input_genes"] == "1,3"
     assert observed.loc[0, "source_genes"] == "1,3"
     assert not {"V1", "V2", "V3"} & set(observed.columns)
     assert observed.loc[0, "common_ids"] == 1
@@ -762,13 +764,113 @@ def test_native_magma_gene_sets_have_configured_columns(tmp_path):
     observed = parse_gene_set_file(gene_sets, module, RecordingLogger())
 
     assert observed.columns == [
-        "FULL_NAME", "gene_set_description", "input_genes",
+        "FULL_NAME", "gene_set_description", "source_input_genes", "input_genes",
     ]
     assert observed.to_dicts() == [{
         "FULL_NAME": "GOBP_SET",
         "gene_set_description": None,
+        "source_input_genes": "1,2,3",
         "input_genes": "1,2,3",
     }]
+
+
+def test_gene_set_ids_use_primary_location_ids_without_translation(tmp_path):
+    module = load_module_configuration("magma")
+    locations = tmp_path / "genes.loc"
+    locations.write_text(
+        "79501 1 69091 70008 + OR4F5\n"
+        "729759 1 367659 368597 + OR4F29\n",
+        encoding="utf-8",
+    )
+    gene_sets = pl.DataFrame(
+        {
+            "FULL_NAME": ["SET"],
+            "gene_set_description": [None],
+            "input_genes": ["79501,729759"],
+        }
+    )
+
+    resolved, reference_ids, summary = resolve_gene_set_identifiers(
+        locations, gene_sets, 0.5, module,
+    )
+
+    assert resolved.equals(gene_sets)
+    assert reference_ids == {"79501", "729759"}
+    assert summary["identifier_source"] == "primary_gene_id"
+    assert summary["translated_unique_ids"] == 0
+
+
+def test_gene_set_ids_translate_sixth_location_column_to_primary_ids(tmp_path):
+    module = load_module_configuration("magma")
+    locations = tmp_path / "genes.loc"
+    locations.write_text(
+        "ENSG1 1 10 20 + GENE1\n"
+        "ENSG2 1 30 40 - GENE2\n"
+        "ENSG3 2 50 60 + GENE2\n",
+        encoding="utf-8",
+    )
+    gene_sets = pl.DataFrame(
+        {
+            "FULL_NAME": ["SET"],
+            "gene_set_description": [None],
+            "input_genes": ["GENE1,GENE2,UNMAPPED1,UNMAPPED2,UNMAPPED3"],
+        }
+    )
+
+    resolved, reference_ids, summary = resolve_gene_set_identifiers(
+        locations, gene_sets, 0.5, module,
+    )
+
+    assert reference_ids == {"ENSG1", "ENSG2", "ENSG3"}
+    assert resolved["input_genes"].to_list() == [
+        "ENSG1,ENSG2,ENSG3,UNMAPPED1,UNMAPPED2,UNMAPPED3"
+    ]
+    assert summary["identifier_source"] == "alternate_gene_id"
+    assert summary["translated_unique_ids"] == 2
+    assert summary["one_to_many_identifiers"] == 1
+    assert summary["match_fraction"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        ("ENSG1 1 start 20 + GENE1\n", "integer start and end"),
+        ("ENSG1 1 10 20 ? GENE1\n", "invalid gene ID, chromosome"),
+        ("ENSG1 1 10 20 + GENE1 EXTRA\n", "must contain five columns"),
+    ],
+)
+def test_gene_location_identifier_resolution_validates_six_column_contract(
+    tmp_path, record, message,
+):
+    module = load_module_configuration("magma")
+    locations = tmp_path / "genes.loc"
+    locations.write_text(record, encoding="utf-8")
+    gene_sets = pl.DataFrame(
+        {
+            "FULL_NAME": ["SET"],
+            "gene_set_description": [None],
+            "input_genes": ["GENE1"],
+        }
+    )
+
+    with pytest.raises(MagmaError, match=message):
+        resolve_gene_set_identifiers(locations, gene_sets, 0.5, module)
+
+
+def test_gene_set_identifier_resolution_fails_when_neither_column_matches(tmp_path):
+    module = load_module_configuration("magma")
+    locations = tmp_path / "genes.loc"
+    locations.write_text("ENSG1 1 10 20 + GENE1\n", encoding="utf-8")
+    gene_sets = pl.DataFrame(
+        {
+            "FULL_NAME": ["SET"],
+            "gene_set_description": [None],
+            "input_genes": ["ABSENT1,ABSENT2"],
+        }
+    )
+
+    with pytest.raises(MagmaError, match="neither primary gene-location column 1"):
+        resolve_gene_set_identifiers(locations, gene_sets, 0.5, module)
 
 
 def test_external_annotation_validation_uses_exact_bim_identifier_overlap(tmp_path):
@@ -801,7 +903,7 @@ def test_nmagma_annotation_union_deduplicates_gene_variant_memberships(tmp_path)
     )
     locations = tmp_path / "protein_coding_gene.loc"
     locations.write_text(
-        "GENE1 1 10 20\nGENE2 1 30 40\n",
+        "GENE1 1 10 20 +\nGENE2 1 30 40 -\n",
         encoding="utf-8",
     )
     output = tmp_path / "merged.genes.annot"
@@ -829,7 +931,7 @@ def test_nmagma_annotation_union_uses_canonical_gene_coordinates(tmp_path):
     first.write_text("GENE1 1:10:20 rs1\n", encoding="utf-8")
     second.write_text("GENE1 1:11:20 rs2\n", encoding="utf-8")
     locations = tmp_path / "protein_coding_gene.loc"
-    locations.write_text("GENE1 1 10 20\n", encoding="utf-8")
+    locations.write_text("GENE1 1 10 20 +\n", encoding="utf-8")
     output = tmp_path / "merged.genes.annot"
 
     result = merge_gene_annotations(
@@ -853,7 +955,7 @@ def test_nmagma_annotation_union_excludes_genes_absent_from_location_reference(
         encoding="utf-8",
     )
     locations = tmp_path / "protein_coding_gene.loc"
-    locations.write_text("GENE1 1 10 20\n", encoding="utf-8")
+    locations.write_text("GENE1 1 10 20 +\n", encoding="utf-8")
     output = tmp_path / "merged.genes.annot"
 
     result = merge_gene_annotations(
@@ -879,7 +981,7 @@ def test_nmagma_annotation_union_replaces_invalid_canonical_gene_coordinate(
     component = tmp_path / "component.genes.annot"
     component.write_text("GENE1 NA rs1\n", encoding="utf-8")
     locations = tmp_path / "protein_coding_gene.loc"
-    locations.write_text("GENE1 1 10 20\n", encoding="utf-8")
+    locations.write_text("GENE1 1 10 20 +\n", encoding="utf-8")
 
     output = tmp_path / "merged.genes.annot"
     result = merge_gene_annotations(
@@ -1023,6 +1125,69 @@ def test_batching_obeys_configured_threads_memory_and_minimum_gene_count(tmp_pat
     assert _batch_plan(annotation, configuration) == (4000, 2, 2)
 
 
+def test_batched_gene_analysis_uses_configured_batch_and_native_prefixes(
+    tmp_path, monkeypatch,
+):
+    from postgwas.modules.magma.analysis import _run_gene_associations
+
+    configuration = load_configuration()
+    module = configuration.modules.magma
+    annotation = tmp_path / "annotation.genes.annot"
+    annotation.write_text("gene1\n", encoding="utf-8")
+    paths = {
+        "harmonised_p_values": tmp_path / "01_inputs" / "p_values.tsv",
+        "gene_batch_prefix": (
+            tmp_path / "02_intermediates" / "positional" / "batches" / "study"
+        ),
+        "gene_prefix": (
+            tmp_path
+            / "02_intermediates"
+            / "positional"
+            / "native_outputs"
+            / "study"
+        ),
+        "genes_raw": tmp_path / "native.genes.raw",
+        "genes_out": tmp_path / "native.genes.out",
+    }
+    commands = []
+
+    monkeypatch.setattr(
+        "postgwas.modules.magma.analysis._batch_plan",
+        lambda *_arguments: (4000, 2, 2),
+    )
+    monkeypatch.setattr(
+        "postgwas.modules.magma.analysis._run_command",
+        lambda command, purpose, *_arguments: commands.append((command, purpose)),
+    )
+
+    _run_gene_associations(
+        "magma",
+        "reference",
+        annotation,
+        paths,
+        module.mapping.definitions["positional"],
+        configuration,
+        RecordingLogger(),
+    )
+
+    batch_commands = [
+        command
+        for command, purpose in commands
+        if " batch " in purpose and "batch merge" not in purpose
+    ]
+    assert len(batch_commands) == 2
+    assert {
+        command[command.index("--out") + 1] for command in batch_commands
+    } == {str(paths["gene_batch_prefix"])}
+    merge_command = next(command for command, purpose in commands if "batch merge" in purpose)
+    assert merge_command[merge_command.index("--merge") + 1] == str(
+        paths["gene_batch_prefix"]
+    )
+    assert merge_command[merge_command.index("--out") + 1] == str(
+        paths["gene_prefix"]
+    )
+
+
 @pytest.mark.parametrize("with_gene_sets", [False, True])
 def test_service_publishes_only_a_complete_mocked_run(
     tmp_path, monkeypatch, capsys, with_gene_sets,
@@ -1116,14 +1281,22 @@ def test_service_publishes_only_a_complete_mocked_run(
         assert result["tested_gene_coverage"]["overlapping_unique_ids"] == 1
         assert result["tested_gene_coverage"]["reference_unique_ids"] == 4
     assert not (output / ".partial" / "STUDY_magma").exists()
-    log = output / "logs" / "STUDY_magma.log"
+    log = output / "05_logs" / "STUDY_magma.log"
     log_text = log.read_text(encoding="utf-8")
     assert "magma_run status=COMPLETED" in log_text
     resolved = yaml.safe_load(
-        (output / "run_metadata" / "resolved_config.yaml").read_text(
+        (output / "00_run_metadata" / "resolved_config.yaml").read_text(
             encoding="utf-8"
         )
     )
+    completion = yaml.safe_load(
+        (output / "00_run_metadata" / "STUDY_magma_completion.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert completion["status"] == "COMPLETED"
+    assert completion["scientific_validation"] == "passed_by_stage"
+    assert completion["outputs"]
     assert list(resolved["modules"]) == ["magma"]
     assert resolved["resources"] == {
         "executables": {"magma": sys.executable}
@@ -1192,6 +1365,12 @@ def test_service_publishes_only_a_complete_mocked_run(
     assert "reference_coordinate_mismatch_rows=0" in compact_log
     assert "reference_allele_mismatch_rows=0" in compact_log
 
+    args.overwrite = False
+    args.resume = True
+    resumed = run_magma_direct(args)
+    assert resumed["resumed"] is True
+    assert resumed["resume_mode"] == "validated_checkpoint"
+
 
 def test_existing_output_detection_excludes_external_mapping_annotations(tmp_path):
     from postgwas.config.models.modules.magma import MagmaMappingDefinition
@@ -1235,105 +1414,31 @@ def test_existing_output_detection_excludes_external_mapping_annotations(tmp_pat
     assert _existing_primary_outputs(output, "STUDY", module) == [generated]
 
 
-def _write_historical_magma_outputs(tmp_path, *, completed_log=True):
+def test_magma_output_layout_separates_inputs_intermediates_and_results(tmp_path):
     from postgwas.modules.magma.analysis import resolve_magma_output_paths
-    from postgwas.modules.magma.service import _expected_magma_artifacts
 
-    gene_sets = tmp_path / "sets.gmt"
-    gene_sets.write_text("SET\tdescription\t1\n", encoding="utf-8")
-    config_file = tmp_path / "magma.yaml"
-    config_file.write_text(
-        "input:\n  gene_set_file: %s\n" % gene_sets,
-        encoding="utf-8",
-    )
-    module = load_module_configuration("magma", config_file)
-    output = tmp_path / "historical"
-    paths = resolve_magma_output_paths(output, "STUDY", module)
-    expected = _expected_magma_artifacts(output, "STUDY", module)
-    for name, path in expected.items():
-        if name in {"magma_genes_prefix", "magma_genes_corrected"}:
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("completed\n", encoding="utf-8")
-    paths["genes_out"].write_text(
-        "GENE CHR START STOP NSNPS NPARAM N ZSTAT P\n"
-        "1 1 10 20 3 1 1000 2.0 0.01\n"
-        "2 1 30 40 2 1 1000 0.0 0.04\n",
-        encoding="utf-8",
-    )
-    log_path = output / "logs" / "STUDY_magma.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(
-        "RUN STATUS magma_run status=%s\n"
-        % ("COMPLETED" if completed_log else "FAILED"),
-        encoding="utf-8",
-    )
-    return output, module, paths, expected, log_path
-
-
-def test_resume_backfills_only_gene_corrections_for_completed_historical_run(
-    tmp_path,
-):
-    from postgwas.modules.magma.service import _resume_result
-
-    output, module, paths, expected, log_path = _write_historical_magma_outputs(
-        tmp_path,
-    )
-    mtimes = {
-        name: path.stat().st_mtime_ns
-        for name, path in expected.items()
-        if name != "magma_genes_prefix" and path.is_file()
-    }
-
-    result = _resume_result(
-        output, "STUDY", module, log_path, RecordingLogger(),
+    module = load_module_configuration("magma")
+    paths = resolve_magma_output_paths(
+        tmp_path, "STUDY", module, "positional",
     )
 
-    assert result is not None
-    assert result["resumed"] is True
-    assert result["resume_mode"] == "derived_output_backfill"
-    assert result["backfilled_outputs"] == [str(paths["corrected_genes"])]
-    observed = pd.read_csv(paths["corrected_genes"], sep="\t")
-    assert observed.columns.tolist()[-2:] == [
-        "P_bonferroni_corr",
-        "P_fdr_bh_corr",
-    ]
-    np.testing.assert_allclose(observed["P_bonferroni_corr"], [0.02, 0.08])
-    np.testing.assert_allclose(observed["P_fdr_bh_corr"], [0.02, 0.04])
-    assert {
-        name: path.stat().st_mtime_ns
-        for name, path in expected.items()
-        if name != "magma_genes_prefix" and name != "magma_genes_corrected"
-    } == mtimes
-
-    corrected_mtime = paths["corrected_genes"].stat().st_mtime_ns
-    repeated = _resume_result(
-        output, "STUDY", module, log_path, RecordingLogger(),
+    assert module.output_layout.completion_manifest.startswith("00_run_metadata/")
+    assert paths["harmonised_p_values"].relative_to(tmp_path).parts[0] == "01_inputs"
+    assert paths["annotation_prefix"].relative_to(tmp_path).parts[:3] == (
+        "02_intermediates", "positional", "annotations",
     )
-    assert repeated is not None
-    assert repeated["resume_mode"] == "completed_outputs"
-    assert repeated["backfilled_outputs"] == []
-    assert paths["corrected_genes"].stat().st_mtime_ns == corrected_mtime
-
-
-@pytest.mark.parametrize("completed_log", [False, True])
-def test_resume_does_not_repair_unverified_or_scientifically_incomplete_run(
-    tmp_path, completed_log,
-):
-    from postgwas.modules.magma.service import _resume_result
-
-    output, module, paths, _, log_path = _write_historical_magma_outputs(
-        tmp_path, completed_log=completed_log,
+    assert paths["gene_batch_prefix"].relative_to(tmp_path).parts[:3] == (
+        "02_intermediates", "positional", "batches",
     )
-    if completed_log:
-        paths["genes_raw"].unlink()
-
-    result = _resume_result(
-        output, "STUDY", module, log_path, RecordingLogger(),
+    assert paths["genes_out"].relative_to(tmp_path).parts[:3] == (
+        "02_intermediates", "positional", "native_outputs",
     )
-
-    assert result is None
-    assert not paths["corrected_genes"].exists()
+    assert paths["corrected_genes"].relative_to(tmp_path).parts[:2] == (
+        "03_results", "positional",
+    )
+    assert paths["mapping_comparison"].relative_to(tmp_path).parts[0] == (
+        "04_comparisons"
+    )
 
 
 def test_service_failure_keeps_isolated_partial_output_and_finalizes_log(
@@ -1368,9 +1473,107 @@ def test_service_failure_keeps_isolated_partial_output_and_finalizes_log(
 
     staging = output / ".partial" / "STUDY_magma"
     assert staging.is_dir()
-    assert not list((output / "results").glob("*.genes.out"))
-    log = output / "logs" / "STUDY_magma.log"
+    assert not list(output.glob("02_intermediates/**/*.genes.out"))
+    log = output / "05_logs" / "STUDY_magma.log"
     assert "FAILED" in log.read_text(encoding="utf-8")
+    partial_checkpoint = yaml.safe_load(
+        (
+            output
+            / "00_run_metadata"
+            / "STUDY_magma_completion.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    assert partial_checkpoint["status"] == "PARTIAL"
+    assert partial_checkpoint["scientific_validation"] == "incomplete"
+
+
+def test_preflight_failure_does_not_create_partial_run_marker(tmp_path):
+    from postgwas.modules.magma.service import run_magma_direct
+
+    locations, p_values, _, genes = _magma_inputs(tmp_path)
+    output = tmp_path / "preflight_failure"
+    args = Namespace(
+        snp_location_file=str(locations),
+        p_value_file=str(p_values),
+        magma_ld_reference=str(tmp_path / "missing_reference"),
+        gene_location_file=str(genes),
+        magma=sys.executable,
+        dataset_id="STUDY",
+        output_directory=str(output),
+        overwrite=False,
+        resume=True,
+    )
+
+    with pytest.raises(MagmaError, match="LD reference is incomplete or empty"):
+        run_magma_direct(args)
+
+    assert not (output / ".partial" / "STUDY_magma").exists()
+    assert "FAILED" in (
+        output / "05_logs" / "STUDY_magma.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_empty_partial_tree_is_restarted_without_overwrite(tmp_path, monkeypatch):
+    from postgwas.modules.magma.service import run_magma_direct
+
+    locations, p_values, reference, genes = _magma_inputs(tmp_path)
+    output = tmp_path / "empty_partial"
+    staging = output / ".partial" / "STUDY_magma"
+    stale_empty_directory = staging / "unused"
+    stale_empty_directory.mkdir(parents=True)
+    args = Namespace(
+        snp_location_file=str(locations),
+        p_value_file=str(p_values),
+        magma_ld_reference=str(reference),
+        gene_location_file=str(genes),
+        magma=sys.executable,
+        dataset_id="STUDY",
+        output_directory=str(output),
+        overwrite=False,
+        resume=True,
+        resolve_variants_to_reference=True,
+    )
+
+    def fail_after_preflight(arguments, purpose, **kwargs):
+        if purpose == "Read MAGMA version":
+            return "MAGMA version: v1.10 (custom)"
+        raise MagmaError("simulated analysis failure after staging recovery")
+
+    monkeypatch.setattr(
+        "postgwas.modules.magma.analysis.run_checked_command",
+        fail_after_preflight,
+    )
+    with pytest.raises(MagmaError, match="after staging recovery"):
+        run_magma_direct(args)
+
+    assert not stale_empty_directory.exists()
+    log_text = (output / "05_logs" / "STUDY_magma.log").read_text(
+        encoding="utf-8"
+    )
+    assert "magma_empty_staging_removed" in log_text
+    assert "reason=no_partial_files" in log_text
+
+
+def test_nonempty_partial_tree_remains_protected_without_overwrite(tmp_path):
+    from postgwas.modules.magma.service import run_magma_direct
+
+    output = tmp_path / "nonempty_partial"
+    staging = output / ".partial" / "STUDY_magma"
+    partial_output = staging / "01_inputs" / "prepared.tsv"
+    partial_output.parent.mkdir(parents=True)
+    partial_output.write_text("SNP\tP\nrs1\t0.05\n", encoding="utf-8")
+
+    with pytest.raises(MagmaError, match="isolated incomplete MAGMA run"):
+        run_magma_direct(
+            Namespace(
+                dataset_id="STUDY",
+                output_directory=str(output),
+                overwrite=False,
+                resume=True,
+            )
+        )
+
+    assert partial_output.read_text(encoding="utf-8") == "SNP\tP\nrs1\t0.05\n"
 
 
 def test_configuration_failure_writes_canonical_log(tmp_path):
@@ -1385,6 +1588,6 @@ def test_configuration_failure_writes_canonical_log(tmp_path):
     with pytest.raises(Exception, match="supported with SNP p-value input"):
         run_magma_direct(args)
 
-    log = output / "logs" / "STUDY_magma.log"
+    log = output / "05_logs" / "STUDY_magma.log"
     assert log.is_file()
     assert "MAGMA configuration failed" in log.read_text(encoding="utf-8")

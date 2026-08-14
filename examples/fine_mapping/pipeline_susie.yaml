@@ -18,7 +18,7 @@ modules:
   ld_annotation:
     enabled: true
     genome_build: GRCh37
-    population: EUR
+    populations: [EUR]
   formatting:
     enabled: true
   ld_clumping:
@@ -28,4 +28,3 @@ modules:
     enabled: true
     engine: susie
     genome_build: GRCh37
-

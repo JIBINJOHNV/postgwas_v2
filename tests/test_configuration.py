@@ -1,8 +1,9 @@
 """Tests for the canonical layered configuration system."""
 
+from argparse import Namespace
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,7 @@ import yaml
 from postgwas.config import (
     load_configuration,
     load_module_configuration,
+    load_run_configuration_for_module,
     resolved_configuration_values,
     write_resolved_configuration,
 )
@@ -19,6 +21,7 @@ from postgwas.config.exporter import (
     render_module_configuration,
     render_pipeline_configuration,
 )
+from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.core.errors import ConfigurationError
 
 
@@ -44,14 +47,91 @@ class ConfigurationTests(unittest.TestCase):
         configuration = load_configuration()
         self.assertTrue(configuration.run.resume)
         self.assertFalse(configuration.run.overwrite)
+        policy = configuration.run.resume_policy
+        self.assertEqual(policy.checkpoint_validation, "sha256")
+        self.assertEqual(
+            policy.checkpoint_directory,
+            Path("run_metadata/checkpoints"),
+        )
+        self.assertEqual(policy.direct_manifest, "{command}_direct.yaml")
+        self.assertEqual(
+            policy.pipeline_stage_manifest,
+            "{stage_number}_{module}.yaml",
+        )
+        self.assertEqual(policy.audit_log, "checkpoint_events.log")
+        self.assertEqual(
+            policy.partial_results,
+            "resume_validated_stages",
+        )
+        self.assertEqual(
+            policy.changed_parameters,
+            "warn_and_restart",
+        )
+        self.assertEqual(
+            policy.changed_inputs,
+            "warn_and_restart",
+        )
+        self.assertEqual(
+            policy.unvalidated_outputs,
+            "warn_and_restart",
+        )
+        self.assertTrue(configuration.logging.show_screen)
         self.assertTrue(configuration.logging.show_progress)
+        self.assertEqual(configuration.logging.progress_refresh_seconds, 1.0)
         self.assertEqual(configuration.logging.terminal_label_width, 42)
+        self.assertEqual(
+            configuration.logging.screen_log_file,
+            "run_metadata/screen.log",
+        )
+
+    def test_resume_policy_paths_and_manifest_patterns_are_schema_validated(self):
+        invalid = (
+            ("run.resume_policy.checkpoint_directory", "../checkpoints"),
+            ("run.resume_policy.direct_manifest", "direct.yaml"),
+            ("run.resume_policy.pipeline_stage_manifest", "{module}.yaml"),
+            ("run.resume_policy.audit_log", "/tmp/checkpoints.log"),
+        )
+        for key, value in invalid:
+            with self.subTest(key=key), self.assertRaises(ConfigurationError):
+                load_configuration(cli_overrides={key: value})
+
+    def test_shared_runtime_cli_values_map_to_canonical_run_configuration(self):
+        overrides = explicit_overrides(
+            Namespace(resume=False, overwrite=True),
+            {},
+        )
+
+        self.assertEqual(
+            overrides,
+            {"run.resume": False, "run.overwrite": True},
+        )
+        configuration = load_configuration(cli_overrides=overrides)
+        self.assertFalse(configuration.run.resume)
+        self.assertTrue(configuration.run.overwrite)
+
+    def test_screen_display_can_be_disabled_from_canonical_configuration(self):
+        configuration = load_configuration(
+            cli_overrides={"logging.show_screen": False},
+        )
+        self.assertFalse(configuration.logging.show_screen)
+
+    def test_screen_log_file_must_remain_inside_the_output_directory(self):
+        with self.assertRaisesRegex(ConfigurationError, "screen_log_file"):
+            load_configuration(
+                cli_overrides={"logging.screen_log_file": "../screen.log"},
+            )
 
     def test_terminal_progress_can_be_disabled_from_canonical_configuration(self):
         configuration = load_configuration(
             cli_overrides={"logging.show_progress": False},
         )
         self.assertFalse(configuration.logging.show_progress)
+
+    def test_progress_refresh_interval_is_schema_validated(self):
+        with self.assertRaisesRegex(ConfigurationError, "progress_refresh_seconds"):
+            load_configuration(
+                cli_overrides={"logging.progress_refresh_seconds": 0},
+            )
 
     def test_terminal_label_width_is_schema_validated(self):
         with self.assertRaisesRegex(ConfigurationError, "terminal_label_width"):
@@ -75,6 +155,19 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(module.method, "mbat_combo")
 
+    def test_module_only_run_loader_preserves_screen_display_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            module_file = Path(directory) / "gcta_gene.yaml"
+            module_file.write_text("method: fastbat_set\n", encoding="utf-8")
+            configuration = load_run_configuration_for_module(
+                "gcta_gene",
+                module_file,
+                module_overrides={"logging.show_screen": False},
+            )
+
+        self.assertFalse(configuration.logging.show_screen)
+        self.assertEqual(configuration.modules.gcta_gene.method, "fastbat_set")
+
     def test_harmonisation_export_styles_share_values_and_analysis_order(self):
         rendered = {
             style: render_module_configuration("harmonisation", style=style)
@@ -83,11 +176,16 @@ class ConfigurationTests(unittest.TestCase):
         parsed = {style: yaml.safe_load(text) for style, text in rendered.items()}
         self.assertEqual(parsed["full"], parsed["minimal"])
         self.assertEqual(parsed["minimal"], parsed["values"])
-        self.assertNotIn("#", rendered["values"])
+        self.assertFalse(any(
+            line.lstrip().startswith("#")
+            for line in rendered["values"].splitlines()
+        ))
         self.assertGreater(rendered["full"].count("#"), rendered["minimal"].count("#"))
         policy_text = rendered["values"].split("policies:\n", 1)[1]
         self.assertLess(policy_text.index("  input:"), policy_text.index("  chromosome:"))
-        self.assertLess(policy_text.index("  chromosome:"), policy_text.index("  filter:"))
+        self.assertLess(
+            policy_text.index("  chromosome:"), policy_text.index("  execution:")
+        )
         chromosome_line = next(
             line
             for line in rendered["values"].splitlines()
@@ -106,7 +204,10 @@ class ConfigurationTests(unittest.TestCase):
             config = load_module_configuration("harmonisation", exported)
         self.assertEqual(config.comparison_af.source, "ALFA")
         self.assertEqual(config.default_eaf.source, "ALFA")
-        self.assertEqual(config.policies["filter"]["maf_cutoff"], 0.01)
+        self.assertNotIn("filter", config.policies)
+        self.assertEqual(
+            load_configuration().modules.qc_summary.rules.maf_min, 0.01
+        )
 
     def test_formatting_export_styles_share_values_and_keep_chromosomes_on_one_line(self):
         rendered = {
@@ -123,6 +224,124 @@ class ConfigurationTests(unittest.TestCase):
             if line.startswith("chromosomes:")
         )
         self.assertIn("'22'", chromosome_line)
+        self.assertEqual(
+            parsed["values"]["ldsc_sample_prevalence"],
+            {"aggregation": "median"},
+        )
+
+    def test_formatting_export_can_select_only_ldsc_and_remains_reloadable(self):
+        rendered = render_module_configuration(
+            "formatting", style="values", formats=["ldsc"],
+        )
+        document = yaml.safe_load(rendered)
+
+        self.assertEqual(document["formats"], ["ldsc"])
+        self.assertEqual(list(document["exports"]), ["ldsc"])
+        self.assertIn("ldsc_reference", document)
+        self.assertIn("ldsc_sample_prevalence", document)
+        self.assertIn("study_design", document)
+        self.assertEqual(
+            document["variant_identifiers"]["target_duplicate_policies"],
+            {},
+        )
+        self.assertNotIn("mixer", document)
+        self.assertNotIn("chromosomes", document)
+        self.assertNotIn("custom_output", document)
+        self.assertNotIn("format_order", document)
+        self.assertNotIn("module_formats", document)
+        self.assertNotIn("resolved_config", document)
+
+        with tempfile.TemporaryDirectory() as directory:
+            exported = Path(directory) / "formatting.yaml"
+            exported.write_text(rendered, encoding="utf-8")
+            reloaded = load_module_configuration("formatting", exported)
+
+        self.assertEqual(reloaded.formats, ["ldsc"])
+        self.assertEqual(
+            reloaded.exports["ldsc"].output_file,
+            "{dataset_id}_ldsc_input.tsv",
+        )
+
+    def test_formatting_export_normalizes_multiple_targets_to_configured_order(self):
+        document = yaml.safe_load(render_module_configuration(
+            "formatting", style="values", formats=["ldsc", "magma"],
+        ))
+
+        self.assertEqual(document["formats"], ["magma", "ldsc"])
+        self.assertEqual(list(document["exports"]), ["magma", "ldsc"])
+        self.assertEqual(
+            document["variant_identifiers"]["target_duplicate_policies"],
+            {},
+        )
+
+    def test_format_selection_is_rejected_for_other_configuration_modules(self):
+        with self.assertRaisesRegex(
+            ConfigurationError,
+            "only with --module formatting",
+        ):
+            render_module_configuration("mixer", formats=["ldsc"])
+
+    def test_format_selection_rejects_empty_unknown_and_duplicate_targets(self):
+        invalid_selections = (
+            ([], "requires at least one"),
+            (["unknown"], "Unknown formatter target"),
+            (["ldsc", "ldsc"], "must not repeat target"),
+        )
+        for formats, message in invalid_selections:
+            with self.subTest(formats=formats), self.assertRaisesRegex(
+                ConfigurationError, message,
+            ):
+                render_module_configuration("formatting", formats=formats)
+
+    def test_config_cli_exports_only_selected_formatter_target(self):
+        from postgwas.__main__ import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_file = Path(directory) / "formatting.yaml"
+            with patch(
+                "sys.argv",
+                [
+                    "postgwas",
+                    "config",
+                    "export",
+                    "--module",
+                    "formatting",
+                    "--format",
+                    "ldsc",
+                    "--style",
+                    "minimal",
+                    "--output",
+                    str(output_file),
+                ],
+            ):
+                self.assertEqual(main(), 0)
+            document = yaml.safe_load(output_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(document["formats"], ["ldsc"])
+        self.assertEqual(list(document["exports"]), ["ldsc"])
+
+    def test_config_cli_rejects_format_selection_for_pipeline_export(self):
+        from postgwas.__main__ import main
+
+        error = StringIO()
+        with patch(
+            "sys.argv",
+            [
+                "postgwas",
+                "config",
+                "export",
+                "--pipeline",
+                "finemap",
+                "--format",
+                "ldsc",
+            ],
+        ), redirect_stderr(error):
+            self.assertEqual(main(), 2)
+
+        self.assertIn(
+            "--format can be used only with --module formatting",
+            error.getvalue(),
+        )
 
     def test_pipeline_export_contains_only_selected_modules(self):
         document = yaml.safe_load(
@@ -265,6 +484,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("--profile", build_parser().format_help())
         help_text = build_export_parser().format_help()
         self.assertIn("--module MODULE", help_text)
+        self.assertIn("--format FORMAT [FORMAT ...]", help_text)
         self.assertIn("Available modules:\n", help_text)
         self.assertIn("--run-config PATH", help_text)
         self.assertNotIn("postgwas config export --module", help_text)

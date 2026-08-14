@@ -20,6 +20,7 @@ from postgwas.config.merger import deep_merge
 from postgwas.cli.compute import get_compute_parser
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.paths import configured_output_path
+from postgwas.core.screen_logging import screen_recording_active
 from postgwas.modules.harmonisation.sample_sheet import (
     HarmonisationSampleSheetRow,
     load_harmonisation_sample_sheet,
@@ -154,7 +155,6 @@ CLI_OVERRIDE_PATHS = {
     "seed": "execution.random_seed",
     "validate": "modules.harmonisation.concordance_validation.enabled",
     "fixed_info": "modules.harmonisation.fixed_info.value",
-    "display_screen": "modules.harmonisation.runtime.display_screen",
     "zero_p_se_action": (
         "modules.harmonisation.policies.pvalue.zero_missing_se"
     ),
@@ -315,7 +315,10 @@ class _DatasetScreenRouter:
                 "Cannot write the required harmonisation screen report %s: %s"
                 % (path, exc)
             ) from exc
-        if self.display and self._terminal is not None:
+        if (
+            self._terminal is not None
+            and (self.display or screen_recording_active())
+        ):
             self._terminal.write(text)
         return len(text)
 
@@ -329,7 +332,10 @@ class _DatasetScreenRouter:
                 "Cannot flush the required harmonisation screen report %s: %s"
                 % (path, exc)
             ) from exc
-        if self.display and self._terminal is not None:
+        if (
+            self._terminal is not None
+            and (self.display or screen_recording_active())
+        ):
             self._terminal.flush()
 
 
@@ -474,31 +480,6 @@ def get_harmonisation_parser(add_help: bool = False) -> argparse.ArgumentParser:
             policy_defaults.get("pvalue.zero_missing_se"),
         ),
     )
-    display = parser.add_argument_group("Terminal display")
-    screen = display.add_mutually_exclusive_group()
-    screen.add_argument(
-        "--show-screen",
-        dest="display_screen",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Show harmonisation progress on the terminal while also saving each "
-            "dataset's screen report",
-            defaults.modules.harmonisation.runtime.display_screen,
-        ),
-    )
-    screen.add_argument(
-        "--hide-screen",
-        dest="display_screen",
-        action="store_false",
-        default=argparse.SUPPRESS,
-        help=(
-            "Suppress normal harmonisation progress on the terminal. Every "
-            "dataset screen report is still written; fatal CLI errors remain on "
-            "standard error."
-        ),
-    )
-
     return parser
 
 
@@ -524,7 +505,7 @@ def _harmonisation_executables(config) -> dict[str, str]:
 
 
 def _engine_defaults(config, resolved_executables=None) -> dict[str, Any]:
-    """Build the scientific engine configuration from the resolved run config."""
+    """Build the engine configuration from the resolved run config."""
     harmonisation = config.modules.harmonisation
     mapping = harmonisation.external_eaf_mapping
 
@@ -565,6 +546,7 @@ def _engine_defaults(config, resolved_executables=None) -> dict[str, Any]:
         "output_layout": dict(harmonisation.output_layout.root),
         "gwas2vcf_input": harmonisation.gwas2vcf_input.model_dump(),
         "vcf_processing": harmonisation.vcf_processing.model_dump(),
+        "qc_summary": config.modules.qc_summary.model_dump(mode="json"),
         "population_frequency_qc": harmonisation.population_frequency_qc.model_dump(),
         "policies": policy_block,
     }
@@ -1070,7 +1052,7 @@ def _write_run_metadata(config, args, row: HarmonisationSampleSheetRow) -> Path:
     write_resolved_configuration(
         config,
         _runtime_path(config, metadata, "resolved_config_file"),
-        modules=("harmonisation",),
+        modules=("harmonisation", "qc_summary"),
         resource_paths=_RESOLVED_RESOURCE_PATHS,
     )
     _write_text(
@@ -1100,7 +1082,7 @@ def _run_validated_rows(
         report_paths = _screen_report_paths(config, rows)
         with _DatasetScreenRouter(
             report_paths,
-            display=config.modules.harmonisation.runtime.display_screen,
+            display=config.logging.show_screen,
         ) as managed_router:
             return _run_validated_rows(
                 args,
@@ -1152,7 +1134,7 @@ def _run_validated_rows(
     write_resolved_configuration(
         config,
         _runtime_path(config, top_metadata, "resolved_config_file"),
-        modules=("harmonisation",),
+        modules=("harmonisation", "qc_summary"),
         resource_paths=_RESOLVED_RESOURCE_PATHS,
     )
     run_summary_path = _runtime_path(

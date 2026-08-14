@@ -2,6 +2,8 @@
 
 import csv
 
+from rich.cells import cell_len
+
 from postgwas.modules.filtering.sumstat_filter import (
     _filtering_summary_lines,
     _summarize_filter_tags,
@@ -53,6 +55,7 @@ def test_filtering_summary_separates_missing_values_from_failed_conditions():
         ],
         variants_before=999999,
         variants_after=979918,
+        terminal_label_width=42,
         reason_statistics={
             "overlap_variants": 34,
             "extra_rule_matches": 38,
@@ -91,10 +94,26 @@ def test_filtering_summary_separates_missing_values_from_failed_conditions():
     assert "study_filter_reason_summary.tsv" in text
     assert "/analysis/qc_summary" not in text
 
+    aligned_lines = [
+        line
+        for line in text.splitlines()
+        if " : " in line
+    ]
+    assert len(aligned_lines) > 10
+    assert len({cell_len(line.split(" : ", 1)[0]) for line in aligned_lines}) == 1
+    assert any(
+        "Palindromic SNPs with ambiguous frequency" in line
+        and " : " not in line
+        for line in text.splitlines()
+    )
+
 
 def test_filtering_summary_omits_inactive_filters():
     text = "\n".join(
-        _filtering_summary_lines([], [], variants_before=10, variants_after=10)
+        _filtering_summary_lines(
+            [], [], variants_before=10, variants_after=10,
+            terminal_label_width=42,
+        )
     )
 
     assert "No variant-level filtering condition is active" in text

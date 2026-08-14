@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Sequence, Type
+from typing import Callable, Sequence, Type
 
 
 class SupervisedProcessTimeout(TimeoutError):
@@ -129,6 +129,8 @@ def run_checked_command(
     timeout_seconds: float | None = None,
     expected_outputs: Sequence[str | Path] = (),
     dry_run: bool = False,
+    progress_callback: Callable[[], None] | None = None,
+    progress_refresh_seconds: float | None = None,
 ) -> str:
     """Run one command safely, optionally streaming stdout to a file.
 
@@ -136,6 +138,12 @@ def run_checked_command(
     the same checked execution and audit behaviour while streaming output.
     """
     command = [str(value) for value in arguments]
+    if progress_callback is not None:
+        if progress_refresh_seconds is None or float(progress_refresh_seconds) <= 0:
+            raise ValueError(
+                "progress_refresh_seconds must be greater than zero when a "
+                "progress callback is supplied"
+            )
     if logger is not None and hasattr(logger, "record"):
         logger.record("INPUT", "external_command", purpose=purpose, command=command)
     if dry_run:
@@ -153,13 +161,85 @@ def run_checked_command(
             if stdout_header:
                 output_handle.write(stdout_header)
                 output_handle.flush()
-        result = subprocess.run(
-            command,
-            stdout=output_handle if output_handle is not None else subprocess.PIPE,
-            stderr=subprocess.STDOUT if stderr_to_stdout else subprocess.PIPE,
-            text=True,
-            timeout=timeout_seconds,
+        process_stdout = (
+            output_handle if output_handle is not None else subprocess.PIPE
         )
+        process_stderr = (
+            subprocess.STDOUT if stderr_to_stdout else subprocess.PIPE
+        )
+        if progress_callback is None:
+            result = subprocess.run(
+                command,
+                stdout=process_stdout,
+                stderr=process_stderr,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        else:
+            started = time.monotonic()
+            process = subprocess.Popen(
+                command,
+                stdout=process_stdout,
+                stderr=process_stderr,
+                text=True,
+            )
+            callback = progress_callback
+
+            def refresh_progress() -> None:
+                nonlocal callback
+                if callback is None:
+                    return
+                try:
+                    callback()
+                except Exception as exc:
+                    callback = None
+                    if logger is not None and hasattr(logger, "record"):
+                        logger.record(
+                            "WARNING",
+                            "external_progress_disabled",
+                            purpose=purpose,
+                            error="%s: %s" % (type(exc).__name__, exc),
+                        )
+
+            refresh_progress()
+            try:
+                while True:
+                    elapsed = time.monotonic() - started
+                    remaining = (
+                        None
+                        if timeout_seconds is None
+                        else float(timeout_seconds) - elapsed
+                    )
+                    if remaining is not None and remaining <= 0:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                        raise subprocess.TimeoutExpired(
+                            command,
+                            timeout_seconds,
+                            output=stdout,
+                            stderr=stderr,
+                        )
+                    wait_seconds = float(progress_refresh_seconds)
+                    if remaining is not None:
+                        wait_seconds = min(wait_seconds, remaining)
+                    try:
+                        stdout, stderr = process.communicate(timeout=wait_seconds)
+                    except subprocess.TimeoutExpired:
+                        refresh_progress()
+                        continue
+                    refresh_progress()
+                    result = subprocess.CompletedProcess(
+                        command,
+                        process.returncode,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                    break
+            except BaseException:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+                raise
         if output_handle is not None and stdout_header is not None:
             output_handle.write("\nexit_code=%s\n" % result.returncode)
             output_handle.flush()

@@ -4,6 +4,7 @@ script_path: k-pops.py
 gene_annotation_file: null
 kernel_matrix_prefix: null
 magma_association_prefix: null
+gene_universe_policy: intersect
 minimum_gene_count: 10
 kernel_validation_chunk_rows: 512
 kernel_symmetry_relative_tolerance: 1.0e-5
@@ -41,10 +42,17 @@ input_schema:
   kernel_matrix_suffix: .bin
   magma_genes_out_suffix: .genes.out
   magma_genes_raw_suffix: .genes.raw
+  magma_raw_header_lines: 2
+  magma_raw_gene_id_index: 0
+  magma_raw_chromosome_index: 1
+  magma_raw_nsnp_index: 4
+  magma_raw_nparam_index: 5
+  magma_raw_mac_index: 7
   kernel_float_bytes: 4
 output_layout:
   output_prefix: '{dataset_id}_kpops'
   staging_directory: '.partial/{dataset_id}_kpops'
+  compatible_magma_prefix: compatible_magma
   resolved_config_file: run_metadata/resolved_config.yaml
   completion_manifest: 'run_metadata/{dataset_id}_kpops_completion.yaml'
   service_log_file: 'logs/{dataset_id}_kpops.log'
@@ -53,3 +61,5 @@ output_layout:
   attribution_suffix: .attr
   attribution_rows_suffix: .genes.row
   attribution_columns_suffix: .genes.col
+  gene_compatibility_table_suffix: .gene_compatibility.tsv
+  gene_compatibility_report_suffix: .gene_compatibility.yaml

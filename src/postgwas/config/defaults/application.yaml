@@ -4,6 +4,16 @@ run:
   dataset_id: postgwas
   overwrite: false
   resume: true
+  resume_policy:
+    checkpoint_validation: sha256
+    checkpoint_directory: run_metadata/checkpoints
+    direct_manifest: '{command}_direct.yaml'
+    pipeline_stage_manifest: '{stage_number}_{module}.yaml'
+    audit_log: checkpoint_events.log
+    partial_results: resume_validated_stages
+    changed_parameters: warn_and_restart
+    changed_inputs: warn_and_restart
+    unvalidated_outputs: warn_and_restart
 execution:
   threads: auto
   memory_gb: auto
@@ -17,8 +27,11 @@ execution:
 logging:
   console_level: INFO
   file_level: DEBUG
+  show_screen: true
   show_progress: true
+  progress_refresh_seconds: 1.0
   terminal_label_width: 42
   filename: postgwas.log
+  screen_log_file: run_metadata/screen.log
   capture_external_tools: true
   include_timestamps: true

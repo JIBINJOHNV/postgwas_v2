@@ -124,7 +124,7 @@ def test_cli_exposes_every_documented_cojo_control_without_argparse_defaults():
         assert option in help_text
     assert "--vcf" not in help_text
     compact_help = " ".join(help_text.split())
-    assert "Configured YAML default: slct" in compact_help
+    assert "Default: slct" in compact_help
     assert "Known SNPs to adjust for" in compact_help
     assert "any explicit mode must be cond" in compact_help
     assert "effects are estimated together in one multiple-SNP model" in compact_help
@@ -141,7 +141,7 @@ def test_cli_exposes_every_documented_cojo_control_without_argparse_defaults():
         "dry_run", "gcta", "gcta_cojo_input_file", "genome_build", "joint_snps",
         "memory_gb",
         "output_directory", "overwrite", "resume", "run_config", "seed",
-        "threads",
+        "show_screen", "threads",
     }
     observed = {action.dest for action in parser._actions if action.dest != "help"}
     assert observed == configurable_destinations
@@ -335,6 +335,26 @@ def test_completed_run_resumes_only_from_validated_manifest(tmp_path):
         resumed.artifacts["normalized_results"].path
     )
     assert resumed.metrics["resumed"] is True
+
+
+def test_completed_run_restarts_when_every_declared_output_is_missing(tmp_path):
+    args = _args(tmp_path)
+    first = run_gcta_cojo_direct(args)
+    completion = first.artifacts["completion_manifest"].path
+    for name, artifact in first.artifacts.items():
+        if name != "completion_manifest":
+            artifact.path.unlink()
+    args.resume = True
+
+    restarted = run_gcta_cojo_direct(args)
+
+    assert restarted.metrics["resumed"] is False
+    assert restarted.artifacts["normalized_results"].path.is_file()
+    assert completion.is_file()
+    log = tmp_path / "out" / "logs" / "STUDY_slct_gcta_cojo.log"
+    assert "reason=incomplete_outputs" in log.read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.skipif(shutil.which("bcftools") is None, reason="bcftools is required")

@@ -114,7 +114,7 @@ class HarmonisationCLITests(unittest.TestCase):
             "validate",
             "fixed_info",
             "zero_p_se_action",
-            "display_screen",
+            "show_screen",
         }
         actions = {action.dest: action for action in parser._actions}
         for destination in configurable:
@@ -142,9 +142,9 @@ class HarmonisationCLITests(unittest.TestCase):
 
     def test_screen_display_cli_flags_are_mutually_exclusive(self):
         parser = get_harmonisation_parser()
-        self.assertFalse(hasattr(parser.parse_args([]), "display_screen"))
-        self.assertTrue(parser.parse_args(["--show-screen"]).display_screen)
-        self.assertFalse(parser.parse_args(["--hide-screen"]).display_screen)
+        self.assertFalse(hasattr(parser.parse_args([]), "show_screen"))
+        self.assertTrue(parser.parse_args(["--show-screen"]).show_screen)
+        self.assertFalse(parser.parse_args(["--hide-screen"]).show_screen)
         with self.assertRaises(SystemExit):
             parser.parse_args(["--show-screen", "--hide-screen"])
 
@@ -208,7 +208,7 @@ class HarmonisationCLITests(unittest.TestCase):
             memory_gb=20,
             fixed_info=0.99,
             zero_p_se_action="approximate",
-            display_screen=False,
+            show_screen=False,
         )
         fake_config = unittest.mock.Mock()
         fake_config.run.output_directory = "output"
@@ -242,7 +242,7 @@ class HarmonisationCLITests(unittest.TestCase):
             overrides["modules.harmonisation.fixed_info.value"], 0.99
         )
         self.assertFalse(
-            overrides["modules.harmonisation.runtime.display_screen"]
+            overrides["logging.show_screen"]
         )
 
     def test_run_configuration_cannot_activate_fixed_info_without_cli(self):
@@ -289,7 +289,9 @@ class HarmonisationCLITests(unittest.TestCase):
             resolved = yaml.safe_load(
                 (metadata / "resolved_config.yaml").read_text(encoding="utf-8")
             )
-            self.assertEqual(list(resolved["modules"]), ["harmonisation"])
+            self.assertEqual(
+                list(resolved["modules"]), ["harmonisation", "qc_summary"]
+            )
             self.assertEqual(
                 set(resolved["resources"]), {"root", "executables"}
             )
@@ -408,7 +410,7 @@ class HarmonisationCLITests(unittest.TestCase):
                 "resources.root": str(resources),
                 "run.output_directory": str(output),
                 "execution.retries": 0,
-                "modules.harmonisation.runtime.display_screen": False,
+                "logging.show_screen": False,
             })
 
             def engine(**kwargs):

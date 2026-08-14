@@ -9,6 +9,7 @@ class PredLDConfig(StrictModel):
     minimum_r2: float = Field(ge=0, le=1)
     minimum_maf: float = Field(ge=0, le=0.5)
     mode: str
+    correlation_method: Literal["pearson", "spearman"]
 
 
 class RaissConfig(StrictModel):

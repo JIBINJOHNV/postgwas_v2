@@ -13,8 +13,9 @@ import pandas as pd
 from scipy import sparse
 
 from postgwas.core.completion import (
+    apply_completion_restart,
     configuration_digest,
-    validate_completion_manifest,
+    resolve_completion_resume,
     write_completion_manifest,
 )
 from postgwas.core.io.reports import write_delimited_report, write_yaml_report
@@ -1091,7 +1092,7 @@ def run_scdrs(
         and not configuration.run.overwrite
         and manifest_path.is_file()
     ):
-        manifest = validate_completion_manifest(
+        decision = resolve_completion_resume(
             manifest_path,
             dataset_id=dataset,
             module="single_cell.scdrs",
@@ -1099,15 +1100,38 @@ def run_scdrs(
             configuration_sha256=digest,
             inputs=completion_inputs,
             outputs=outputs,
+            resume_policy=configuration.run.resume_policy,
             error_type=SingleCellError,
         )
-        return ScdrsExecution(
-            outputs=outputs,
-            traits=preflight.traits,
-            metrics=dict(manifest.get("metrics", {})),
-            resumed=True,
+        if decision.action == "resume":
+            return ScdrsExecution(
+                outputs=outputs,
+                traits=preflight.traits,
+                metrics=dict(decision.manifest.get("metrics", {})),
+                resumed=True,
+            )
+        apply_completion_restart(
+            decision,
+            output_root=configuration.run.output_directory,
+            manifest=manifest_path,
+            logger=logger,
+            operation="scdrs_resume",
+            error_type=SingleCellError,
         )
-    if (engine.exists() or manifest_path.exists()) and not configuration.run.overwrite:
+        if engine.is_dir() and not any(
+            path.is_file() or path.is_symlink()
+            for path in engine.rglob("*")
+        ):
+            remove_owned_directory(
+                engine,
+                configuration.run.output_directory,
+                "empty stale scDRS engine directory",
+                error_type=SingleCellError,
+            )
+    if (
+        engine.exists()
+        or manifest_path.exists()
+    ) and not configuration.run.overwrite:
         raise SingleCellError(
             "Existing or incomplete scDRS output was found; use --resume for "
             "a matching complete run or --overwrite to replace it"

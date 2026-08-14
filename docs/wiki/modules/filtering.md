@@ -17,20 +17,25 @@ actions are explicit for every nullable field used by an active rule.
 not a raw P-value: genome-wide significance at P ≤ 5×10⁻⁸ corresponds to
 approximately `7.30103`.
 
-The configured `genome_build` must be declared in the VCF header using one of
-the corresponding `genome_build_header_tokens`. Filename text is never used to
-infer a build. When MHC removal is enabled, `mhc.genome_build` must equal the
-analysis build, the header must declare contigs, and the configured chromosome
-must match a header contig (the equivalent `6`/`chr6` spelling is accepted and
-logged). A missing MHC contig is an error because continuing would silently
-retain the region.
+The genome build is inferred only from the authoritative harmonisation metadata
+line `##genome_build=<build>`. Each input must contain exactly one such line,
+and its complete value must match a build in `resources.genomes`. Filename text,
+`##reference`, contig `assembly`, and liftover metadata are not used as
+substitutes. This prevents inherited source-build metadata from overriding the
+build explicitly assigned to the merged VCF.
 
-The default GRCh37 MHC interval is 6:25,000,000–34,000,000 in one-based,
-inclusive VCF coordinates. PostGWAS converts its start to zero-based,
-half-open BED coordinates when it invokes bcftools. Change the configured
-interval and build together when a different scientific definition is needed.
-The packaged broad interval follows the extended-MHC convention used in major
-GWAS analyses; it remains configurable because published definitions differ.
+When MHC removal is enabled, filtering selects the matching entry from
+`mhc_regions`, requires the header to declare contigs, and requires the
+configured chromosome to match a header contig. The equivalent `6`/`chr6`
+spelling is accepted and logged. A missing build-specific region or MHC contig
+is an error because continuing would silently retain the region.
+
+The packaged one-based, inclusive Genome Reference Consortium MHC intervals are
+GRCh37 `6:28,477,797–33,448,354` and GRCh38
+`6:28,510,120–33,480,577`. PostGWAS converts the selected start to zero-based,
+half-open BED coordinates when it invokes bcftools. These intervals describe
+the GRC MHC region, not a broader extended-MHC convention; edit the appropriate
+`mhc_regions` entry if an analysis protocol requires a different definition.
 
 ## When to use it
 
@@ -42,7 +47,8 @@ incorrect build, allele orientation, or study-sample mapping.
 ## Input requirements
 
 - A non-empty harmonised `.vcf` or `.vcf.gz`.
-- A VCF header declaring the configured build, active FORMAT/INFO tags, and,
+- A VCF header containing exactly one authoritative `##genome_build=<build>`
+  declaration, active FORMAT/INFO tags, and,
   when MHC removal is active, contigs.
 - The configured `bcftools`, `tabix`, and `bash` executables.
 - A filename-safe dataset ID and an output directory.
@@ -98,7 +104,7 @@ postgwas config export --module filtering --style full --output filtering.yaml
 
 Important keys include:
 
-- `genome_build`, `genome_build_header_tokens`, and `mhc`
+- `mhc_regions` (separate GRCh37 and GRCh38 intervals)
 - `maf_min`, `info_min`, `info_max`, and `minimum_neglog10_p`
 - `missing_af_action`, `missing_info_action`, and `missing_pvalue_action`
 - `reference_population_tag` and `frequency_difference_max`
@@ -133,6 +139,9 @@ With the packaged output layout, dataset `STUDY` and build `GRCh37` produce:
 - `logs/STUDY_GRCh37_filter_gwas_vcf_bcftools.log`
 - `STUDY_GRCh37_mhc_exclude.bed` when MHC removal is active
 
+If validation fails before a build can be inferred, the failure is recorded in
+`logs/STUDY_filter_preflight.log` instead of fabricating a build-specific name.
+
 ## QC and logs
 
 The log records the resolved filtering configuration, resolved executable
@@ -150,7 +159,7 @@ they can be reconciled without claiming that a variant failed only one rule.
 ## Common problems
 
 - A missing configured FORMAT or INFO tag stops preflight before filtering.
-- A build mismatch between the VCF header and `genome_build` stops the run.
+- A missing, duplicate, or unsupported `##genome_build` declaration stops the run.
 - An MHC rule requires the configured chromosome to exist in the VCF header.
 - Missing values follow their explicit `missing_*_action`; they are never
   silently treated as passing values.
@@ -166,4 +175,5 @@ sample layout already has the intended filtering semantics.
 - [bcftools filtering expressions and target-file behavior](https://samtools.github.io/bcftools/bcftools.html)
 - [GWAS-VCF specification](https://github.com/MRCIEU/gwas-vcf-specification)
 - [GWAS Catalog summary-statistics format](https://www.ebi.ac.uk/gwas/docs/summary-statistics-format)
-- [Sekar et al., extended-MHC analysis at chr6:25–34 Mb](https://www.nature.com/articles/nature16549)
+- [Genome Reference Consortium GRCh37 MHC interval](https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC?asm=GRCh37)
+- [Genome Reference Consortium GRCh38 MHC interval](https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC?asm=GRCh38)

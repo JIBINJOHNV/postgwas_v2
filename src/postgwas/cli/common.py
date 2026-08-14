@@ -17,6 +17,10 @@ from postgwas.core.execution.runtime import validate_alphanumeric, validate_path
 # ARGUMENT PARSER BUILDER (BASE + DIRECT ONLY)
 # ==================================================================
 def sumstat_summary_arg_parser() -> argparse.ArgumentParser:
+    from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
+    defaults = load_configuration().modules.qc_summary
     parser = argparse.ArgumentParser(add_help=False)
     # 💥 DEFINE ARGUMENT GROUP for Step 2 💥
     group = parser.add_argument_group("GWAS-VCF QC settings")
@@ -25,11 +29,11 @@ def sumstat_summary_arg_parser() -> argparse.ArgumentParser:
         "--reference-af-column",
         dest="reference_af_column",
         metavar="TAG",
-        default="EUR",
-        help=(
-            "Name of the INFO/<AF> tag used as external reference AF.\n"
-            "Examples: EUR, AFR, EAS.\n"
-            "Default: EUR"
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Name of the INFO/<AF> tag used as external reference AF. "
+            "Examples: EUR, AFR, EAS",
+            defaults.reference_af_column,
         ),
     )
 
@@ -38,11 +42,11 @@ def sumstat_summary_arg_parser() -> argparse.ArgumentParser:
         dest="maximum_af_difference",
         type=float,
         metavar="VALUE",
-        default=0.2,
-        help=(
-            "Maximum allowed absolute difference between FORMAT/AF and "
-            "INFO/<external_af_name>.\n"
-            "Default: 0.2"
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Maximum allowed absolute difference between study INFO/AF and "
+            "INFO/<external_af_name>",
+            defaults.rules.maximum_af_difference,
         ),
     )
 
@@ -57,6 +61,12 @@ def get_annot_ldblock_parser(add_help=False):
     """
     Returns the core ArgumentParser for annot_ldblock arguments, structured using a group.
     """
+    from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
+    configuration = load_configuration()
+    defaults = configuration.modules.ld_annotation
+    populations = [population.value for population in defaults.populations]
     # Create bare parser for inheritance
     parser = argparse.ArgumentParser(add_help=add_help)
 
@@ -67,13 +77,14 @@ def get_annot_ldblock_parser(add_help=False):
         "--ld-block-populations",
         dest="ld_block_populations",
         nargs="+",
+        choices=list(configuration.resources.populations),
         metavar="POPULATION",
-        default=["EUR", "AFR", "EAS"],
-        help=(
+        default=populations,
+        help=help_with_default(
             "Populations to annotate (e.g., EUR AFR). "
-            "Files must be named following the pattern: [cyan]Genomeversion_Population_ldetect.bed.gz ;Eg. GRCh37_EUR_ldetect.bed.gz [/cyan]."
-            "[bold green]Default:[/bold green] [cyan]EUR AFR EAS[/cyan] "
-        )
+            "Files must follow the configured genome-build/population pattern",
+            " ".join(populations),
+        ),
     )
     group.add_argument(
         "--ld-region-dir",
@@ -100,8 +111,9 @@ def get_formatter_parser(*, direct_controls=False):
     from typing import get_args
 
     from postgwas.config import load_configuration
+    from postgwas.config.models.modules.formatting import FormattingDuplicatePolicy
     from postgwas.core.variant_identifiers import VariantIdentifierType
-    from postgwas.core.ui import help_with_default
+    from postgwas.core.ui import format_cli_choices, help_with_default
     from postgwas.modules.formatting.contracts import FORMAT_CONTRACTS
 
     configuration = load_configuration()
@@ -120,11 +132,15 @@ def get_formatter_parser(*, direct_controls=False):
         default=argparse.SUPPRESS,
         metavar="FORMAT",
         help=(
-            "One or more downstream inputs to create. Available values:\n%s\n"
+            "One or more downstream inputs to create.\n%s.\n"
+            "Format details:\n%s\n"
             "If omitted, modules.formatting.formats is read from --run-config."
-            % "\n".join(
-                "  %-16s %s" % (target, FORMAT_CONTRACTS[target].name)
-                for target in available
+            % (
+                format_cli_choices(available),
+                "\n".join(
+                    "  %-16s %s" % (target, FORMAT_CONTRACTS[target].name)
+                    for target in available
+                ),
             )
         ),
     )
@@ -139,7 +155,22 @@ def get_formatter_parser(*, direct_controls=False):
             "construct the configured chromosome-position-REF-ALT identifier. "
             "Per-target YAML settings can use different conventions",
             defaults.variant_identifiers.default_type,
-            label="Configured default",
+        ),
+    )
+    identifiers.add_argument(
+        "--duplicate-id-policy",
+        choices=get_args(FormattingDuplicatePolicy),
+        default=argparse.SUPPRESS,
+        metavar="POLICY",
+        help=help_with_default(
+            "Action for conflicting duplicate IDs after collapsing exact repeated "
+            "records and applying supported reference matching (currently LDSC "
+            "--merge-alleles). exclude_all "
+            "removes every ambiguous record; error stops; most_significant, "
+            "highest_maf, and highest_info retain only a unique best-ranked row. "
+            "A missing ranking value or tied best rank excludes the whole group. "
+            "Per-target YAML settings can use different policies",
+            defaults.variant_identifiers.default_duplicate_policy,
         ),
     )
     if direct_controls:
@@ -152,26 +183,6 @@ def get_formatter_parser(*, direct_controls=False):
                 "override the matching YAML values."
             ),
         )
-        group.add_argument(
-            "--resume",
-            action=argparse.BooleanOptionalAction,
-            default=argparse.SUPPRESS,
-            help=help_with_default(
-                "Reuse existing formatter outputs only after their provenance and "
-                "content have been validated",
-                configuration.run.resume,
-            ),
-        )
-        group.add_argument(
-            "--overwrite",
-            action="store_true",
-            default=argparse.SUPPRESS,
-            help=help_with_default(
-                "Rerun formatting and replace existing outputs; this takes "
-                "precedence over resume",
-                configuration.run.overwrite,
-            ),
-        )
 
     return parser
 
@@ -179,64 +190,109 @@ def get_formatter_parser(*, direct_controls=False):
 
 
 def get_ld_clump_parser(add_help=False):
-    """
-    Returns a parent-safe parser containing arguments
-    that are shared between DIRECT and PIPELINE modes.
+    """Return YAML-backed LD-clumping options without argparse defaults."""
+    from typing import get_args
 
-    COMMON arguments:
-        --ld-mode
-        --population
-        --r2-cutoff
-        --window-kb
+    from postgwas.config import load_configuration
+    from postgwas.config.models.modules.ld_clumping import LDClumpingMethod
+    from postgwas.core.ui import help_with_default
 
-    (VCF input, outdir, resource folder, bcftools, harmonisation,
-     annot_ldblock etc. are added separately in main() via their own
-     get_*_parser functions.)
-    """
+    defaults = load_configuration().modules.ld_clumping
     parser = argparse.ArgumentParser(add_help=add_help)
-
-    # -------------------------------
-    # General LD clumping options
-    # -------------------------------
-    general = parser.add_argument_group("LD-clumping settings")
-
-    # general.add_argument(
-    #     "--ld-mode",
-    #     default="by_regions",
-    #     choices=["by_regions", "standard"],
-    #     metavar=" ",
-    #     help=(
-    #         "LD clumping strategy.\n"
-    #         "Choices: [cyan]by_regions[/cyan], [cyan]standard[/cyan]\n"
-    #         f"[bold green]Default:[/bold green] [cyan]by_regions[/cyan]"
-    #     )
-    # )
-
-    # -------------------------------
-    # Standard-mode arguments
-    # -------------------------------
-    standard = parser.add_argument_group(
-        "PLINK-style clumping"
+    general = parser.add_argument_group("LD-clumping analysis")
+    general.add_argument(
+        "--clumping-methods",
+        nargs="+",
+        choices=get_args(LDClumpingMethod),
+        metavar="METHOD",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Analyses to run: region selects one association per annotated LD "
+            "block; standard performs two-stage r² clumping against the tabix "
+            "LD reference",
+            " ".join(defaults.methods),
+        ),
+    )
+    general.add_argument(
+        "--lead-p", metavar="P", type=float, default=argparse.SUPPRESS,
+        help=help_with_default(
+            "P-value threshold for lead SNPs", defaults.lead_pvalue,
+        ),
+    )
+    general.add_argument(
+        "--candidate-p", metavar="P", type=float, default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Maximum P-value for GWAS variants included as candidate SNPs",
+            defaults.candidate_pvalue,
+        ),
+    )
+    general.add_argument(
+        "--remove-mhc",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Exclude the build-specific MHC interval before either analysis",
+            defaults.remove_mhc,
+        ),
     )
 
-    # Required Inputs
-    standard.add_argument("--ld-folder", metavar="PATH",
-                     type=validate_path(must_exist=True,must_not_be_empty=True),
-                     help="Folder containing EUR_chr*.ld.gz files")
-
-    # Thresholds
-    standard.add_argument("--lead-p", metavar="P", type=float, default=5e-8,
-                          help="P-value threshold for Lead SNPs [bold green]Default:[/bold green] [cyan]5e-8[/cyan]")
-    standard.add_argument("--r2-clump", metavar="R2", type=float, default=0.6,
-                          help="The minimum r2 for defining independent significant SNPs. [bold green]Default:[/bold green] [cyan]0.6[/cyan]")
-    standard.add_argument("--r2-lead", metavar="R2", type=float, default=0.1,
-                          help="The minimum r2 for defining lead SNPs, which is used for the second clumping (clumping of the independent significant SNPs). [bold green]Default:[/bold green] [cyan]0.1[/cyan]")
-
-    # System & Output
-    standard.add_argument("--merge-dist", metavar="BP", type=int, default=250000,
-                          help="The maximum distance between LD blocks of independent significant SNPs to merge into a single genomic locus. [bold green]Default:[/bold green] [cyan]250000[/cyan]")
-
-
+    standard = parser.add_argument_group("Standard r² clumping")
+    standard.add_argument(
+        "--ld-folder",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        type=validate_path(
+            must_exist=True,
+            must_be_dir=True,
+            must_not_be_empty=True,
+        ),
+        help=(
+            "Required when standard clumping is selected: directory containing "
+            "the configured LD manifest and symmetric tabix-indexed files."
+        ),
+    )
+    standard.add_argument(
+        "--r2-clump", metavar="R2", type=float, default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum r² for defining independent significant SNPs",
+            defaults.clump_r2,
+        ),
+    )
+    standard.add_argument(
+        "--r2-lead", metavar="R2", type=float, default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum r² for the second clumping step that defines lead SNPs",
+            defaults.lead_r2,
+        ),
+    )
+    standard.add_argument(
+        "--ld-window-kb", dest="window_kb", metavar="KB", type=int,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Maximum distance from an index SNP for assigning LD partners",
+            defaults.window_kb,
+        ),
+    )
+    standard.add_argument(
+        "--merge-dist", metavar="BP", type=int, default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Maximum distance between independent-significant-SNP LD blocks "
+            "that are merged into one genomic locus",
+            defaults.merge_distance_bp,
+        ),
+    )
+    standard.add_argument(
+        "--missing-index-action",
+        choices=("error", "self_only"),
+        metavar="ACTION",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Action when a significant index SNP cannot be found in the LD "
+            "reference. error prevents unsupported independence calls; self_only "
+            "is an explicit assumption that it has no LD partners",
+            defaults.missing_index_action,
+        ),
+    )
     return parser
 
 
@@ -282,6 +338,7 @@ def get_genome_build_parser(
     available_builds=None,
     default_build=None,
     suppress_default=False,
+    display_default=True,
 ):
     """
     Common parser for shared input arguments across PostGWAS modules:
@@ -295,11 +352,15 @@ def get_genome_build_parser(
         from postgwas.config import load_configuration
 
         available_builds = list(load_configuration().resources.genomes)
+    from postgwas.core.ui import help_with_default
+
     available_builds = list(available_builds)
     if not available_builds:
         raise ValueError("At least one configured genome build is required")
-    resolved_default = default_build or available_builds[0]
-    if resolved_default not in available_builds:
+    resolved_default = default_build
+    if resolved_default is None and (not suppress_default or display_default):
+        resolved_default = available_builds[0]
+    if resolved_default is not None and resolved_default not in available_builds:
         raise ValueError("The default genome build must be one of available_builds")
     parser = argparse.ArgumentParser(
         add_help=False,
@@ -309,32 +370,108 @@ def get_genome_build_parser(
     input_group = parser.add_argument_group("Genome coordinates")
 
     # -------- GENOME VERSION --------
+    build_help = (
+        "Genome build used by the input VCF and all reference files. "
+        "Do not mix resources from different builds"
+    )
     input_group.add_argument(
         "--genome-build",
         default=argparse.SUPPRESS if suppress_default else resolved_default,
         choices=available_builds,
         metavar="BUILD",
         help=(
-            "Genome build used by the input VCF and all reference files "
-            "(default: %s). Do not mix resources from different builds."
-            % resolved_default
-        )
+            help_with_default(build_help, resolved_default)
+            if display_default
+            else build_help + ". If omitted, the selected modules' canonical "
+            "run configuration supplies the value."
+        ),
     )
     return parser
 
 
-def get_population_parser(add_help=False):
-    """Return the shared reference-population option."""
+def get_pipeline_genome_build_parser(add_help=False):
+    """Return one default-free genome-build override shared by pipeline modules."""
+    from postgwas.config import load_configuration
+
+    configuration = load_configuration()
+    builds = list(configuration.resources.genomes)
+    return get_genome_build_parser(
+        available_builds=builds,
+        suppress_default=True,
+        display_default=False,
+    )
+
+
+def get_ld_annotation_genome_build_parser(add_help=False):
+    """Return the LD-annotation build option from its canonical YAML."""
+    from postgwas.config import load_configuration
+
+    configuration = load_configuration()
+    return get_genome_build_parser(
+        available_builds=list(configuration.resources.genomes),
+        default_build=configuration.modules.ld_annotation.genome_build.value,
+    )
+
+
+def get_qc_genome_build_parser(add_help=False):
+    """Return the QC-summary build option from its canonical YAML."""
+    from postgwas.config import load_configuration
+
+    configuration = load_configuration()
+    return get_genome_build_parser(
+        available_builds=list(configuration.resources.genomes),
+        default_build=configuration.modules.qc_summary.target_build.value,
+        suppress_default=True,
+    )
+
+
+def _get_population_parser(
+    module_name: str,
+    add_help=False,
+    *,
+    suppress_default: bool = False,
+):
+    """Return a module-specific, YAML-backed reference-population option."""
+    from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
+    configuration = load_configuration()
+    configured = getattr(configuration.modules, module_name).population.value
     parser = argparse.ArgumentParser(add_help=add_help)
     group = parser.add_argument_group("Reference population")
     group.add_argument(
         "--population",
-        choices=["EUR", "AFR", "EAS", "SAS", "AMR"],
-        default="EUR",
+        choices=list(configuration.resources.populations),
+        default=argparse.SUPPRESS if suppress_default else configured,
         metavar="CODE",
-        help="Population represented by the reference data (default: EUR).",
+        help=help_with_default(
+            "Population represented by the reference data",
+            configured,
+        ),
     )
     return parser
+
+
+def get_imputation_population_parser(add_help=False):
+    return _get_population_parser("imputation", add_help=add_help)
+
+
+def get_ld_clumping_population_parser(add_help=False):
+    return _get_population_parser(
+        "ld_clumping", add_help=add_help, suppress_default=True,
+    )
+
+
+def get_ld_clumping_genome_build_parser(add_help=False):
+    """Return the LD-clumping build override backed by canonical YAML."""
+    from postgwas.config import load_configuration
+
+    configuration = load_configuration()
+    return get_genome_build_parser(
+        available_builds=list(configuration.resources.genomes),
+        default_build=configuration.modules.ld_clumping.genome_build.value,
+        suppress_default=True,
+    )
 
 def get_common_out_parser():
     """
@@ -415,7 +552,6 @@ def get_common_magma_covar_parser(add_help=False):
             "separately. See 'How to choose a MAGMA model' and 'Advanced MAGMA "
             "model modifiers' below" % accepted_modifiers,
             " ".join(defaults.model) if defaults.model else "none",
-            label="Configured default",
         ),
     )
 
@@ -429,7 +565,6 @@ def get_common_magma_covar_parser(add_help=False):
             "MAGMA's default for any gene property. The original FLAMES README "
             "relies on that default, while tissue-specific analysis uses greater",
             defaults.direction,
-            label="Configured default",
         ),
     )
     group.add_argument(
@@ -441,11 +576,10 @@ def get_common_magma_covar_parser(add_help=False):
             "Minimum overlapping genes required before execution and in every "
             "published COVAR result",
             defaults.minimum_genes,
-            label="Configured default",
         ),
     )
 
-    choice_lines = ["Choose the model that matches your scientific question:"]
+    choice_lines = ["Choose the model that matches your research question:"]
     for use_case in defaults.model_use_cases.values():
         selected_model = (
             "--covariate-model " + " ".join(use_case.model)
@@ -517,6 +651,8 @@ def get_common_magma_assoc_parser(add_help=False):
     This is parent-safe and can be inserted into direct/pipeline mode.
     """
     from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
     defaults = load_configuration().modules.magma
     parser = argparse.ArgumentParser(add_help=add_help)
     group = parser.add_argument_group("MAGMA settings")
@@ -544,11 +680,11 @@ def get_common_magma_assoc_parser(add_help=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         type=validate_path(must_exist=True, must_be_file=True, must_not_be_empty=True),
-        help=(
+        help=help_with_default(
             "[bold bright_red]Required[/bold bright_red]: MAGMA gene location file (.loc) matching the genome build. "
             "Must contain columns in the following order: Gene ID, Chromosome, Gene Start, Gene End. "
-            "Gene IDs must match those used in pathway files and gene-covariate files. "
-            "[bold green]Default:[/bold green] [cyan]None[/cyan]"
+            "Gene IDs must match those used in pathway files and gene-covariate files",
+            defaults.input.gene_location_file,
         ),
     )
 
@@ -557,9 +693,9 @@ def get_common_magma_assoc_parser(add_help=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         type=validate_path(must_exist=True, must_be_file=True, must_not_be_empty=True),
-        help=(
-            "Pathway file (.gmt). MSigDB or custom GMT supported."
-            f"\n[bold green]Default:[/bold green] [cyan]None[/cyan]"
+        help=help_with_default(
+            "Pathway file (.gmt). MSigDB or custom GMT supported",
+            defaults.input.gene_set_file,
         ),
     )
 
@@ -568,9 +704,9 @@ def get_common_magma_assoc_parser(add_help=False):
         type=int,
         default=argparse.SUPPRESS,
         metavar="KB",
-        help=(
-            "Upstream gene window in kb. "
-            f"[bold green]Configured default:[/bold green] [cyan]{defaults.gene_window_upstream_kb}[/cyan]"
+        help=help_with_default(
+            "Upstream gene window in kb",
+            defaults.gene_window_upstream_kb,
         ),
     )
 
@@ -579,9 +715,9 @@ def get_common_magma_assoc_parser(add_help=False):
         type=int,
         default=argparse.SUPPRESS,
         metavar="KB",
-        help=(
-            "Downstream gene window in kb. "
-            f"[bold green]Configured default:[/bold green] [cyan]{defaults.gene_window_downstream_kb}[/cyan]"
+        help=help_with_default(
+            "Downstream gene window in kb",
+            defaults.gene_window_downstream_kb,
         ),
     )
 
@@ -589,9 +725,9 @@ def get_common_magma_assoc_parser(add_help=False):
         "--gene-model",
         default=argparse.SUPPRESS,
         metavar="MODEL",
-        help=(
-            "MAGMA model supported with SNP p-value input. "
-            f"[bold green]Configured default:[/bold green] [cyan]{defaults.gene_model}[/cyan]"
+        help=help_with_default(
+            "MAGMA model supported with SNP p-value input",
+            defaults.gene_model,
         ),
     )
 
@@ -600,9 +736,9 @@ def get_common_magma_assoc_parser(add_help=False):
         dest="sample_size_column",
         default=argparse.SUPPRESS,
         metavar="COLUMN",
-        help=(
-            "Column name for sample sizes in *.pval input. "
-            f"[bold green]Configured default:[/bold green] [cyan]{defaults.input.sample_size_column}[/cyan]"
+        help=help_with_default(
+            "Column name for sample sizes in *.pval input",
+            defaults.input.sample_size_column,
         ),
     )
 
@@ -615,6 +751,7 @@ def get_magma_binary_parser(add_help=False):
     This is parent-safe and can be inserted into direct/pipeline mode.
     """
     from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
 
     configured = load_configuration().resources.executables.magma
     parser = argparse.ArgumentParser(add_help=add_help)
@@ -625,10 +762,10 @@ def get_magma_binary_parser(add_help=False):
         "--magma",
         default=argparse.SUPPRESS,
         metavar="PATH",
-        help=(
+        help=help_with_default(
             "Path to the MAGMA binary. "
-            "If not provided, assumes 'magma' is available in your system PATH. "
-            f"[bold green]Configured default:[/bold green] [cyan]{configured}[/cyan]"
+            "If not provided, assumes 'magma' is available in your system PATH",
+            configured,
         ),
     )
     return parser
@@ -654,7 +791,6 @@ def get_plink_binary_parser(add_help=False):
         help=help_with_default(
             "Full path or command name for the PLINK executable used for LD",
             configured,
-            label="Configured default",
         ),
     )
     return parser
@@ -679,7 +815,26 @@ def get_bcftools_binary_parser(add_help=False):
         help=help_with_default(
             "Full path or command name for bcftools",
             configured,
-            label="Packaged default",
+        ),
+    )
+    return parser
+
+
+def get_tabix_binary_parser(add_help=False):
+    """Return the shared tabix executable option."""
+    from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
+    configured = load_configuration().resources.executables.tabix
+    parser = argparse.ArgumentParser(add_help=add_help)
+    group = parser.add_argument_group("External software")
+    group.add_argument(
+        "--tabix",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help=help_with_default(
+            "Full path or command name for tabix",
+            configured,
         ),
     )
     return parser
@@ -693,7 +848,10 @@ def get_common_pops_parser(add_help=False):
     from typing import get_args
 
     from postgwas.config import load_configuration
-    from postgwas.config.models.modules.pops import PopsMethod
+    from postgwas.config.models.modules.pops import (
+        PopsGeneUniversePolicy,
+        PopsMethod,
+    )
     from postgwas.core.ui import help_with_default
 
     module = load_configuration().modules.pops
@@ -708,7 +866,6 @@ def get_common_pops_parser(add_help=False):
             "Required standard-PoPS prefix shared by its matrix, column, and row "
             "files",
             module.feature_matrix_prefix,
-            label="Configured default",
         ),
     )
     grp_feats.add_argument(
@@ -720,7 +877,6 @@ def get_common_pops_parser(add_help=False):
             "Number of consecutively numbered feature-matrix chunks; this must "
             "match the files below --feature-matrix-prefix",
             module.feature_matrix_chunks,
-            label="Configured default",
         ),
     )
     grp_feats.add_argument(
@@ -731,7 +887,18 @@ def get_common_pops_parser(add_help=False):
             "Required standard-PoPS gene annotation containing the configured "
             "Ensembl gene, chromosome, and TSS columns",
             module.gene_location_file,
-            label="Configured default",
+        ),
+    )
+    grp_feats.add_argument(
+        "--gene-universe-policy",
+        choices=get_args(PopsGeneUniversePolicy),
+        metavar="POLICY",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "How MAGMA target genes absent from PoPS resources are handled: "
+            "strict fails before fitting; intersect explicitly derives aligned "
+            "compatible and excluded MAGMA files with a full audit report",
+            module.gene_universe_policy,
         ),
     )
     grp_cov = parser.add_argument_group("PoPS covariates")
@@ -744,7 +911,6 @@ def get_common_pops_parser(add_help=False):
             "gene size and density, before fitting. This does not consume a "
             "MAGMACOVAR .gsa.out file or use --covariate-model",
             module.use_magma_covariates,
-            label="Configured default",
         ),
     )
     grp_cov.add_argument(
@@ -761,7 +927,6 @@ def get_common_pops_parser(add_help=False):
         help=help_with_default(
             "Use the MAGMA gene-error covariance during fitting",
             module.use_magma_error_covariance,
-            label="Configured default",
         ),
     )
     grp_cov.add_argument(
@@ -775,7 +940,10 @@ def get_common_pops_parser(add_help=False):
         "--target-score-file",
         metavar="PATH",
         default=argparse.SUPPRESS,
-        help="Custom target-score table used only when no MAGMA prefix is supplied.",
+        help=(
+            "Custom target-score table; mutually exclusive with "
+            "--magma-association-prefix."
+        ),
     )
     grp_cov.add_argument(
         "--target-covariates-file",
@@ -787,7 +955,9 @@ def get_common_pops_parser(add_help=False):
         "--target-error-covariance-file",
         metavar="PATH",
         default=argparse.SUPPRESS,
-        help="Optional SciPy NPZ or NumPy NPY covariance for custom target scores.",
+        help=(
+            "Optional SciPy NPZ or NumPy NPY covariance for custom target scores."
+        ),
     )
     grp_cov.add_argument(
         "--covariate-projection-chromosomes",
@@ -803,7 +973,6 @@ def get_common_pops_parser(add_help=False):
         help=help_with_default(
             "Apply upstream PoPS HLA exclusion during covariate projection",
             module.remove_hla_during_covariate_projection,
-            label="Configured default",
         ),
     )
     grp_cov.add_argument(
@@ -845,7 +1014,6 @@ def get_common_pops_parser(add_help=False):
         help=help_with_default(
             "Strict marginal-association p-value cutoff for feature selection",
             module.feature_selection_p_cutoff,
-            label="Configured default",
         ),
     )
     grp_sel.add_argument(
@@ -869,7 +1037,6 @@ def get_common_pops_parser(add_help=False):
         help=help_with_default(
             "Apply upstream PoPS HLA exclusion during feature selection",
             module.remove_hla_during_feature_selection,
-            label="Configured default",
         ),
     )
     grp_sel.add_argument(
@@ -895,7 +1062,6 @@ def get_common_pops_parser(add_help=False):
         help=help_with_default(
             "Apply upstream PoPS HLA exclusion during coefficient fitting",
             module.remove_hla_during_training,
-            label="Configured default",
         ),
     )
     grp_train.add_argument(
@@ -915,7 +1081,6 @@ def get_common_pops_parser(add_help=False):
         help=help_with_default(
             "Upstream PoPS coefficient model: ridge, lasso or linreg",
             module.method,
-            label="Configured default",
         ),
     )
     grp_misc.add_argument(
@@ -925,7 +1090,6 @@ def get_common_pops_parser(add_help=False):
         help=help_with_default(
             "Write upstream PoPS training and prediction matrices",
             module.save_matrix_files,
-            label="Configured default",
         ),
     )
     grp_misc.add_argument(
@@ -966,7 +1130,6 @@ def get_common_sumstat_filter_parser(add_help=False):
             "Keep variants with -log10(P) at or above this value. "
             "For genome-wide significance (P <= 5e-8), use 7.30103",
             module.minimum_neglog10_p,
-            label="Packaged default",
         ),
     )
 
@@ -979,7 +1142,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "Remove variants below this minor-allele frequency",
             module.maf_min,
-            label="Packaged default",
         ),
     )
 
@@ -991,7 +1153,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "Reference-population frequency INFO tag",
             module.reference_population_tag,
-            label="Packaged default",
         ),
     )
 
@@ -1005,7 +1166,6 @@ def get_common_sumstat_filter_parser(add_help=False):
             "Remove variants whose study and reference allele frequencies differ "
             "by more than this value",
             module.frequency_difference_max,
-            label="Packaged default",
         ),
     )
 
@@ -1018,7 +1178,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "Minimum INFO score",
             module.info_min,
-            label="Packaged default",
         ),
     )
 
@@ -1031,7 +1190,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "Remove variants above this INFO score",
             module.info_max,
-            label="Packaged default",
         ),
     )
 
@@ -1045,7 +1203,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "What to do when INFO is missing: remove or keep",
             module.missing_info_action,
-            label="Packaged default",
         ),
     )
     # =====================================================
@@ -1058,7 +1215,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "Keep insertion/deletion and other non-SNP variants",
             module.include_indels,
-            label="Packaged default",
         ),
     )
 
@@ -1070,7 +1226,6 @@ def get_common_sumstat_filter_parser(add_help=False):
             "Remove ambiguous A/T and C/G SNPs when their allele frequency falls "
             "between the two palindromic AF bounds",
             module.remove_palindromic,
-            label="Packaged default",
         ),
     )
     # =====================================================
@@ -1084,7 +1239,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "Lower ambiguity bound used with --remove-palindromic",
             module.palindromic_lower,
-            label="Packaged default",
         ),
     )
 
@@ -1096,7 +1250,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "Upper ambiguity bound used with --remove-palindromic",
             module.palindromic_upper,
-            label="Packaged default",
         ),
     )
 
@@ -1110,42 +1263,6 @@ def get_common_sumstat_filter_parser(add_help=False):
         help=help_with_default(
             "Remove variants in the configured build-specific MHC region",
             module.remove_mhc,
-            label="Packaged default",
-        ),
-    )
-
-    group.add_argument(
-        "--mhc-chrom",
-        default=argparse.SUPPRESS,
-        metavar="CHROM",
-        help=help_with_default(
-            "Chromosome containing the MHC region",
-            module.mhc.chromosome,
-            label="Packaged default",
-        ),
-    )
-
-    group.add_argument(
-        "--mhc-start",
-        type=int,
-        default=argparse.SUPPRESS,
-        metavar="POSITION",
-        help=help_with_default(
-            "One-based inclusive start coordinate of the MHC region",
-            module.mhc.start,
-            label="Packaged default",
-        ),
-    )
-
-    group.add_argument(
-        "--mhc-end",
-        type=int,
-        default=argparse.SUPPRESS,
-        metavar="POSITION",
-        help=help_with_default(
-            "One-based inclusive end coordinate of the MHC region",
-            module.mhc.end,
-            label="Packaged default",
         ),
     )
 
@@ -1160,12 +1277,12 @@ def get_common_sumstat_filter_parser(add_help=False):
 def get_flames_common_parser(add_help=False):
     """Return YAML-backed FLAMES options shared by direct and pipeline modes."""
     from postgwas.config import load_configuration
-    from postgwas.core.ui import help_with_default
+    from postgwas.core.ui import help_with_conditional_requirement, help_with_default
 
     defaults = load_configuration()
     module = defaults.modules.flames
     parser = argparse.ArgumentParser(add_help=add_help)
-    group = parser.add_argument_group("FLAMES scientific settings")
+    group = parser.add_argument_group("FLAMES analysis settings")
     group.add_argument(
         "--flames-annotation-directory",
         dest="annotation_resource_directory",
@@ -1185,7 +1302,6 @@ def get_flames_common_parser(add_help=False):
             "Genome build shared by credible-set coordinates and upstream gene evidence; "
             "PostGWAS does not infer it",
             module.genome_build.value,
-            label="Configured default",
         ),
     )
     group.add_argument(
@@ -1206,20 +1322,25 @@ def get_flames_common_parser(add_help=False):
         help=help_with_default(
             "Use the upstream Ensembl VEP API or a configured local VEP installation",
             module.vep_mode,
-            label="Configured default",
         ),
     )
     group.add_argument(
         "--vep-command",
         metavar="PATH",
         default=argparse.SUPPRESS,
-        help="VEP executable required when --flames-vep-mode local is selected.",
+        help=help_with_conditional_requirement(
+            "VEP executable",
+            "when --flames-vep-mode local is selected",
+        ),
     )
     group.add_argument(
         "--vep-cache",
         metavar="PATH",
         default=argparse.SUPPRESS,
-        help="Build-compatible VEP cache directory required for local VEP.",
+        help=help_with_conditional_requirement(
+            "Build-compatible VEP cache directory",
+            "when --flames-vep-mode local is selected",
+        ),
     )
     group.add_argument(
         "--flames-cadd-mode",
@@ -1229,26 +1350,27 @@ def get_flames_common_parser(add_help=False):
         help=help_with_default(
             "Use the upstream CADD API or a configured local tabix-indexed CADD file",
             module.cadd_mode,
-            label="Configured default",
         ),
     )
     group.add_argument(
         "--cadd-file",
         metavar="PATH",
         default=argparse.SUPPRESS,
-        help="Genome-build-matched CADD file required for local CADD mode.",
-    )
-    group.add_argument(
-        "--tabix",
-        metavar="COMMAND",
-        default=argparse.SUPPRESS,
-        help="Tabix executable override for local CADD mode.",
+        help=help_with_conditional_requirement(
+            "Genome-build-matched tabix-indexed CADD file",
+            "when --flames-cadd-mode local is selected",
+        ),
     )
     return parser
 
 
 
 def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentParser:
+    from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
+    module = load_configuration().modules.imputation
+    pred_ld = module.engines.pred_ld
     parser = argparse.ArgumentParser(add_help=add_help)
     grp = parser.add_argument_group("Imputation settings")
 
@@ -1257,12 +1379,11 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         dest="imputation_engine",
         metavar="ENGINE",
         type=str,
-        choices=["pred_ld"],
-        default="pred_ld",
-        help=(
-            "Choose imputation tool. "
-            "[bold]Available options:[/bold] [cyan]pred_ld[/cyan] "
-            "[bold green]Default:[/bold green] [cyan]pred_ld[/cyan]"
+        choices=[module.engine],
+        default=module.engine,
+        help=help_with_default(
+            "Choose the configured imputation tool",
+            module.engine,
         ),
     )
 
@@ -1285,9 +1406,10 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         dest="imputation_r2_threshold",
         metavar="R2",
         type=float,
-        default=0.8,
-        help=("LD r² tagging threshold."
-              "[bold green]Default:[/bold green] [cyan]0.8[/cyan]")
+        default=pred_ld.minimum_r2,
+        help=help_with_default(
+            "LD r² tagging threshold", pred_ld.minimum_r2,
+        ),
     )
 
     grp.add_argument(
@@ -1295,35 +1417,40 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         dest="imputation_minimum_maf",
         metavar="MAF",
         type=float,
-        default=0.001,
-        help=("Minor allele frequency threshold."
-              "[bold green]Default:[/bold green] [cyan]0.001[/cyan]")
+        default=pred_ld.minimum_maf,
+        help=help_with_default(
+            "Minor allele frequency threshold", pred_ld.minimum_maf,
+        ),
     )
 
     grp.add_argument(
         "--ref",
         metavar="NAME",
         type=str,
-        default="TOP_LD",
-        help=("Reference panel name label."
-              "[bold green]Default:[/bold green] [cyan]TOP_LD[/cyan]")
+        default=pred_ld.mode,
+        help=help_with_default(
+            "Reference panel name label", pred_ld.mode,
+        ),
     )
 
     grp.add_argument(
         "--correlation-method",
+        dest="corr_method",
         metavar="METHOD",
         type=str,
-        default="pearson",
+        default=pred_ld.correlation_method,
         choices=["pearson", "spearman"],
-        help=("Correlation method used in QC/post-processing."
-              "[bold green]Default:[/bold green] [cyan]pearson[/cyan]")
+        help=help_with_default(
+            "Correlation method used in QC/post-processing",
+            pred_ld.correlation_method,
+        ),
 
     )
 
     grp.add_argument(
         "--resource-directory",
         metavar="PATH",
-        default=None,
+        default=argparse.SUPPRESS,
         type=validate_path(must_exist=True, must_be_dir=True),
         help="[bold bright_red]Required[/bold bright_red]: PostGWAS resource directory.",
     )
@@ -1332,43 +1459,114 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
 
 
 
-def get_ldsc_common_parser(add_help: bool = False) -> argparse.ArgumentParser:
+def get_ldsc_merge_alleles_parser(
+    add_help: bool = False,
+) -> argparse.ArgumentParser:
+    """Expose one shared HapMap3 option to formatter and LDSC commands."""
+    parser = argparse.ArgumentParser(add_help=add_help)
+    group = parser.add_argument_group("LDSC allele matching")
+    group.add_argument(
+        "--merge-alleles",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        type=validate_path(
+            must_exist=True,
+            must_be_file=True,
+            must_not_be_empty=True,
+        ),
+        help=(
+            "HapMap3 SNP-and-allele table (for example w_hm3.snplist). "
+            "The direct formatter uses it optionally to select one rsID-and-allele "
+            "compatible LDSC record. Without it, the selected duplicate-ID "
+            "policy handles duplicated rsIDs. Heritability workflows require it "
+            "and reuse the same file during munge_sumstats."
+        ),
+    )
+    return parser
+
+
+def get_ldsc_common_parser(
+    add_help: bool = False,
+    *,
+    pipeline_mode: bool = False,
+) -> argparse.ArgumentParser:
     """
     Arguments shared by LDSC DIRECT and PIPELINE modes.
 
     DIRECT mode:
-        --sumstats      → munged .sumstats.gz (LDSC-ready)
+        --ldsc-input    → formatter-created LDSC input table
+        --merge-alleles → HapMap3 SNP+allele list (w_hm3.snplist)
         --ref-ld-chr    → eur_w_ld_chr/ (directory)
         --w-ld-chr      → eur_w_ld_chr/ (directory)
         --samp-prev / --pop-prev
 
     PIPELINE mode:
-        --sumstats      → raw LDSC-input TSV (your vcf_to_ldsc output)
+        formatter output is supplied to the service by the pipeline context
         --merge-alleles → HapMap3 SNP+allele list (w_hm3.snplist)
         --info-min / --maf-min used during munge_sumstats
         (ref/w ld-chr + prevs also used)
-
-    Tools mode:
-        Gets the same arguments; backend can decide what to use.
     """
-    parser = argparse.ArgumentParser(add_help=add_help)
-    grp = parser.add_argument_group("Allele matching")
+    from postgwas.config import load_configuration
+    from postgwas.config.models.common import GenomeBuild, Population
+    from postgwas.core.ui import help_with_default
 
-    grp.add_argument(
-        "--merge-alleles",
-        metavar="PATH",
-        type=validate_path(must_exist=True, must_be_file=True),
-        help=(
-            "[bold bright_red]Required[/bold bright_red]: HapMap3 SNP list with alleles (w_hm3.snplist). Used during munge_sumstats.\n"
-            "Optional in DIRECT mode; recommended in PIPELINE mode."
-        ),
+    defaults = load_configuration()
+    module = defaults.modules.ldsc
+    if pipeline_mode:
+        sample_prevalence_help = (
+            "Optional sample-prevalence override for liability-scale h². When "
+            "population prevalence is set and no CLI or YAML sample prevalence "
+            "is supplied, PostGWAS uses the formatter-returned value; it does "
+            "not recalculate it"
+        )
+        population_prevalence_help = (
+            "Population prevalence that activates liability-scale h². Sample "
+            "prevalence comes from CLI or YAML, or from the formatter result "
+            "when neither supplies it"
+        )
+    else:
+        sample_prevalence_help = (
+            "Sample prevalence for liability-scale h². Direct mode requires "
+            "it from --samp-prev or YAML together with population prevalence; "
+            "PostGWAS does not calculate or infer it"
+        )
+        population_prevalence_help = (
+            "Population prevalence for liability-scale h². Direct mode also "
+            "requires sample prevalence from --samp-prev or YAML; omit population "
+            "prevalence to run observed-scale h² only"
+        )
+    parser = argparse.ArgumentParser(
+        add_help=add_help,
+        parents=[get_ldsc_merge_alleles_parser()],
     )
 
     ref = parser.add_argument_group("LDSC reference")
 
     ref.add_argument(
+        "--ldsc-population",
+        choices=[population.value for population in Population],
+        default=argparse.SUPPRESS,
+        metavar="CODE",
+        help=help_with_default(
+            "Population represented by the supplied LDSC reference files",
+            module.population,
+        ),
+    )
+    ref.add_argument(
+        "--ldsc-genome-build",
+        choices=[build.value for build in GenomeBuild],
+        default=argparse.SUPPRESS,
+        metavar="BUILD",
+        help=help_with_default(
+            "Declared genome build of the supplied LDSC reference release",
+            module.genome_build,
+        ),
+    )
+
+    ref.add_argument(
         "--ref-ld-chr",
         metavar="PATH",
+        default=argparse.SUPPRESS,
         type=validate_path(must_exist=True, must_be_dir=True),
         help="[bold bright_red]Required[/bold bright_red]: Directory containing reference LD scores (e.g., eur_w_ld_chr/).",
     )
@@ -1376,8 +1574,28 @@ def get_ldsc_common_parser(add_help: bool = False) -> argparse.ArgumentParser:
     ref.add_argument(
         "--w-ld-chr",
         metavar="PATH",
+        default=argparse.SUPPRESS,
         type=validate_path(must_exist=True, must_be_dir=True),
         help="[bold bright_red]Required[/bold bright_red]: Directory containing LDSC regression weights (often same as --ref-ld-chr).",
+    )
+
+    ref.add_argument(
+        "--ldsc-executable",
+        metavar="PATH_OR_COMMAND",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "CBIIT ldsc.py executable path or command name",
+            defaults.resources.executables.ldsc,
+        ),
+    )
+    ref.add_argument(
+        "--munge-sumstats-executable",
+        metavar="PATH_OR_COMMAND",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "CBIIT munge_sumstats.py executable path or command name",
+            defaults.resources.executables.munge_sumstats,
+        ),
     )
 
     prev = parser.add_argument_group("Liability-scale reporting")
@@ -1386,77 +1604,189 @@ def get_ldsc_common_parser(add_help: bool = False) -> argparse.ArgumentParser:
         "--samp-prev",
         metavar="VALUE",
         type=float,
-        default=None,
-        help=("Sample prevalence (cases / total) used for liability h²."
-              "[bold green]Default:[/bold green] [cyan]None[/cyan]" )
-
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            sample_prevalence_help,
+            module.sample_prevalence,
+        ),
     )
 
     prev.add_argument(
         "--pop-prev",
         metavar="VALUE",
         type=float,
-        default=None,
-        help=("Population prevalence (e.g., 0.01)."
-              "[bold green]Default:[/bold green] [cyan]None[/cyan]")
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            population_prevalence_help,
+            module.population_prevalence,
+        ),
+    )
+
+    regression = parser.add_argument_group("LDSC heritability regression")
+    regression.add_argument(
+        "--intercept-h2",
+        dest="ldsc_intercept",
+        metavar="VALUE",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Constrain the single-trait LDSC intercept to this value",
+            module.intercept,
+        ),
+    )
+    regression.add_argument(
+        "--two-step",
+        dest="ldsc_two_step",
+        metavar="CHI_SQUARE",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Two-step estimator chi-square cutoff; when unset, LDSC applies "
+            "its data-dependent single-annotation behaviour",
+            module.two_step,
+        ),
+    )
+    regression.add_argument(
+        "--chisq-max",
+        dest="ldsc_chisq_max",
+        metavar="VALUE",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Maximum chi-square statistic retained by LDSC",
+            module.chisq_max,
+        ),
+    )
+    regression.add_argument(
+        "--n-blocks",
+        dest="ldsc_n_blocks",
+        metavar="N",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Number of block-jackknife blocks",
+            module.n_blocks,
+        ),
+    )
+    m_group = regression.add_mutually_exclusive_group()
+    m_group.add_argument(
+        "--use-M-5-50",
+        dest="ldsc_use_m_5_50",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Use the common-SNP .l2.M_5_50 files",
+            module.use_m_5_50,
+        ),
+    )
+    m_group.add_argument(
+        "--not-M-5-50",
+        dest="ldsc_use_m_5_50",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Use .l2.M files, matching the original LDSC flag.",
+    )
+    regression.add_argument(
+        "--print-cov",
+        dest="ldsc_print_covariance",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Write the covariance matrix of LDSC estimates",
+            module.print_covariance,
+        ),
+    )
+    regression.add_argument(
+        "--print-delete-vals",
+        dest="ldsc_print_delete_values",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Write block-jackknife delete values",
+            module.print_delete_values,
+        ),
     )
 
     mung = parser.add_argument_group("LDSC formatting filters")
 
     mung.add_argument(
-        "--ldsc-minimum-info",
+        "--info-min", "--ldsc-minimum-info",
         dest="ldsc_minimum_info",
         metavar="VALUE",
         type=float,
-        default=0.9,
-        help=("Minimum INFO score during munge_sumstats. "
-              "[bold green]Default:[/bold green] [cyan]0.9[/cyan]" )
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum INFO score during munge_sumstats",
+            module.minimum_info,
+        ),
     )
 
     mung.add_argument(
-        "--ldsc-minimum-maf",
+        "--maf-min", "--ldsc-minimum-maf",
         dest="ldsc_minimum_maf",
         metavar="VALUE",
         type=float,
-        default=0.01,
-        help=("Minimum MAF during munge_sumstats (default: 0.01). [bold green]Default:[/bold green] [cyan]0.01[/cyan]" )
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum MAF during munge_sumstats",
+            module.minimum_maf,
+        ),
+    )
+    mung.add_argument(
+        "--n-min",
+        dest="ldsc_minimum_n",
+        metavar="N",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum per-variant sample size; when unset, upstream LDSC uses "
+            "the 90th percentile divided by 1.5",
+            module.minimum_n,
+        ),
+    )
+    mung.add_argument(
+        "--chunksize",
+        dest="ldsc_chunksize",
+        metavar="N",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Rows read per munge_sumstats chunk",
+            module.chunksize,
+        ),
+    )
+    mung.add_argument(
+        "--keep-maf",
+        dest="ldsc_keep_maf",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Retain the frequency column in munged statistics",
+            module.keep_maf,
+        ),
     )
 
-    # docker_grp = parser.add_argument_group("LDSC Docker Execution ")
-
-    # docker_grp.add_argument(
-    #     "--docker-image",
-    #     metavar=" ",
-    #     type=str,
-    #     default="jibinjv/ldsc:1.0.1",
-    #     help=("Docker image used to run LDSC. [bold green]Default:[/bold green] [cyan]0.7[/cyan]"),
-    # )
-
-    # docker_grp.add_argument(
-    #     "--platform",
-    #     metavar=" ",
-    #     type=str,
-    #     default="linux/amd64",
-    #     help="Docker platform (default: linux/amd64, for Apple Silicon + x86 image). [bold green]Default:[/bold green] [cyan]linux/amd64[/cyan]",
-    # )
-
     return parser
+
+
+def get_ldsc_pipeline_parser(
+    add_help: bool = False,
+) -> argparse.ArgumentParser:
+    """Return LDSC options with pipeline-specific prevalence guidance."""
+    return get_ldsc_common_parser(add_help=add_help, pipeline_mode=True)
 
 
 
 def get_assoc_plot_parser(add_help=False):
     """
     Parent-safe parser containing common assoc-plot arguments
-    shared between DIRECT and PIPELINE modes.
-    Matches the original assoc_plot.R defaults:
-      • min-lp default = 2
-      • spacing default = 20 (R default)
-      • cyto-ratio default = 25
-      • loglog-pval default = 10
-      • width = 7.0
-      • fontsize = 12
-      • nauto = 22
+    shared between DIRECT and PIPELINE modes. Every displayed and effective
+    parser default is loaded from canonical ``modules.manhattan`` YAML.
     """
+    from postgwas.config import load_configuration
+    from postgwas.core.ui import help_with_default
+
+    defaults = load_configuration().modules.manhattan
     parser = argparse.ArgumentParser(add_help=add_help)
     # ------------------------------------------------------------
     # OUTPUTS
@@ -1492,13 +1822,21 @@ def get_assoc_plot_parser(add_help=False):
     flag_group.add_argument(
         "--allelic-shift",
         action="store_true",
-        help="Input VCF contains allelic-shift annotation."
+        default=defaults.allelic_shift,
+        help=help_with_default(
+            "Input VCF contains allelic-shift annotation",
+            defaults.allelic_shift,
+        ),
     )
 
     flag_group.add_argument(
         "--csq",
         action="store_true",
-        help="Flag coding variants (from CSQ annotation) in red."
+        default=defaults.flag_coding,
+        help=help_with_default(
+            "Flag coding variants from CSQ annotation in red",
+            defaults.flag_coding,
+        ),
     )
     # ------------------------------------------------------------
     # NUMERIC OPTIONS
@@ -1507,59 +1845,72 @@ def get_assoc_plot_parser(add_help=False):
     numeric_group.add_argument(
         "--nauto",
         type=int,
-        default=22,
+        default=defaults.autosome_count,
         metavar="N",
-        help="Number of autosomes. [bold green]Default:[/bold green] [cyan]22[/cyan]"
+        help=help_with_default(
+            "Number of autosomes", defaults.autosome_count,
+        ),
     )
 
     numeric_group.add_argument(
         "--min-af",
         type=float,
-        default=0.0,
+        default=defaults.minimum_af,
         metavar="AF",
-        help="Minimum allele frequency filter. [bold green]Default:[/bold green] [cyan]0.0[/cyan]"
+        help=help_with_default(
+            "Minimum allele frequency filter", defaults.minimum_af,
+        ),
     )
 
     numeric_group.add_argument(
         "--min-lp",
-        type=int,
-        default=2,
+        type=float,
+        default=defaults.minimum_neglog10_p,
         metavar="LP",
-        help="Minimum −log10(P) threshold. [bold green]Default:[/bold green] [cyan]2[/cyan]"
+        help=help_with_default(
+            "Minimum −log10(P) threshold", defaults.minimum_neglog10_p,
+        ),
     )
 
     numeric_group.add_argument(
         "--loglog-pval",
-        type=int,
-        default=10,
+        type=float,
+        default=defaults.loglog_pvalue,
         metavar="LP",
-        help="-log10(P) threshold for switching to log-log scale. "
-             "[bold green]Default:[/bold green] [cyan]10[/cyan]"
+        help=help_with_default(
+            "−log10(P) threshold for switching to log-log scale",
+            defaults.loglog_pvalue,
+        ),
     )
 
     numeric_group.add_argument(
         "--cyto-ratio",
-        type=int,
-        default=25,
+        type=float,
+        default=defaults.cytoband_ratio,
         metavar="RATIO",
-        help="Plot height : cytoband height ratio. "
-             "[bold green]Default:[/bold green] [cyan]25[/cyan]"
+        help=help_with_default(
+            "Plot-height to cytoband-height ratio", defaults.cytoband_ratio,
+        ),
     )
 
     numeric_group.add_argument(
         "--max-height",
-        type=int,
+        type=float,
+        default=defaults.maximum_height,
         metavar="VALUE",
-        help="Maximum vertical height of plot (optional)."
+        help=help_with_default(
+            "Maximum vertical height of the plot", defaults.maximum_height,
+        ),
     )
 
     numeric_group.add_argument(
         "--spacing",
         type=int,
-        default=20,
+        default=defaults.chromosome_spacing,
         metavar="VALUE",
-        help="Spacing between chromosomes. "
-             "[bold green]Default:[/bold green] [cyan]20[/cyan]"
+        help=help_with_default(
+            "Spacing between chromosomes", defaults.chromosome_spacing,
+        ),
     )
     # ------------------------------------------------------------
     # FIGURE SIZE
@@ -1569,24 +1920,31 @@ def get_assoc_plot_parser(add_help=False):
     fig_group.add_argument(
         "--width",
         type=float,
-        default=7.0,
+        default=defaults.width,
         metavar="INCHES",
-        help="Plot width in inches. [bold green]Default:[/bold green] [cyan]7.0[/cyan]"
+        help=help_with_default(
+            "Plot width in inches", defaults.width,
+        ),
     )
 
     fig_group.add_argument(
         "--height",
         type=float,
+        default=defaults.height,
         metavar="INCHES",
-        help="Plot height in inches (optional)."
+        help=help_with_default(
+            "Plot height in inches", defaults.height,
+        ),
     )
 
     fig_group.add_argument(
         "--fontsize",
         type=int,
-        default=12,
+        default=defaults.font_size,
         metavar="POINTS",
-        help="Font size. [bold green]Default:[/bold green] [cyan]12[/cyan]"
+        help=help_with_default(
+            "Font size", defaults.font_size,
+        ),
     )
 
     return parser

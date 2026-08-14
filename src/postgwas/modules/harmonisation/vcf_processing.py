@@ -583,6 +583,7 @@ def concat_vcfs_by_build(
     logger=None,
 ):
     binaries = dict(executables)
+    bash = binaries["bash"]
     bcftools = binaries["bcftools"]
     tabix = binaries["tabix"]
     outdir = Path(output_dir)
@@ -766,31 +767,70 @@ def concat_vcfs_by_build(
     # -------------------------------------------------------
     # MERGE FUNCTION (SAFE)
     # -------------------------------------------------------
-    def merge(tag, vcf_list, out, *, require_records):
+    header_template = str(vcf_config["genome_build_header"])
+
+    def merge(tag, vcf_list, out, *, genome_build, require_records):
         if not vcf_list:
             return None, "no valid chromosome inputs", 0
+
+        try:
+            build_header = header_template.format(build=genome_build)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                "vcf_processing.genome_build_header cannot be rendered for %s: %s"
+                % (genome_build, exc)
+            ) from exc
 
         index_path = Path(str(out) + ".tbi")
         failures = []
         for attempt in range(1, concat_max_attempts + 1):
             unlink_vcf(out)
             try:
-                run_checked_command([
-                    bcftools, "concat",
-                    "-a",
-                    "--output-type", "z",
-                    "--output", str(out),
-                    "--threads", str(threads_per_job),
-                    "--write-index=tbi",
-                    *map(str, vcf_list)
-                ], "Concatenating %s VCFs (attempt %d/%d)" % (
-                    tag, attempt, concat_max_attempts,
-                ), logger=logger, error_type=RuntimeError,
-                    expected_outputs=[out, index_path])
+                commands = [
+                    [
+                        bcftools, "concat", "-a", "--output-type", "u",
+                        *map(str, vcf_list),
+                    ],
+                    [
+                        bcftools, "annotate", "--header-line", build_header,
+                        "--output-type", "z", "--output", str(out),
+                        "--threads", str(threads_per_job), "--write-index=tbi",
+                    ],
+                ]
+                run_checked_command(
+                    [
+                        bash, "-c", "set -euo pipefail\n" + " | ".join(
+                            shlex.join(command) for command in commands
+                        ),
+                    ],
+                    "Concatenating %s VCFs and declaring genome build %s "
+                    "(attempt %d/%d)"
+                    % (tag, genome_build, attempt, concat_max_attempts),
+                    logger=logger,
+                    error_type=RuntimeError,
+                    expected_outputs=[out, index_path],
+                )
                 if Path(out).stat().st_size < min_valid_size:
                     raise RuntimeError(
                         "merged output is smaller than vcf.min_valid_size_bytes (%d): %s"
                         % (min_valid_size, out)
+                    )
+                header = run_checked_command(
+                    [bcftools, "view", "--header-only", str(out)],
+                    "Validating genome-build header for %s (attempt %d/%d)"
+                    % (tag, attempt, concat_max_attempts),
+                    logger=logger,
+                    error_type=RuntimeError,
+                )
+                build_headers = [
+                    line.strip()
+                    for line in header.splitlines()
+                    if line.lower().startswith("##genome_build=")
+                ]
+                if build_headers != [build_header]:
+                    raise RuntimeError(
+                        "merged VCF %s must contain exactly one %r header; found %r"
+                        % (out, build_header, build_headers)
                     )
                 count_text = run_checked_command(
                     [bcftools, "index", "-n", str(out)],
@@ -816,6 +856,11 @@ def concat_vcfs_by_build(
                     report(
                         "✅ [%s] concat recovered on attempt %d/%d."
                         % (tag, attempt, concat_max_attempts)
+                    )
+                if logger is not None:
+                    logger.record(
+                        "OUTPUT", "vcf_genome_build_header",
+                        build=genome_build, header=build_header, path=str(out),
                     )
                 return str(out), None, attempt
             except RuntimeError as exc:
@@ -844,26 +889,43 @@ def concat_vcfs_by_build(
     # -------------------------------------------------------
     # PARALLEL EXECUTION
     # -------------------------------------------------------
-    # tag -> (files that were merged, output path)
+    # tag -> (files that were merged, output path, records' coordinate build)
     merge_inputs = {
-        build.lower(): (files, configured_output_path(
-            outdir,
-            output_layout["merged_build_vcf"],
-            dataset_id=gwas_outputname,
-            build=build,
-            target_build=target_build,
-        ))
+        build.lower(): (
+            files,
+            configured_output_path(
+                outdir,
+                output_layout["merged_build_vcf"],
+                dataset_id=gwas_outputname,
+                build=build,
+                target_build=target_build,
+            ),
+            build,
+        )
         for build, files in build_files.items()
     }
     merge_inputs.update({
-        "gwas2vcf": (raw_files, configured_output_path(
-            outdir, output_layout["merged_raw_vcf"],
-            dataset_id=gwas_outputname, build=grch_version, target_build=target_build,
-        )),
-        "notlifted": (notlifted_files, configured_output_path(
-            outdir, output_layout["merged_not_lifted_vcf"],
-            dataset_id=gwas_outputname, build=grch_version, target_build=target_build,
-        )),
+        "gwas2vcf": (
+            raw_files,
+            configured_output_path(
+                outdir, output_layout["merged_raw_vcf"],
+                dataset_id=gwas_outputname,
+                build=grch_version,
+                target_build=target_build,
+            ),
+            grch_version,
+        ),
+        # Rejected records never entered the target coordinate system.
+        "notlifted": (
+            notlifted_files,
+            configured_output_path(
+                outdir, output_layout["merged_not_lifted_vcf"],
+                dataset_id=gwas_outputname,
+                build=grch_version,
+                target_build=target_build,
+            ),
+            grch_version,
+        ),
     })
     merge_labels = {
         **{build.lower(): build for build in build_files},
@@ -887,12 +949,12 @@ def concat_vcfs_by_build(
 
     # Remove stale merged outputs before deciding which tasks can run. A path
     # from an earlier attempt must never satisfy downstream output validation.
-    for _files, out_path in merge_inputs.values():
+    for _files, out_path, _build in merge_inputs.values():
         unlink_vcf(out_path)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
-        for key, (files, out_path) in merge_inputs.items():
+        for key, (files, out_path, build) in merge_inputs.items():
             blocked = bool(input_failures[key]) and on_merge_failure == "fail"
             if files and not blocked:
                 futures[key] = executor.submit(
@@ -900,6 +962,7 @@ def concat_vcfs_by_build(
                     merge_labels[key],
                     files,
                     out_path,
+                    genome_build=build,
                     require_records=key in required_groups,
                 )
 
@@ -946,7 +1009,7 @@ def concat_vcfs_by_build(
         ):
             unlink_vcf(path)
 
-    for key, (files, _out) in merge_inputs.items():
+    for key, (files, _out, _build) in merge_inputs.items():
         if results.get(key) and key not in merge_failures:
             for path in files:
                 unlink_vcf(path)

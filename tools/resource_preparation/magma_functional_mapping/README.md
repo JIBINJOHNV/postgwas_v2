@@ -30,7 +30,7 @@ manifest and generated PostGWAS configuration, then exits successfully.
 identifier table used for eMAGMA network identifier harmonisation.
 
 After updating only the preparer or generated-configuration schema, refresh the
-metadata without downloading or modifying scientific resources:
+metadata without downloading or modifying reference resources:
 
 ```bash
 postgwas resources refresh magma
@@ -60,7 +60,7 @@ different biological question and a separate multiple-testing family.
 The same file can be supplied to `postgwas pipeline --run-config` because its
 MAGMA values are stored under the canonical `modules.magma` namespace.
 
-## Scientific contracts
+## Mapping contracts
 
 - eMAGMA uses GTEx v8 tissue-specific eQTL SNP–gene assignments. PostGWAS uses
   each annotation directly and converts the optional two-column co-expression
@@ -107,5 +107,5 @@ and mixed identifiers for chromMAGMA. No method's targets are silently
 relabelled.
 
 Some pinned GitHub repositories do not contain a machine-readable licence.
-Their resources are installed for local scientific use with an explicit warning
+Their resources are installed for local analysis with an explicit warning
 in `resource_manifest.yaml`; redistribution terms must be checked separately.

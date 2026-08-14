@@ -13,6 +13,7 @@ from postgwas.cli.common import (
     get_common_out_parser,
     get_formatter_parser,
     get_inputvcf_parser,
+    get_ldsc_merge_alleles_parser,
 )
 from postgwas.cli.compute import get_compute_parser
 from postgwas.config.models.modules.formatting import FormattingCustomField
@@ -89,11 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="postgwas formatter",
         usage=(
-            "postgwas formatter --vcf PATH "
+            "postgwas formatter --vcf PATH --output-directory PATH "
             "[--format FORMAT [FORMAT ...]] [--custom-output FILE] [options]"
         ),
         description=(
-            "Create scientifically validated MAGMA, SuSiE, FINEMAP, PRED-LD, "
+            "Create validated MAGMA, SuSiE, FINEMAP, PRED-LD, "
             "LDSC, or MiXeR inputs, plus an optional custom table, from one "
             "harmonised GWAS-VCF. The VCF is read once even when several "
             "outputs are requested."
@@ -131,9 +132,14 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             ),
             (
-                "Export a reusable formatter configuration:",
+                "Export a reusable LDSC-only formatter configuration:",
                 "postgwas config export",
-                ("--module formatting", "--style minimal", "--output formatting.yaml"),
+                (
+                    "--module formatting",
+                    "--format ldsc",
+                    "--style minimal",
+                    "--output formatting.yaml",
+                ),
             ),
             (
                 "Create an additional custom table without editing YAML:",
@@ -154,13 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
             get_formatter_parser(direct_controls=True),
             get_common_out_parser(),
             get_bcftools_binary_parser(),
+            get_ldsc_merge_alleles_parser(),
         ],
     )
     _add_custom_output_arguments(parser)
     for action in parser._actions:
-        if action.dest == "vcf":
+        if action.dest in {"vcf", "output_directory"}:
             action.required = True
-        elif action.dest in {"bcftools", "dataset_id", "output_directory"}:
+        if action.dest in {"bcftools", "dataset_id", "output_directory"}:
             action.default = argparse.SUPPRESS
     return parser
 
