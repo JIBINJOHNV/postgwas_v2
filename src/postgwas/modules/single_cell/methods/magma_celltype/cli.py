@@ -21,7 +21,7 @@ def add_magma_celltype_arguments(
         help=(
             "Whitespace-delimited MAGMA gene-covariate matrix with gene IDs in "
             "column one, one average-expression column, and one or more cell-type "
-            "columns. The GWAS pipeline cannot create this biological input."
+            "columns."
         ),
     )
     settings = parser.add_argument_group("MAGMA cell-type settings")
@@ -32,7 +32,6 @@ def add_magma_celltype_arguments(
         help=help_with_default(
             "Exact covariate column containing expression averaged across cell types",
             module.magma_celltype.average_property,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -44,7 +43,6 @@ def add_magma_celltype_arguments(
         help=help_with_default(
             "Corrections applied across all tested cell types in this dataset",
             " ".join(module.multiple_testing.methods),
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -55,7 +53,6 @@ def add_magma_celltype_arguments(
         help=help_with_default(
             "Primary adjusted-p method recorded for downstream reporting",
             module.multiple_testing.primary_method,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -65,7 +62,6 @@ def add_magma_celltype_arguments(
         help=help_with_default(
             "Adjusted-p reporting threshold; it does not filter result rows",
             module.multiple_testing.significance_threshold,
-            label="Configured default",
         ),
     )
 

@@ -238,13 +238,11 @@ def load_run_configuration_for_module(
     duplicated fallback logic or hide an invalid full-run configuration.
     """
     name = canonical_module_name(module)
-    local = dict(module_overrides or {})
+    local = _module_cli_overrides(name, module_overrides)
     global_values = dict(global_overrides or {})
     if config_file is None:
         overrides = dict(global_values)
-        overrides.update(
-            {"modules.%s.%s" % (name, key): value for key, value in local.items()}
-        )
+        overrides.update(local)
         return load_configuration(cli_overrides=overrides)
 
     path = Path(config_file)
@@ -254,16 +252,23 @@ def load_run_configuration_for_module(
     )
     if not module_only:
         overrides = dict(global_values)
-        overrides.update(
-            {"modules.%s.%s" % (name, key): value for key, value in local.items()}
-        )
+        overrides.update(local)
         return load_configuration(path, cli_overrides=overrides)
 
-    root = load_configuration(cli_overrides=global_values)
+    root_overrides = {
+        key: value for key, value in local.items()
+        if not key.startswith("modules.")
+    }
+    root_overrides.update(global_values)
+    module_values = {
+        key: value for key, value in local.items()
+        if key.startswith("modules.")
+    }
+    root = load_configuration(cli_overrides=root_overrides)
     setattr(
         root.modules,
         name,
-        load_module_configuration(name, path, cli_overrides=local),
+        load_module_configuration(name, path, cli_overrides=module_values),
     )
     return root
 

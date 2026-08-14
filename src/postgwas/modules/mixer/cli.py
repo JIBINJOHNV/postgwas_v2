@@ -15,6 +15,7 @@ from postgwas.core.execution.runtime import validate_path
 from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_examples,
+    help_with_conditional_requirement,
     help_with_default,
 )
 from postgwas.config.models.modules.mixer import MixerAnalysis, MixerExecutionBackend
@@ -35,18 +36,18 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=(
-            "REQUIRED in standalone mode. MiXeR input created by "
-            "postgwas formatter. A pipeline run receives this file automatically."
-            " Configured filename pattern: %s." % mixer_input_pattern
+            "MiXeR input created by postgwas formatter. Configured filename "
+            "pattern: %s." % mixer_input_pattern
         ),
     )
     inputs.add_argument(
         "--bim-file-pattern",
         metavar="PATTERN",
         default=argparse.SUPPRESS,
-        help=(
+        help=help_with_conditional_requirement(
             "Per-chromosome BIM path containing %s, for example reference/chr%s.bim."
-            % (chromosome_placeholder, chromosome_placeholder)
+            % (chromosome_placeholder, chromosome_placeholder),
+            "for every MiXeR analysis",
         ),
     )
     inputs.add_argument(
@@ -54,7 +55,8 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
         metavar="PATTERN",
         default=argparse.SUPPRESS,
         help=(
-            "Per-chromosome MiXeR LD path containing %s, for example reference/chr%s.ld."
+            "Per-chromosome MiXeR LD path containing %s, for example "
+            "reference/chr%s.ld."
             % (chromosome_placeholder, chromosome_placeholder)
         ),
     )
@@ -63,9 +65,10 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
         "--gsa-annotation-file-pattern",
         metavar="PATTERN",
         default=argparse.SUPPRESS,
-        help=(
-            "Per-chromosome SNP annotation path containing %s. Required for "
-            "--analysis gsa or all." % chromosome_placeholder
+        help=help_with_conditional_requirement(
+            "Per-chromosome SNP annotation path containing %s"
+            % chromosome_placeholder,
+            "for gsa/all",
         ),
     )
     gsa.add_argument(
@@ -90,9 +93,9 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
             ),
             metavar="PATH",
             default=argparse.SUPPRESS,
-            help=(
-                "GSA-MiXeR %s table. Required for --analysis gsa or all."
-                % label
+            help=help_with_conditional_requirement(
+                "GSA-MiXeR %s table" % label,
+                "for gsa/all",
             ),
         )
     settings = parser.add_argument_group("MiXeR execution")
@@ -128,8 +131,8 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Path to mixer_figures.py, used for official univariate QQ and power "
-            "diagnostics",
+            "Path to mixer_figures.py, used for official univariate QQ and "
+            "power diagnostics",
             defaults.resources.executables.mixer_figures,
         ),
     )
@@ -138,7 +141,7 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
         metavar="IMAGE",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "GSA-MiXeR container image used by the docker backend",
+            "GSA-MiXeR container image",
             container_defaults.image,
         ),
     )
@@ -147,7 +150,7 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
         metavar="COMMAND",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Container command used by the docker backend",
+            "Container command",
             container_defaults.runtime,
         ),
     )
@@ -155,25 +158,15 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
         "--mixer-container-platform",
         metavar="PLATFORM",
         default=argparse.SUPPRESS,
-        help=help_with_default("Container platform", container_defaults.platform),
+        help=help_with_default(
+            "Container platform",
+            container_defaults.platform,
+        ),
     )
     if direct_controls:
         settings.add_argument(
             "--run-config", metavar="PATH", default=argparse.SUPPRESS,
             help="YAML settings for MiXeR, references, software paths, and execution.",
-        )
-        settings.add_argument(
-            "--resume",
-            action=argparse.BooleanOptionalAction,
-            default=argparse.SUPPRESS,
-            help=help_with_default(
-                "Keep each validated existing result and run only unfinished steps",
-                defaults.run.resume,
-            ),
-        )
-        settings.add_argument(
-            "--overwrite", action="store_true", default=argparse.SUPPRESS,
-            help="Allow MiXeR to replace existing fit and test results.",
         )
         settings.add_argument(
             "--dry-run", action="store_true", default=argparse.SUPPRESS,

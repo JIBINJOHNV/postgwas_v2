@@ -8,5 +8,5 @@ For quantitative traits, `control_count` or `control_count_column` represents
 total N and all case-count fields must be empty. For case-control traits, both
 control and case counts are required.
 
-The compressed ADHD fixture is retained for header validation and scientific
+The compressed ADHD fixture is retained for header validation and analysis
 regression tests. It is test input, not generated output.

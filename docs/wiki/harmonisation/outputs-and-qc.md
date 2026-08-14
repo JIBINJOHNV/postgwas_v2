@@ -81,11 +81,14 @@ contains the shared run preparation and final summary plus only that dataset's
 processing output; it does not duplicate another dataset's chromosome blocks.
 The run-level CSV records the exact report path in `screen_report`.
 
-Terminal display is enabled by default. `--hide-screen` suppresses normal
-progress on stdout without disabling report creation; `--show-screen`
-explicitly restores terminal display. Fatal CLI errors still use stderr, while
-preflight failures are also recorded in each selected dataset's report once
-the sample sheet has supplied reliable dataset IDs.
+Terminal display is enabled by default. `--hide-screen` suppresses the terminal
+copy without disabling the dataset reports or the shared transcript. The
+packaged transcript path is `<output>/run_metadata/screen.log`, and
+`logging.screen_log_file` can change the relative location. `--show-screen`
+explicitly restores display. The shared transcript captures stdout and stderr,
+including fatal CLI errors. Preflight failures are also recorded in each
+selected dataset's report once the sample sheet has supplied reliable dataset
+IDs.
 
 ## Rejections and duplicate evidence
 
@@ -124,6 +127,23 @@ smallest P value.
 Rule counts can overlap. Only the combined mask defines total excluded and
 virtual QC-passed records. Harmonisation does not write a filtered replacement
 VCF from this assessment.
+
+This assessment is owned by the QC module and uses the schema-validated
+`modules.qc_summary` rules, VCF fields, build-specific MHC interval, table
+settings, and output layout. Harmonisation invokes that service internally and
+includes the resolved QC configuration in its provenance, so `postgwas qc` and
+harmonisation do not maintain separate summary policies.
+
+Every merged VCF declares its coordinate system explicitly as
+`##genome_build=<build>`. Source-build annotated and raw GWAS-to-VCF outputs use
+the detected input build; successfully lifted outputs use the target build. A
+not-lifted VCF uses the input build because those records never entered the
+target coordinate system. PostGWAS adds this line while the existing
+chromosome-concatenation stream is written, using uncompressed BCF between
+bcftools commands, so no second full-file pass is required. This follows the
+official [bcftools streaming guidance](https://samtools.github.io/bcftools/howtos/scaling.html)
+and the VCF `##key=value` metadata convention in the
+[VCF specification](https://samtools.github.io/hts-specs/VCFv4.5.pdf).
 
 ## Frequency QC
 

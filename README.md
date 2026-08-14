@@ -3,74 +3,36 @@
 PostGWAS is a command-line toolkit that converts heterogeneous genome-wide
 association study (GWAS) summary statistics into a validated GWAS-VCF, and then
 runs reproducible post-GWAS analyses from that file. It provides one
-configuration system, one logging and QC convention, standalone scientific
+configuration system, one logging and QC convention, standalone analysis
 modules, and a dependency-aware pipeline for multi-stage analyses.
 
 > **Research software.** A command that exits successfully is not evidence that
-> the analysis was scientifically valid. Verify the genome build, ancestry,
+> the analysis was valid. Verify the genome build, ancestry,
 > allele convention, sample-size definition, reference resources, resolved
 > configuration, QC reports, and external-tool output before interpreting
 > results.
 
 ## Contents
 
-[Overview](#overview) ·
-[Supported analyses](#supported-analyses) ·
-[Workflow](#workflow) ·
-[Execution modes](#execution-modes) ·
-[Installation](#installation) ·
+**Using PostGWAS** — [Overview](#overview) · [Execution modes](#execution-modes) ·
+[Quick start](#quick-start) · [Modules and execution order](#modules-and-execution-order)
+
+**Setting up** — [Installation](#installation) ·
 [External software](#external-software) ·
 [Reference data](#reference-data-and-resource-files) ·
-[Input formats](#input-formats) ·
-[Configuration](#configuration) ·
-[Quick start](#quick-start) ·
-[Pipeline mode in detail](#pipeline-mode-in-detail) ·
-[Direct mode in detail](#direct-mode-in-detail) ·
-[Modules and execution order](#modules-and-execution-order) ·
-[Outputs](#outputs) ·
+[Input formats](#input-formats) · [Configuration](#configuration)
+
+**Results and support** — [Outputs](#outputs) ·
 [QC, logging and provenance](#qc-logging-and-provenance) ·
 [Troubleshooting](#troubleshooting) ·
 [Scope and current limitations](#scope-and-current-limitations) ·
-[Documentation](#documentation) ·
-[Development](#development) ·
+[Documentation](#documentation) · [Development](#development) ·
 [License](#license)
 
 ## Overview
 
-PostGWAS separates data preparation from analysis.
-
-1. **Preparation.** The `harmonisation` command reads raw summary-statistics
-   tables described by a sample sheet, standardises coordinates, alleles,
-   frequencies, effect statistics, sample sizes and imputation quality, and
-   writes a bgzip-compressed, tabix-indexed GWAS-VCF for each requested genome
-   build, together with rejection and QC evidence.
-2. **Analysis.** Every downstream module reads a harmonised GWAS-VCF, or an
-   artifact derived from one. You can run a single module yourself
-   (*direct mode*) or ask the `pipeline` command to resolve and execute the
-   registered prerequisites of one or more final analyses (*pipeline mode*).
-
-Harmonisation is a mandatory, standalone first step. It is deliberately not a
-pipeline stage: the pipeline starts from a harmonised GWAS-VCF and never ingests
-the original summary-statistics table.
-
-## Supported analyses
-
-- **Preparation and QC** — harmonisation with rejection provenance, GWAS-VCF
-  filtering, GWAS-VCF QC summaries, Manhattan and QQ plots.
-- **Variant-level analysis** — LD-block annotation, LD clumping, SuSiE or
-  FINEMAP fine-mapping, GCTA-COJO conditional and joint analysis, summary-
-  statistic imputation.
-- **Gene and gene-set analysis** — MAGMA gene and gene-set association, GCTA
-  fastBAT and mBAT-combo, MAGMA gene-property analysis.
-- **Gene prioritisation** — PoPS, kernel-based K-POPS, CALDERA, FLAMES.
-- **Trait-level and integrative analysis** — LDSC SNP heritability, MiXeR
-  polygenic architecture and GSA-MiXeR gene-set analysis, single-cell cell-type
-  integration, pathway and interaction enrichment.
-- **Reproducibility** — schema-validated YAML, a resolved configuration written
-  beside every run, canonical logs, recorded commands and tool versions, QC
-  summaries, and completion manifests for the modules that support resume.
-
-## Workflow
+PostGWAS separates data preparation from analysis, and the boundary between them
+is a validated GWAS-VCF.
 
 ```mermaid
 flowchart LR
@@ -82,27 +44,34 @@ flowchart LR
     E --> F
 ```
 
-Both execution modes consume the same harmonised GWAS-VCF. They differ only in
-who is responsible for producing the intermediate artifacts that a module needs.
+1. **Preparation.** `harmonisation` reads raw summary-statistics tables described
+   by a sample sheet, standardises coordinates, alleles, frequencies, effect
+   statistics, sample sizes and imputation quality, and writes a
+   bgzip-compressed, tabix-indexed GWAS-VCF for each configured genome build,
+   together with rejection and QC evidence. It is a mandatory, standalone first
+   step and is deliberately not a pipeline stage.
+2. **Analysis.** Every downstream module reads that GWAS-VCF, or an artifact
+   derived from it: filtering and QC, LD annotation and clumping, fine-mapping,
+   heritability, gene and gene-set testing, gene prioritisation, single-cell
+   integration, polygenic architecture, and pathway enrichment. Run one module
+   yourself (*direct mode*), or let `pipeline` resolve and execute the registered
+   prerequisites of the analyses you ask for (*pipeline mode*).
+
+Both modes consume the same GWAS-VCF and differ only in who produces the
+intermediate artifacts. [Modules and execution
+order](#modules-and-execution-order) lists every available analysis, its
+command, and its pipeline dependencies.
 
 ## Execution modes
 
 ### Harmonisation: required preparation for raw data
 
-Harmonisation is driven by a **sample sheet** — a CSV or TSV file with one row
-per dataset that maps the column names actually present in each study to the
-concepts PostGWAS requires. Column meanings are declared, not guessed, so raw
-files do not have to be pre-formatted.
-
-Start from a maintained template:
-
-```text
-examples/configs/harmonisation/sample_sheet_quantitative.csv
-examples/configs/harmonisation/sample_sheet_case_control.csv
-examples/configs/harmonisation/run_config.yaml
-```
-
-Then run harmonisation:
+Harmonisation is driven by a **sample sheet**: a CSV or TSV file with one row per
+dataset that maps the column names actually present in each study to the concepts
+PostGWAS requires. Column meanings are declared, not guessed, so raw files do not
+have to be pre-formatted. The column reference is under
+[Input formats](#input-formats); a filled-in example and its matching GWAS file
+ship in `tests/data/harmonisation/`.
 
 ```console
 postgwas harmonisation \
@@ -117,7 +86,7 @@ postgwas harmonisation \
 `--run-config`. `--dataset-id` restricts the run to one row of the sample sheet;
 without it every row is processed.
 
-Structural and scientific harmonisation checks always run. `--validate` adds an
+Structural and cross-field harmonisation checks always run. `--validate` adds an
 independent post-harmonisation concordance comparison between each original
 dataset and its same-build merged GWAS-VCF. The same comparison can be run later
 against an existing file:
@@ -144,135 +113,295 @@ See also the [harmonisation overview](docs/wiki/harmonisation/overview.md),
 ### Direct mode: run one module
 
 Use direct mode when the module's required input already exists and you want to
-control that one step explicitly.
-
-In direct mode **you** supply every input: the harmonised GWAS-VCF or the
-upstream artifact the module consumes, all reference and resource files, and all
-module-specific parameters. Direct execution never infers, plans, or recreates a
-missing upstream analysis, and it does not verify that inputs produced elsewhere
+control that one step explicitly. **You** supply every input: the harmonised
+GWAS-VCF or the upstream artifact the module consumes, all reference files, and
+all analysis parameters. Direct execution never infers, plans, or recreates a
+missing upstream analysis, and it does not check that inputs produced elsewhere
 share a compatible genome build, ancestry, allele convention or sample-size
 definition.
 
+`postgwas COMMAND --help` is authoritative for option names, packaged defaults
+and a worked example for that module. The examples below are the ones those help
+pages print.
+
+Create the tables downstream tools need, then run MAGMA from them:
+
 ```console
-postgwas finemap --help
-postgwas magma --help
-postgwas pathway_enrichment --help
+postgwas formatter \
+  --vcf study.vcf.gz \
+  --dataset-id STUDY \
+  --output-directory formatted \
+  --format magma ldsc
 ```
+
+```console
+postgwas magma \
+  --snp-location-file formatted/STUDY_magma_snp_loc.tsv \
+  --p-value-file formatted/STUDY_magma_p_values.tsv \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --resolve-variants-to-reference \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+Run SuSiE-RSS fine-mapping:
+
+```console
+postgwas finemap \
+  --finemap-method susie \
+  --susie-input-file formatted/STUDY_susie.tsv.gz \
+  --locus-file loci.tsv \
+  --finemap-ld-reference reference/1000G_EUR \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+`STUDY` is your `--dataset-id`; `study.vcf.gz` is a merged GWAS-VCF from
+harmonisation; files under `formatted/` are written by `formatter`; `loci.tsv` is
+a locus file, which `ld_clump` produces; paths under `reference/` are downloaded
+resources. Any module can also run entirely from an exported configuration, which
+is the reproducible form — see [Configuration](#configuration).
+
+See [Running Modules Independently](docs/wiki/core/running-modules-independently.md).
 
 ### Pipeline mode: request final analyses
 
 Use pipeline mode when PostGWAS should plan and run the registered
-prerequisites. You name the final analyses you want with `--modules`; the
-planner expands them into a deterministic execution order and runs shared
-prerequisites once where possible.
+prerequisites. You name the final analyses with `--modules`; the planner expands
+them into a deterministic execution order and runs shared prerequisites once
+where possible.
 
-In pipeline mode you supply one harmonised GWAS-VCF, a dataset identifier, an
-output directory, a run configuration, and every external reference resource the
-selected modules need. PostGWAS supplies the intermediate artifacts that earlier
-steps produce; the options that carry those artifacts are hidden from the
-contextual help because setting them has no effect.
+**You provide** one harmonised GWAS-VCF (`--vcf`), a dataset identifier
+(`--dataset-id`), an output directory (`--output-directory`), the analysis
+settings and reference paths for every selected module (as options or through
+`--run-config`), and the analyses you want.
 
-Inspect the plan and its context-specific options before running anything:
+**PostGWAS provides** the execution order, including modules you did not name,
+and the intermediate artifacts passed between steps — the LD-block annotated VCF,
+formatter tables, the clumped locus file, MAGMA gene results, PoPS scores. The
+options that carry those artifacts are hidden from the contextual help because
+setting them has no effect.
+
+**Ordering.** Each target's registered dependencies are expanded recursively,
+cycles are rejected, and steps are emitted in a fixed order: filtering; then
+formatting and imputation, with an automatic post-imputation filtering step when
+both are active; then LD-block annotation; then formatting for downstream tools;
+then the analysis modules; then plotting and QC summaries. Formatting can
+legitimately appear twice, because the pre- and post-imputation representations
+are different data.
+
+**Workflow switches.** `--apply-filter`, `--apply-imputation`,
+`--apply-manhattan` and `--heritability` add `sumstat_filter`, `imputation`,
+`manhattan` and `heritability` to the plan without naming them as targets.
+
+**Inspect before running.** With `--help`, the pipeline prints the exact steps
+that will run, only the options that apply to them, and a worked example for the
+selected target:
 
 ```console
 postgwas pipeline --modules finemap magma pops --help
 ```
 
+For that selection the plan is `annot_ldblock`, `formatter`, `ld_clump`,
+`magma`, `pops`, `finemap`.
+
+**Run the plan.** The examples below are the ones the command prints for those
+targets. LD annotation, clumping, formatting and SuSiE fine-mapping:
+
+```console
+postgwas pipeline \
+  --modules finemap \
+  --vcf study_GRCh37.vcf.gz \
+  --genome-build GRCh37 \
+  --ld-region-dir reference/ld_blocks \
+  --ld-block-populations EUR \
+  --ld-folder reference/pairwise_ld \
+  --population EUR \
+  --variant-id-type unique \
+  --finemap-method susie \
+  --finemap-ld-reference reference/1000G_EUR \
+  --plink plink \
+  --bcftools bcftools \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+MAGMA gene analysis followed by PoPS prioritisation:
+
+```console
+postgwas pipeline \
+  --modules pops \
+  --vcf study.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/FUMA/ENSGv102.coding.genes.txt \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 116 \
+  --pops-gene-location-file reference/pops/gene_annots.txt \
+  --control-features-file reference/pops/control.features \
+  --pops-genome-build GRCh37 \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+A `--run-config` can replace any of the analysis options above:
+
+```console
+postgwas pipeline \
+  --modules finemap magma pops \
+  --vcf study_GRCh37.vcf.gz \
+  --dataset-id STUDY \
+  --output-directory results \
+  --run-config analysis_pipeline.yaml
+```
+
+Execution stops at the first failed step. A later step is never reported as
+complete unless execution reached it successfully. See
+[Pipeline Workflow](docs/wiki/core/pipeline-workflow.md).
+
 ## Installation
 
-### Container image (recommended)
+Two installation paths provide the same `postgwas` command but different
+platform and external-tool coverage. Neither path supplies the
+reference files required by the analyses.
 
-The repository `Dockerfile` is the complete software-stack definition and the
-only installation path that assembles every external program.
+### Container image
+
+The repository `Dockerfile` attempts to assemble the broadest Linux x86-64
+software stack, including programs unavailable natively on Apple Silicon.
+Build and smoke-test it from the repository root, and read the `Dockerfile`
+itself for the exact programs and versions it installs.
 
 ```console
 docker build --platform linux/amd64 -t postgwas:local .
 docker run --rm --platform linux/amd64 postgwas:local postgwas --help
 ```
 
-`linux/amd64` is required: several pinned binaries and the GSA-MiXeR container
-are x86-64 only.
-
 Mount input, output and reference-resource directories into the container, and
 use the paths visible **inside** the container in commands and YAML. Review the
-licences of the bundled third-party tools before redistributing an image; the
-MAGMA binary in particular may not be redistributable.
+licences of the bundled third-party tools before redistributing an image.
 
 ### Local installation
 
 ```console
-conda env create -f environment.yml
+bash tools/setup/install_postgwas.sh --editable
 conda activate postgwas
-python -m pip install -e .
 postgwas --help
 ```
 
-Python 3.10 or newer is required. A plain `pip install -e .` installs only the
-CLI, configuration and validation layers; the scientific Python dependencies
-live in the `analysis`, `enrichment` and `single-cell` extras. **No** external
-binary and **no** reference resource is installed by pip — install and configure
-the programs listed below before running a module.
+The installer supports macOS arm64/x86-64 and glibc-based Linux x86-64. It
+creates the environment, installs this checkout, builds the bcftools liftover
+plugin inside the environment, and verifies the software layer. `environment.yml`
+remains the authoritative dependency list. Platform-specific or licensed
+programs and all reference resources still need the preparation described in
+the installation guide.
 
-See [Installation](docs/wiki/getting-started/installation.md) for the supported
-setup paths and their limitations.
+See [Installation](docs/wiki/getting-started/installation.md).
 
 ## External software
 
 PostGWAS calls external programs rather than reimplementing them. Every
-executable is configurable under `resources.executables`, and most commands also
-expose a matching flag such as `--bcftools`, `--plink`, `--magma` or `--gcta`.
+executable below is a key under `resources.executables`, and most commands also
+expose a matching flag. The defaults are the plain command names shown in the
+second column, so any program on `PATH` works without configuration.
 
-| Program | Required by |
-|---|---|
-| bcftools (with the `liftover` plugin), htslib/tabix, bgzip, bash | `harmonisation`, `sumstat_filter`, `formatter`, `annot_ldblock`, `ld_clump`, `qc` |
-| PLINK 1.9 (SuSiE) and PLINK 2 (FINEMAP) | `finemap` |
-| R with `susieR`, `data.table`, `ggplot2` and related packages | `finemap` (SuSiE), `manhattan`, `caldera` |
-| LDstore 2.0, FINEMAP 1.4.2 and `bgenix` | `finemap` (FINEMAP engine) |
-| MAGMA 1.10 or newer | `magma`, `magmacovar`, `single_cell` |
-| GCTA 1.94.1 or newer | `gcta_cojo`, `gcta_gene` |
-| LDSC (`ldsc.py`, `munge_sumstats.py`) | `heritability`, `single_cell` (LDSC cell-type analysis) |
-| scDRS 1.0.3 | `single_cell` (scDRS analysis) |
-| GSA-MiXeR 2.2.1 (native install or container) | `mixer` |
-| PyTorch and the upstream `k-pops.py` script | `kpops` |
-| The upstream CALDERA R repository | `caldera` |
-| Ensembl VEP and CADD, or their web APIs | `flames` |
-| Network access plus BioGRID and DAVID credentials | `pathway_enrichment` |
+| `resources.executables` key | Default | CLI flag | Used by |
+|---|---|---|---|
+| `bcftools` | `bcftools` | `--bcftools` | `harmonisation`, `sumstat_filter`, `formatter`, `annot_ldblock`, `ld_clump`, `qc`, `gcta_gene` |
+| `tabix` | `tabix` | `--tabix` (FLAMES) | `harmonisation`, `annot_ldblock`, `ld_clump`, `flames` |
+| `bash` | `bash` | — | `harmonisation`, `sumstat_filter`, `ld_clump`, `qc` |
+| `python` | `python` | — | `harmonisation` (GWAS-to-VCF adapter), `kpops` |
+| `pigz` | `pigz` | — | `harmonisation` (optional; falls back to gzip) |
+| `plink` | `plink` | `--plink` | `finemap` |
+| `plink2` | `plink2` | — | `finemap` (FINEMAP engine) |
+| `rscript` | `Rscript` | — | `finemap` (SuSiE), `manhattan`, `caldera` |
+| `finemap` | `finemap` | — | `finemap` (FINEMAP engine, together with `ldstore` and `bgenix` on `PATH`) |
+| `magma` | `magma` | `--magma` | `magma`, `magmacovar`, `single_cell` |
+| `gcta` | `gcta64` | `--gcta` | `gcta_cojo`, `gcta_gene` |
+| `ldsc` | `ldsc.py` | `--ldsc` (single-cell only) | `heritability`, `single_cell` |
+| `munge_sumstats` | `munge_sumstats.py` | `--munge-sumstats` (single-cell only) | `heritability`, `single_cell` |
+| `scdrs` | `scdrs` | `--scdrs` | `single_cell` |
+| `mixer`, `mixer_figures` | `/tools/mixer/precimed/mixer*.py` | `--mixer`, `--mixer-figures` | `mixer` |
 
-The container image pins bcftools/htslib 1.23.1 with the `liftover` plugin,
-PLINK 1.9 and 2, MAGMA 1.10, GCTA 1.95.0, LDstore 2.0, FINEMAP 1.4.2, SMR,
-LDSC, Ensembl VEP 113, GSA-MiXeR 2.2.1, K-POPS, CALDERA, and R with SuSiE.
+`resources.containers.mixer` configures the GSA-MiXeR container alternative
+(`ghcr.io/precimed/gsa-mixer:2.2.1`, `linux/amd64`) selected with
+`--mixer-backend`. `kpops` additionally needs the upstream `k-pops.py` script
+(`--kpops-script`), `caldera` needs the upstream CALDERA R repository
+(`--caldera-repository`), `flames` needs Ensembl VEP and CADD either locally
+(`--vep-command`, `--vep-cache`, `--cadd-file`) or through their web APIs, and
+`pathway_enrichment` needs network access with a BioGRID key and a registered
+DAVID email.
+
+The repository `Dockerfile` attempts to install these for Linux x86-64. Treat
+the image as ready only after its build and relevant tool smoke tests pass.
 
 ## Reference data and resource files
 
-Reference data is a scientific input, not an installation detail. PostGWAS does
-not download a universal bundle, and resource compatibility is never inferred
-from a filename.
+> **All reference and resource files must be downloaded.** PostGWAS does not
+> generate them, and none of them ship with the package.
+>
+> **Download link:** _to be added._
+>
+> Until the link is published, create the directory structure below and place the
+> downloaded files in it.
 
-**Harmonisation** resolves its resources from `resources.root` using configurable
-path templates. For each genome build it needs a per-chromosome reference FASTA,
-dbSNP VCF and allele-frequency VCF, an Ensembl GFF3 annotation, a tabular
-allele-frequency reference used for strand and MAF/EAF resolution, chain files
-for liftover, and build-check tables. Indexed resources must carry their `.tbi`,
-`.csi` or `.fai` companions. The packaged build transition is GRCh37 ↔ GRCh38.
+Every path is resolved from a single **resource root**, supplied as
+`--resource-directory` or as `resources.root` in a run configuration.
 
-**Downstream modules** need their own references — PLINK genotype panels,
-LD-block BED files, pairwise LD tables, LDSC LD scores and weights, gene-location
-annotations, gene sets, PoPS or K-POPS feature matrices, FLAMES annotation
-bundles, MiXeR LD resources, single-cell atlases. None of these are bundled.
+### Harmonisation resource folder structure
 
-One bundle has an installer. `postgwas resources` downloads, SHA-256 verifies and
-installs the pinned MAGMA functional-mapping bundle, including the eMAGMA,
-H-MAGMA, nMAGMA and chromMAGMA mapping sets, and writes a matching configuration
-fragment:
+These seven templates are the exact patterns harmonisation expands
+(`modules.harmonisation.resource_layout`). `{build}` is `GRCh37` or `GRCh38`,
+`{chromosome}` is the chromosome label without a `chr` prefix, and `{source}` is
+the configured panel name.
+
+```text
+<resource-root>/
+├── GRCh37/
+│   ├── fasta_files/            GRCh37_chr{chromosome}.fa            (+ .fai)
+│   ├── dbSNP/vcf_files/        GRCh37_dbSNP157_chr{chromosome}.vcf.gz   (+ .tbi/.csi)
+│   ├── external_af/vcf_files/  GRCh37_ALFA_freq_chr{chromosome}.vcf.gz  (+ .tbi/.csi)
+│   ├── default_af/tab_files/   GRCh37_ALFA_freq_chr{chromosome}.tsv.gz
+│   └── gff_files/              GRCh37_ensembl.gff3.gz
+├── GRCh38/
+│   └── (same five subdirectories, with GRCh38 in place of GRCh37)
+├── chain_files/                GRCh37_to_GRCh38.chain
+│                               GRCh38_to_GRCh37.chain
+└── GRCh37_38_check_files/      GRCh37_check_file.tsv
+                                GRCh38_check_file.tsv
+```
+
+The `{source}` token is a configuration value, not a fixed filename. The
+allele-frequency VCF used for annotation and QC accepts `ALFA` or `1000G`
+(`modules.harmonisation.comparison_af.source`, default `ALFA`). The tabular
+frequency table used for strand and MAF/EAF resolution accepts `ALFA`,
+`wgs_ukb`, `panukb`, `1000G` or `fingen`
+(`modules.harmonisation.default_eaf.source`, default `ALFA`). The dbSNP token
+comes from `modules.harmonisation.reference.dbsnp_source` (default `dbSNP157`).
+Change a source and the filenames must change with it.
+
+Files are needed only for the chromosomes present in your study. Missing files,
+missing indexes, wrong chromosome labels and wrong header tags are all reported
+together by the resource preflight before any chromosome worker starts.
+
+### Downstream module resources
+
+Each downstream module takes its reference data through its own options. The
+**Reference data** column of [Modules and execution
+order](#modules-and-execution-order) names them per module; download only what
+the analyses you plan to run require.
+
+One bundle has a built-in installer. `postgwas resources` downloads, SHA-256
+verifies and installs the pinned MAGMA functional-mapping bundle, including the
+eMAGMA, H-MAGMA, nMAGMA and chromMAGMA mapping sets, and writes a matching
+configuration fragment:
 
 ```console
 postgwas resources prepare magma --output-directory /path/to/resources/magma
 ```
 
-Everything else is prepared by the user. Helper scripts are in
-`tools/resource_preparation/`. The expected trees and a preparation checklist
-are on the [Resource Setup](docs/wiki/getting-started/resource-setup.md) and
-[Reference Resources](docs/wiki/reference/reference-resources.md) pages.
+See [Resource Setup](docs/wiki/getting-started/resource-setup.md) and
+[Reference Resources](docs/wiki/reference/reference-resources.md).
 
 ## Input formats
 
@@ -294,8 +423,10 @@ one row per dataset. Unrecognised columns are rejected.
 | Declared or inferred | `trait_type`, `effect_type`, `p_value_type`, `variant_id_column`, `delimiter` | optional; the inferable fields default to `auto` |
 
 Relative `input_file` and external-file paths are resolved from the directory
-containing the sample sheet. The full column reference, accepted values and
-validation rules are in [Input Data](docs/wiki/reference/input-data.md) and the
+containing the sample sheet; absolute paths are also accepted. A filled-in
+example is `tests/data/harmonisation/manifest_v2.csv`. The full column
+reference, accepted values and validation rules are in
+[Input Data](docs/wiki/reference/input-data.md) and the
 [sample-sheet guide](docs/wiki/harmonisation/sample-sheet.md).
 
 ### Stage 2 — harmonised GWAS-VCF
@@ -320,10 +451,10 @@ from the host after merging. A user YAML file may pull in other files with an
 | `config_version` | configuration schema version |
 | `run` | output directory, dataset identifier, `resume`, `overwrite` |
 | `execution` | threads, memory, random seed, retries, temporary directory |
-| `logging` | console and file levels, log filename, progress display |
+| `logging` | console and file levels, terminal display, screen transcript, canonical log filename, progress display |
 | `resources` | resource root, executable locations, container settings, genome builds, populations |
 | `pipeline` | a validated record of the intended module list; module selection itself comes from `--modules` |
-| `modules` | per-module scientific settings and output layout |
+| `modules` | per-module analysis settings and output layout |
 
 Export a starting configuration instead of copying one from an older run:
 
@@ -333,6 +464,12 @@ postgwas config export \
   --style full \
   --output finemap_pipeline.yaml
 
+postgwas config export \
+  --module formatting \
+  --format ldsc \
+  --style minimal \
+  --output formatting.yaml
+
 postgwas config validate --config finemap_pipeline.yaml
 postgwas config show --config finemap_pipeline.yaml --module fine_mapping
 ```
@@ -341,197 +478,74 @@ postgwas config show --config finemap_pipeline.yaml --module fine_mapping
 module in execution order. `--module` accepts configuration module names, which
 are not always identical to command names — for example `filtering`,
 `fine_mapping`, `qc_summary` and `enrichment`. `--style` controls comment
-density only; the resolved values are identical.
+density only; the resolved values are identical. With `--module formatting`,
+`--format` limits the exported file to shared formatter settings and the
+selected target schemas. It does not apply to pipeline or other module exports.
 
 See [Configuration](docs/wiki/core/configuration.md) and
 [Configuration Defaults](docs/wiki/reference/configuration-defaults.md).
 
 ## Quick start
 
-1. **Install** the container image or the local environment, and confirm the
-   external programs your analyses need are on the path.
-2. **Prepare reference data** for your genome build and ancestry.
-3. **Write a sample sheet** from a template in
-   `examples/configs/harmonisation/`.
-4. **Harmonise**, then read the QC and rejection reports before going further:
+The order of work, with the section covering each step:
 
-   ```console
-   postgwas harmonisation \
-     --sample-sheet studies.csv \
-     --run-config harmonisation.yaml \
-     --resource-directory /absolute/path/to/resources \
-     --output-directory results \
-     --validate
-   ```
+| # | Step | See |
+|---|---|---|
+| 1 | Install the container image or the local environment | [Installation](#installation) |
+| 2 | Confirm the external programs your analyses need are on the path | [External software](#external-software) |
+| 3 | Download the reference data into one resource root | [Reference data](#reference-data-and-resource-files) |
+| 4 | Write a sample sheet describing each raw GWAS file | [Input formats](#input-formats) |
+| 5 | Harmonise, then read the QC and rejection reports before going further | [Harmonisation](#harmonisation-required-preparation-for-raw-data) |
+| 6 | Export and complete a configuration for the analyses you want | [Configuration](#configuration) |
+| 7 | Run those analyses from the harmonised GWAS-VCF | [Direct mode](#direct-mode-run-one-module) or [pipeline mode](#pipeline-mode-request-final-analyses) |
+| 8 | Review the complete run record, not only the final table or plot | [QC, logging and provenance](#qc-logging-and-provenance) |
 
-5. **Choose an execution mode** and export a configuration for it:
-
-   ```console
-   postgwas config export \
-     --pipeline finemap magma pops \
-     --style full \
-     --output analysis_pipeline.yaml
-   ```
-
-6. **Fill in the resource paths** in `analysis_pipeline.yaml`, then run the
-   analysis from the harmonised GWAS-VCF:
-
-   ```console
-   postgwas pipeline \
-     --modules finemap magma pops \
-     --vcf results/STUDY/harmonisation/STUDY_GRCh37_merged.vcf.gz \
-     --dataset-id STUDY \
-     --output-directory results/analysis \
-     --run-config analysis_pipeline.yaml
-   ```
-
-7. **Review the run as a scientific record** — resolved configuration, canonical
-   logs, tool versions, QC summaries and completion status, not only the final
-   table or plot.
-
-The [Quick Start](docs/wiki/getting-started/quick-start.md) page expands each
-step.
-
-## Pipeline mode in detail
-
-**What you provide**
-
-- one harmonised GWAS-VCF (`--vcf`), a dataset identifier (`--dataset-id`) and
-  an output directory (`--output-directory`);
-- a run configuration (`--run-config`) containing the scientific settings and
-  reference paths for every selected module;
-- the final analyses you want (`--modules`), plus any optional workflow
-  switches.
-
-**What PostGWAS provides**
-
-- the execution order, including modules you did not name;
-- the intermediate artifacts passed between steps, such as the LD-block
-  annotated VCF, formatter tables, the clumped locus file, MAGMA gene results
-  and PoPS scores.
-
-**Selecting and ordering modules.** `--modules` accepts one or more pipeline
-target names from the table below. Each target's registered dependencies are
-expanded recursively, cycles are rejected, and the resulting steps are emitted
-in a fixed order: filtering, then formatting and imputation (with an automatic
-post-imputation filtering step when both filtering and imputation are active),
-then LD-block annotation, then formatting for downstream tools, then the
-analysis modules, then plotting and QC summaries. Formatting can legitimately
-appear twice, because the pre-imputation and post-imputation representations are
-different data.
-
-**Optional workflow switches.** `--apply-filter`, `--apply-imputation`,
-`--apply-manhattan` and `--heritability` add `sumstat_filter`, `imputation`,
-`manhattan` and `heritability` to the plan without naming them as targets.
-
-**Inspect before running.** With `--help`, the pipeline prints the exact steps
-that will run and only the options that apply to them:
-
-```console
-postgwas pipeline --modules finemap magma pops --help
-```
-
-For the example above the plan is `annot_ldblock`, `formatter`, `ld_clump`,
-`magma`, `pops`, `finemap`.
-
-**Run the plan.**
-
-```console
-postgwas pipeline \
-  --modules finemap magma pops \
-  --vcf STUDY_GRCh37_merged.vcf.gz \
-  --dataset-id STUDY \
-  --output-directory results \
-  --run-config analysis_pipeline.yaml
-```
-
-Execution stops at the first failed step. A later step is never reported as
-complete unless execution reached it successfully. See
-[Pipeline Workflow](docs/wiki/core/pipeline-workflow.md).
-
-## Direct mode in detail
-
-**What you provide:** everything. The module's own input artifact, every
-reference file, and every scientific parameter.
-
-Read the module page and the installed `--help` output together before running a
-module directly — the module page explains the input contract and the
-interpretation, and `postgwas COMMAND --help` is authoritative for option names
-and packaged defaults.
-
-Filter a harmonised GWAS-VCF:
-
-```console
-postgwas sumstat_filter \
-  --vcf STUDY_GRCh37_merged.vcf.gz \
-  --dataset-id STUDY \
-  --output-directory results \
-  --run-config filtering.yaml \
-  --minimum-maf 0.01 \
-  --minimum-info 0.7 \
-  --remove-mhc
-```
-
-Run MAGMA from formatter output:
-
-```console
-postgwas magma \
-  --snp-location-file STUDY_magma_snp_loc.tsv \
-  --p-value-file STUDY_magma_p_values.tsv \
-  --magma-ld-reference /path/to/reference/g1000_eur \
-  --gene-location-file /path/to/reference/NCBI37.3.gene.loc \
-  --dataset-id STUDY \
-  --output-directory results
-```
-
-Placeholders used above: `STUDY` is your `--dataset-id`;
-`STUDY_GRCh37_merged.vcf.gz` is a merged GWAS-VCF written by harmonisation;
-`STUDY_magma_snp_loc.tsv` and `STUDY_magma_p_values.tsv` are written by
-`formatter`; paths beginning `/path/to/reference/` are user-prepared resources.
-
-See [Running Modules Independently](docs/wiki/core/running-modules-independently.md).
+The [Quick Start](docs/wiki/getting-started/quick-start.md) page walks through the
+same sequence with more explanation.
 
 ## Modules and execution order
 
-The table reflects the current public command registry. **Direct** means the
-module has its own `postgwas COMMAND` interface. **Pipeline** gives the target
-name accepted by `postgwas pipeline --modules`, and **Requires** lists the
-pipeline dependencies the planner inserts automatically.
+This is the single reference for what each module does, how it is selected, what
+it depends on, and what reference data you must download for it. Every module has
+its own `postgwas COMMAND` interface. **Pipeline target** is the name accepted by
+`postgwas pipeline --modules`. **Requires** lists the dependencies the planner
+inserts automatically. **Reference data** names the options that take downloaded
+files; the pipeline supplies everything else from earlier steps.
 
-| Command | Purpose | Direct | Pipeline | Requires |
-|---|---|:---:|:---:|---|
-| [`harmonisation`](docs/wiki/harmonisation/overview.md) | Standardise raw summary statistics and create validated GWAS-VCF artifacts. | Yes | No — required before the pipeline | — |
-| [`sumstat_filter`](docs/wiki/modules/filtering.md) | Apply configured GWAS-VCF quality-control filters. | Yes | `sumstat_filter` | — |
-| [`formatter`](docs/wiki/modules/formatting.md) | Create validated inputs for downstream scientific tools. | Yes | `formatter` | — |
-| [`imputation`](docs/wiki/modules/imputation.md) | Impute missing summary statistics. | Yes | `imputation` | `formatter` |
-| [`annot_ldblock`](docs/wiki/modules/ld-annotation.md) | Annotate variants with population-specific LD blocks. | Yes | `annot_ldblock` | — |
-| [`ld_clump`](docs/wiki/modules/ld-clumping.md) | Identify independent significant variants and genomic loci. | Yes | `ld_clump` | `annot_ldblock` |
-| [`manhattan`](docs/wiki/modules/manhattan.md) | Generate Manhattan and QQ plots. | Yes | `manhattan` | — |
-| [`qc`](docs/wiki/modules/qc-summary.md) | Generate a GWAS-VCF QC summary. | Yes | `qc_summary` | — |
-| [`heritability`](docs/wiki/modules/ldsc.md) | Estimate SNP heritability with LDSC. | Yes | `heritability` | `formatter` |
-| [`finemap`](docs/wiki/modules/fine-mapping.md) | Run SuSiE or FINEMAP fine-mapping. | Yes | `finemap` | `ld_clump`, `formatter` |
-| [`magma`](docs/wiki/modules/magma.md) | Run MAGMA gene and gene-set association analysis. | Yes | `magma` | `formatter` |
-| [`gcta_cojo`](docs/modules/gcta_cojo/README.md) | Run GCTA-COJO conditional, joint, or stepwise association analysis. | Yes | `gcta_cojo` | `formatter` |
-| [`gcta_gene`](docs/wiki/modules/gcta-gene.md) | Run GCTA fastBAT or mBAT-combo gene, segment, or set analysis. | Yes | `gcta_gene` | `formatter` |
-| [`magmacovar`](docs/wiki/modules/magmacovar.md) | Run MAGMA gene-property analysis. | Yes | `magmacovar` | `magma` |
-| [`single_cell`](docs/wiki/modules/single-cell.md) | Identify GWAS-associated cell types using single-cell expression data. | Yes | `single_cell` | `magma`, or `formatter` for LDSC cell-type analysis |
-| [`pops`](docs/wiki/modules/pops.md) | Prioritise genes with PoPS. | Yes | `pops` | `magma` |
-| [`kpops`](docs/modules/kpops.md) | Prioritise genes with kernel-based K-POPS. | Yes | `kpops` | `magma` |
-| [`caldera`](docs/modules/caldera.md) | Prioritise causal genes using PoPS and fine-mapped credible sets. | Yes | `caldera` | `pops`, `finemap` |
-| [`flames`](docs/wiki/modules/flames.md) | Integrate fine-mapping, MAGMA, gene-property, and PoPS evidence. | Yes | `flames` | `finemap`, `magmacovar`, `pops` |
-| [`mixer`](docs/wiki/modules/mixer.md) | Run single-trait MiXeR architecture or GSA gene-set analysis. | Yes | `mixer` | `formatter` |
-| [`pathway_enrichment`](docs/wiki/modules/pathway-enrichment.md) | Run pathway and interaction enrichment analyses. | Yes | No — standalone terminal analysis | — |
+| Command | Purpose | Pipeline target | Requires | Reference data |
+|---|---|---|---|---|
+| [`harmonisation`](docs/wiki/harmonisation/overview.md) | Standardise raw summary statistics and create validated GWAS-VCF artifacts. | No — required before the pipeline | — | resource root (`--resource-directory`) |
+| [`sumstat_filter`](docs/wiki/modules/filtering.md) | Apply configured GWAS-VCF quality-control filters. | `sumstat_filter` | — | none |
+| [`formatter`](docs/wiki/modules/formatting.md) | Create validated inputs for downstream analysis tools. | `formatter` | — | none |
+| [`imputation`](docs/wiki/modules/imputation.md) | Impute missing summary statistics. | `imputation` | `formatter` | PRED-LD panel (`--imputation-ld-reference`), resource root (`--resource-directory`) |
+| [`annot_ldblock`](docs/wiki/modules/ld-annotation.md) | Annotate variants with population-specific LD blocks. | `annot_ldblock` | — | LD-block BEDs (`--ld-region-dir`) |
+| [`ld_clump`](docs/wiki/modules/ld-clumping.md) | Identify independent significant variants and genomic loci. | `ld_clump` | `annot_ldblock` | pairwise LD tables (`--ld-folder`) |
+| [`manhattan`](docs/wiki/modules/manhattan.md) | Generate Manhattan and QQ plots. | `manhattan` | — | none |
+| [`qc`](docs/wiki/modules/qc-summary.md) | Generate a GWAS-VCF QC summary. | `qc_summary` | — | none |
+| [`heritability`](docs/wiki/modules/ldsc.md) | Estimate SNP heritability with LDSC. | `heritability` | `formatter` | LD scores and weights (`--ref-ld-chr`, `--w-ld-chr`, `--merge-alleles`) |
+| [`finemap`](docs/wiki/modules/fine-mapping.md) | Run SuSiE or FINEMAP fine-mapping. | `finemap` | `ld_clump`, `formatter` | PLINK genotype reference (`--finemap-ld-reference`) |
+| [`magma`](docs/wiki/modules/magma.md) | Run MAGMA gene and gene-set association analysis. | `magma` | `formatter` | PLINK LD reference (`--magma-ld-reference`), gene locations (`--gene-location-file`), optional gene sets (`--gene-set-file`) |
+| [`gcta_cojo`](docs/modules/gcta_cojo/README.md) | Run GCTA-COJO conditional, joint, or stepwise association analysis. | `gcta_cojo` | `formatter` | PLINK reference (`--cojo-reference-prefix`) |
+| [`gcta_gene`](docs/wiki/modules/gcta-gene.md) | Run GCTA fastBAT or mBAT-combo gene, segment, or set analysis. | `gcta_gene` | `formatter` | PLINK reference (`--gcta-reference-prefix`), gene list (`--gene-list`), optional GMT sets (`--gmt`) |
+| [`magmacovar`](docs/wiki/modules/magmacovar.md) | Run MAGMA gene-property analysis. | `magmacovar` | `magma` | gene-level covariate table (`--covariates`) |
+| [`single_cell`](docs/wiki/modules/single-cell.md) | Identify GWAS-associated cell types using single-cell expression data. | `single_cell` | `magma`, or `formatter` for LDSC cell-type analysis | per tool: expression matrix (`--single-cell-covariates`), H5AD atlas and gene-ID map (`--scdrs-h5ad-file`, `--scdrs-gene-id-map`), or LDSC cell-type files (`--ldsc-celltype-ldcts-file`, `--ldsc-celltype-baseline-prefix`, `--ldsc-celltype-weights-prefix`, `--ldsc-celltype-merge-alleles-file`) |
+| [`pops`](docs/wiki/modules/pops.md) | Prioritise genes with PoPS. | `pops` | `magma` | feature matrix (`--feature-matrix-prefix`, `--feature-matrix-chunks`), gene annotation (`--pops-gene-location-file`), optional control features (`--control-features-file`) |
+| [`kpops`](docs/modules/kpops.md) | Prioritise genes with kernel-based K-POPS. | `kpops` | `magma` | gene annotation (`--kpops-gene-annotation-file`), kernel matrix (`--kernel-matrix-prefix`) |
+| [`caldera`](docs/modules/caldera.md) | Prioritise causal genes using PoPS and fine-mapped credible sets. | `caldera` | `pops`, `finemap` | CALDERA repository with its data and model (`--caldera-repository`) |
+| [`flames`](docs/wiki/modules/flames.md) | Integrate fine-mapping, MAGMA, gene-property, and PoPS evidence. | `flames` | `finemap`, `magmacovar`, `pops` | annotation bundle (`--flames-annotation-directory`), optional local VEP cache and CADD file |
+| [`mixer`](docs/wiki/modules/mixer.md) | Run single-trait MiXeR architecture or GSA gene-set analysis. | `mixer` | `formatter` | BIM and LD patterns (`--bim-file-pattern`, `--ld-file-pattern`), plus GO tables for GSA |
+| [`pathway_enrichment`](docs/wiki/modules/pathway-enrichment.md) | Run pathway and interaction enrichment analyses. | No — standalone terminal analysis | — | none; providers are queried over the network |
 
 One additional step, `post_imputation_filter`, is internal: the planner inserts
 it automatically when filtering and imputation are combined, and it cannot be
 selected on the command line.
 
-Supporting commands are not scientific pipeline targets:
+Supporting commands are not pipeline targets:
 
 | Command | Purpose |
 |---|---|
 | `postgwas config` | Validate, inspect, show, and export resolved configuration. |
-| `postgwas resources` | Install or validate supported pinned scientific resource bundles. |
+| `postgwas resources` | Install or validate supported pinned reference bundles. |
 | `postgwas pipeline` | Plan and execute a multi-module downstream workflow. |
 | `postgwas --validate` | Compare an original summary-statistics dataset with an existing same-build harmonised GWAS-VCF. |
 
@@ -600,16 +614,26 @@ describes the output classes and how to archive a run.
 - **Canonical logs.** Modules log through one formatter with explicit markers
   (`STEP`, `INPUT`, `PARAM`, `DECIDE`, `ACTION`, `RESULT`, `OUTPUT`, `STATUS`),
   so a log can be read as the executed method.
+- **Screen transcript.** Terminal display defaults to on and can be controlled
+  for every module and pipeline with `--show-screen` or
+  `--hide-screen`. Both modes append stdout and stderr to the configured
+  transcript; its packaged path is `run_metadata/screen.log`. Hiding changes
+  only the terminal copy.
 - **Provenance.** Runs write the resolved configuration, the executed command,
   external-tool versions and a run manifest alongside results.
 - **Failure reporting.** A failed step records `STATUS: FAILED` with the external
   command, its output and the corrective guidance. Partially written outputs are
   not evidence of completion; harmonisation additionally reports per-dataset
   statuses such as `PARTIAL`, `FAILED` and `PREFLIGHT_FAILED` in its run summary.
-- **Resume.** Modules that support it write a completion manifest recording the
-  configuration digest and the checksums of every input and output. `--resume`
-  reuses a step only when all of these still match; `--overwrite` always takes
-  precedence and reruns the step. Support is per module, not universal.
+- **Global validated resume.** Every direct command and pipeline
+  stage uses the schema-validated `run.resume_policy`. The default `--resume`
+  reuses only checksum-validated completed boundaries. Real partial results
+  restart from the earliest safe incomplete boundary; changed parameters or
+  tracked inputs print and log a warning, invalidate downstream checkpoints,
+  and rerun automatically. PostGWAS replaces only checksum-matching files it
+  recorded as owned inside the output root; modified or unproven files are
+  preserved and refused. `--overwrite` remains the explicit forced restart and
+  takes precedence.
 
 See [Logging and Reproducibility](docs/wiki/core/logging-and-reproducibility.md).
 
@@ -634,27 +658,46 @@ symptom.
 
 ## Scope and current limitations
 
-- `harmonisation` runs only as a standalone command; it is not a pipeline stage.
-  Start pipelines from a harmonised GWAS-VCF.
-- `pathway_enrichment` is a standalone terminal analysis. It requires network
-  access and user-supplied BioGRID and DAVID credentials, and its providers are
-  not individually selectable.
-- `imputation` currently implements the PRED-LD engine only.
-- `heritability` provides single-trait observed- and liability-scale h² only —
-  no partitioned heritability and no genetic correlation. `mixer` provides
-  single-trait and GSA analyses only; cross-trait MiXeR is not exposed.
-- `caldera` supports GRCh37 only in pipeline mode. In direct mode GRCh38 is
-  accepted when the credible-set file carries a gene or rsID column.
-- `single_cell`, `kpops`, `caldera`, `flames`, `gcta_cojo`, `gcta_gene`,
-  `heritability`, `mixer`, `qc`, `manhattan` and `pathway_enrichment` are
-  terminal: no module consumes their results.
-- `--apply-filter` cannot currently be combined with a target whose plan also
-  defines a genome-build option, including `finemap`, `ld_clump`, `caldera`,
-  `flames`, `mixer`, `gcta_cojo` and `gcta_gene`. Run `sumstat_filter` as a
-  separate step and pass the filtered VCF to the pipeline instead.
-- Genome build, ancestry and reference panels must agree across the study and
-  every resource. PostGWAS validates what it can, but it cannot infer intent.
-- External tools and reference data are not bundled outside the container.
+Each limitation below is stated by the code itself — the module registry's
+reason strings, an option's declared choices, or an explicit guard.
+
+- **`harmonisation` is not a pipeline stage.** The registry records the reason as
+  "full-pipeline adapter is not implemented; use `postgwas harmonisation`". Start
+  pipelines from a harmonised GWAS-VCF.
+- **`pathway_enrichment` is a standalone terminal analysis** — the registry's
+  reason is "enrichment currently runs as a standalone terminal analysis". It
+  requires network access, a BioGRID key and a registered DAVID email, and its
+  providers are not individually selectable.
+- **`imputation` offers one engine.** `--imputation-engine` declares
+  `pred_ld` as its only available option.
+- **`mixer` is single-trait only.** `--analysis` accepts `univariate`, `gsa` or
+  `all`; the command's own description states that no multi-trait analysis is
+  exposed.
+- **`heritability` reports observed- and liability-scale h² only.** There is no
+  partitioned-heritability or genetic-correlation interface.
+- **`caldera` rejects GRCh38 in pipeline mode.** The service raises because the
+  fine-mapping interchange cannot carry the gene or rsID column that GRCh38
+  needs; direct mode accepts GRCh38 when the credible-set file supplies one.
+  Pipeline mode also requires the CALDERA and fine-mapping builds to match.
+- **`single_cell` changes the plan with `--tools`.** `magma_celltype` and
+  `scdrs` depend on `magma`; `ldsc_celltype` depends on `formatter` only.
+- **Terminal modules.** No registered module declares a dependency on
+  `caldera`, `flames`, `gcta_cojo`, `gcta_gene`, `heritability`, `kpops`,
+  `manhattan`, `mixer`, `qc_summary` or `single_cell`, so nothing consumes their
+  results. `sumstat_filter` is also not a declared dependency of anything, but it
+  does hand its filtered VCF to later steps through the shared `--vcf` input.
+- **`--apply-filter` cannot be combined with a target whose plan also defines a
+  genome-build option** — this includes `finemap`, `ld_clump`, `qc_summary`,
+  `caldera`, `flames`, `mixer`, `gcta_cojo` and `gcta_gene`. Run
+  `postgwas sumstat_filter` as a separate step and pass the filtered VCF to the
+  pipeline instead.
+- **Compatibility is declared, not inferred.** Genome build, ancestry and
+  reference panels must agree across the study and every resource. Several
+  modules refuse to guess a build or population and require it explicitly.
+- **Reference data are not bundled.** Reference and resource data must be
+  downloaded. The local environment installs only the portable external
+  programs available for its host platform; the container attempts the broader
+  Linux x86-64 stack.
 
 ## Documentation
 
@@ -672,7 +715,7 @@ Start with the [PostGWAS User Guide](docs/wiki/home.md), or open a topic below.
 [Pipeline Workflow](docs/wiki/core/pipeline-workflow.md) ·
 [Input and Output Contracts](docs/wiki/core/input-output-contracts.md) ·
 [Logging and Reproducibility](docs/wiki/core/logging-and-reproducibility.md) ·
-[Scientific Considerations](docs/wiki/core/scientific-considerations.md) ·
+[Method and Data Considerations](docs/wiki/core/scientific-considerations.md) ·
 [Running Modules Independently](docs/wiki/core/running-modules-independently.md)
 
 **Harmonisation** ·
@@ -710,7 +753,7 @@ Start with the [PostGWAS User Guide](docs/wiki/home.md), or open a topic below.
 [Output Structure](docs/wiki/reference/output-structure.md) ·
 [Command Reference](docs/wiki/reference/command-reference.md) ·
 [Validation Reference](docs/wiki/reference/validation.md) ·
-[Scientific References](docs/wiki/reference/scientific-references.md) ·
+[Method References](docs/wiki/reference/scientific-references.md) ·
 [scDRS Evidence Review](docs/wiki/reference/scdrs-evidence-review.md)
 
 **Help** ·
@@ -720,7 +763,7 @@ Start with the [PostGWAS User Guide](docs/wiki/home.md), or open a topic below.
 
 `gcta_cojo` is documented in [docs/modules/gcta_cojo/README.md](docs/modules/gcta_cojo/README.md).
 Module documentation follows the methods of the underlying tools; see
-[Scientific References](docs/wiki/reference/scientific-references.md) for the
+[Method References](docs/wiki/reference/scientific-references.md) for the
 publications behind MAGMA, GCTA, SuSiE, FINEMAP, LDSC, PoPS, CALDERA, FLAMES,
 MiXeR, scDRS and PRED-LD.
 
@@ -739,7 +782,7 @@ pages, not generated copies. When adding a page, follow the contract in
 [docs/wiki/README.md](docs/wiki/README.md) and start module pages from
 [docs/templates/module-page.md](docs/templates/module-page.md).
 
-Repository development must follow [AGENTS.md](AGENTS.md), including scientific
+Repository development must follow [AGENTS.md](AGENTS.md), including method
 validation, focused regression tests, cumulative-diff review, and protection of
 the bundled harmonisation adapters.
 

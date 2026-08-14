@@ -288,8 +288,6 @@ class HarmonisationOutputLayout(RootModel[dict[str, str]]):
             "sort_temp_directory", "merged_build_vcf", "merged_raw_vcf",
             "merged_not_lifted_vcf", "dataset_reject", "reject_summary",
             "run_manifest", "qc_summary", "gwas2vcf_summary", "dataset_log",
-            "qc_assessment_summary", "qc_filter_rules", "qc_assessment_json",
-            "qc_assessment_temporary",
             "population_frequency_qc", "population_frequency_temporary",
             "screen_report",
             "combined_log", "concordance_log", "concordance_summary",
@@ -351,42 +349,15 @@ class Gwas2VcfInputConfig(StrictModel):
         return self
 
 
-class HarmonisationQCVcfFields(StrictModel):
-    chromosome: str
-    position: str
-    reference_allele: str
-    alternate_allele: str
-    study_info_af: str
-    external_info_af: str
-    study_format_af: str
-    imputation_format: str
-    log_pvalue_format: str
-    effective_sample_size_format: str
-
-    @field_validator("*")
-    @classmethod
-    def nonempty_query_field(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("VCF query fields must not be empty")
-        return value
-
-    @model_validator(mode="after")
-    def external_field_is_parameterised(self):
-        if "{external_af}" not in self.external_info_af:
-            raise ValueError("external_info_af must contain {external_af}")
-        return self
-
-
 class HarmonisationVcfConfig(StrictModel):
     """Tool-facing VCF fields and build transitions used by bcftools."""
 
     external_frequency_columns: list[str]
     missing_id_format: str
+    genome_build_header: str
     target_builds: dict[str, str]
     required_merge_groups: list[str]
     liftover_plugin: str
-    qc_fields: HarmonisationQCVcfFields
     concordance_fields: dict[str, str]
     table_delimiter: str
     table_null_values: list[str]
@@ -465,6 +436,28 @@ class HarmonisationVcfConfig(StrictModel):
             )
         return value
 
+    @field_validator("genome_build_header")
+    @classmethod
+    def valid_genome_build_header(cls, value: str) -> str:
+        value = value.strip()
+        if (
+            "\n" in value
+            or "\r" in value
+            or not value.startswith("##genome_build=")
+            or value.count("{build}") != 1
+        ):
+            raise ValueError(
+                "must be one VCF metadata line starting with "
+                "##genome_build= and containing {build} exactly once"
+            )
+        try:
+            value.format(build="GRCh37")
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                "must contain no format field other than {build}"
+            ) from exc
+        return value
+
     @model_validator(mode="after")
     def complete_build_map(self):
         if len(self.target_builds) < 2:
@@ -529,7 +522,6 @@ class PopulationFrequencyQCConfig(StrictModel):
 
 
 class HarmonisationRuntimeConfig(StrictModel):
-    display_screen: bool
     metadata_directory: str
     top_metadata_directory: str
     resolved_config_file: str

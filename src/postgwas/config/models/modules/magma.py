@@ -148,11 +148,12 @@ class MagmaInputConfig(StrictModel):
     @field_validator("gene_location_columns")
     @classmethod
     def complete_gene_location_roles(cls, values: list[str]) -> list[str]:
-        required = {"gene_id", "chromosome", "start", "end"}
-        if len(values) != 4 or set(values) != required:
+        required = ["gene_id", "chromosome", "start", "end", "strand"]
+        allowed = required + ["alternate_gene_id"]
+        if values not in (required, allowed):
             raise ValueError(
-                "must map the four MAGMA gene-location roles: %s"
-                % ", ".join(sorted(required))
+                "must map, in order, gene_id, chromosome, start, end, strand, "
+                "with optional alternate_gene_id as column six"
             )
         return values
 
@@ -559,6 +560,7 @@ class MagmaResultSchema(StrictModel):
     family_correction_column_pattern: str
     report_dataset_column: str
     report_gene_set_description_column: str
+    report_source_input_genes_column: str
     report_input_genes_column: str
     report_common_genes_column: str
     report_common_gene_p_values_column: str
@@ -588,6 +590,7 @@ class MagmaResultSchema(StrictModel):
         "gene_set_name_column", "gene_set_p_value_column",
         "gene_set_full_name_column", "gene_id_column", "gene_p_value_column",
         "report_dataset_column", "report_gene_set_description_column",
+        "report_source_input_genes_column",
         "report_input_genes_column", "report_common_genes_column",
         "report_common_gene_p_values_column", "report_total_genes_column",
         "report_common_gene_count_column", "report_null_value",
@@ -634,19 +637,20 @@ class MagmaResultSchema(StrictModel):
 class MagmaOutputLayout(StrictModel):
     log_file: str
     resolved_config_file: str
+    completion_manifest: str
     staging_directory: str
     harmonised_p_values: str
     harmonised_snp_locations: str
     annotation_prefix: str
     component_annotation_prefix: str
     gene_result_prefix: str
+    gene_batch_prefix: str
     gene_set_prefix: str
     corrected_genes: str
     corrected_gene_sets: str
     annotated_gene_sets: str
     prepared_gene_sets: str
     chrom_magma_genes: str
-    mapping_directory: str
     mapping_comparison: str
 
     @field_validator("*")
@@ -656,17 +660,25 @@ class MagmaOutputLayout(StrictModel):
 
     @model_validator(mode="after")
     def required_dataset_tokens(self):
+        mapping_fields = {
+            "annotation_prefix",
+            "component_annotation_prefix",
+            "gene_result_prefix",
+            "gene_batch_prefix",
+            "gene_set_prefix",
+            "corrected_genes",
+            "corrected_gene_sets",
+            "annotated_gene_sets",
+            "prepared_gene_sets",
+            "chrom_magma_genes",
+        }
         for field, value in self.model_dump().items():
             if field == "resolved_config_file":
                 continue
-            if field == "mapping_directory":
-                if "{analysis}" not in value:
-                    raise ValueError(
-                        "mapping_directory must contain '{analysis}'"
-                    )
-                continue
             if "{dataset_id}" not in value:
                 raise ValueError("%s must contain '{dataset_id}'" % field)
+            if field in mapping_fields and "{analysis}" not in value:
+                raise ValueError("%s must contain '{analysis}'" % field)
         return self
 
 

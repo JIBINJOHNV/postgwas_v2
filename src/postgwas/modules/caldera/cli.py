@@ -10,7 +10,12 @@ from postgwas.cli.common import get_common_out_parser
 from postgwas.cli.compute import get_compute_parser
 from postgwas.config import load_configuration
 from postgwas.core.errors import ConfigurationError
-from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples, help_with_default
+from postgwas.core.ui import (
+    AlignedRichHelpFormatter,
+    format_cli_examples,
+    help_with_default,
+    mark_cli_required_help,
+)
 from postgwas.modules.caldera.errors import CalderaError
 
 
@@ -49,26 +54,39 @@ def get_caldera_parser(add_help=False, *, direct_controls=False):
     module = defaults.modules.caldera
     parser = argparse.ArgumentParser(add_help=add_help)
     inputs = parser.add_argument_group("CALDERA inputs")
-    inputs.add_argument("--pops-file", metavar="PATH", default=argparse.SUPPRESS)
-    inputs.add_argument("--credible-set-file", metavar="PATH", default=argparse.SUPPRESS)
-    inputs.add_argument("--caldera-repository", metavar="PATH", default=argparse.SUPPRESS)
-    inputs.add_argument("--caldera-adapter-script", metavar="PATH", default=argparse.SUPPRESS)
+    inputs.add_argument(
+        "--pops-file", metavar="PATH", default=argparse.SUPPRESS,
+        help="PoPS .preds file containing the gene-prioritisation scores.",
+    )
+    inputs.add_argument(
+        "--credible-set-file", metavar="PATH", default=argparse.SUPPRESS,
+        help="Annotated credible-set table consumed by direct CALDERA analysis.",
+    )
+    inputs.add_argument(
+        "--caldera-repository", metavar="PATH", default=argparse.SUPPRESS,
+        help=(
+            "Optional CALDERA repository override. When omitted, PostGWAS uses "
+            "the installed repository location configured in YAML."
+        ),
+    )
+    inputs.add_argument(
+        "--caldera-adapter-script", metavar="PATH", default=argparse.SUPPRESS,
+        help=(
+            "Optional PostGWAS CALDERA R adapter override. When omitted, the "
+            "packaged adapter is used."
+        ),
+    )
     inputs.add_argument(
         "--caldera-genome-build", choices=list(defaults.resources.genomes),
         metavar="BUILD", default=argparse.SUPPRESS,
         help=help_with_default(
             "Genome build of credible-set coordinates and CALDERA gene locations",
-            module.genome_build.value, label="Configured default",
+            module.genome_build.value,
         ),
     )
     if direct_controls:
         controls = parser.add_argument_group("Configuration")
         controls.add_argument("--run-config", metavar="PATH", default=argparse.SUPPRESS)
-        controls.add_argument(
-            "--resume", action=argparse.BooleanOptionalAction,
-            default=argparse.SUPPRESS,
-        )
-        controls.add_argument("--overwrite", action="store_true", default=argparse.SUPPRESS)
     return parser
 
 
@@ -88,10 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "--dataset-id STUDY", "--output-directory results",
                 ),
             ),
-            *get_caldera_pipeline_examples(),
             notes=(
                 "Direct credible-set tables require locus, chr, bp, and pip columns with at least 0.95 cumulative PIP per locus.",
-                "Pipeline mode supplies PoPS predictions and credible sets internally and currently supports GRCh37 only.",
             ),
         ),
         parents=[
@@ -103,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         if action.dest in {"dataset_id", "output_directory", "threads", "memory_gb", "seed"}:
             action.default = argparse.SUPPRESS
             action.type = None
+    mark_cli_required_help(parser, ("pops_file", "credible_set_file"))
     return parser
 
 

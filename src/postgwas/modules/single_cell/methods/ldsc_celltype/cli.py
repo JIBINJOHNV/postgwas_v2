@@ -16,8 +16,7 @@ def add_ldsc_celltype_arguments(parser: argparse.ArgumentParser, defaults) -> No
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=(
-            "Pre-munged LDSC .sumstats.gz in direct mode. Pipeline mode binds "
-            "the formatter's LDSC table and mungs it before regression."
+            "Pre-munged LDSC .sumstats.gz consumed by direct cell-type analysis."
         ),
     )
     inputs.add_argument(
@@ -55,7 +54,6 @@ def add_ldsc_celltype_arguments(parser: argparse.ArgumentParser, defaults) -> No
         help=help_with_default(
             "LDSC executable path or command name",
             defaults.resources.executables.ldsc,
-            label="Configured default",
         ),
     )
     inputs.add_argument(
@@ -65,7 +63,6 @@ def add_ldsc_celltype_arguments(parser: argparse.ArgumentParser, defaults) -> No
         help=help_with_default(
             "LDSC munge_sumstats executable path or command name",
             defaults.resources.executables.munge_sumstats,
-            label="Configured default",
         ),
     )
     settings = parser.add_argument_group("LDSC cell-type settings")
@@ -76,7 +73,6 @@ def add_ldsc_celltype_arguments(parser: argparse.ArgumentParser, defaults) -> No
         help=help_with_default(
             "Whether the supplied statistics are already munged or formatter output",
             method.input.source,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -86,7 +82,6 @@ def add_ldsc_celltype_arguments(parser: argparse.ArgumentParser, defaults) -> No
         help=help_with_default(
             "Declared genome build shared by GWAS and LD-score resources",
             method.genome_build.value,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -96,7 +91,6 @@ def add_ldsc_celltype_arguments(parser: argparse.ArgumentParser, defaults) -> No
         help=help_with_default(
             "Declared ancestry of the LD-score resources",
             method.population.value,
-            label="Configured default",
         ),
     )
 

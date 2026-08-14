@@ -6,6 +6,7 @@ engines:
     minimum_r2: 0.8
     minimum_maf: 0.001
     mode: TOP_LD
+    correlation_method: pearson
   raiss:
     minimum_r2: 0.8
   ssimp:

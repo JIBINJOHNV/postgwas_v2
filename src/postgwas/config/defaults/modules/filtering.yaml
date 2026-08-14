@@ -3,10 +3,6 @@ inputs:
   vcf: null
   dataset_id: null
 output_directory: null
-genome_build: GRCh37
-genome_build_header_tokens:
-  GRCh37: [GRCh37]
-  GRCh38: [GRCh38]
 maf_min: 0.01
 missing_af_action: remove
 info_min: 0.7
@@ -21,11 +17,15 @@ remove_palindromic: true
 palindromic_lower: 0.4
 palindromic_upper: 0.6
 remove_mhc: true
-mhc:
-  genome_build: GRCh37
-  chromosome: "6"
-  start: 25000000
-  end: 34000000
+mhc_regions:
+  GRCh37:
+    chromosome: "6"
+    start: 28477797
+    end: 33448354
+  GRCh38:
+    chromosome: "6"
+    start: 28510120
+    end: 33480577
 empty_expression_action: match_all
 sort_output: false
 report_missing_counts: true
@@ -43,5 +43,6 @@ vcf_fields:
 output_layout:
   filtered_vcf: "{dataset_id}_{genome_build}_filtered.vcf.gz"
   log_file: "logs/{dataset_id}_{genome_build}_filter_gwas_vcf_bcftools.log"
+  preflight_log: "logs/{dataset_id}_filter_preflight.log"
   reason_summary: "qc_summary/{dataset_id}_{genome_build}_filter_reason_summary.tsv"
   mhc_exclusion_bed: "{dataset_id}_{genome_build}_mhc_exclude.bed"

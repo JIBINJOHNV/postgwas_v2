@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from postgwas.core.gcta import require_supported_gcta as _require_supported_gcta
 from postgwas.core.processes import run_checked_command
@@ -85,6 +85,7 @@ def run_gcta_command(
     logger,
     *,
     dry_run: bool,
+    progress_callback: Callable[[], None] | None = None,
 ) -> None:
     run_checked_command(
         command,
@@ -94,6 +95,11 @@ def run_gcta_command(
         timeout_seconds=configuration.execution.timeout_seconds,
         expected_outputs=[expected_result],
         dry_run=dry_run,
+        progress_callback=progress_callback,
+        progress_refresh_seconds=(
+            configuration.logging.progress_refresh_seconds
+            if progress_callback is not None else None
+        ),
     )
 
 

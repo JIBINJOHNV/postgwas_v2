@@ -4,10 +4,15 @@ import unittest
 import subprocess
 import sys
 from argparse import Namespace
+from tempfile import TemporaryDirectory
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from rich.console import Console
+
+from postgwas.config import load_configuration
 from postgwas.core.contracts import Artifact, ModuleResult, RunContext
 from postgwas.core.errors import ModuleExecutionError, PipelinePlanningError
 from postgwas.pipeline.executor import execute_pipeline
@@ -69,6 +74,41 @@ class RegistryTests(unittest.TestCase):
                 spec.cli_entrypoint.startswith("postgwas.modules."),
                 (command, spec.cli_entrypoint),
             )
+
+    def test_only_pipeline_executor_owns_its_top_level_progress(self):
+        owners = {
+            command
+            for command, spec in REGISTRY.commands().items()
+            if spec.owns_top_level_progress
+        }
+        self.assertEqual(owners, {"pipeline"})
+
+    def test_kpops_owns_its_detailed_direct_progress(self):
+        direct_progress_owners = {
+            command
+            for command, spec in REGISTRY.commands().items()
+            if spec.owns_direct_progress
+        }
+        self.assertEqual(direct_progress_owners, {"kpops"})
+
+    def test_every_scientific_direct_command_has_a_checkpoint_strategy(self):
+        strategies = {
+            command: spec.direct_checkpoint
+            for command, spec in REGISTRY.commands().items()
+        }
+        self.assertEqual(
+            {
+                command for command, strategy in strategies.items()
+                if strategy == "not_applicable"
+            },
+            {"config", "pipeline", "resources"},
+        )
+        self.assertTrue(all(
+            strategy in {"orchestrated", "native", "not_applicable"}
+            for strategy in strategies.values()
+        ))
+        self.assertEqual(strategies["formatter"], "orchestrated")
+        self.assertEqual(strategies["magma"], "native")
 
     def test_unknown_module_fails_during_planning(self):
         with self.assertRaisesRegex(PipelinePlanningError, "Unknown module 'unknown'"):
@@ -199,26 +239,54 @@ class PlannerTests(unittest.TestCase):
 
 
 class ExecutorTests(unittest.TestCase):
+    @staticmethod
+    def _configuration(output_directory):
+        return load_configuration(cli_overrides={
+            "run.output_directory": str(output_directory),
+        })
+
     def test_executor_uses_the_supplied_plan_without_replanning(self):
         calls = []
 
         def runner(args, context):
             calls.append(args._step_num)
-            context["formatter"] = {"ok": True}
+            stage = Path(args.output_directory) / "01_formatter"
+            stage.mkdir(parents=True, exist_ok=True)
+            output = stage / "result.tsv"
+            output.write_text("ok\n", encoding="utf-8")
+            context["formatter"] = {"ok": True, "output": str(output)}
+            return context["formatter"]
 
         fake_registry = Mock()
         fake_registry.require_pipeline_enabled.return_value = SimpleNamespace(
-            runner="tests.test_architecture:unused"
+            runner="tests.test_architecture:unused",
+            description="Convert GWAS-VCF inputs",
+            pipeline_output_name=None,
         )
         plan = PipelinePlan(("formatter",), ("formatter",), ("formatter",))
+        stream = StringIO()
+        progress_console = Console(
+            file=stream,
+            force_terminal=True,
+            color_system=None,
+            width=120,
+        )
 
-        with patch("postgwas.pipeline.executor.REGISTRY", fake_registry), patch(
+        with TemporaryDirectory() as directory, patch(
+            "postgwas.pipeline.executor.REGISTRY", fake_registry
+        ), patch(
             "postgwas.pipeline.executor.resolve_reference", return_value=runner
-        ):
-            context = execute_pipeline(Namespace(), plan)
+        ), patch("postgwas.pipeline.executor.console", progress_console):
+            args = Namespace(
+                output_directory=directory, resume=True, overwrite=False,
+            )
+            context = execute_pipeline(
+                args, plan, self._configuration(directory),
+            )
 
         self.assertEqual(calls, ["01"])
         self.assertTrue(context["formatter"]["ok"])
+        self.assertIn("Completed 1/1 · Convert GWAS-VCF inputs", stream.getvalue())
 
     def test_executor_wraps_module_failures_with_module_name(self):
         def runner(args, context):
@@ -226,15 +294,283 @@ class ExecutorTests(unittest.TestCase):
 
         fake_registry = Mock()
         fake_registry.require_pipeline_enabled.return_value = SimpleNamespace(
-            runner="tests.test_architecture:unused"
+            runner="tests.test_architecture:unused",
+            description="Convert GWAS-VCF inputs",
+            pipeline_output_name=None,
         )
         plan = PipelinePlan(("formatter",), ("formatter",), ("formatter",))
+        stream = StringIO()
+        progress_console = Console(
+            file=stream,
+            force_terminal=True,
+            color_system=None,
+            width=120,
+        )
 
-        with patch("postgwas.pipeline.executor.REGISTRY", fake_registry), patch(
+        with TemporaryDirectory() as directory, patch(
+            "postgwas.pipeline.executor.REGISTRY", fake_registry
+        ), patch(
+            "postgwas.pipeline.executor.resolve_reference", return_value=runner
+        ), patch("postgwas.pipeline.executor.console", progress_console):
+            args = Namespace(
+                output_directory=directory, resume=True, overwrite=False,
+            )
+            with self.assertRaisesRegex(ModuleExecutionError, "formatter: bad input"):
+                execute_pipeline(
+                    args, plan, self._configuration(directory),
+                )
+        self.assertIn("Failed 1/1 · Convert GWAS-VCF inputs", stream.getvalue())
+        self.assertNotIn("All 1 stages completed", stream.getvalue())
+
+    def test_executor_resumes_completed_stage_without_rerunning(self):
+        calls = []
+
+        def runner(args, context):
+            calls.append(args._step_num)
+            stage = Path(args.output_directory) / "01_formatter"
+            stage.mkdir(parents=True, exist_ok=True)
+            output = stage / "result.tsv"
+            output.write_text("validated\n", encoding="utf-8")
+            context["formatter"] = {"output": str(output), "rows": 1}
+            return context["formatter"]
+
+        fake_registry = Mock()
+        fake_registry.require_pipeline_enabled.return_value = SimpleNamespace(
+            runner="tests.test_architecture:unused",
+            description="Convert GWAS-VCF inputs",
+            pipeline_output_name=None,
+        )
+        plan = PipelinePlan(("formatter",), ("formatter",), ("formatter",))
+        with TemporaryDirectory() as directory, patch(
+            "postgwas.pipeline.executor.REGISTRY", fake_registry
+        ), patch(
             "postgwas.pipeline.executor.resolve_reference", return_value=runner
         ):
-            with self.assertRaisesRegex(ModuleExecutionError, "formatter: bad input"):
-                execute_pipeline(Namespace(), plan)
+            configuration = self._configuration(directory)
+            first = execute_pipeline(
+                Namespace(
+                    output_directory=directory, resume=True, overwrite=False,
+                ),
+                plan,
+                configuration,
+            )
+            second = execute_pipeline(
+                Namespace(
+                    output_directory=directory, resume=True, overwrite=False,
+                ),
+                plan,
+                configuration,
+            )
+
+        self.assertEqual(calls, ["01"])
+        self.assertEqual(first.snapshot(), second.snapshot())
+
+    def test_executor_changed_parameter_warns_and_restarts_stage(self):
+        calls = []
+
+        def runner(args, context):
+            calls.append(args.threshold)
+            stage = Path(args.output_directory) / "01_formatter"
+            stage.mkdir(parents=True, exist_ok=True)
+            output = stage / "result.tsv"
+            output.write_text("threshold=%s\n" % args.threshold, encoding="utf-8")
+            context["formatter"] = {"output": str(output)}
+            return context["formatter"]
+
+        fake_registry = Mock()
+        fake_registry.require_pipeline_enabled.return_value = SimpleNamespace(
+            runner="tests.test_architecture:unused",
+            description="Convert GWAS-VCF inputs",
+            pipeline_output_name=None,
+        )
+        plan = PipelinePlan(("formatter",), ("formatter",), ("formatter",))
+        with TemporaryDirectory() as directory, patch(
+            "postgwas.pipeline.executor.REGISTRY", fake_registry
+        ), patch(
+            "postgwas.pipeline.executor.resolve_reference", return_value=runner
+        ):
+            configuration = self._configuration(directory)
+            for threshold in (0.05, 0.01):
+                execute_pipeline(
+                    Namespace(
+                        output_directory=directory,
+                        resume=True,
+                        overwrite=False,
+                        threshold=threshold,
+                    ),
+                    plan,
+                    configuration,
+                )
+            audit = Path(directory) / (
+                "run_metadata/checkpoints/checkpoint_events.log"
+            )
+            audit_text = audit.read_text(encoding="utf-8")
+            result_text = (
+                Path(directory) / "01_formatter" / "result.tsv"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(calls, [0.05, 0.01])
+        self.assertIn("changed_parameters", audit_text)
+        self.assertEqual(result_text, "threshold=0.01\n")
+
+    def test_executor_restarts_verified_partial_stage_after_warning(self):
+        attempts = []
+
+        def runner(args, context):
+            attempts.append(len(attempts) + 1)
+            stage = Path(args.output_directory) / "01_formatter"
+            stage.mkdir(parents=True, exist_ok=True)
+            output = stage / "result.tsv"
+            output.write_text("attempt=%d\n" % attempts[-1], encoding="utf-8")
+            if len(attempts) == 1:
+                raise ValueError("simulated interruption")
+            context["formatter"] = {"output": str(output)}
+            return context["formatter"]
+
+        fake_registry = Mock()
+        fake_registry.require_pipeline_enabled.return_value = SimpleNamespace(
+            runner="tests.test_architecture:unused",
+            description="Convert GWAS-VCF inputs",
+            pipeline_output_name=None,
+        )
+        plan = PipelinePlan(("formatter",), ("formatter",), ("formatter",))
+        with TemporaryDirectory() as directory, patch(
+            "postgwas.pipeline.executor.REGISTRY", fake_registry
+        ), patch(
+            "postgwas.pipeline.executor.resolve_reference", return_value=runner
+        ):
+            configuration = self._configuration(directory)
+            arguments = Namespace(
+                output_directory=directory, resume=True, overwrite=False,
+            )
+            with self.assertRaisesRegex(
+                ModuleExecutionError, "simulated interruption",
+            ):
+                execute_pipeline(arguments, plan, configuration)
+            execute_pipeline(
+                Namespace(
+                    output_directory=directory, resume=True, overwrite=False,
+                ),
+                plan,
+                configuration,
+            )
+            audit_text = (
+                Path(directory)
+                / "run_metadata/checkpoints/checkpoint_events.log"
+            ).read_text(encoding="utf-8")
+            result_text = (
+                Path(directory) / "01_formatter" / "result.tsv"
+            ).read_text(encoding="utf-8")
+
+        self.assertEqual(attempts, [1, 2])
+        self.assertIn("partial_results", audit_text)
+        self.assertEqual(result_text, "attempt=2\n")
+
+    def test_overwrite_control_does_not_invalidate_the_following_resume(self):
+        calls = []
+
+        def runner(args, context):
+            calls.append(args._step_num)
+            stage = Path(args.output_directory) / (
+                "%s_formatter" % args._step_num
+            )
+            stage.mkdir(parents=True, exist_ok=True)
+            output = stage / "result.tsv"
+            output.write_text("validated\n", encoding="utf-8")
+            context["formatter"] = {"output": str(output)}
+            return context["formatter"]
+
+        fake_registry = Mock()
+        fake_registry.require_pipeline_enabled.return_value = SimpleNamespace(
+            runner="tests.test_architecture:unused",
+            description="Convert GWAS-VCF inputs",
+            pipeline_output_name=None,
+        )
+        plan = PipelinePlan(
+            ("formatter",),
+            ("formatter",),
+            ("formatter", "formatter"),
+        )
+        with TemporaryDirectory() as directory, patch(
+            "postgwas.pipeline.executor.REGISTRY", fake_registry
+        ), patch(
+            "postgwas.pipeline.executor.resolve_reference", return_value=runner
+        ):
+            overwrite_configuration = load_configuration(cli_overrides={
+                "run.output_directory": directory,
+                "run.overwrite": True,
+            })
+            execute_pipeline(
+                Namespace(
+                    output_directory=directory,
+                    resume=True,
+                    overwrite=True,
+                ),
+                plan,
+                overwrite_configuration,
+            )
+            execute_pipeline(
+                Namespace(
+                    output_directory=directory,
+                    resume=True,
+                    overwrite=False,
+                ),
+                plan,
+                self._configuration(directory),
+            )
+
+        self.assertEqual(calls, ["01", "02"])
+
+    def test_executor_refuses_modified_checkpoint_output(self):
+        calls = []
+
+        def runner(args, context):
+            calls.append(1)
+            stage = Path(args.output_directory) / "01_formatter"
+            stage.mkdir(parents=True, exist_ok=True)
+            output = stage / "result.tsv"
+            output.write_text("validated\n", encoding="utf-8")
+            context["formatter"] = {"output": str(output)}
+            return context["formatter"]
+
+        fake_registry = Mock()
+        fake_registry.require_pipeline_enabled.return_value = SimpleNamespace(
+            runner="tests.test_architecture:unused",
+            description="Convert GWAS-VCF inputs",
+            pipeline_output_name=None,
+        )
+        plan = PipelinePlan(("formatter",), ("formatter",), ("formatter",))
+        with TemporaryDirectory() as directory, patch(
+            "postgwas.pipeline.executor.REGISTRY", fake_registry
+        ), patch(
+            "postgwas.pipeline.executor.resolve_reference", return_value=runner
+        ):
+            configuration = self._configuration(directory)
+            execute_pipeline(
+                Namespace(
+                    output_directory=directory, resume=True, overwrite=False,
+                ),
+                plan,
+                configuration,
+            )
+            output = Path(directory) / "01_formatter" / "result.tsv"
+            output.write_text("user-modified\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ModuleExecutionError, "modified after validation",
+            ):
+                execute_pipeline(
+                    Namespace(
+                        output_directory=directory,
+                        resume=True,
+                        overwrite=False,
+                    ),
+                    plan,
+                    configuration,
+                )
+            preserved = output.read_text(encoding="utf-8")
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(preserved, "user-modified\n")
 
 
 if __name__ == "__main__":

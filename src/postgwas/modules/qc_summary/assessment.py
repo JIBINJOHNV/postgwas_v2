@@ -15,6 +15,7 @@ from typing import Any
 
 import polars as pl
 
+from postgwas.config.models.modules.qc_summary import QCSummaryConfig
 from postgwas.core.vcf import VCF_TAG, extract_vcf_table
 from postgwas.core.paths import configured_output_path
 
@@ -45,7 +46,7 @@ def extract_vcf_assessment_table(
     if not VCF_TAG.fullmatch(str(external_af_name)):
         raise VcfAssessmentError(
             "The comparison allele-frequency column must be a valid VCF INFO tag "
-            "(letters, numbers, dot, underscore, or hyphen): %r" % external_af_name
+            "beginning with a letter: %r" % external_af_name
         )
     vcf = Path(vcf_path).expanduser().resolve()
     table = Path(table_path)
@@ -180,11 +181,12 @@ def _variant_masks() -> dict[str, pl.Expr]:
 
 
 def build_qc_rules(
-    policies,
+    configuration: QCSummaryConfig,
+    genome_build: str,
     external_af_name: str,
     field_labels: dict[str, str],
 ) -> list[dict[str, Any]]:
-    """Build independent raw-VCF QC rules from resolved policy values."""
+    """Build independent rules from the resolved QC configuration."""
     if not VCF_TAG.fullmatch(str(external_af_name)):
         raise VcfAssessmentError(
             "Invalid comparison allele-frequency INFO tag: %r" % external_af_name
@@ -202,9 +204,10 @@ def build_qc_rules(
     study_info_af_label = field_labels["study_info_af"]
     external_info_af_label = field_labels["external_info_af"]
 
-    lp_cutoff = policies.get("filter.lp_cutoff")
+    rules_config = configuration.rules
+    lp_cutoff = rules_config.minimum_neglog10_p
     if lp_cutoff is not None:
-        lp_missing = policies.get("filter.lp_missing")
+        lp_missing = rules_config.missing_pvalue_action
         missing_lp = _missing("FORMAT_LP")
         below = _present("FORMAT_LP") & (lp < float(lp_cutoff))
         rules.append({
@@ -220,8 +223,8 @@ def build_qc_rules(
             ],
         })
 
-    maf = float(policies.get("filter.maf_cutoff"))
-    af_missing_action = policies.get("filter.af_missing")
+    maf = float(rules_config.maf_min)
+    af_missing_action = rules_config.missing_af_action
     missing_format_af = _missing("FORMAT_AF")
     outside_maf = _present("FORMAT_AF") & ((af < maf) | (af > 1.0 - maf))
     rules.append({
@@ -240,14 +243,9 @@ def build_qc_rules(
         ],
     })
 
-    info_min = float(policies.get("filter.info_cutoff"))
-    info_max = float(policies.get("filter.info_max"))
-    if info_min > info_max:
-        raise VcfAssessmentError(
-            "Invalid imputation-quality interval: filter.info_cutoff (%s) is "
-            "greater than filter.info_max (%s)." % (info_min, info_max)
-        )
-    info_missing_action = policies.get("filter.info_missing")
+    info_min = float(rules_config.info_min)
+    info_max = float(rules_config.info_max)
+    info_missing_action = rules_config.missing_info_action
     missing_info = _missing("FORMAT_SI")
     outside_info = _present("FORMAT_SI") & (
         (info < info_min) | (info > info_max)
@@ -268,7 +266,7 @@ def build_qc_rules(
         ],
     })
 
-    difference_cutoff = float(policies.get("filter.af_diff_cutoff"))
+    difference_cutoff = float(rules_config.maximum_af_difference)
     missing_study_info_af = _missing("INFO_AF")
     missing_external_af = _missing("INFO_EXTERNAL_AF")
     discordant = (
@@ -299,7 +297,7 @@ def build_qc_rules(
         ],
     })
 
-    if not bool(policies.get("filter.include_indels")):
+    if not rules_config.include_indels:
         non_snp = ~masks["snp"]
         rules.append({
             "key": "variant_type",
@@ -312,9 +310,9 @@ def build_qc_rules(
             ],
         })
 
-    if bool(policies.get("filter.exclude_palindromic")):
-        lower = float(policies.get("filter.palindromic_af_lower"))
-        upper = float(policies.get("filter.palindromic_af_upper"))
+    if rules_config.remove_palindromic:
+        lower = float(rules_config.palindromic_lower)
+        upper = float(rules_config.palindromic_upper)
         ambiguous = (
             masks["palindromic"]
             & _present("FORMAT_AF")
@@ -333,13 +331,14 @@ def build_qc_rules(
             ],
         })
 
-    if bool(policies.get("filter.remove_mhc")):
-        configured_chromosome = str(policies.get("filter.mhc_chrom"))
+    if rules_config.remove_mhc:
+        mhc_region = configuration.mhc_region(genome_build)
+        configured_chromosome = str(mhc_region.chromosome)
         chromosome = configured_chromosome.lower()
         if chromosome.startswith("chr"):
             chromosome = chromosome[3:]
-        start = int(policies.get("filter.mhc_start"))
-        end = int(policies.get("filter.mhc_end"))
+        start = int(mhc_region.start)
+        end = int(mhc_region.end)
         normalized_chromosome = _text("CHROM").str.to_lowercase().str.replace(
             r"^chr", ""
         )
@@ -446,7 +445,8 @@ def _with_sample_size_statistics(
 
 def assess_variant_table(
     table_path: str | Path,
-    policies,
+    configuration: QCSummaryConfig,
+    genome_build: str,
     external_af_name: str,
     vcf_fields: dict[str, str],
     *,
@@ -464,10 +464,12 @@ def assess_variant_table(
         infer_schema_length=0,
     ).with_columns(pl.col("POS").cast(pl.Int64, strict=False))
     field_labels = _qc_field_labels(vcf_fields, external_af_name)
-    rules = build_qc_rules(policies, external_af_name, field_labels)
-    difference_cutoff = float(policies.get("filter.af_diff_cutoff"))
+    rules = build_qc_rules(
+        configuration, genome_build, external_af_name, field_labels,
+    )
+    difference_cutoff = float(configuration.rules.maximum_af_difference)
     sample_size_sd_multiplier = float(
-        policies.get("qc.sample_size_outlier_standard_deviations")
+        configuration.rules.sample_size_outlier_standard_deviations
     )
     rule_selections = []
 
@@ -610,76 +612,93 @@ def _write_assessment_reports(
     delimiter: str,
     null_output: str,
 ) -> dict[str, str]:
-    summary_path = report_paths["summary"]
-    rules_path = report_paths["rules"]
-    json_path = report_paths["json"]
     for path in report_paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
-
-    with summary_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["stage", "metric", "value"],
-            delimiter=delimiter,
+    staged_paths = {}
+    for name, destination in report_paths.items():
+        handle = tempfile.NamedTemporaryFile(
+            prefix=".%s." % destination.name,
+            suffix=".tmp",
+            dir=destination.parent,
+            delete=False,
         )
-        writer.writeheader()
-        for stage in ("raw", "qc_passed"):
-            for metric, value in assessment[stage].items():
+        handle.close()
+        staged_paths[name] = Path(handle.name)
+
+    try:
+        with staged_paths["summary"].open(
+            "w", encoding="utf-8", newline="",
+        ) as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["stage", "metric", "value"],
+                delimiter=delimiter,
+            )
+            writer.writeheader()
+            for stage in ("raw", "qc_passed"):
+                for metric, value in assessment[stage].items():
+                    writer.writerow({
+                        "stage": stage,
+                        "metric": metric,
+                        "value": null_output if value is None else value,
+                    })
+            for metric in (
+                "active_rule_count", "excluded_total", "rule_match_total",
+                "accounting_balanced", "retained_fraction", "overlap_variants",
+                "extra_rule_matches", "sample_size_outlier_standard_deviations",
+                "definition",
+            ):
+                value = assessment[metric]
                 writer.writerow({
-                    "stage": stage,
-                    "metric": metric,
+                    "stage": "assessment", "metric": metric,
                     "value": null_output if value is None else value,
                 })
-        for metric in (
-            "active_rule_count", "excluded_total", "rule_match_total",
-            "accounting_balanced", "retained_fraction", "overlap_variants",
-            "extra_rule_matches", "sample_size_outlier_standard_deviations",
-            "definition",
-        ):
-            value = assessment[metric]
-            writer.writerow({
-                "stage": "assessment", "metric": metric,
-                "value": null_output if value is None else value,
-            })
 
-    with rules_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "record_type", "rule_number", "rule", "criterion", "detail",
-                "action", "variants_matching_in_raw_vcf",
-            ],
-            delimiter=delimiter,
-        )
-        writer.writeheader()
-        for rule in assessment["rules"]:
-            writer.writerow({
-                "record_type": "rule",
-                "rule_number": rule["number"],
-                "rule": rule["label"],
-                "criterion": rule["criterion"],
-                "action": "fail_qc",
-                "variants_matching_in_raw_vcf": rule["failed_raw"],
-            })
-            for detail in rule["details"]:
+        with staged_paths["rules"].open(
+            "w", encoding="utf-8", newline="",
+        ) as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "record_type", "rule_number", "rule", "criterion", "detail",
+                    "action", "variants_matching_in_raw_vcf",
+                ],
+                delimiter=delimiter,
+            )
+            writer.writeheader()
+            for rule in assessment["rules"]:
                 writer.writerow({
-                    "record_type": "detail",
+                    "record_type": "rule",
                     "rule_number": rule["number"],
                     "rule": rule["label"],
                     "criterion": rule["criterion"],
-                    "detail": detail["label"],
-                    "action": detail["action"],
-                    "variants_matching_in_raw_vcf": detail["matched_raw"],
+                    "action": "fail_qc",
+                    "variants_matching_in_raw_vcf": rule["failed_raw"],
                 })
+                for detail in rule["details"]:
+                    writer.writerow({
+                        "record_type": "detail",
+                        "rule_number": rule["number"],
+                        "rule": rule["label"],
+                        "criterion": rule["criterion"],
+                        "detail": detail["label"],
+                        "action": detail["action"],
+                        "variants_matching_in_raw_vcf": detail["matched_raw"],
+                    })
 
-    json_path.write_text(
-        json.dumps(assessment, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+        staged_paths["json"].write_text(
+            json.dumps(assessment, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        for name, destination in report_paths.items():
+            staged_paths[name].replace(destination)
+    finally:
+        for path in staged_paths.values():
+            path.unlink(missing_ok=True)
     return {
-        "summary": str(summary_path),
-        "rules": str(rules_path),
-        "json": str(json_path),
+        "summary": str(report_paths["summary"]),
+        "rules": str(report_paths["rules"]),
+        "json": str(report_paths["json"]),
     }
 
 
@@ -690,40 +709,36 @@ def run_vcf_qc_assessment(
     dataset_id: str,
     genome_build: str,
     external_af_name: str,
-    vcf_fields: dict[str, str],
-    output_layout: dict[str, str],
-    table_delimiter: str,
-    table_null_values: list[str],
-    table_null_output: str,
-    temporary_table_suffix: str,
-    io_buffer_bytes: int,
-    policies,
+    configuration: QCSummaryConfig,
     bcftools_bin: str,
     logger=None,
 ) -> dict[str, Any]:
     """Extract once, assess raw rules, persist summaries, and remove the TSV."""
+    vcf_fields = configuration.vcf_fields.model_dump()
+    output_layout = configuration.output_layout
+    table_configuration = configuration.table
     report_paths = {
         "summary": configured_output_path(
-            output_directory, output_layout["qc_assessment_summary"],
+            output_directory, output_layout.metric_report,
             error_type=VcfAssessmentError, dataset_id=dataset_id, build=genome_build,
         ),
         "rules": configured_output_path(
-            output_directory, output_layout["qc_filter_rules"],
+            output_directory, output_layout.rule_report,
             error_type=VcfAssessmentError, dataset_id=dataset_id, build=genome_build,
         ),
         "json": configured_output_path(
-            output_directory, output_layout["qc_assessment_json"],
+            output_directory, output_layout.assessment_json,
             error_type=VcfAssessmentError, dataset_id=dataset_id, build=genome_build,
         ),
     }
     temporary_prefix = configured_output_path(
-        output_directory, output_layout["qc_assessment_temporary"],
+        output_directory, output_layout.temporary_table_prefix,
         error_type=VcfAssessmentError, dataset_id=dataset_id, build=genome_build,
     )
     temporary_prefix.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
         prefix=temporary_prefix.name,
-        suffix=temporary_table_suffix,
+        suffix=table_configuration.temporary_suffix,
         dir=temporary_prefix.parent,
         delete=False,
     )
@@ -736,22 +751,22 @@ def run_vcf_qc_assessment(
             dataset_id=dataset_id,
             external_af_name=external_af_name,
             vcf_fields=vcf_fields,
-            table_delimiter=table_delimiter,
-            io_buffer_bytes=io_buffer_bytes,
+            table_delimiter=table_configuration.delimiter,
+            io_buffer_bytes=table_configuration.io_buffer_bytes,
             bcftools_bin=bcftools_bin,
             logger=logger,
         )
         assessment = assess_variant_table(
-            table_path, policies, external_af_name, vcf_fields,
-            delimiter=table_delimiter,
-            null_values=table_null_values,
+            table_path, configuration, genome_build, external_af_name, vcf_fields,
+            delimiter=table_configuration.delimiter,
+            null_values=table_configuration.null_values,
         )
         assessment["raw_vcf"] = str(Path(vcf_path).expanduser().resolve())
         assessment["reports"] = _write_assessment_reports(
             assessment,
             report_paths,
-            delimiter=table_delimiter,
-            null_output=table_null_output,
+            delimiter=table_configuration.delimiter,
+            null_output=table_configuration.null_output,
         )
         if logger is not None:
             logger.record(

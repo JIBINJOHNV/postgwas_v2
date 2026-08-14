@@ -18,12 +18,14 @@ from postgwas.config.models.modules.gcta_gene import (
     GctaOversizedSetPolicy,
     GctaUnmappedGenePolicy,
 )
-from postgwas.core.errors import ConfigurationError
+from postgwas.core.errors import ConfigurationError, MissingRequiredArgumentsError
 from postgwas.core.execution.runtime import validate_path
 from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_examples,
+    help_with_conditional_requirement,
     help_with_default,
+    mark_cli_required_help,
 )
 from postgwas.modules.gcta_gene.errors import GctaGeneError
 
@@ -32,7 +34,6 @@ def _with_configured_default(description: str, value) -> str:
     return help_with_default(
         description,
         value,
-        label="Configured YAML default",
     )
 
 
@@ -43,23 +44,12 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
     inputs = parser.add_argument_group("GCTA association inputs")
     if direct_controls:
         inputs.add_argument(
-            "--vcf",
-            type=validate_path(must_exist=True, must_be_file=True, must_not_be_empty=True),
-            metavar="PATH",
-            default=argparse.SUPPRESS,
-            help=(
-                "Harmonised GWAS-VCF used to reconcile formatter variant IDs to "
-                "the exact PLINK BIM IDs. Pipeline mode supplies this automatically"
-            ),
-        )
-        inputs.add_argument(
             "--gcta-input-file",
             type=validate_path(must_exist=True, must_be_file=True, must_not_be_empty=True),
             metavar="PATH",
             default=argparse.SUPPRESS,
             help=_with_configured_default(
-                "Formatter-created input for the selected method. In pipeline mode "
-                "this is supplied automatically",
+                "Formatter-created GCTA summary-statistics input for the selected method",
                 module.input_file,
             ),
         )
@@ -78,7 +68,10 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=_with_configured_default(
-            "Four-column chromosome, start, end, gene-ID file used by GCTA",
+            help_with_conditional_requirement(
+                "Four-column chromosome, start, end, gene-ID file used by GCTA",
+                "for fastbat_gene, mbat_combo, or fastbat_set with --gmt",
+            ),
             module.gene_annotation.file,
         ),
     )
@@ -88,8 +81,8 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=_with_configured_default(
-            "Prepared custom fastBAT set file containing a set ID, SNP IDs, and "
-            "END. For fastbat_set, use this or --gmt, not both",
+            "Prepared custom fastBAT set file containing a set ID, SNP IDs, "
+            "and END. Use this or --gmt, not both",
             module.set_annotation.file,
         ),
     )
@@ -99,13 +92,13 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=_with_configured_default(
-            "GMT pathway file converted to a fastBAT set list using --gene-list "
-            "and the reference BIM. Valid only for fastbat_set and mutually "
-            "exclusive with --fastbat-set-list",
+            "GMT pathway file converted to a fastBAT set list using "
+            "--gene-list and the reference BIM; mutually exclusive with "
+            "--fastbat-set-list",
             module.set_annotation.gmt_file,
         ),
     )
-    compatibility = parser.add_argument_group("Scientific compatibility")
+    compatibility = parser.add_argument_group("Input and reference compatibility")
     compatibility.add_argument(
         "--genome-build",
         choices=list(defaults.resources.genomes),
@@ -134,15 +127,22 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
         choices=get_args(GctaGeneMethod),
         default=argparse.SUPPRESS,
         help=_with_configured_default(
-            "Run fastBAT by genes, fixed segments, or custom SNP sets, or run "
-            "gene-based mBAT-combo",
+            "Choose the tested unit and GCTA procedure:\n"
+            "  fastbat_gene: Test SNPs assigned to each gene and its configured "
+            "window with LD-aware fastBAT.\n"
+            "  fastbat_segment: Test consecutive fixed-size genomic segments "
+            "with LD-aware fastBAT.\n"
+            "  fastbat_set: Test custom SNP sets supplied through "
+            "--fastbat-set-list or converted from --gmt pathways.\n"
+            "  mbat_combo: Test each gene by combining signed mBAT and unsigned "
+            "fastBAT evidence",
             module.method,
         ),
     )
     settings.add_argument(
         "--gene-window-kb", type=int, metavar="KB", default=argparse.SUPPRESS,
         help=_with_configured_default(
-            "Window added to both sides of each gene boundary, including GMT conversion",
+            "Window added to both sides of each gene boundary",
             module.gene_window_kb,
         ),
     )
@@ -196,38 +196,39 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
         "--fastbat-segment-size-kb", type=int, metavar="KB",
         default=argparse.SUPPRESS,
         help=_with_configured_default(
-            "Fixed segment size for the fastbat_segment method",
+            "Fixed segment size",
             module.segment_size_kb,
         ),
     )
-    settings.add_argument(
-        "--gcta-coordinate-fallback",
-        action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=_with_configured_default(
-            "Resolve nonmatching summary-statistic IDs by an unambiguous "
-            "chromosome, position, and allele-pair match to the PLINK BIM",
-            module.variant_harmonisation.coordinate_fallback,
-        ),
-    )
-    settings.add_argument(
-        "--gcta-minimum-reference-overlap",
-        type=float,
-        metavar="FRACTION",
-        default=argparse.SUPPRESS,
-        help=_with_configured_default(
-            "Minimum fraction of unique input variants that must resolve to "
-            "exact PLINK BIM IDs",
-            module.variant_harmonisation.minimum_overlap_fraction,
-        ),
-    )
+    if not direct_controls:
+        settings.add_argument(
+            "--gcta-coordinate-fallback",
+            action=argparse.BooleanOptionalAction,
+            default=argparse.SUPPRESS,
+            help=_with_configured_default(
+                "Resolve nonmatching summary-statistic IDs by an unambiguous "
+                "chromosome, position, and allele-pair match to the PLINK BIM",
+                module.variant_harmonisation.coordinate_fallback,
+            ),
+        )
+        settings.add_argument(
+            "--gcta-minimum-reference-overlap",
+            type=float,
+            metavar="FRACTION",
+            default=argparse.SUPPRESS,
+            help=_with_configured_default(
+                "Minimum fraction of unique pipeline variants that must "
+                "resolve to exact PLINK BIM IDs",
+                module.variant_harmonisation.minimum_overlap_fraction,
+            ),
+        )
     settings.add_argument(
         "--gcta-chromosome-label-policy",
         choices=get_args(GctaChromosomeLabelPolicy),
         default=argparse.SUPPRESS,
         help=_with_configured_default(
-            "How variant-ID reconciliation compares chromosome labels in the "
-            "harmonised VCF and PLINK BIM",
+            "How reference and VCF chromosome labels are normalized before "
+            "compatibility checks",
             module.variant_harmonisation.chromosome_label_policy,
         ),
     )
@@ -277,7 +278,7 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
         action=argparse.BooleanOptionalAction,
         default=argparse.SUPPRESS,
         help=_with_configured_default(
-            "For mBAT-combo, include mBAT and fastBAT component p-values",
+            "Include mBAT and fastBAT component p-values",
             module.print_component_p_values,
         ),
     )
@@ -347,31 +348,8 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
     )
     if direct_controls:
         settings.add_argument(
-            "--bcftools", metavar="PATH", default=argparse.SUPPRESS,
-            help=_with_configured_default(
-                "bcftools executable used to read variant coordinates from --vcf",
-                defaults.resources.executables.bcftools,
-            ),
-        )
-        settings.add_argument(
             "--run-config", metavar="PATH", default=argparse.SUPPRESS,
             help="YAML settings; explicit command-line values override matching keys.",
-        )
-        settings.add_argument(
-            "--resume",
-            action=argparse.BooleanOptionalAction,
-            default=argparse.SUPPRESS,
-            help=_with_configured_default(
-                "Reuse an existing validated primary result",
-                defaults.run.resume,
-            ),
-        )
-        settings.add_argument(
-            "--overwrite", action="store_true", default=argparse.SUPPRESS,
-            help=_with_configured_default(
-                "Replace completed or isolated partial outputs",
-                defaults.run.overwrite,
-            ),
         )
         settings.add_argument(
             "--dry-run", action="store_true", default=argparse.SUPPRESS,
@@ -381,7 +359,7 @@ def get_gcta_gene_parser(add_help=False, *, direct_controls=False):
 
 
 def get_gcta_gene_pipeline_examples():
-    """Return scientifically distinct GCTA examples for pipeline help."""
+    """Return distinct GCTA analysis examples for pipeline help."""
     return (
         (
             "Run gene-based mBAT-combo:",
@@ -483,15 +461,32 @@ def build_parser():
                 defaults.run.output_directory,
             )
             action.default = argparse.SUPPRESS
+    mark_cli_required_help(
+        parser,
+        (
+            "gcta_input_file",
+            "gcta_reference_prefix",
+            "genome_build",
+            "gcta_reference_population",
+        ),
+    )
     return parser
 
 
 def main(argv=None):
     from postgwas.modules.gcta_gene.service import run_gcta_gene_direct
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     try:
         run_gcta_gene_direct(args)
+    except MissingRequiredArgumentsError as exc:
+        console = Console(stderr=True)
+        console.print(
+            "\n[bold red]GCTA gene analysis failed.[/bold red] %s\n" % exc
+        )
+        parser.print_help(file=console.file)
+        return 1
     except (GctaGeneError, ConfigurationError, OSError, ValueError) as exc:
         Console(stderr=True).print(
             "\n[bold red]GCTA gene analysis failed.[/bold red] %s\n" % exc

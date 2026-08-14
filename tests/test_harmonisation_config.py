@@ -274,12 +274,13 @@ class HarmonisationConfigTests(unittest.TestCase):
             config.output_layout.root["qc_summary"],
             "qc_summary/{dataset_id}_chromosomewise_harmonisation_metrics.tsv",
         )
+        qc = load_configuration().modules.qc_summary.output_layout
         self.assertEqual(
-            config.output_layout.root["qc_assessment_summary"],
+            qc.metric_report,
             "qc_summary/{dataset_id}_{build}_vcf_qc_metrics.tsv",
         )
         self.assertEqual(
-            config.output_layout.root["qc_filter_rules"],
+            qc.rule_report,
             "qc_summary/{dataset_id}_{build}_vcf_qc_rule_results.tsv",
         )
 
@@ -357,17 +358,12 @@ class HarmonisationConfigTests(unittest.TestCase):
                 "min_match_fraction", "deduplicate_reference",
             ],
         )
-        self.assertEqual(exported["policies"]["filter"]["maf_cutoff"], 0.01)
-        self.assertEqual(
-            list(exported["policies"]["filter"]),
-            [
-                "lp_cutoff", "lp_missing", "maf_cutoff", "af_missing",
-                "info_cutoff", "info_max", "info_missing", "af_diff_cutoff",
-                "include_indels", "exclude_palindromic",
-                "palindromic_af_lower", "palindromic_af_upper", "remove_mhc",
-                "mhc_chrom", "mhc_start", "mhc_end",
-            ],
+        self.assertNotIn("filter", exported["policies"])
+        self.assertNotIn("qc", exported["policies"])
+        qc_exported = yaml.safe_load(
+            render_module_configuration("qc_summary", style="values")
         )
+        self.assertEqual(qc_exported["rules"]["maf_min"], 0.01)
         self.assertTrue(
             exported["policies"]["execution"]["fail_dataset_on_chr_error"]
         )
@@ -397,7 +393,7 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertIn("module", document)
         self.assertIn("policies", document)
         self.assertFalse(old_location.exists())
-        self.assertEqual(default_policies().get("filter.maf_cutoff"), 0.01)
+        self.assertNotIn("filter.maf_cutoff", default_policies())
         self.assertEqual(default_policies().get("sample_size.cases_only"), "fail")
         self.assertEqual(default_policies().get("sample_size.min_value"), 1)
 
@@ -525,11 +521,31 @@ class HarmonisationConfigTests(unittest.TestCase):
             config.missing_id_format,
             "+%CHROM\\_%POS\\_%REF\\_%ALT",
         )
+        self.assertEqual(
+            config.genome_build_header,
+            "##genome_build={build}",
+        )
 
         with self.assertRaisesRegex(ConfigurationError, "must start with"):
             load_configuration(cli_overrides={
                 "modules.harmonisation.vcf_processing.missing_id_format":
                     "%CHROM_%POS",
+            })
+
+        with self.assertRaisesRegex(
+            ConfigurationError, "starting with ##genome_build="
+        ):
+            load_configuration(cli_overrides={
+                "modules.harmonisation.vcf_processing.genome_build_header":
+                    "##assembly={build}",
+            })
+
+        with self.assertRaisesRegex(
+            ConfigurationError, "no format field other than"
+        ):
+            load_configuration(cli_overrides={
+                "modules.harmonisation.vcf_processing.genome_build_header":
+                    "##genome_build={build}-{unknown}",
             })
 
     def test_eaf_cutoff_has_one_canonical_policy_location(self):

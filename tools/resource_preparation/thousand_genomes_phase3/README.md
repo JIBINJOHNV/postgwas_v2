@@ -48,7 +48,7 @@ Outputs include the VCFs and CSI indexes, exact group sample lists, a structured
 JSON-lines run log, and a YAML resource manifest with resolved configuration,
 software version, file sizes, and SHA-256 checksums.
 
-## Scientific sources
+## References
 
 - [Official Phase 3 release directory](https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/)
 - [Official Phase 3 call-set README](https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/README_phase3_callset_20150220)

@@ -29,7 +29,6 @@ class FilteringInputsConfig(StrictModel):
 
 
 class FilteringMHCConfig(GenomicRegion):
-    genome_build: GenomeBuild
     start: int = Field(ge=1)
 
 
@@ -99,6 +98,7 @@ class FilteringVcfFieldsConfig(StrictModel):
 class FilteringOutputLayoutConfig(StrictModel):
     filtered_vcf: str
     log_file: str
+    preflight_log: str
     reason_summary: str
     mhc_exclusion_bed: str
 
@@ -108,10 +108,8 @@ class FilteringOutputLayoutConfig(StrictModel):
         value = value.strip()
         if not value:
             raise ValueError("output path patterns must not be empty")
-        if "{dataset_id}" not in value or "{genome_build}" not in value:
-            raise ValueError(
-                "output path patterns must contain {dataset_id} and {genome_build}"
-            )
+        if "{dataset_id}" not in value:
+            raise ValueError("output path patterns must contain {dataset_id}")
         try:
             rendered = Path(
                 value.format(dataset_id="dataset", genome_build="build")
@@ -126,6 +124,21 @@ class FilteringOutputLayoutConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_destinations(self):
+        build_specific = (
+            self.filtered_vcf,
+            self.log_file,
+            self.reason_summary,
+            self.mhc_exclusion_bed,
+        )
+        if any("{genome_build}" not in pattern for pattern in build_specific):
+            raise ValueError(
+                "build-specific filtering outputs must contain {genome_build}"
+            )
+        if "{genome_build}" in self.preflight_log:
+            raise ValueError(
+                "preflight_log must not contain {genome_build} because it records "
+                "failures that occur before the VCF build is inferred"
+            )
         values = list(self.model_dump().values())
         if len(values) != len(set(values)):
             raise ValueError("filtering output path patterns must be unique")
@@ -137,8 +150,6 @@ class FilteringOutputLayoutConfig(StrictModel):
 class FilteringConfig(ModuleConfig):
     inputs: FilteringInputsConfig
     output_directory: Path | None = None
-    genome_build: GenomeBuild
-    genome_build_header_tokens: dict[GenomeBuild, list[str]]
     maf_min: float | None = Field(default=None, ge=0, le=0.5, allow_inf_nan=False)
     missing_af_action: Literal["keep", "remove"]
     info_min: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
@@ -157,7 +168,7 @@ class FilteringConfig(ModuleConfig):
     palindromic_lower: float = Field(ge=0, le=0.5, allow_inf_nan=False)
     palindromic_upper: float = Field(ge=0.5, le=1, allow_inf_nan=False)
     remove_mhc: bool
-    mhc: FilteringMHCConfig
+    mhc_regions: dict[GenomeBuild, FilteringMHCConfig]
     empty_expression_action: Literal["match_all", "match_none"]
     sort_output: bool
     report_missing_counts: bool
@@ -175,24 +186,14 @@ class FilteringConfig(ModuleConfig):
             )
         return value
 
-    @field_validator("genome_build_header_tokens")
+    @field_validator("mhc_regions")
     @classmethod
-    def valid_build_header_tokens(
-        cls, values: dict[GenomeBuild, list[str]],
-    ) -> dict[GenomeBuild, list[str]]:
+    def configured_mhc_regions(
+        cls, values: dict[GenomeBuild, FilteringMHCConfig],
+    ) -> dict[GenomeBuild, FilteringMHCConfig]:
         if not values:
-            raise ValueError("must define at least one genome-build header token")
-        normalized: dict[GenomeBuild, list[str]] = {}
-        for build, tokens in values.items():
-            cleaned = [str(token).strip() for token in tokens]
-            if not cleaned or any(not token for token in cleaned):
-                raise ValueError(
-                    "every genome build must define non-empty header tokens"
-                )
-            if len(cleaned) != len(set(token.lower() for token in cleaned)):
-                raise ValueError("genome-build header tokens must be unique per build")
-            normalized[build] = cleaned
-        return normalized
+            raise ValueError("must define at least one build-specific MHC region")
+        return values
 
     @model_validator(mode="after")
     def validate_intervals(self):
@@ -204,10 +205,4 @@ class FilteringConfig(ModuleConfig):
             raise ValueError("info_max must be greater than or equal to info_min")
         if self.palindromic_upper <= self.palindromic_lower:
             raise ValueError("palindromic_upper must be greater than palindromic_lower")
-        if self.mhc.genome_build != self.genome_build:
-            raise ValueError("mhc.genome_build must match genome_build")
-        if self.genome_build not in self.genome_build_header_tokens:
-            raise ValueError(
-                "genome_build_header_tokens must define the configured genome_build"
-            )
         return self

@@ -250,6 +250,26 @@ def test_resume_revalidates_completion_without_rerunning_magma(tmp_path):
     assert native_log.read_text(encoding="utf-8") == before
 
 
+def test_resume_restarts_when_every_declared_output_is_missing(tmp_path):
+    magma = _fake_magma(tmp_path / "magma")
+    args = _arguments(tmp_path, magma)
+    first = Path(run_magma_covar_direct(args))
+    native_log = first.parent / "study.log"
+    completion = first.parent / "logs" / "study_magmacovar_completion.yaml"
+    first.unlink()
+    native_log.unlink()
+
+    restarted = Path(run_magma_covar_direct(args))
+
+    assert restarted.is_file()
+    assert native_log.is_file()
+    assert completion.is_file()
+    canonical_log = first.parent / "logs" / "study_magmacovar.log"
+    assert "reason=incomplete_outputs" in canonical_log.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_input_sharing_the_output_prefix_is_never_treated_as_owned_output(tmp_path):
     magma = _fake_magma(tmp_path / "magma")
     gene_results = _gene_results(tmp_path / "study.genes.raw")

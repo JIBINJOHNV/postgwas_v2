@@ -6,7 +6,9 @@ reference file, and is then brought inside the configured window in exactly the
 way the effect-allele-frequency step does.
 
 There is deliberately no INFO equivalent of ``eaf_degenerate``: an INFO of 0 is
-meaningless but not mathematically fatal, and the 0.7 filter removes it later.
+scientifically poor but not mathematically fatal. Harmonisation applies its
+configured range action here, and the QC module independently assesses the
+retained value against ``modules.qc_summary.rules`` after VCF creation.
 
 All messages go through the PipelineLogger supplied by the orchestrator; the
 module never writes to stdout.
@@ -525,8 +527,8 @@ def harmonise_imputation_quality(
                     "missing imputation quality",
                     explanation
                     + " Policy 'info.on_missing' is 'keep', so they were left "
-                      "alone; missing values are removed later by "
-                      "'filter.info_missing'.",
+                      "unchanged for the independently configured post-merge "
+                      "modules.qc_summary rules.",
                     df.height, df.height, step=STEP_LABEL,
                 )
         else:

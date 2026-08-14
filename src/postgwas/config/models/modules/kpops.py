@@ -16,6 +16,9 @@ from postgwas.config.models.common import (
 )
 
 
+KPopsGeneUniversePolicy = Literal["strict", "intersect"]
+
+
 class KPopsInputSchema(StrictModel):
     table_delimiter_pattern: str
     predictions_table_delimiter: str
@@ -34,6 +37,12 @@ class KPopsInputSchema(StrictModel):
     kernel_matrix_suffix: str
     magma_genes_out_suffix: str
     magma_genes_raw_suffix: str
+    magma_raw_header_lines: int = Field(ge=0)
+    magma_raw_gene_id_index: int = Field(ge=0)
+    magma_raw_chromosome_index: int = Field(ge=0)
+    magma_raw_nsnp_index: int = Field(ge=0)
+    magma_raw_nparam_index: int = Field(ge=0)
+    magma_raw_mac_index: int = Field(ge=0)
     kernel_float_bytes: int = Field(ge=1)
 
     @field_validator("table_delimiter_pattern")
@@ -74,10 +83,24 @@ class KPopsInputSchema(StrictModel):
             raise ValueError("must be a filename suffix beginning with '.'")
         return value
 
+    @model_validator(mode="after")
+    def unique_magma_raw_columns(self):
+        indexes = (
+            self.magma_raw_gene_id_index,
+            self.magma_raw_chromosome_index,
+            self.magma_raw_nsnp_index,
+            self.magma_raw_nparam_index,
+            self.magma_raw_mac_index,
+        )
+        if len(indexes) != len(set(indexes)):
+            raise ValueError("MAGMA raw column indexes must be unique")
+        return self
+
 
 class KPopsOutputLayout(StrictModel):
     output_prefix: str
     staging_directory: str
+    compatible_magma_prefix: str
     resolved_config_file: str
     completion_manifest: str
     service_log_file: str
@@ -86,6 +109,8 @@ class KPopsOutputLayout(StrictModel):
     attribution_suffix: str
     attribution_rows_suffix: str
     attribution_columns_suffix: str
+    gene_compatibility_table_suffix: str
+    gene_compatibility_report_suffix: str
 
     @field_validator("output_prefix", "staging_directory", "service_log_file")
     @classmethod
@@ -103,15 +128,38 @@ class KPopsOutputLayout(StrictModel):
             raise ValueError("must be a relative path below the output directory")
         return value
 
+    @field_validator("compatible_magma_prefix")
+    @classmethod
+    def safe_staged_prefix(cls, value: str) -> str:
+        if not value.strip() or Path(value).name != value:
+            raise ValueError("must be a non-empty filename prefix")
+        return value
+
     @field_validator(
         "predictions_suffix", "coefficients_suffix", "attribution_suffix",
         "attribution_rows_suffix", "attribution_columns_suffix",
+        "gene_compatibility_table_suffix", "gene_compatibility_report_suffix",
     )
     @classmethod
     def safe_suffix(cls, value: str) -> str:
         if not value.startswith(".") or Path(value).name != value:
             raise ValueError("must be a filename suffix beginning with '.'")
         return value
+
+    @model_validator(mode="after")
+    def unique_suffixes(self):
+        suffixes = (
+            self.predictions_suffix,
+            self.coefficients_suffix,
+            self.attribution_suffix,
+            self.attribution_rows_suffix,
+            self.attribution_columns_suffix,
+            self.gene_compatibility_table_suffix,
+            self.gene_compatibility_report_suffix,
+        )
+        if len(suffixes) != len(set(suffixes)):
+            raise ValueError("K-POPS output suffixes must be unique")
+        return self
 
 
 class KPopsConfig(ModuleConfig):
@@ -120,6 +168,7 @@ class KPopsConfig(ModuleConfig):
     gene_annotation_file: str | None = None
     kernel_matrix_prefix: str | None = None
     magma_association_prefix: str | None = None
+    gene_universe_policy: KPopsGeneUniversePolicy
     minimum_gene_count: int = Field(ge=2)
     kernel_validation_chunk_rows: int = Field(ge=1)
     kernel_symmetry_relative_tolerance: float = Field(ge=0, allow_inf_nan=False)
@@ -178,4 +227,4 @@ class KPopsConfig(ModuleConfig):
         return self
 
 
-__all__ = ["KPopsConfig"]
+__all__ = ["KPopsConfig", "KPopsGeneUniversePolicy"]

@@ -71,8 +71,11 @@ behavior. Export the YAML before creating study-specific overrides.
 
 ## Processing steps
 
-Validate executable/version and every input; deduplicate variants by lowest
-valid P; optionally retain exact BIM IDs and fail below the configured overlap threshold;
+Validate executable/version and every input; consume the exact paired MAGMA
+tables returned by formatter in pipeline mode; optionally retain exact BIM IDs
+and fail below the configured overlap threshold; consolidate a repeated,
+coordinate/allele-consistent ID by lowest valid P only for independently
+prepared direct-module input;
 write harmonized MAGMA inputs; run annotation and gene analysis; parse results;
 apply configured Bonferroni/FDR corrections; optionally validate/convert gene
 sets, run MAGMA with `--set-annot`, and annotate common tested genes; publish staged
@@ -90,11 +93,13 @@ contains mixed target identifiers.
 
 ## Outputs
 
-Shared inputs are in `inputs/`; each mapping's raw and scientifically valid
-derived reports are in
-`mappings/<mapping-name>/`; and the long provenance catalogue is
-`results/<dataset>_magma_mapping_comparison.tsv`. Provenance is in
-`logs/<dataset>_magma.log` and `run_metadata/resolved_config.yaml`.
+Validated shared inputs are in `01_inputs/`. Each mapping has annotations,
+prepared gene sets, batches, and native MAGMA outputs under
+`02_intermediates/<mapping-name>/`; corrected and annotated reports are under
+`03_results/<mapping-name>/`. The long provenance catalogue is
+`04_comparisons/<dataset>_magma_mapping_comparison.tsv`. Provenance is in
+`05_logs/<dataset>_magma.log`; the resolved configuration and validated
+completion manifest are in `00_run_metadata/`.
 
 The resource preparer writes 88 schema-validated GRCh37/EUR mapping definitions
 and an eMAGMA Ensembl-to-Entrez network conversion report under
@@ -108,6 +113,26 @@ Review formatter ID type, optional exact BIM-ID matches, coordinate/allele
 conflicts, overlap fractions, duplicate resolution, gene-ID overlap, MAGMA commands and
 version, genes tested, correction families, and staged publication status.
 
+For positional and nMAGMA gene sets, the configured location records contain
+primary gene ID, chromosome, integer start/end, `+`/`-` strand, and an optional
+alternate ID. PostGWAS keeps compatible column-one identifiers unchanged; only
+when they are incompatible does it translate matching column-six identifiers to
+column one, expanding one-to-many mappings and logging all counts. It fails when
+neither identifier system reaches the configured overlap threshold. Annotated
+results retain both source and effective gene memberships. Column six
+is PostGWAS metadata, because the [MAGMA manual](https://ibg.colorado.edu/cdrom2021/Day10-posthuma/magma_session/manual_v1.09a.pdf)
+defines four required gene-location columns and an optional fifth strand column.
+Compatibility uses the smaller reference/effective gene universe, avoiding a
+false failure when a comprehensive GMT contains genes outside a coding reference.
+
+Formatter-produced MAGMA tables are already unique: formatter excludes every
+row in a duplicated selected-ID group and records the loss before writing its
+paired files. Pipeline MAGMA uses those exact files. MAGMA's own preparation
+still rejects conflicting coordinates/alleles and the external command receives
+`duplicate=error`. The configured `lowest_p` rule is a safety policy for direct
+MAGMA runs supplied with independently prepared, internally consistent duplicate
+rows; it does not restore variants excluded by formatter.
+
 ## Interpretation
 
 Gene P values reflect the selected gene window, model, LD reference, and SNP
@@ -118,7 +143,10 @@ multiple-testing interpretation.
 
 Reference ID/allele mismatch, wrong gene build, insufficient overlap,
 incompatible GMT identifiers, missing MAGMA license/binary, old version, or
-partial outputs blocking safe resume.
+non-empty partial outputs blocking safe resume. MAGMA preflight validation runs
+before staging is created, and an old staging tree containing no files is
+removed automatically. A staging tree containing any file remains protected
+and requires explicit `--overwrite` after review.
 
 ## Limitations
 

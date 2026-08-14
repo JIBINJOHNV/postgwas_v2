@@ -27,7 +27,7 @@ input:
   bim_extension: .bim
   bim_columns: [chromosome, variant_id, genetic_distance, position, allele1, allele2]
   gene_location_has_header: false
-  gene_location_columns: [gene_id, chromosome, start, end]
+  gene_location_columns: [gene_id, chromosome, start, end, strand, alternate_gene_id]
 snp_harmonisation:
   resolve_variants_to_reference: false
   minimum_overlap_fraction: 0.50
@@ -128,6 +128,7 @@ result_schema:
   family_correction_column_pattern: '{family}_P_{method}_corr'
   report_dataset_column: dataset_id
   report_gene_set_description_column: gene_set_description
+  report_source_input_genes_column: source_input_genes
   report_input_genes_column: input_genes
   report_common_genes_column: CommonGenes
   report_common_gene_p_values_column: CommonGenes_Pvalues
@@ -147,19 +148,20 @@ minimum_magma_version: '1.10'
 version_arguments: [--version]
 version_pattern: '(?i)MAGMA\s+(?:version:\s+)?v([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
 output_layout:
-  log_file: 'logs/{dataset_id}_magma.log'
-  resolved_config_file: run_metadata/resolved_config.yaml
+  log_file: '05_logs/{dataset_id}_magma.log'
+  resolved_config_file: 00_run_metadata/resolved_config.yaml
+  completion_manifest: '00_run_metadata/{dataset_id}_magma_completion.yaml'
   staging_directory: '.partial/{dataset_id}_magma'
-  harmonised_p_values: 'inputs/{dataset_id}_magma_p_values_harmonised.tsv'
-  harmonised_snp_locations: 'inputs/{dataset_id}_magma_snp_locations_harmonised.tsv'
-  annotation_prefix: 'raw/{dataset_id}_magma_annotation'
-  component_annotation_prefix: 'raw/{dataset_id}_magma_positional_component'
-  gene_result_prefix: 'results/{dataset_id}_magma_{upstream}up_{downstream}down'
-  gene_set_prefix: 'raw/{dataset_id}_magma_gene_sets'
-  corrected_genes: 'results/{dataset_id}_magma_genes_corrected.tsv'
-  corrected_gene_sets: 'results/{dataset_id}_magma_gene_sets_corrected.tsv'
-  annotated_gene_sets: 'results/{dataset_id}_magma_gene_sets_annotated.tsv'
-  prepared_gene_sets: 'inputs/{dataset_id}_magma_gene_sets.txt'
-  chrom_magma_genes: 'results/{dataset_id}_chrom_magma_genes.tsv'
-  mapping_directory: 'mappings/{analysis}'
-  mapping_comparison: 'results/{dataset_id}_magma_mapping_comparison.tsv'
+  harmonised_p_values: '01_inputs/{dataset_id}_magma_p_values_harmonised.tsv'
+  harmonised_snp_locations: '01_inputs/{dataset_id}_magma_snp_locations_harmonised.tsv'
+  annotation_prefix: '02_intermediates/{analysis}/annotations/{dataset_id}_magma_annotation'
+  component_annotation_prefix: '02_intermediates/{analysis}/annotations/{dataset_id}_magma_positional_component'
+  gene_result_prefix: '02_intermediates/{analysis}/native_outputs/{dataset_id}_magma_{upstream}up_{downstream}down'
+  gene_batch_prefix: '02_intermediates/{analysis}/batches/{dataset_id}_magma_{upstream}up_{downstream}down'
+  gene_set_prefix: '02_intermediates/{analysis}/native_outputs/{dataset_id}_magma_gene_sets'
+  corrected_genes: '03_results/{analysis}/{dataset_id}_magma_genes_corrected.tsv'
+  corrected_gene_sets: '03_results/{analysis}/{dataset_id}_magma_gene_sets_corrected.tsv'
+  annotated_gene_sets: '03_results/{analysis}/{dataset_id}_magma_gene_sets_annotated.tsv'
+  prepared_gene_sets: '02_intermediates/{analysis}/prepared_gene_sets/{dataset_id}_magma_gene_sets.txt'
+  chrom_magma_genes: '03_results/{analysis}/{dataset_id}_chrom_magma_genes.tsv'
+  mapping_comparison: '04_comparisons/{dataset_id}_magma_mapping_comparison.tsv'

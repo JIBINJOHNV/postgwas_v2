@@ -16,10 +16,12 @@ from postgwas.config import (
 )
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.core.completion import (
+    apply_completion_restart,
     configuration_digest,
-    validate_completion_manifest,
+    resolve_completion_resume,
     write_completion_manifest,
 )
+from postgwas.core.io.reports import write_yaml_report
 from postgwas.core.paths import (
     configured_output_path,
     require_nonempty_file,
@@ -29,8 +31,21 @@ from postgwas.core.paths import (
 )
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
 from postgwas.core.processes import run_checked_command
+from postgwas.core.required_arguments import (
+    RequiredArgument,
+    require_resolved_arguments,
+)
+from postgwas.core.ui import StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.modules.kpops.errors import KPopsError
+
+
+_KPOPS_PROGRESS_STAGES = (
+    "Validate K-POPS inputs and reference resources",
+    "Resolve the compatible MAGMA gene universe",
+    "Fit K-POPS models and calculate gene scores",
+    "Validate and publish K-POPS results",
+)
 
 
 def _resolved_configuration(args: argparse.Namespace):
@@ -40,6 +55,7 @@ def _resolved_configuration(args: argparse.Namespace):
         "kpops_gene_annotation_file": "gene_annotation_file",
         "kernel_matrix_prefix": "kernel_matrix_prefix",
         "magma_association_prefix": "magma_association_prefix",
+        "gene_universe_policy": "gene_universe_policy",
         "training_chromosomes": "training_chromosomes",
         "kpops_device": "device",
         "top_contributor_gene_count": "top_contributor_gene_count",
@@ -86,14 +102,39 @@ def _require_columns(table: pd.DataFrame, columns: list[str], label: str) -> Non
         raise KPopsError("%s is missing required columns: %s" % (label, ", ".join(missing)))
 
 
-def validate_kpops_configuration(args: argparse.Namespace, *, pipeline: bool = False):
-    configuration = _resolved_configuration(args)
+def validate_kpops_configuration(
+    args: argparse.Namespace,
+    *,
+    pipeline: bool = False,
+    configuration=None,
+):
+    configuration = configuration or _resolved_configuration(args)
     module = configuration.modules.kpops
     schema = module.input_schema
-    if module.genome_build is None:
-        raise KPopsError(
-            "Declare modules.kpops.genome_build; K-POPS does not encode or infer a genome build"
-        )
+    requirements = [
+        RequiredArgument(
+            "--kpops-genome-build",
+            "modules.kpops.genome_build",
+            module.genome_build,
+        ),
+        RequiredArgument(
+            "--kpops-gene-annotation-file",
+            "modules.kpops.gene_annotation_file",
+            module.gene_annotation_file,
+        ),
+        RequiredArgument(
+            "--kernel-matrix-prefix",
+            "modules.kpops.kernel_matrix_prefix",
+            module.kernel_matrix_prefix,
+        ),
+    ]
+    if not pipeline:
+        requirements.append(RequiredArgument(
+            "--magma-association-prefix",
+            "modules.kpops.magma_association_prefix",
+            module.magma_association_prefix,
+        ))
+    require_resolved_arguments(requirements)
     if pipeline and module.genome_build != configuration.modules.magma.genome_build:
         raise KPopsError(
             "K-POPS genome build %s does not match pipeline MAGMA genome build %s"
@@ -147,6 +188,13 @@ def validate_kpops_configuration(args: argparse.Namespace, *, pipeline: bool = F
                 "Configured K-POPS gene-name anchors map to multiple Ensembl IDs: %s"
                 % ", ".join(ambiguous_anchors[:10])
             )
+    if module.anchor_gene_type == "ENSGID":
+        anchor_gene_ids = set(module.anchor_genes)
+    else:
+        gene_id_by_name = dict(zip(gene_names, gene_ids))
+        anchor_gene_ids = {
+            gene_id_by_name[name] for name in module.anchor_genes
+        }
     kernel_genes_path = _prefix_file(
         module.kernel_matrix_prefix, schema.kernel_genes_suffix, "K-POPS kernel genes",
     )
@@ -178,13 +226,23 @@ def validate_kpops_configuration(args: argparse.Namespace, *, pipeline: bool = F
         ):
             raise KPopsError("K-POPS kernel matrix must be symmetric")
     annotation_set = set(gene_ids)
+    annotation_chromosomes = dict(zip(gene_ids, chromosomes))
     missing_annotation = set(kernel_genes) - annotation_set
     if missing_annotation:
         raise KPopsError("%d kernel genes are absent from the K-POPS annotation" % len(missing_annotation))
     outcome = None
     if not pipeline:
-        outcome = _validate_magma(module, set(kernel_genes), annotation_set)
+        outcome = _validate_magma(
+            module, set(kernel_genes), annotation_chromosomes,
+        )
         outcome_genes = outcome["genes"]
+        missing_target_anchors = sorted(anchor_gene_ids - outcome_genes)
+        if missing_target_anchors:
+            raise KPopsError(
+                "Configured K-POPS anchor genes are absent from the retained "
+                "MAGMA target universe: %s"
+                % ", ".join(missing_target_anchors[:10])
+            )
         chromosome_by_gene = dict(zip(gene_ids, chromosomes))
         if module.training_chromosomes == ["loco"]:
             counts = pd.Series([chromosome_by_gene[gene] for gene in outcome_genes]).value_counts()
@@ -203,6 +261,7 @@ def validate_kpops_configuration(args: argparse.Namespace, *, pipeline: bool = F
     return configuration, {
         "script": script,
         "annotation": annotation_path,
+        "annotation_gene_count": len(gene_ids),
         "annotation_gene_names": dict(zip(gene_ids, gene_names)),
         "annotation_gene_chromosomes": dict(zip(gene_ids, chromosomes)),
         "kernel": kernel_path,
@@ -213,8 +272,13 @@ def validate_kpops_configuration(args: argparse.Namespace, *, pipeline: bool = F
     }
 
 
-def _validate_magma(module, kernel_genes: set[str], annotation_genes: set[str]) -> dict:
+def _validate_magma(
+    module,
+    kernel_genes: set[str],
+    annotation_chromosomes: dict[str, str],
+) -> dict:
     schema = module.input_schema
+    annotation_genes = set(annotation_chromosomes)
     genes_out = _prefix_file(
         module.magma_association_prefix, schema.magma_genes_out_suffix, "MAGMA gene results",
     )
@@ -227,39 +291,124 @@ def _validate_magma(module, kernel_genes: set[str], annotation_genes: set[str]) 
     scores = pd.to_numeric(table[schema.magma_score_column], errors="coerce")
     if genes.duplicated().any() or scores.isna().any() or not np.isfinite(scores.to_numpy()).all():
         raise KPopsError("MAGMA gene IDs must be unique and Z statistics must be finite")
-    absent_kernel = set(genes) - kernel_genes
-    absent_annotation = set(genes) - annotation_genes
-    if absent_kernel or absent_annotation:
+
+    try:
+        raw_lines = genes_raw.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise KPopsError("Cannot read MAGMA raw gene results: %s" % exc) from exc
+    header_count = schema.magma_raw_header_lines
+    headers = raw_lines[:header_count]
+    raw_data_lines = [
+        line for line in raw_lines[header_count:] if line.strip()
+    ]
+    rows = [line.split() for line in raw_data_lines]
+    raw_indexes = (
+        schema.magma_raw_gene_id_index,
+        schema.magma_raw_chromosome_index,
+        schema.magma_raw_nsnp_index,
+        schema.magma_raw_nparam_index,
+        schema.magma_raw_mac_index,
+    )
+    minimum_fields = max(raw_indexes) + 1
+    if (
+        len(headers) != header_count
+        or len(rows) != len(genes)
+        or any(len(row) < minimum_fields for row in rows)
+    ):
         raise KPopsError(
-            "Every MAGMA gene must occur in the kernel and annotation "
-            "(missing kernel=%d, missing annotation=%d)"
-            % (len(absent_kernel), len(absent_annotation))
+            "MAGMA .genes.raw must contain the configured header and one "
+            "sufficiently populated row per MAGMA gene"
         )
-    if len(genes) < module.minimum_gene_count:
-        raise KPopsError("MAGMA gene count is below configured minimum_gene_count")
+    raw_gene_ids = [row[schema.magma_raw_gene_id_index] for row in rows]
+    gene_ids = genes.tolist()
+    if raw_gene_ids != gene_ids:
+        raise KPopsError("MAGMA .genes.raw and .genes.out gene order must match")
+
+    absent_kernel = sorted(set(gene_ids) - kernel_genes)
+    absent_annotation = sorted(set(gene_ids) - annotation_genes)
+    shared = kernel_genes & annotation_genes
+    retained_gene_ids = [gene for gene in gene_ids if gene in shared]
+    retained = set(retained_gene_ids)
+    excluded_gene_ids = [gene for gene in gene_ids if gene not in retained]
+    absent_kernel_set = set(absent_kernel)
+    absent_annotation_set = set(absent_annotation)
+    absent_from_both = absent_kernel_set & absent_annotation_set
+    compatibility = {
+        "policy": module.gene_universe_policy,
+        "original_target_genes": len(gene_ids),
+        "retained_target_genes": len(retained_gene_ids),
+        "excluded_target_genes": len(excluded_gene_ids),
+        "retained_percent": 100 * len(retained_gene_ids) / len(gene_ids),
+        "excluded_percent": 100 * len(excluded_gene_ids) / len(gene_ids),
+        "absent_from_kernel": len(absent_kernel),
+        "absent_from_annotation": len(absent_annotation),
+        "absent_from_both": len(absent_from_both),
+        "absent_only_from_kernel": len(absent_kernel_set - absent_annotation_set),
+        "absent_only_from_annotation": len(
+            absent_annotation_set - absent_kernel_set
+        ),
+        "retained_gene_ids": retained_gene_ids,
+        "excluded_gene_ids": excluded_gene_ids,
+        "missing_kernel_gene_ids": absent_kernel,
+        "missing_annotation_gene_ids": absent_annotation,
+    }
+    raw_chromosomes = [
+        row[schema.magma_raw_chromosome_index] for row in rows
+    ]
+    chromosome_mismatches = [
+        (gene, chromosome, annotation_chromosomes[gene])
+        for gene, chromosome in zip(gene_ids, raw_chromosomes)
+        if gene in retained and chromosome != annotation_chromosomes[gene]
+    ]
+    if chromosome_mismatches:
+        examples = ", ".join(
+            "%s (MAGMA=%s, K-POPS=%s)" % values
+            for values in chromosome_mismatches[:module.reporting.top_gene_count]
+        )
+        raise KPopsError(
+            "MAGMA raw metadata and the K-POPS annotation disagree on "
+            "chromosome for %d retained genes. Examples: %s. Gene-universe "
+            "intersection cannot repair a chromosome disagreement."
+            % (len(chromosome_mismatches), examples)
+        )
+    if excluded_gene_ids and module.gene_universe_policy == "strict":
+        raise KPopsError(
+            "K-POPS input gene universes are incompatible: MAGMA genes=%d, "
+            "shared genes=%d, missing from kernel=%d, missing from annotation=%d. "
+            "Example excluded genes: %s. Supply matching resources or use "
+            "--gene-universe-policy intersect to retain and audit the shared genes."
+            % (
+                len(gene_ids), len(retained_gene_ids), len(absent_kernel),
+                len(absent_annotation),
+                ", ".join(excluded_gene_ids[:module.reporting.top_gene_count]),
+            )
+        )
+    if len(retained_gene_ids) < module.minimum_gene_count:
+        raise KPopsError(
+            "K-POPS retains only %d shared MAGMA genes, below the configured "
+            "minimum_gene_count of %d"
+            % (len(retained_gene_ids), module.minimum_gene_count)
+        )
     if module.use_magma_covariates:
         try:
-            raw_lines = genes_raw.read_text(encoding="utf-8").splitlines()[2:]
-        except OSError as exc:
-            raise KPopsError("Cannot read MAGMA raw gene results: %s" % exc) from exc
-        rows = [line.split() for line in raw_lines if line.strip()]
-        if len(rows) != len(genes) or any(len(row) < 8 for row in rows):
-            raise KPopsError(
-                "MAGMA raw gene results must contain one upstream covariance row "
-                "per MAGMA gene after its two header lines"
-            )
-        if [row[0] for row in rows] != genes.tolist():
-            raise KPopsError("MAGMA .genes.raw and .genes.out gene order must match")
-        try:
             covariate_values = np.asarray(
-                [[float(row[4]), float(row[5]), float(row[7])] for row in rows],
+                [
+                    [
+                        float(row[schema.magma_raw_nsnp_index]),
+                        float(row[schema.magma_raw_nparam_index]),
+                        float(row[schema.magma_raw_mac_index]),
+                    ]
+                    for row in rows
+                ],
                 dtype=float,
             )
         except ValueError as exc:
             raise KPopsError("MAGMA raw NSNPS, NPARAM, and MAC values must be numeric") from exc
         if not np.isfinite(covariate_values).all() or (covariate_values <= 0).any():
             raise KPopsError("MAGMA raw NSNPS, NPARAM, and MAC values must be finite and positive")
-        chromosome_blocks = [row[1] for row in rows]
+        chromosome_blocks = [
+            row[schema.magma_raw_chromosome_index] for row in rows
+        ]
         completed = set()
         previous = None
         for chromosome in chromosome_blocks:
@@ -271,21 +420,166 @@ def _validate_magma(module, kernel_genes: set[str], annotation_genes: set[str]) 
                 previous = chromosome
     return {
         "genes_out": genes_out, "genes_raw": genes_raw,
-        "gene_count": len(genes), "genes": set(genes),
+        "gene_count": len(retained_gene_ids), "genes": retained,
+        "original_gene_count": len(gene_ids),
+        "original_gene_ids": gene_ids,
+        "table": table,
+        "raw_headers": headers,
+        "raw_data_lines": raw_data_lines,
+        "raw_chromosomes": raw_chromosomes,
+        "compatibility": compatibility,
     }
+
+
+def _prepare_intersected_magma(
+    module,
+    outcome: dict,
+    paths: dict[str, Path],
+    published_paths: dict[str, Path],
+    derived_prefix: Path,
+) -> tuple[str, dict]:
+    """Create temporary aligned K-POPS inputs and a durable exclusion audit."""
+    compatibility = outcome["compatibility"]
+    retained = set(compatibility["retained_gene_ids"])
+    missing_kernel = set(compatibility["missing_kernel_gene_ids"])
+    missing_annotation = set(compatibility["missing_annotation_gene_ids"])
+    audit_rows = []
+    chromosome_statistics = {}
+    for row_number, (gene, chromosome) in enumerate(
+        zip(outcome["original_gene_ids"], outcome["raw_chromosomes"]), 1,
+    ):
+        in_kernel = gene not in missing_kernel
+        in_annotation = gene not in missing_annotation
+        is_retained = gene in retained
+        if is_retained:
+            decision = "retained"
+        elif not in_kernel and not in_annotation:
+            decision = "missing_kernel_and_annotation"
+        elif not in_kernel:
+            decision = "missing_kernel"
+        else:
+            decision = "missing_annotation"
+        audit_rows.append({
+            "magma_row": row_number,
+            "gene_id": gene,
+            "chromosome": chromosome,
+            "present_in_kpops_annotation": in_annotation,
+            "present_in_kernel": in_kernel,
+            "retained_for_kpops": is_retained,
+            "decision": decision,
+        })
+        counts = chromosome_statistics.setdefault(
+            chromosome, {"original": 0, "retained": 0, "excluded": 0},
+        )
+        counts["original"] += 1
+        counts["retained" if is_retained else "excluded"] += 1
+
+    pd.DataFrame(audit_rows).to_csv(
+        paths["gene_compatibility_table"],
+        sep=module.input_schema.published_table_delimiter,
+        index=False,
+    )
+    excluded = compatibility["excluded_target_genes"]
+    report = {
+        key: value
+        for key, value in compatibility.items()
+        if not key.endswith("_gene_ids")
+    }
+    report.update({
+        "decision": (
+            "MAGMA targets were restricted to genes present in both the K-POPS "
+            "annotation and kernel."
+            if excluded
+            else "All MAGMA targets were already compatible; no restriction was required."
+        ),
+        "analysis_effect": (
+            "K-POPS fitting uses only retained MAGMA target genes; rankings may "
+            "differ from a run built from one fully matched gene annotation release."
+        ),
+        "original_files_unchanged": True,
+        "derived_magma_inputs": (
+            "Temporary aligned .genes.out and .genes.raw inputs are removed after "
+            "the K-POPS run and must not be reused by another analysis."
+        ),
+        "excluded_gene_examples": compatibility["excluded_gene_ids"][
+            :module.reporting.top_gene_count
+        ],
+        "exclusion_reason_counts": {
+            reason: sum(row["decision"] == reason for row in audit_rows)
+            for reason in (
+                "retained", "missing_kernel", "missing_annotation",
+                "missing_kernel_and_annotation",
+            )
+        },
+        "chromosomes": chromosome_statistics,
+        "files": {
+            "original_genes_out": str(outcome["genes_out"]),
+            "original_genes_raw": str(outcome["genes_raw"]),
+            "gene_audit_table": str(published_paths["gene_compatibility_table"]),
+            "compatibility_report": str(
+                published_paths["gene_compatibility_report"]
+            ),
+        },
+    })
+    write_yaml_report(report, paths["gene_compatibility_report"])
+    if not excluded:
+        return str(module.magma_association_prefix), report
+
+    schema = module.input_schema
+    genes_out = Path(str(derived_prefix) + schema.magma_genes_out_suffix)
+    genes_raw = Path(str(derived_prefix) + schema.magma_genes_raw_suffix)
+    output_ids = outcome["table"][schema.magma_gene_id_column].astype(str)
+    outcome["table"].loc[output_ids.isin(retained)].to_csv(
+        genes_out, sep=schema.published_table_delimiter, index=False,
+    )
+    selected_raw_lines = [
+        line
+        for gene, line in zip(
+            outcome["original_gene_ids"], outcome["raw_data_lines"],
+        )
+        if gene in retained
+    ]
+    genes_raw.write_text(
+        "\n".join(outcome["raw_headers"] + selected_raw_lines) + "\n",
+        encoding="utf-8",
+    )
+    derived = _read_table(
+        genes_out, schema.table_delimiter_pattern,
+        "derived compatible MAGMA gene results",
+    )
+    derived_ids = derived[schema.magma_gene_id_column].astype(str).tolist()
+    if derived_ids != compatibility["retained_gene_ids"]:
+        raise KPopsError(
+            "Derived compatible MAGMA gene results failed order validation"
+        )
+    derived_raw_ids = [
+        line.split()[schema.magma_raw_gene_id_index]
+        for line in selected_raw_lines
+    ]
+    if derived_raw_ids != compatibility["retained_gene_ids"]:
+        raise KPopsError(
+            "Derived compatible MAGMA raw results failed order validation"
+        )
+    return str(derived_prefix), report
 
 
 def preflight_kpops_pipeline(args: argparse.Namespace) -> None:
     validate_kpops_configuration(args, pipeline=True)
 
 
-def _arguments(configuration, output_prefix: Path, script: Path) -> list[str]:
+def _arguments(
+    configuration,
+    output_prefix: Path,
+    script: Path,
+    *,
+    magma_prefix: str | None = None,
+) -> list[str]:
     module = configuration.modules.kpops
     values = [
         configuration.resources.executables.python, script,
         "--gene_annot_path", module.gene_annotation_file,
         "--kernel_mat_prefix", module.kernel_matrix_prefix,
-        "--magma_prefix", module.magma_association_prefix,
+        "--magma_prefix", magma_prefix or module.magma_association_prefix,
         "--out_prefix", str(output_prefix),
         "--random_seed", str(configuration.execution.random_seed),
         "--device", module.device,
@@ -321,6 +615,15 @@ def _output_paths(root: Path, dataset: str, module) -> tuple[Path, dict[str, Pat
             "attribution": Path(str(prefix) + module.output_layout.attribution_suffix),
             "attribution_rows": Path(str(prefix) + module.output_layout.attribution_rows_suffix),
             "attribution_columns": Path(str(prefix) + module.output_layout.attribution_columns_suffix),
+        })
+    if module.gene_universe_policy == "intersect":
+        paths.update({
+            "gene_compatibility_table": Path(
+                str(prefix) + module.output_layout.gene_compatibility_table_suffix
+            ),
+            "gene_compatibility_report": Path(
+                str(prefix) + module.output_layout.gene_compatibility_report_suffix
+            ),
         })
     return prefix, paths
 
@@ -384,7 +687,13 @@ def _training_design(module) -> str:
     return "configured chromosome(s): %s" % ", ".join(module.training_chromosomes)
 
 
-def _summarise_outputs(path: Path, module, resources: dict) -> dict:
+def _summarise_outputs(
+    path: Path,
+    module,
+    resources: dict,
+    *,
+    paths: dict[str, Path] | None = None,
+) -> dict:
     """Validate K-POPS results and derive scientific reporting metrics."""
     table = _validate_predictions(path, module)
     schema = module.input_schema
@@ -441,11 +750,34 @@ def _summarise_outputs(path: Path, module, resources: dict) -> dict:
             "No finite K-POPS scores were available on chromosome(s): %s."
             % ", ".join(missing_chromosomes)
         )
+    compatibility = {
+        key: value
+        for key, value in resources["outcome"]["compatibility"].items()
+        if not key.endswith("_gene_ids")
+    }
+    if compatibility["excluded_target_genes"]:
+        warnings.append(
+            "Gene-universe intersection excluded %d of %d MAGMA target genes "
+            "and retained %d (%.1f%%). K-POPS fitting used only the retained "
+            "genes; review the compatibility audit before interpreting rankings."
+            % (
+                compatibility["excluded_target_genes"],
+                compatibility["original_target_genes"],
+                compatibility["retained_target_genes"],
+                compatibility["retained_percent"],
+            )
+        )
+    if module.gene_universe_policy == "intersect" and paths is not None:
+        compatibility["audit_table"] = str(paths["gene_compatibility_table"])
+        compatibility["report"] = str(paths["gene_compatibility_report"])
     return {
         "genes_in_output": len(table),
         "genes_scored": len(scored_genes),
         "compatible_genes": compatible_count,
         "target_genes": resources["outcome"]["gene_count"],
+        "original_target_genes": resources["outcome"]["original_gene_count"],
+        "excluded_target_genes": compatibility["excluded_target_genes"],
+        "gene_compatibility": compatibility,
         "training_design": _training_design(module),
         "top_genes": top_genes,
         "warnings": warnings,
@@ -484,7 +816,19 @@ def _render_summary(
             indent=10, label_width=label_width,
         ),
         screen_field(
-            "count", "MAGMA target genes", f'{summary["target_genes"]:,}',
+            "count", "Original MAGMA target genes",
+            f'{summary["original_target_genes"]:,}',
+            indent=10, label_width=label_width,
+        ),
+        screen_field(
+            "success", "MAGMA target genes retained",
+            f'{summary["target_genes"]:,}',
+            indent=10, label_width=label_width,
+        ),
+        screen_field(
+            "warning" if summary["excluded_target_genes"] else "success",
+            "MAGMA target genes excluded",
+            f'{summary["excluded_target_genes"]:,}',
             indent=10, label_width=label_width,
         ),
         screen_field(
@@ -532,6 +876,20 @@ def _render_summary(
             )
             for number, warning in enumerate(summary["warnings"], 1)
         )
+    compatibility = summary["gene_compatibility"]
+    if "audit_table" in compatibility:
+        lines.extend([
+            "",
+            screen_line("decision", "Gene-universe audit", indent=6),
+            screen_field(
+                "info", "Gene-level decisions", compatibility["audit_table"],
+                indent=10, label_width=label_width,
+            ),
+            screen_field(
+                "info", "Compatibility report", compatibility["report"],
+                indent=10, label_width=label_width,
+            ),
+        ])
     lines.extend([
         "",
         screen_field(
@@ -553,9 +911,54 @@ def _record_summary(logger: PipelineLogger, summary: dict) -> None:
 
 
 def run_kpops_direct(args: argparse.Namespace, ctx=None):
+    progress = StageProgress(
+        "K-POPS analysis progress",
+        enabled=True,
+    )
+    total_progress_stages = len(_KPOPS_PROGRESS_STAGES)
+    active_progress_step = 1
+    progress.start_step(
+        active_progress_step,
+        total_progress_stages,
+        _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+    )
     try:
-        configuration, resources = validate_kpops_configuration(args)
+        configuration = _resolved_configuration(args)
+        configuration, resources = validate_kpops_configuration(
+            args,
+            configuration=configuration,
+        )
+        compatibility = resources["outcome"]["compatibility"]
+        progress.complete_step(
+            active_progress_step,
+            total_progress_stages,
+            _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+            outcome_fields=[
+                (
+                    "genetic", "Declared genome build",
+                    configuration.modules.kpops.genome_build.value,
+                ),
+                (
+                    "count", "Annotation genes",
+                    resources["annotation_gene_count"],
+                ),
+                ("count", "Kernel genes", resources["kernel_gene_count"]),
+                (
+                    "count", "Original MAGMA target genes",
+                    compatibility["original_target_genes"],
+                ),
+                (
+                    "success", "Compatible target genes",
+                    compatibility["retained_target_genes"],
+                ),
+            ],
+        )
     except BaseException as exc:
+        progress.fail_step(
+            active_progress_step,
+            total_progress_stages,
+            _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+        )
         fallback = load_configuration()
         output = Path(
             getattr(args, "output_directory", None) or fallback.run.output_directory
@@ -576,50 +979,168 @@ def run_kpops_direct(args: argparse.Namespace, ctx=None):
             sample_id=dataset, file_level=fallback.logging.file_level,
             screen_level=fallback.logging.console_level,
         )
+        progress.close()
         raise
-    module = configuration.modules.kpops
-    output = Path(configuration.run.output_directory).expanduser().resolve()
-    dataset = validate_filename_component(configuration.run.dataset_id, "dataset_id", error_type=KPopsError)
-    output.mkdir(parents=True, exist_ok=True)
-    prefix, final_paths = _output_paths(output, dataset, module)
-    completion = configured_output_path(output, module.output_layout.completion_manifest, error_type=KPopsError, dataset_id=dataset)
-    log_path = configured_output_path(output, module.output_layout.service_log_file, error_type=KPopsError, dataset_id=dataset)
-    logger = PipelineLogger(
-        dataset, "run", str(log_path.parent), level=configuration.logging.file_level,
-        screen_level=configuration.logging.console_level, log_path=str(log_path),
+    active_progress_step = 2
+    progress.start_step(
+        active_progress_step,
+        total_progress_stages,
+        _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
     )
+    try:
+        module = configuration.modules.kpops
+        output = Path(configuration.run.output_directory).expanduser().resolve()
+        dataset = validate_filename_component(
+            configuration.run.dataset_id,
+            "dataset_id",
+            error_type=KPopsError,
+        )
+        output.mkdir(parents=True, exist_ok=True)
+        prefix, final_paths = _output_paths(output, dataset, module)
+        completion = configured_output_path(
+            output,
+            module.output_layout.completion_manifest,
+            error_type=KPopsError,
+            dataset_id=dataset,
+        )
+        log_path = configured_output_path(
+            output,
+            module.output_layout.service_log_file,
+            error_type=KPopsError,
+            dataset_id=dataset,
+        )
+        logger = PipelineLogger(
+            dataset,
+            "run",
+            str(log_path.parent),
+            level=configuration.logging.file_level,
+            screen_level=configuration.logging.console_level,
+            log_path=str(log_path),
+        )
+    except BaseException:
+        progress.fail_step(
+            active_progress_step,
+            total_progress_stages,
+            _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+        )
+        progress.close()
+        raise
     try:
         resolved_path = configured_output_path(output, module.output_layout.resolved_config_file, error_type=KPopsError, dataset_id=dataset)
         write_resolved_configuration(configuration, resolved_path, modules="kpops")
+        logger.record(
+            "PARAM", "kpops_run",
+            genome_build=module.genome_build.value,
+            gene_universe_policy=module.gene_universe_policy,
+            training_chromosomes=module.training_chromosomes,
+            use_magma_covariates=module.use_magma_covariates,
+        )
+        logger.record(
+            "OBSERVED", "kpops_gene_compatibility",
+            **{
+                key: value
+                for key, value in compatibility.items()
+                if not key.endswith("_gene_ids")
+            },
+        )
         completion_inputs = _completion_inputs(resources)
         completion_digest = _completion_configuration(configuration)
-        if configuration.run.resume and not configuration.run.overwrite and completion.is_file() and all(path.is_file() for path in final_paths.values()):
-            validate_completion_manifest(
+        if (
+            configuration.run.resume
+            and not configuration.run.overwrite
+            and completion.is_file()
+        ):
+            decision = resolve_completion_resume(
                 completion, dataset_id=dataset, module="kpops",
                 genome_build=module.genome_build.value,
                 configuration_sha256=completion_digest,
                 inputs=completion_inputs, outputs=final_paths,
+                resume_policy=configuration.run.resume_policy,
                 error_type=KPopsError,
             )
-            summary = _summarise_outputs(
-                final_paths["predictions"], module, resources,
+            if decision.action == "resume":
+                progress.complete_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                    outcome_fields=[
+                        (
+                            "success", "Checkpoint inputs",
+                            "matched the completed run",
+                        ),
+                        (
+                            "count", "Compatible target genes",
+                            compatibility["retained_target_genes"],
+                        ),
+                    ],
+                )
+                active_progress_step = 3
+                progress.start_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                )
+                progress.complete_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                    outcome_fields=[
+                        (
+                            "decision", "Model execution",
+                            "reused checksum-validated outputs",
+                        ),
+                    ],
+                )
+                active_progress_step = 4
+                progress.start_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                )
+                summary = _summarise_outputs(
+                    final_paths["predictions"], module, resources,
+                    paths=final_paths,
+                )
+                result = {
+                    "status": "success",
+                    "kpops_file": str(final_paths["predictions"]),
+                    "published_files": [str(path) for path in final_paths.values()],
+                    "completion_manifest": str(completion),
+                    "summary": summary,
+                }
+                if ctx is not None:
+                    ctx["kpops"] = result
+                logger.record("SKIP", "kpops_run", reason="validated_complete_outputs")
+                _record_summary(logger, summary)
+                progress.complete_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                    outcome_fields=[
+                        (
+                            "count", "Genes with finite K-POPS scores",
+                            summary["genes_scored"],
+                        ),
+                        (
+                            "success", "Published result files",
+                            len(final_paths),
+                        ),
+                    ],
+                )
+                active_progress_step = 0
+                print(_render_summary(
+                    summary, dataset, module, final_paths, log_path,
+                    configuration.logging.terminal_label_width,
+                ))
+                return result
+            apply_completion_restart(
+                decision,
+                output_root=output,
+                manifest=completion,
+                logger=logger,
+                operation="kpops_resume",
+                error_type=KPopsError,
             )
-            result = {
-                "status": "success",
-                "kpops_file": str(final_paths["predictions"]),
-                "published_files": [str(path) for path in final_paths.values()],
-                "completion_manifest": str(completion),
-                "summary": summary,
-            }
-            if ctx is not None:
-                ctx["kpops"] = result
-            logger.record("SKIP", "kpops_run", reason="validated_complete_outputs")
-            _record_summary(logger, summary)
-            print(_render_summary(
-                summary, dataset, module, final_paths, log_path,
-                configuration.logging.terminal_label_width,
-            ))
-            return result
         existing = [path for path in final_paths.values() if path.exists()]
         if existing and not configuration.run.overwrite:
             raise KPopsError("Existing K-POPS outputs require --overwrite: %s" % ", ".join(map(str, existing)))
@@ -632,16 +1153,115 @@ def run_kpops_direct(args: argparse.Namespace, ctx=None):
                     name: Path(str(staged_prefix) + str(path).removeprefix(str(prefix)))
                     for name, path in final_paths.items()
                 }
+                effective_magma_prefix = module.magma_association_prefix
+                if module.gene_universe_policy == "intersect":
+                    effective_magma_prefix, compatibility_report = (
+                        _prepare_intersected_magma(
+                            module,
+                            resources["outcome"],
+                            staged_paths,
+                            final_paths,
+                            Path(directory)
+                            / module.output_layout.compatible_magma_prefix,
+                        )
+                    )
+                    logger.record(
+                        "ACTION", "kpops_gene_universe_intersection",
+                        **{
+                            key: value
+                            for key, value in compatibility_report.items()
+                            if key not in {"chromosomes", "files"}
+                        },
+                    )
+                    for chromosome, counts in compatibility_report[
+                        "chromosomes"
+                    ].items():
+                        logger.record(
+                            "OBSERVED", "kpops_gene_compatibility_chromosome",
+                            chromosome=chromosome, **counts,
+                        )
+                    logger.record(
+                        "OUTPUT", "kpops_gene_compatibility_files",
+                        **compatibility_report["files"],
+                    )
+                    if compatibility_report["excluded_target_genes"]:
+                        logger.warning(
+                            "K-POPS gene-universe intersection retained %d of %d "
+                            "MAGMA target genes (%.1f%%) and excluded %d; original "
+                            "MAGMA files were not modified."
+                            % (
+                                compatibility_report["retained_target_genes"],
+                                compatibility_report["original_target_genes"],
+                                compatibility_report["retained_percent"],
+                                compatibility_report["excluded_target_genes"],
+                            )
+                        )
+                progress.complete_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                    outcome_fields=[
+                        (
+                            "decision", "Gene-universe policy",
+                            module.gene_universe_policy,
+                        ),
+                        (
+                            "success", "Retained MAGMA target genes",
+                            compatibility["retained_target_genes"],
+                        ),
+                        (
+                            "warning"
+                            if compatibility["excluded_target_genes"]
+                            else "success",
+                            "Excluded MAGMA target genes",
+                            compatibility["excluded_target_genes"],
+                        ),
+                    ],
+                )
+                active_progress_step = 3
+                progress.start_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                )
                 python = resolve_executable(configuration.resources.executables.python, "Python", error_type=KPopsError)
-                command = _arguments(configuration, staged_prefix, resources["script"])
+                command = _arguments(
+                    configuration,
+                    staged_prefix,
+                    resources["script"],
+                    magma_prefix=effective_magma_prefix,
+                )
                 command[0] = python
                 run_checked_command(
                     command, "K-POPS", logger=logger, error_type=KPopsError,
                     timeout_seconds=configuration.execution.timeout_seconds,
                     expected_outputs=list(staged_paths.values()),
                 )
+                progress.complete_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                    outcome_fields=[
+                        (
+                            "decision", "Training design",
+                            " ".join(module.training_chromosomes),
+                        ),
+                        ("info", "Compute device", module.device),
+                        (
+                            "success", "Scored target genes submitted",
+                            compatibility["retained_target_genes"],
+                        ),
+                    ],
+                )
+                active_progress_step = 4
+                progress.start_step(
+                    active_progress_step,
+                    total_progress_stages,
+                    _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+                )
                 summary = _summarise_outputs(
                     staged_paths["predictions"], module, resources,
+                    paths=final_paths,
                 )
                 if configuration.run.overwrite:
                     completion.unlink(missing_ok=True)
@@ -666,6 +1286,8 @@ def run_kpops_direct(args: argparse.Namespace, ctx=None):
                 "prediction_count": summary["genes_in_output"],
                 "finite_score_count": summary["genes_scored"],
                 "target_gene_count": summary["target_genes"],
+                "original_target_gene_count": summary["original_target_genes"],
+                "excluded_target_gene_count": summary["excluded_target_genes"],
             },
             error_type=KPopsError,
         )
@@ -676,6 +1298,27 @@ def run_kpops_direct(args: argparse.Namespace, ctx=None):
             predictions=summary["genes_in_output"],
             finite_scores=summary["genes_scored"],
         )
+        progress.complete_step(
+            active_progress_step,
+            total_progress_stages,
+            _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+            outcome_fields=[
+                (
+                    "success", "Output validation",
+                    "all required files are non-empty",
+                ),
+                (
+                    "count", "Genes with finite K-POPS scores",
+                    summary["genes_scored"],
+                ),
+                (
+                    "warning" if summary["warnings"] else "success",
+                    "Scientific warnings", len(summary["warnings"]),
+                ),
+                ("success", "Published result files", len(final_paths)),
+            ],
+        )
+        active_progress_step = 0
         if ctx is not None:
             ctx["kpops"] = result
         print(_render_summary(
@@ -684,9 +1327,16 @@ def run_kpops_direct(args: argparse.Namespace, ctx=None):
         ))
         return result
     except BaseException as exc:
+        if active_progress_step:
+            progress.fail_step(
+                active_progress_step,
+                total_progress_stages,
+                _KPOPS_PROGRESS_STAGES[active_progress_step - 1],
+            )
         logger.error("K-POPS analysis failed: %s: %s" % (type(exc).__name__, exc))
         raise
     finally:
+        progress.close()
         logger.close()
 
 

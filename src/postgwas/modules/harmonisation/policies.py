@@ -1214,22 +1214,9 @@ def _cross_check(values):
                 )
             )
 
-    pair("filter.palindromic_af_lower", "filter.palindromic_af_upper", "ambiguous")
     pair("pvalue.clip_low", "pvalue.clip_high", "p-value")
     pair("info.clip_min", "info.clip_max", "imputation quality")
-    pair("filter.mhc_start", "filter.mhc_end", "MHC")
     pair("input.delimiter_min_columns", "input.delimiter_max_columns", "column count")
-
-    info_min = values.get("filter.info_cutoff")
-    info_max = values.get("filter.info_max")
-    if info_min is not None and info_max is not None and info_min > info_max:
-        problems.append(
-            PolicyProblem(
-                "filter.info_cutoff", info_min,
-                "must not be above filter.info_max (%s), otherwise no imputation-quality "
-                "value can pass the QC level" % format_value(info_max),
-            )
-        )
 
     mlogp_max = values.get("pvalue.mlogp_max")
     if mlogp_max is not None and mlogp_max <= values.get("pvalue.mlogp_min", 0.0):

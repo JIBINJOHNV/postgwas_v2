@@ -11,6 +11,7 @@ from postgwas.config.loader import (
     canonical_module_name,
     load_configuration,
     load_module_configuration,
+    select_configuration_values,
 )
 from postgwas.config.models.modules.single_cell import (
     single_cell_formatter_targets,
@@ -97,6 +98,16 @@ _FORMATTING_COMMENTS = {
     ),
     "numeric_columns": ("Extracted canonical columns parsed as numeric values.",),
     "canonical_columns": ("Semantic roles used to validate and identify variants.",),
+    "sample_size_reporting": (
+        "Trait-aware sample-size meanings and downstream-use notes shown in the "
+        "terminal and log.",
+    ),
+    "sample_size_reporting.source_semantics": (
+        "Descriptions of total, effective, case, and control/quantitative-total N.",
+    ),
+    "sample_size_reporting.target_notes": (
+        "Per-target explanation of how the saved sample-size values are consumed.",
+    ),
     "chromosome_labels": (
         "Normalization applied to chromosome labels before any target is exported.",
     ),
@@ -116,6 +127,15 @@ _FORMATTING_COMMENTS = {
     "variant_identifiers.target_types": (
         "Optional formatter target -> identifier type overrides.",
     ),
+    "variant_identifiers.default_duplicate_policy": (
+        "Duplicate-ID action used unless a formatter target overrides it.",
+    ),
+    "variant_identifiers.target_duplicate_policies": (
+        "Optional target-specific duplicate-ID actions for formatter outputs.",
+    ),
+    "variant_identifiers.duplicate_rank_tolerance": (
+        "Absolute tolerance used to treat effectively equal duplicate ranks as ties.",
+    ),
     "variant_identifiers.rsid_pattern": (
         "Pattern used to identify rsIDs in an external reference.",
     ),
@@ -125,12 +145,18 @@ _FORMATTING_COMMENTS = {
     "variant_identifiers.unique_id_template": (
         "Template used to construct an ID from VCF chromosome, position, REF, and ALT.",
     ),
+    "ldsc_sample_prevalence": (
+        "Reduction of valid per-variant case fractions for LDSC pipeline handoff.",
+    ),
+    "ldsc_sample_prevalence.aggregation": (
+        "Use median (default, robust) or mean; repeated variant counts are never summed.",
+    ),
     "study_design": (
         "Columns and target formats used to infer binary versus quantitative traits.",
     ),
     "study_design.required_formats": (
         "Formatter targets that require trait-specific sample-size interpretation.",
-        "The validated scientific contract requires exactly LDSC and MiXeR.",
+        "The validated formatter contract requires exactly LDSC and MiXeR.",
     ),
     "runtime": ("Configured formatter logs, metadata paths, and I/O settings.",),
     "vcf_include_expression": ("Optional bcftools expression applied during extraction.",),
@@ -181,6 +207,59 @@ def _render_formatting(module_config, style: str) -> str:
     return _render_commented(module_config, style, _FORMATTING_COMMENTS)
 
 
+def _select_formatting_configuration(
+    module_config,
+    formats: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    """Return reloadable common settings plus only the requested target schemas."""
+    requested = list(formats)
+    if not requested:
+        raise ConfigurationError("--format requires at least one formatter target")
+
+    available = set(module_config.format_order)
+    unknown = list(dict.fromkeys(
+        target for target in requested if target not in available
+    ))
+    if unknown:
+        raise ConfigurationError(
+            "Unknown formatter target%s: %s. Available targets: %s"
+            % (
+                "s" if len(unknown) != 1 else "",
+                ", ".join(unknown),
+                ", ".join(module_config.format_order),
+            )
+        )
+    duplicates = list(dict.fromkeys(
+        target for target in requested if requested.count(target) > 1
+    ))
+    if duplicates:
+        raise ConfigurationError(
+            "--format must not repeat target%s: %s"
+            % ("s" if len(duplicates) != 1 else "", ", ".join(duplicates))
+        )
+
+    selected = required_formats(module_config, requested=requested)
+    paths = [
+        "enabled",
+        *module_config.resolved_config.common_fields,
+        *module_config.resolved_config.reporting_fields,
+    ]
+    for target in selected:
+        paths.extend(module_config.resolved_config.format_fields[target])
+    values = select_configuration_values(
+        module_config.model_dump(mode="json"), paths,
+    )
+    values["formats"] = selected
+    identifier_policy = values["variant_identifiers"]
+    for field in ("target_types", "target_duplicate_policies"):
+        identifier_policy[field] = {
+            target: setting
+            for target, setting in identifier_policy[field].items()
+            if target in selected
+        }
+    return values
+
+
 _MIXER_COMMENTS = {
     "enabled": ("Enable single-trait MiXeR when this module is part of a pipeline.",),
     "analysis": (
@@ -210,7 +289,7 @@ _MIXER_COMMENTS = {
         "Additional official test1 options. Protected and trait-2 options are rejected.",
     ),
     "gsa": (
-        "Reference inputs, scientific options, schemas, and reporting policy for single-trait GSA-MiXeR.",
+        "Reference inputs, analysis options, schemas, and reporting policy for single-trait GSA-MiXeR.",
     ),
     "gsa.annotation_file_pattern": (
         "Per-chromosome SNP annotation using the configured chromosome placeholder.",
@@ -251,7 +330,7 @@ _MIXER_COMMENTS = {
         "Run official mixer_figures after test1 to create QQ and power diagnostics.",
     ),
     "reporting.quality": (
-        "Configured error, warning, or ignore actions for scientifically material checks.",
+        "Configured error, warning, or ignore actions for material validity checks.",
     ),
 }
 
@@ -390,16 +469,26 @@ def render_module_configuration(
     *,
     config_file: str | Path | None = None,
     style: str = "minimal",
+    formats: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Render one complete module configuration as reloadable YAML."""
     if style not in EXPORT_STYLES:
         raise ConfigurationError("Unknown export style: %s" % style)
     name = canonical_module_name(module)
+    if formats is not None and name != "formatting":
+        raise ConfigurationError(
+            "--format can be used only with --module formatting"
+        )
     config = load_module_configuration(name, config_file)
     if name == "harmonisation":
         return _render_harmonisation(config, style)
     if name == "formatting":
-        return _render_formatting(config, style)
+        values = (
+            config
+            if formats is None
+            else _select_formatting_configuration(config, formats)
+        )
+        return _render_formatting(values, style)
     if name == "mixer":
         return _render_mixer(config, style)
     if name == "magma":

@@ -32,7 +32,7 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         default=argparse.SUPPRESS,
         help=(
             "Headered MAGMA gene result containing configured gene IDs and "
-            "ZSTAT values. The pipeline supplies this from its MAGMA stage."
+            "ZSTAT values; used when --scdrs-gene-set-source magma is selected."
         ),
     )
     inputs.add_argument(
@@ -60,7 +60,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "scDRS executable path or command name",
             defaults.resources.executables.scdrs,
-            label="Configured default",
         ),
     )
     settings = parser.add_argument_group("scDRS settings")
@@ -71,7 +70,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "Species of identifiers in the H5AD file",
             method.h5ad_species,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -81,7 +79,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "Use an exact .gs file or construct it from MAGMA Z statistics",
             method.magma_gene_set.source,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -91,7 +88,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "Declared MAGMA gene-identifier namespace",
             method.magma_gene_set.source_identifier_type,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -101,7 +97,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "Declared adata.var_names identifier namespace",
             method.magma_gene_set.target_identifier_type,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -111,7 +106,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "Species of identifiers in the scDRS gene sets",
             method.gene_set_species,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -121,7 +115,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "Declared state of adata.X; raw counts are normalized by scDRS",
             method.matrix_state,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -145,7 +138,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "Correlate gene expression with scDRS disease scores",
             method.downstream.gene_analysis,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -156,7 +148,6 @@ def add_scdrs_arguments(parser: argparse.ArgumentParser, defaults) -> None:
         help=help_with_default(
             "Number of matched control gene sets used by scDRS",
             method.control_gene_sets,
-            label="Configured default",
         ),
     )
 

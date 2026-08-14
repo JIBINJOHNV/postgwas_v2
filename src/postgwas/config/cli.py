@@ -1,10 +1,11 @@
-"""Inspect and validate configuration without starting scientific work."""
+"""Inspect and validate configuration without starting an analysis."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
+from typing import get_args
 
 import yaml
 
@@ -14,6 +15,7 @@ from postgwas.config.loader import (
     load_module_configuration,
     write_resolved_configuration,
 )
+from postgwas.config.models.modules.formatting import FormattingTarget
 from postgwas.core.errors import ConfigurationError
 from postgwas.config.exporter import (
     EXPORT_STYLES,
@@ -27,6 +29,7 @@ from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples
 PIPELINE_TARGETS = tuple(
     name for name in REGISTRY.names() if REGISTRY.get(name).pipeline_enabled
 )
+FORMATTER_TARGETS = tuple(get_args(FormattingTarget))
 
 
 def _choice_lines(values: tuple[str, ...], size: int = 4) -> str:
@@ -40,6 +43,16 @@ EXPORT_EXAMPLES = format_cli_examples(
         "Export one fully annotated module configuration:",
         "postgwas config export",
         ("--module harmonisation", "--style full", "--output harmonisation.yaml"),
+    ),
+    (
+        "Export only the LDSC formatter settings:",
+        "postgwas config export",
+        (
+            "--module formatting",
+            "--format ldsc",
+            "--style minimal",
+            "--output formatting.yaml",
+        ),
     ),
     (
         "Export a fine-mapping pipeline with all prerequisites:",
@@ -84,6 +97,19 @@ def _add_export_arguments(parser: argparse.ArgumentParser) -> None:
             "Available modules:\n" + _choice_lines(MODULE_NAMES)
         ),
     )
+    target_group.add_argument(
+        "--format",
+        dest="formatter_formats",
+        nargs="+",
+        choices=FORMATTER_TARGETS,
+        default=argparse.SUPPRESS,
+        metavar="FORMAT",
+        help=(
+            "With --module formatting, export only the selected downstream\n"
+            "formatter settings and schemas. Available formats:\n"
+            + _choice_lines(FORMATTER_TARGETS)
+        ),
+    )
     target.add_argument(
         "--pipeline",
         nargs="+",
@@ -103,7 +129,7 @@ def _add_export_arguments(parser: argparse.ArgumentParser) -> None:
         default="minimal",
         metavar="STYLE",
         help=(
-            "full     Detailed scientific explanation for every setting.\n"
+            "full     Detailed explanation for every setting.\n"
             "minimal  Short comments beside settings (default).\n"
             "values   Key-value pairs only; analysis values remain identical."
         ),
@@ -197,11 +223,17 @@ def main() -> int:
         args.action = "export"
     try:
         if args.action == "export":
+            formatter_formats = getattr(args, "formatter_formats", None)
+            if formatter_formats is not None and args.module != "formatting":
+                raise ConfigurationError(
+                    "--format can be used only with --module formatting"
+                )
             if args.module:
                 rendered = render_module_configuration(
                     args.module,
                     config_file=args.config,
                     style=args.style,
+                    formats=formatter_formats,
                 )
             else:
                 rendered = render_pipeline_configuration(

@@ -23,6 +23,7 @@ gene_annotation:
 set_annotation:
   file: null
   gmt_file: null
+  maximum_set_variants: 20000
   oversized_set_policy: omit
   conversion:
     allowed_chromosomes: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', X, Y]
@@ -30,10 +31,22 @@ set_annotation:
     duplicate_gene_policy: deduplicate
     unmapped_gene_policy: report
     empty_pathway_policy: omit
+    parallelism:
+      worker_memory_multiplier: 8.0
+    audit:
+      level: normalized
+      format: parquet
+      compression: zstd
+      batch_rows: 100000
+    disk:
+      minimum_free_gb: 20.0
+      estimation_safety_factor: 1.25
     output_names:
       set_list: pathways.fastbat.set
       pathway_mapping: pathway_mapping.tsv
-      gene_variant_mapping: gene_variant_mapping.tsv
+      pathway_gene_mapping: pathway_gene_mapping.parquet
+      gene_variant_mapping: gene_variant_mapping.parquet
+      expanded_mapping: pathway_gene_variant_mapping.parquet
       unmapped_genes: unmapped_genes.tsv
       manifest: resource_manifest.yaml
       readme: README.md

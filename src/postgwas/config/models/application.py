@@ -75,9 +75,54 @@ class PostGWASConfig(StrictModel):
         if self.pipeline.stop_after and self.pipeline.stop_after not in self.pipeline.modules:
             raise ValueError("pipeline.stop_after must name an enabled pipeline module")
         configured_builds = set(self.resources.genomes)
-        if self.modules.filtering.genome_build.value not in configured_builds:
+        filtering_mhc_builds = {
+            build.value for build in self.modules.filtering.mhc_regions
+        }
+        missing_filtering_mhc_builds = configured_builds - filtering_mhc_builds
+        if self.modules.filtering.remove_mhc and missing_filtering_mhc_builds:
             raise ValueError(
-                "modules.filtering.genome_build must be defined in resources.genomes"
+                "modules.filtering.mhc_regions must define every configured genome "
+                "build when MHC removal is enabled; missing: %s"
+                % ", ".join(sorted(missing_filtering_mhc_builds))
+            )
+        ld_clumping = self.modules.ld_clumping
+        if ld_clumping.genome_build.value not in configured_builds:
+            raise ValueError(
+                "modules.ld_clumping.genome_build must be defined in "
+                "resources.genomes"
+            )
+        if ld_clumping.population.value not in self.resources.populations:
+            raise ValueError(
+                "modules.ld_clumping.population must be defined in "
+                "resources.populations"
+            )
+        ld_clumping_mhc_builds = {
+            build.value for build in ld_clumping.mhc_regions
+        }
+        missing_ld_clumping_mhc_builds = (
+            configured_builds - ld_clumping_mhc_builds
+        )
+        if ld_clumping.remove_mhc and missing_ld_clumping_mhc_builds:
+            raise ValueError(
+                "modules.ld_clumping.mhc_regions must define every configured "
+                "genome build when MHC removal is enabled; missing: %s"
+                % ", ".join(sorted(missing_ld_clumping_mhc_builds))
+            )
+        qc_summary = self.modules.qc_summary
+        if qc_summary.target_build.value not in configured_builds:
+            raise ValueError(
+                "modules.qc_summary.target_build must be defined in "
+                "resources.genomes"
+            )
+        qc_mhc_builds = {
+            build.value for build in qc_summary.rules.mhc_regions
+        }
+        missing_qc_mhc_builds = configured_builds - qc_mhc_builds
+        if qc_summary.rules.remove_mhc and missing_qc_mhc_builds:
+            raise ValueError(
+                "modules.qc_summary.rules.mhc_regions must define every configured "
+                "genome build when MHC assessment is enabled; missing: %s"
+                % ", ".join(sorted(missing_qc_mhc_builds))
             )
         if self.modules.mixer.genome_build not in configured_builds:
             raise ValueError(

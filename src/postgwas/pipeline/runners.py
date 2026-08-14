@@ -291,7 +291,7 @@ def run_formatter_runner(args, ctx):
         configure_reference_variant_identifiers(
             args, formatting_config, requirements,
         )
-    if "ldsc" in requested_formats:
+    if "ldsc" in args.format:
         configure_required_variant_identifier_type(
             args,
             formatting_config,
@@ -343,9 +343,8 @@ def run_ld_clump_runner(args, ctx):
     from postgwas.modules.ld_clumping.service import run_ld_clump_direct
 
     root = setup_subdir(args, "ld_clump")
-    args.ld_mode = "by_regions"
     try:
-        outputs = run_ld_clump_direct(args)
+        outputs = run_ld_clump_direct(args, pipeline=True)
         ctx["ld_clump"] = outputs
         return outputs
     finally:
@@ -356,7 +355,15 @@ def run_finemap_runner(args, ctx):
     from postgwas.modules.fine_mapping.service import run_fine_mapping
 
     root = setup_subdir(args, "finemap")
-    args.locus_file = ctx["ld_clump"]["ld_clump_standard"]["ldpruned_sig_file"]
+    standard = ctx.get("ld_clump", {}).get("ld_clump_standard")
+    locus_file = standard.get("ldpruned_sig_file") if standard else None
+    if not locus_file:
+        raise ValueError(
+            "Fine-mapping cannot start because standard LD clumping produced no "
+            "genomic risk loci. Check the lead P threshold, LD reference overlap, "
+            "and standard clumping log."
+        )
+    args.locus_file = locus_file
     method = getattr(args, "finemap_method", None)
     if method is None:
         from postgwas.config import load_module_configuration
@@ -576,19 +583,8 @@ def run_heritability_runner(args, ctx):
 
     args.ldsc_input = ctx["formatter"]["ldsc"]["ldsc_file"]
 
-    if args.samp_prev is None and args.pop_prev is not None:
-        print("Since population prevalence is provided and sample prevalence is not provided, using inferred sample prevalence from summary statistics")
-
-        print("Sample Prevalence = median(N_CAS) / (median(N_CAS) + median(N_CON))")
-
-        sprev = ctx["formatter"]["ldsc"]["sample_prev"]
-
-        print(f"Sample Prevalence = {sprev:.4f}")
-
-        args.samp_prev = sprev
-
     try:
-        outputs = run_ldsc_direct(args)
+        outputs = run_ldsc_direct(args, ctx)
         ctx["heritability"] = outputs
         return outputs
     finally:

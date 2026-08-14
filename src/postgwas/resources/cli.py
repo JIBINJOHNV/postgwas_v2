@@ -1,4 +1,4 @@
-"""Installed command-line interface for reproducible scientific resources."""
+"""Installed command-line interface for reproducible reference resources."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="postgwas resources",
         usage="postgwas resources {prepare,refresh} RESOURCE [options]",
         description=(
-            "Install or revalidate pinned scientific reference bundles without "
+            "Install or revalidate pinned reference bundles without "
             "using a repository-specific script path."
         ),
         formatter_class=AlignedRichHelpFormatter,
@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download, verify, and atomically install a resource bundle.",
         description=(
             "Download, checksum, validate, and atomically install a pinned "
-            "scientific resource bundle."
+            "reference bundle."
         ),
         formatter_class=AlignedRichHelpFormatter,
         epilog=RESOURCE_EXAMPLES,
@@ -107,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         usage="postgwas resources refresh RESOURCE [options]",
         help="Revalidate resources and regenerate configuration metadata.",
         description=(
-            "Verify every installed scientific file against its recorded "
+            "Verify every installed reference file against its recorded "
             "checksum, then regenerate only the manifest and PostGWAS YAML."
         ),
         formatter_class=AlignedRichHelpFormatter,

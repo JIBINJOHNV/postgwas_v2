@@ -1,4 +1,4 @@
-"""Shared compute options for every PostGWAS command."""
+"""Shared runtime options for every PostGWAS command."""
 
 from __future__ import annotations
 
@@ -25,8 +25,9 @@ def _positive_float(value: str) -> float:
 
 
 def get_compute_parser() -> argparse.ArgumentParser:
-    """Return reusable compute flags without assigning argparse defaults."""
-    defaults = load_configuration().execution
+    """Return reusable runtime flags without assigning argparse defaults."""
+    configuration = load_configuration()
+    defaults = configuration.execution
     parser = argparse.ArgumentParser(
         add_help=False,
         formatter_class=RichHelpFormatter,
@@ -41,7 +42,6 @@ def get_compute_parser() -> argparse.ArgumentParser:
             "Maximum number of tasks PostGWAS may run at the same time. "
             "If omitted, PostGWAS chooses automatically",
             defaults.threads,
-            label="Effective default",
         ),
     )
     group.add_argument(
@@ -54,7 +54,6 @@ def get_compute_parser() -> argparse.ArgumentParser:
             "If omitted, PostGWAS uses up to "
             f"{defaults.usable_memory_fraction * 100:g}%% of available physical memory",
             "%g GB" % defaults.memory_gb,
-            label="Effective default",
         ),
     )
     group.add_argument(
@@ -66,6 +65,49 @@ def get_compute_parser() -> argparse.ArgumentParser:
             "Number used to make randomized analyses reproducible. "
             "Use the same value to reproduce a run",
             defaults.random_seed,
+        ),
+    )
+    screen = parser.add_argument_group("Screen output")
+    visibility = screen.add_mutually_exclusive_group()
+    visibility.add_argument(
+        "--show-screen",
+        dest="show_screen",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Display PostGWAS progress, summaries, warnings, and errors in the terminal",
+            configuration.logging.show_screen,
+        ),
+    )
+    visibility.add_argument(
+        "--hide-screen",
+        dest="show_screen",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help=(
+            "Hide PostGWAS terminal output while continuing to save the same "
+            "screen stream to logging.screen_log_file."
+        ),
+    )
+    continuation = parser.add_argument_group("Run continuation")
+    continuation.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Reuse existing outputs only after the selected module validates "
+            "their completion state and provenance",
+            configuration.run.resume,
+        ),
+    )
+    continuation.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Replace existing outputs owned by the selected run; this takes "
+            "precedence over resume",
+            configuration.run.overwrite,
         ),
     )
     return parser

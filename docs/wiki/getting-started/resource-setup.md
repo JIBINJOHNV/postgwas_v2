@@ -1,8 +1,14 @@
 # Resource Setup
 
-PostGWAS does not download one universal reference bundle. Create a versioned,
-read-only resource root and record where every file came from, its build and
-population, preparation command, and checksum.
+**All reference and resource files must be downloaded.** PostGWAS does not
+generate them and none of them ship with the package.
+
+**Download link:** _to be added._
+
+Until the link is published, create the directory structure below inside a
+single versioned, read-only resource root, and place the downloaded files in it.
+Record where every file came from, its build and population, and its checksum.
+The root is supplied as `--resource-directory` or as `resources.root`.
 
 ## Harmonisation resource tree
 
@@ -18,6 +24,10 @@ The current canonical harmonisation YAML expands these paths below
 chain_files/<source_build>_to_<target_build>.chain
 GRCh37_38_check_files/<build>_check_file.tsv
 ```
+
+Indexed files must keep their companions: `.fai` beside each FASTA, and `.tbi`
+or `.csi` beside each bgzipped VCF. Files are needed only for the builds and
+chromosomes your study actually contains.
 
 The packaged build transition is GRCh37 ↔ GRCh38. The indexed VCF comparison
 sources exposed by the CLI are `1000G` and `ALFA`; ALFA EUR is the packaged

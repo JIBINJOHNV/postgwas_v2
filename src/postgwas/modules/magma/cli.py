@@ -14,6 +14,7 @@ from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_examples,
     help_with_default,
+    mark_cli_required_help,
 )
 from postgwas.modules.magma.errors import MagmaError
 
@@ -32,10 +33,7 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         "--snp-location-file",
         metavar="PATH",
         default=argparse.SUPPRESS,
-        help=(
-            "Formatter-created SNP location table. Pipeline mode supplies this "
-            "automatically."
-        ),
+        help="Formatter-created SNP location table consumed by direct MAGMA analysis.",
     )
     inputs.add_argument(
         "--p-value-file",
@@ -43,7 +41,7 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         default=argparse.SUPPRESS,
         help=(
             "Formatter-created SNP, raw p-value and per-variant sample-size table. "
-            "Pipeline mode supplies this automatically."
+            "The SNP identifiers must correspond to --snp-location-file."
         ),
     )
     inputs.add_argument(
@@ -81,7 +79,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
             "each is analysed as a separate hypothesis family. The generated "
             "functional-resource YAML lists every available tissue and cell context",
             " ".join(module.mapping.selected),
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -89,11 +86,10 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         metavar="NAME",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Mapping whose MAGMA gene results are passed to downstream pipeline "
-            "modules. Use positional, eMAGMA, H-MAGMA, or nMAGMA rather than "
-            "chromMAGMA when later steps require ordinary MAGMA gene units",
+            "Mapping designated as the primary MAGMA result. Use positional, "
+            "eMAGMA, H-MAGMA, or nMAGMA rather than chromMAGMA when subsequent "
+            "analyses require ordinary MAGMA gene units",
             module.mapping.primary,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -103,7 +99,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         help=help_with_default(
             "Kilobases added upstream of each gene",
             module.gene_window_upstream_kb,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -113,7 +108,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         help=help_with_default(
             "Kilobases added downstream of each gene",
             module.gene_window_downstream_kb,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -124,7 +118,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
             "MAGMA model supported with SNP p-value input, for example "
             "snp-wise=mean, snp-wise=top or multi=snp-wise",
             module.gene_model,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -134,7 +127,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         help=help_with_default(
             "Per-variant total-sample-size column in the p-value table",
             module.input.sample_size_column,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -145,7 +137,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
             "Minimum fraction of unique formatter variants that must have exact "
             "BIM field-2 matches when --resolve-variants-to-reference is enabled",
             module.snp_harmonisation.minimum_overlap_fraction,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -156,7 +147,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
             "Minimum gene-ID overlap required between tested MAGMA units and a "
             "gene-set file unless a mapping definition supplies its own validated floor",
             module.gene_sets.minimum_gene_id_overlap_fraction,
-            label="Configured default",
         ),
     )
     settings.add_argument(
@@ -168,7 +158,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
             "only exact coordinate-and-allele-consistent reference matches. When "
             "disabled, use the formatter files directly without reference filtering",
             module.snp_harmonisation.resolve_variants_to_reference,
-            label="Configured default",
         ),
     )
     if direct_controls:
@@ -177,21 +166,6 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
             metavar="PATH",
             default=argparse.SUPPRESS,
             help="YAML settings; explicit command-line values override matching keys.",
-        )
-        settings.add_argument(
-            "--resume",
-            action=argparse.BooleanOptionalAction,
-            default=argparse.SUPPRESS,
-            help=help_with_default(
-                "Reuse an existing complete MAGMA result after validation",
-                defaults.run.resume,
-            ),
-        )
-        settings.add_argument(
-            "--overwrite",
-            action="store_true",
-            default=argparse.SUPPRESS,
-            help="Replace completed results or an isolated partial run.",
         )
     return parser
 
@@ -203,7 +177,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_value_name = formatting["p_values"].output_file.format(dataset_id="STUDY")
     parser = argparse.ArgumentParser(
         prog="postgwas magma",
-        usage="postgwas magma --snp-location-file PATH --p-value-file PATH [options]",
+        usage=(
+            "postgwas magma --snp-location-file PATH --p-value-file PATH "
+            "--magma-ld-reference PREFIX --gene-location-file PATH "
+            "--dataset-id NAME --output-directory PATH [options]"
+        ),
         description=(
             "Run MAGMA gene association and optional competitive gene-set analysis "
             "from PostGWAS formatter inputs."
@@ -251,6 +229,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "--primary-magma-mapping positional",
                     "--snp-location-file formatted/%s" % location_name,
                     "--p-value-file formatted/%s" % p_value_name,
+                    "--magma-ld-reference reference/g1000_eur",
+                    "--gene-location-file reference/NCBI37.3.gene.loc",
                     "--dataset-id STUDY",
                     "--output-directory results",
                 ),
@@ -269,6 +249,17 @@ def build_parser() -> argparse.ArgumentParser:
         }:
             action.default = argparse.SUPPRESS
             action.type = None
+    mark_cli_required_help(
+        parser,
+        (
+            "snp_location_file",
+            "p_value_file",
+            "magma_ld_reference",
+            "gene_location_file",
+            "dataset_id",
+            "output_directory",
+        ),
+    )
     return parser
 
 
@@ -298,6 +289,8 @@ def get_magma_pipeline_examples():
                 "--run-config resources/magma/functional_mapping/configs/magma_functional_mapping.yaml",
                 "--magma-mapping positional emagma_brain_amygdala h_magma_adult_brain n_magma_cortex chrom_magma_ovarian_h3k27ac",
                 "--primary-magma-mapping positional",
+                "--magma-ld-reference reference/g1000_eur",
+                "--gene-location-file reference/NCBI37.3.gene.loc",
             ),
         ),
     )

@@ -7,14 +7,16 @@ import argparse
 
 from rich.console import Console
 
-from postgwas.cli.common import get_common_out_parser, get_flames_common_parser
+from postgwas.cli.common import (
+    get_common_out_parser,
+    get_flames_common_parser,
+    get_tabix_binary_parser,
+)
 from postgwas.cli.compute import get_compute_parser
-from postgwas.config import load_configuration
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_examples,
-    help_with_default,
 )
 from postgwas.modules.flames.errors import FlamesError
 
@@ -64,7 +66,6 @@ def get_flames_pipeline_examples():
 
 def get_flames_direct_parser(add_help=False):
     """Return direct-mode inputs and run controls without argparse defaults."""
-    defaults = load_configuration()
     parser = argparse.ArgumentParser(add_help=add_help)
     inputs = parser.add_argument_group("FLAMES inputs")
     inputs.add_argument(
@@ -94,18 +95,6 @@ def get_flames_direct_parser(add_help=False):
     controls.add_argument(
         "--run-config", metavar="PATH", default=argparse.SUPPRESS,
         help="YAML settings; explicit command-line values override matching keys.",
-    )
-    controls.add_argument(
-        "--resume", action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Reuse outputs only after their completion manifest and inputs validate",
-            defaults.run.resume,
-        ),
-    )
-    controls.add_argument(
-        "--overwrite", action="store_true", default=argparse.SUPPRESS,
-        help="Replace an existing complete FLAMES result after validation.",
     )
     controls.add_argument(
         "--dry-run", action="store_true", default=argparse.SUPPRESS,
@@ -156,18 +145,19 @@ def build_parser() -> argparse.ArgumentParser:
                 "declared, never inferred.",
                 "For reproducible production annotation, configure versioned local "
                 "VEP and CADD resources instead of live APIs.",
-                "Pipeline defaults follow the literal original FLAMES README: the "
-                "54-specific-tissue file with marginal two-sided MAGMA tests. "
-                "Direct mode cannot infer those settings from an existing .gsa.out "
-                "file, so verify its MAGMA log or provenance.",
+                "The literal original FLAMES README uses the 54-specific-tissue "
+                "file with marginal two-sided MAGMA tests. Direct analysis cannot "
+                "infer those settings from an existing .gsa.out file, so verify "
+                "its MAGMA log or provenance.",
                 "FUMA uses a different 30-general-tissue input with "
-                "condition-hide=Average and direction greater; pipeline users can "
-                "select that model explicitly with the MAGMACOVAR options.",
+                "condition-hide=Average and direction greater; reproduce that "
+                "model when generating the MAGMACOVAR .gsa.out input.",
             ),
         ),
         parents=[
             get_compute_parser(), get_common_out_parser(),
             get_flames_direct_parser(), get_flames_common_parser(),
+            get_tabix_binary_parser(),
         ],
     )
     for action in parser._actions:

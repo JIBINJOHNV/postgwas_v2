@@ -4,6 +4,7 @@ import sys
 import polars as pl
 import pytest
 from rich.console import Console
+from rich.cells import cell_len
 
 from postgwas.core.io.delimiters import resolve_delimiter
 from postgwas.core.io.tables import read_delimited_table
@@ -27,7 +28,8 @@ from postgwas.core.values import (
     optional_text,
     parse_integer,
 )
-from postgwas.core.ui import StageProgress
+from postgwas.core.ui import MeasuredProgress, StageProgress, run_with_progress
+from postgwas.core.ui.screen import screen_field
 from postgwas.modules.harmonisation.shared.runtime import reject_rows
 
 
@@ -37,6 +39,49 @@ def test_optional_values_have_one_normalization_rule():
     assert optional_text(None) is None
     assert parse_integer("38,691") == 38691
     assert parse_integer("not-a-count") is None
+
+
+def test_screen_fields_align_unicode_symbols_and_wrap_long_values():
+    count = screen_field(
+        "count", "Count label", "10", width=80, indent=10, label_width=42,
+    )
+    warning = screen_field(
+        "warning", "Warning label", "1", width=80, indent=10, label_width=42,
+    )
+    assert cell_len(count.split(":", 1)[0]) == cell_len(
+        warning.split(":", 1)[0]
+    )
+
+    rendered = screen_field(
+        "info", "Long path",
+        "/Users/example/" + "a" * 100 + "/report.yaml",
+        width=80,
+        indent=10,
+        label_width=42,
+        break_long_values=True,
+    )
+    lines = rendered.splitlines()
+    assert len(lines) > 1
+    assert all(cell_len(line) <= 80 for line in lines)
+    assert all(line.startswith(" " * 59) for line in lines[1:])
+
+    long_label = screen_field(
+        "loss",
+        "Palindromic SNPs with ambiguous frequency (0.4 ≤ AF ≤ 0.6)",
+        "matched 153,472; removed for this reason 150,313",
+        width=120,
+        indent=8,
+        label_width=42,
+    )
+    long_lines = long_label.splitlines()
+    assert len(long_lines) == 2
+    assert " : " not in long_lines[0]
+    aligned_reference = screen_field(
+        "count", "Count label", "10", width=120, indent=8, label_width=42,
+    )
+    assert cell_len(long_lines[1].split(" : ", 1)[0]) == cell_len(
+        aligned_reference.split(" : ", 1)[0]
+    )
 
 
 def test_stage_progress_shows_current_completed_and_failed_stages():
@@ -76,7 +121,9 @@ def test_stage_progress_shows_current_completed_and_failed_stages():
 
     text = stream.getvalue()
     assert "Test analysis progress" in text
+    assert "Started 1/3 · Validate inputs" not in text
     assert "Current 1/3 · Validate inputs" in text
+    assert "\n      🔬  Current 1/3 · Validate inputs\n" not in text
     assert "Current 2/3 · Run analysis" in text
     assert "Completed 1/3 · Validate inputs" in text
     assert "Outcome" in text
@@ -95,6 +142,205 @@ def test_stage_progress_shows_current_completed_and_failed_stages():
     assert len({line.index(" : ") for line in outcome_lines}) == 1
     assert "Failed 3/3 · Validate results" in text
     assert "2/3" in text
+
+
+def test_measured_progress_does_not_leave_a_static_current_line():
+    stream = StringIO()
+    progress = MeasuredProgress(
+        "Measured analysis progress",
+        enabled=True,
+        console=Console(
+            file=stream,
+            force_terminal=True,
+            color_system=None,
+            width=120,
+        ),
+    )
+
+    progress.start("Run external analysis", total=10)
+    progress.complete(10, total=10)
+
+    text = stream.getvalue()
+    assert "Current 0/10 · Run external analysis" in text
+    assert "\n      🔬  Current 0/10 · Run external analysis\n" not in text
+
+
+def test_measured_progress_records_an_observed_phase_change():
+    stream = StringIO()
+    progress = MeasuredProgress(
+        "External phases",
+        enabled=True,
+        console=Console(
+            file=stream,
+            force_terminal=False,
+            color_system=None,
+            width=120,
+        ),
+    )
+
+    progress.start("Load inputs")
+    progress.set_phase("Match variants")
+    progress.update(1, total=2)
+    progress.complete(2, total=2)
+
+    text = stream.getvalue()
+    assert "Started 0/? · Load inputs" in text
+    assert "Current 0/? · Match variants" in text
+    assert "Progress 1/2 · Match variants · 50%" in text
+
+
+def test_stage_progress_context_marks_success_and_failure_truthfully():
+    stream = StringIO()
+    progress = StageProgress(
+        "Context-managed stages",
+        enabled=True,
+        console=Console(
+            file=stream,
+            force_terminal=False,
+            color_system=None,
+            width=120,
+        ),
+    )
+
+    with progress.step(1, 2, "Prepare inputs"):
+        pass
+    with pytest.raises(ValueError, match="invalid result"):
+        with progress.step(2, 2, "Validate results"):
+            raise ValueError("invalid result")
+
+    text = stream.getvalue()
+    assert "Completed 1/2 · Prepare inputs" in text
+    assert "Failed 2/2 · Validate results" in text
+    assert "All 2 stages completed" not in text
+
+
+def test_top_level_progress_reports_success_failure_and_disabled_runs():
+    stream = StringIO()
+    console = Console(
+        file=stream,
+        force_terminal=True,
+        color_system=None,
+        width=120,
+    )
+
+    assert run_with_progress(
+        lambda: 0,
+        label="Module progress",
+        title="Run module",
+        enabled=True,
+        console=console,
+    ) == 0
+    assert "Completed 1/1 · Run module" in stream.getvalue()
+
+    with pytest.raises(ValueError, match="failed operation"):
+        run_with_progress(
+            lambda: (_ for _ in ()).throw(ValueError("failed operation")),
+            label="Module progress",
+            title="Run module",
+            enabled=True,
+            console=console,
+        )
+    assert "Failed 1/1 · Run module" in stream.getvalue()
+
+    with pytest.raises(SystemExit) as successful_exit:
+        run_with_progress(
+            lambda: (_ for _ in ()).throw(SystemExit(0)),
+            label="Module progress",
+            title="Run module",
+            enabled=True,
+            console=console,
+        )
+    assert successful_exit.value.code == 0
+    assert stream.getvalue().count("Completed 1/1 · Run module") >= 2
+
+    hidden = StringIO()
+    assert run_with_progress(
+        lambda: "result",
+        label="Module progress",
+        title="Run module",
+        enabled=False,
+        console=Console(file=hidden, force_terminal=True, color_system=None),
+    ) == "result"
+    assert hidden.getvalue() == ""
+
+
+def test_detailed_progress_can_run_inside_mandatory_module_progress():
+    stream = StringIO()
+    console = Console(
+        file=stream,
+        force_terminal=True,
+        color_system=None,
+        width=120,
+    )
+    outer = StageProgress("Module progress", enabled=True, console=console)
+    inner = StageProgress("Scientific stages", enabled=True, console=console)
+
+    outer.start_step(1, 1, "Run module")
+    inner.start_step(1, 2, "Validate inputs")
+    inner.complete_step(1, 2, "Validate inputs")
+    inner.start_step(2, 2, "Calculate associations")
+    inner.complete_step(2, 2, "Calculate associations")
+    outer.complete_step(1, 1, "Run module")
+
+    text = stream.getvalue()
+    assert "Scientific stages" in text
+    assert "Completed 2/2 · Calculate associations" in text
+    assert "Completed 1/1 · Run module" in text
+    assert not any(
+        "Current 1/1 · Run module" in line
+        and "Current 1/2 · Validate inputs" in line
+        for line in text.splitlines()
+    )
+
+
+def test_nested_progress_uses_deterministic_milestones_without_a_terminal():
+    stream = StringIO()
+    console = Console(
+        file=stream,
+        force_terminal=False,
+        color_system=None,
+        width=120,
+    )
+    outer = StageProgress("Module progress", enabled=True, console=console)
+    inner = StageProgress("Scientific stages", enabled=True, console=console)
+
+    outer.start_step(1, 1, "Run module")
+    inner.start_step(1, 2, "Validate inputs")
+    inner.complete_step(1, 2, "Validate inputs")
+    inner.start_step(2, 2, "Calculate associations")
+    inner.fail_step(2, 2, "Calculate associations")
+    outer.fail_step(1, 1, "Run module")
+
+    text = stream.getvalue()
+    assert "None" not in text
+    assert "━" not in text
+    assert text.count("Started 1/1 · Run module") == 1
+    assert text.count("Started 1/2 · Validate inputs") == 1
+    assert text.count("Completed 1/2 · Validate inputs") == 1
+    assert text.count("Started 2/2 · Calculate associations") == 1
+    assert text.count("Failed 2/2 · Calculate associations") == 1
+    assert text.count("Failed 1/1 · Run module") == 1
+
+
+def test_failed_nested_progress_keeps_enclosing_live_region_paused():
+    stream = StringIO()
+    console = Console(
+        file=stream,
+        force_terminal=True,
+        color_system=None,
+        width=120,
+    )
+    outer = StageProgress("Module progress", enabled=True, console=console)
+    inner = StageProgress("Scientific stages", enabled=True, console=console)
+    outer.start_step(1, 1, "Run module")
+    inner.start_step(1, 1, "Validate results")
+    resume_calls = []
+    outer._resume = lambda: resume_calls.append(True)
+
+    inner.fail_step(1, 1, "Validate results")
+
+    assert resume_calls == []
+    outer.fail_step(1, 1, "Run module")
 
 
 def test_percentage_formatters_handle_missing_and_zero_denominators():
@@ -215,6 +461,24 @@ def test_process_transcript_records_command_outcome(tmp_path):
     assert destination.read_text(encoding="utf-8") == (
         "tool=fixture\ntool output\n\nexit_code=0\n"
     )
+
+
+def test_checked_process_calls_progress_while_command_is_active():
+    updates = []
+
+    output = run_checked_command(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.08); print('finished')",
+        ],
+        "Progress callback fixture",
+        progress_callback=lambda: updates.append(len(updates)),
+        progress_refresh_seconds=0.01,
+    )
+
+    assert output.strip() == "finished"
+    assert len(updates) >= 3
 
 
 def test_failed_process_reports_stdout_and_stderr():

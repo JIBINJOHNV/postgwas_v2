@@ -14,13 +14,15 @@ from postgwas.core.execution.runtime import validate_path
 from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_examples,
+    help_with_conditional_requirement,
     help_with_default,
+    mark_cli_required_help,
 )
 from postgwas.modules.gcta_cojo.errors import GctaCojoError
 
 
 def _default(description: str, value) -> str:
-    return help_with_default(description, value, label="Configured YAML default")
+    return help_with_default(description, value)
 
 
 def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
@@ -69,10 +71,13 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=_default(
-            "Known SNPs to adjust for, with one BIM SNP ID per line. GCTA tests "
-            "the other included SNPs conditional on these variants. Supplying "
-            "this option selects cond mode when --cojo-mode is omitted; any "
-            "explicit mode must be cond",
+            help_with_conditional_requirement(
+                "Known SNPs to adjust for, with one BIM SNP ID per line. GCTA "
+                "tests the other included SNPs conditional on these variants. "
+                "Supplying this option selects cond mode when --cojo-mode is "
+                "omitted; any explicit mode must be cond",
+                "for cond mode",
+            ),
             module.inputs.condition_snps,
         ),
     )
@@ -82,9 +87,13 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=_default(
-            "SNPs whose effects are estimated together in one multiple-SNP model, "
-            "with one BIM SNP ID per line. Supplying this option selects joint mode "
-            "when --cojo-mode is omitted; any explicit mode must be joint",
+            help_with_conditional_requirement(
+                "SNPs whose effects are estimated together in one multiple-SNP "
+                "model, with one BIM SNP ID per line. Supplying this option "
+                "selects joint mode when --cojo-mode is omitted; any explicit "
+                "mode must be joint",
+                "for joint mode",
+            ),
             module.inputs.joint_snps,
         ),
     )
@@ -94,9 +103,8 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=_default(
-            "Only test or select SNPs listed in this file, with one BIM SNP ID "
-            "per line. GCTA still reads the full .ma file. Do not use in joint "
-            "mode; --joint-snps defines that analysis set",
+            "Only test or select SNPs listed in this file, with one BIM SNP "
+            "ID per line. GCTA still reads the full .ma file",
             module.inputs.extract_snps,
         ),
     )
@@ -112,7 +120,7 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         ),
     )
 
-    compatibility = parser.add_argument_group("Scientific compatibility")
+    compatibility = parser.add_argument_group("Input and reference compatibility")
     compatibility.add_argument(
         "--genome-build",
         choices=list(defaults.resources.genomes),
@@ -171,7 +179,7 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         metavar="N",
         default=argparse.SUPPRESS,
         help=_default(
-            "Fixed number of independent signals selected by top_snps mode",
+            "Fixed number of independent signals selected by GCTA",
             module.analysis.top_snp_count,
         ),
     )
@@ -259,7 +267,7 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         metavar="P",
         default=argparse.SUPPRESS,
         help=_default(
-            "Adjusted-p threshold used only for the terminal scientific summary",
+            "Adjusted-p threshold used only for the terminal findings summary",
             module.reporting.finding_threshold,
         ),
     )
@@ -288,24 +296,6 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
             metavar="PATH",
             default=argparse.SUPPRESS,
             help="YAML settings; explicit CLI values override matching keys.",
-        )
-        settings.add_argument(
-            "--resume",
-            action=argparse.BooleanOptionalAction,
-            default=argparse.SUPPRESS,
-            help=_default(
-                "Reuse outputs only when the checksummed completion manifest matches",
-                defaults.run.resume,
-            ),
-        )
-        settings.add_argument(
-            "--overwrite",
-            action="store_true",
-            default=argparse.SUPPRESS,
-            help=_default(
-                "Replace completed or explicitly isolated partial outputs",
-                defaults.run.overwrite,
-            ),
         )
         settings.add_argument(
             "--dry-run",
@@ -359,7 +349,7 @@ def build_parser():
         description=(
             "Run GCTA-COJO stepwise, fixed-count, joint, or conditional analysis "
             "from an existing GCTA .ma file using an ancestry- and build-matched "
-            "PLINK LD reference. Use pipeline mode to prepare the .ma file from VCF."
+            "PLINK LD reference."
         ),
         epilog=format_cli_examples(
             (
@@ -413,6 +403,15 @@ def build_parser():
                 defaults.run.output_directory,
             )
             action.default = argparse.SUPPRESS
+    mark_cli_required_help(
+        parser,
+        (
+            "gcta_cojo_input_file",
+            "cojo_reference_prefix",
+            "genome_build",
+            "cojo_reference_population",
+        ),
+    )
     return parser
 
 

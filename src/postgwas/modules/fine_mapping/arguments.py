@@ -28,11 +28,9 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
         metavar="METHOD",
         choices=["susie", "finemap"],
         default=argparse.SUPPRESS,
-        help=(
-            "Fine-mapping method to use. "
-            "[bold]Choices:[/bold] [bright_yellow]{susie, finemap}[/bright_yellow]. "
-            "[bold green]Configured default:[/bold green] [cyan]%s[/cyan]"
-            % configured_engine
+        help=help_with_default(
+            "Fine-mapping method to use",
+            configured_engine,
         ),
     )
 
@@ -60,7 +58,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
                 "\n[bold]point[/bold]: Uses the POS column. [italic]--window-kb[/italic] is used to create the window."
             ) % format_cli_default(
                 fine_mapping_defaults.locus_type,
-                label="Configured default",
             ),
         )
     grp.add_argument(
@@ -75,7 +72,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
                 "\nSet to 0 if you want to use the exact coordinates in 'range' mode. %s."
             ) % format_cli_default(
                 fine_mapping_defaults.locus_window_kb,
-                label="Configured default",
             ),
         )
 
@@ -91,7 +87,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
             "Minus log10(P) threshold used to include a locus for fine-mapping. "
             "The locus file must contain an LP column representing −log10(P) values",
             fine_mapping_defaults.locus_lp_threshold,
-            label="Configured default",
         ),
     )
 
@@ -104,7 +99,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
             "Minimum RAM (in GB) reserved per worker when running fine-mapping "
             "in parallel. Used for auto-detecting optimal worker count",
             fine_mapping_defaults.memory_per_worker_gb,
-            label="Configured default",
         ),
     )
 
@@ -118,7 +112,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
             "fine-mapping locus before dense LD construction. Increase only "
             "when sufficient memory is available",
             fine_mapping_defaults.ld_resource_guard.maximum_variants_per_locus,
-            label="Configured default",
         ),
     )
 
@@ -134,7 +127,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
         help=help_with_default(
             "Skip the configured extended MHC region",
             fine_mapping_defaults.skip_mhc,
-            label="Configured default",
         ),
     )
 
@@ -156,7 +148,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
         help=help_with_default(
             "Chromosome containing the MHC region",
             fine_mapping_defaults.mhc_chromosome,
-            label="Configured default",
         ),
     )
 
@@ -168,7 +159,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
         help=help_with_default(
             "Start coordinate for the MHC region",
             fine_mapping_defaults.mhc_start,
-            label="Configured default",
         ),
     )
 
@@ -180,7 +170,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
         help=help_with_default(
             "End coordinate for the MHC region",
             fine_mapping_defaults.mhc_end,
-            label="Configured default",
         ),
     )
 
@@ -193,7 +182,6 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
             help=help_with_default(
                 "Genome build used by locus coordinates, summary statistics, and LD",
                 fine_mapping_defaults.genome_build.value,
-                label="Configured default",
             ),
         )
 
@@ -264,7 +252,6 @@ def get_common_susie_arguments(add_help=False):
             "Maximum number of SuSiE credible sets per locus. "
             "Increasing this may increase runtime and memory usage",
             defaults.max_causal_components,
-            label="Configured default",
         ),
     )
 
@@ -277,7 +264,6 @@ def get_common_susie_arguments(add_help=False):
             "Minimum absolute within-set correlation required for a SuSiE "
             "credible set",
             defaults.minimum_purity,
-            label="Configured default",
         ),
     )
 
@@ -293,7 +279,6 @@ def get_common_susie_arguments(add_help=False):
             "Maximum time (in seconds) allowed for PLINK LD-matrix computation "
             "per locus. Execution aborts for loci exceeding this limit",
             defaults.execution.ld_timeout_seconds,
-            label="Configured default",
         ),
     )
 
@@ -306,7 +291,6 @@ def get_common_susie_arguments(add_help=False):
             "Maximum time (in seconds) allowed for SuSiE model fitting per locus. "
             "Loci exceeding the limit are skipped with a warning",
             defaults.execution.susie_timeout_seconds,
-            label="Configured default",
         ),
     )
 
@@ -318,7 +302,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "Maximum iterations for the primary SuSiE fit",
             defaults.fitting.main_max_iter,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -329,7 +312,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "Maximum iterations for a recovery fit",
             defaults.recovery.max_iter,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -340,7 +322,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "Maximum iterations for a fit using repaired and revalidated LD",
             defaults.recovery.repaired_max_iter,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -351,7 +332,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "Maximum causal components used by reduced-L recovery",
             defaults.recovery.reduced_l_max,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -362,7 +342,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "Negative-eigenvalue tolerance used to classify LD as non-PSD",
             defaults.ld_validation.eigenvalue_tolerance,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -373,7 +352,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "SuSiE-RSS LD/z mismatch lambda that produces a warning",
             defaults.ld_validation.mismatch_warning_threshold,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -384,7 +362,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "SuSiE-RSS LD/z mismatch lambda that invalidates a locus",
             defaults.ld_validation.mismatch_failure_threshold,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -395,7 +372,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "Largest absolute correlation change permitted during LD repair",
             defaults.ld_validation.repair_maximum_change,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -406,7 +382,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "Hard timeout for each PLINK subprocess invoked by the R worker",
             defaults.execution.plink_timeout_seconds,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -417,7 +392,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "System memory-use percentage that activates the R memory throttle",
             defaults.memory.used_threshold_percent,
-            label="Configured default",
         ),
     )
     susie.add_argument(
@@ -428,7 +402,6 @@ def get_common_susie_arguments(add_help=False):
         help=help_with_default(
             "Maximum time an R worker waits for memory pressure to subside",
             defaults.memory.maximum_wait_seconds,
-            label="Configured default",
         ),
     )
 
@@ -479,10 +452,10 @@ def get_common_finemap_finemap_arguments(add_help=False):
         "--sss",
         action="store_true",
         default=argparse.SUPPRESS,
-        help=(
+        help=help_with_default(
             "Fine-mapping with [bold]shotgun stochastic search[/bold]. "
-            "Use either [cyan]--sss[/cyan] or [cyan]--cond[/cyan], not both. "
-            "Configured default: [cyan]%s[/cyan]." % defaults.algorithm
+            "Use either [cyan]--sss[/cyan] or [cyan]--cond[/cyan], not both",
+            defaults.algorithm,
         ),
     )
 
@@ -507,7 +480,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Maximum total runtime for LDstore processing within one locus",
             defaults.ldstore_timeout_seconds,
-            label="Configured default",
         ),
     )
 
@@ -519,7 +491,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Maximum FINEMAP model-fitting runtime for one locus",
             defaults.finemap_timeout_seconds,
-            label="Configured default",
         ),
     )
 
@@ -532,7 +503,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
             "Grace period after timeout before the external process tree is "
             "force-killed",
             defaults.termination_grace_seconds,
-            label="Configured default",
         ),
     )
 
@@ -547,7 +517,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Maximum number of SSS iterations",
             defaults.n_iter,
-            label="Configured default",
         ),
     )
 
@@ -560,7 +529,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
             "Consecutive iterations for which added posterior mass must stay "
             "below --prob-conv-sss-tol",
             defaults.n_conv_sss,
-            label="Configured default",
         ),
     )
 
@@ -572,7 +540,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Added-posterior-mass tolerance used to terminate SSS",
             defaults.prob_conv_sss_tol,
-            label="Configured default",
         ),
     )
 
@@ -584,7 +551,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Number of top causal configurations to save",
             defaults.n_configs_top,
-            label="Configured default",
         ),
     )
 
@@ -599,7 +565,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Maximum, rather than exact, number of causal SNPs per locus",
             defaults.n_causal_snps,
-            label="Configured default",
         ),
     )
 
@@ -621,7 +586,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Prior standard deviation for causal effect sizes",
             defaults.prior_std,
-            label="Configured default",
         ),
     )
 
@@ -637,7 +601,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
             "Set a causal configuration's posterior probability to zero when it "
             "contains a SNP pair with absolute correlation above this threshold",
             defaults.corr_config,
-            label="Configured default",
         ),
     )
 
@@ -659,7 +622,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Marginal p-value threshold for including SNPs",
             defaults.pvalue_snps,
-            label="Configured default",
         ),
     )
 
@@ -671,7 +633,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Significance threshold for conditional search",
             defaults.cond_pvalue,
-            label="Configured default",
         ),
     )
 
@@ -683,7 +644,6 @@ def get_common_finemap_finemap_arguments(add_help=False):
         help=help_with_default(
             "Posterior coverage target for each credible set",
             load_configuration().modules.fine_mapping.credible_set_coverage,
-            label="Configured default",
         ),
     )
 

@@ -55,9 +55,9 @@ postgwas annot_ldblock \
 
 ## Parameters
 
-The standalone command defaults to GRCh37 and populations EUR, AFR, and EAS.
-Pass both explicitly because the command and module YAML differ.
-Compute options are shared, although annotation is performed sequentially by
+Canonical `modules.ld_annotation` YAML supplies GRCh37 and populations EUR,
+AFR, and EAS. The corresponding CLI options override those values. Compute
+options are shared, although annotation is performed sequentially by
 population.
 
 ## Processing steps
@@ -91,8 +91,7 @@ population file, or unavailable bcftools/tabix.
 
 The current engine copies the input before completing all resource validation,
 processes populations sequentially, and does not produce a summary report of
-assigned/unassigned variants. The standalone default differs from YAML, so pass
-the build and population explicitly.
+assigned/unassigned variants.
 
 ## Scientific references
 

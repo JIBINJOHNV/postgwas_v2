@@ -16,6 +16,81 @@ from postgwas.modules.magma.errors import MagmaError
 from postgwas.modules.magma.reference import read_reference_bim_matches
 
 
+def read_gene_locations(
+    gene_location_file: str | Path,
+    module_config,
+    label: str = "MAGMA gene-location reference",
+) -> dict[str, tuple[str, int, int, str, str | None]]:
+    """Read the configured five-column MAGMA locations plus optional alias."""
+    source = require_nonempty_file(
+        gene_location_file, label, error_type=MagmaError,
+    )
+    input_config = module_config.input
+    roles = input_config.gene_location_columns
+    indexes = {role: roles.index(role) for role in roles}
+    delimiter = re.compile(input_config.table_delimiter_pattern)
+    locations: dict[str, tuple[str, int, int, str, str | None]] = {}
+    header_pending = input_config.gene_location_has_header
+    try:
+        with open_text(source) as handle:
+            for line_number, raw in enumerate(handle, 1):
+                text = raw.strip()
+                if not text or text.startswith(
+                    module_config.annotation_validation.comment_prefix
+                ):
+                    continue
+                if header_pending:
+                    header_pending = False
+                    continue
+                fields = delimiter.split(text)
+                if len(fields) not in {5, 6}:
+                    raise MagmaError(
+                        "%s line %d must contain five columns plus an optional "
+                        "alternate gene identifier; found %d"
+                        % (label, line_number, len(fields))
+                    )
+                gene = fields[indexes["gene_id"]].strip()
+                chromosome = fields[indexes["chromosome"]].strip()
+                try:
+                    start = int(fields[indexes["start"]])
+                    end = int(fields[indexes["end"]])
+                except ValueError as exc:
+                    raise MagmaError(
+                        "%s line %d requires integer start and end coordinates"
+                        % (label, line_number)
+                    ) from exc
+                strand = fields[indexes["strand"]].strip()
+                if (
+                    not gene
+                    or not chromosome
+                    or chromosome in input_config.invalid_chromosome_labels
+                    or start < 1
+                    or end < start
+                    or strand not in {"+", "-"}
+                ):
+                    raise MagmaError(
+                        "%s line %d has an invalid gene ID, chromosome, interval, "
+                        "or strand" % (label, line_number)
+                    )
+                if gene in locations:
+                    raise MagmaError(
+                        "%s repeats primary gene ID %s at line %d"
+                        % (label, gene, line_number)
+                    )
+                alternate_index = indexes.get("alternate_gene_id")
+                alternate = (
+                    fields[alternate_index].strip() or None
+                    if alternate_index is not None and alternate_index < len(fields)
+                    else None
+                )
+                locations[gene] = (chromosome, start, end, strand, alternate)
+    except (OSError, UnicodeError) as exc:
+        raise MagmaError("Cannot read %s %s: %s" % (label, source, exc)) from exc
+    if not locations:
+        raise MagmaError("%s contains no genes" % label)
+    return locations
+
+
 def validate_gene_annotation(
     annotation_file: str | Path,
     ld_reference_prefix: str | Path,
@@ -114,75 +189,16 @@ def merge_gene_annotations(
 ) -> dict:
     """Union nMAGMA SNP assignments using its canonical gene coordinates."""
     policy = module_config.annotation_validation
-    coordinate = re.compile(policy.coordinate_pattern)
     input_config = module_config.input
+    coordinate = re.compile(policy.coordinate_pattern)
     delimiter = re.compile(input_config.table_delimiter_pattern)
-    location_source = require_nonempty_file(
-        gene_location_file,
-        "nMAGMA gene-location reference",
-        error_type=MagmaError,
+    source_locations = read_gene_locations(
+        gene_location_file, module_config, "nMAGMA gene-location reference",
     )
-    location_roles = list(input_config.gene_location_columns)
-    location_indexes = {role: location_roles.index(role) for role in location_roles}
-    maximum_location_index = max(location_indexes.values())
-    gene_locations: dict[str, str] = {}
-    try:
-        with open_text(location_source) as handle:
-            for line_number, raw in enumerate(handle, 1):
-                if input_config.gene_location_has_header and line_number == 1:
-                    continue
-                text = raw.strip()
-                if not text or text.startswith(policy.comment_prefix):
-                    continue
-                fields = delimiter.split(text)
-                if len(fields) <= maximum_location_index:
-                    raise MagmaError(
-                        "nMAGMA gene-location reference line %d has %d fields; "
-                        "configured column %d is required."
-                        % (line_number, len(fields), maximum_location_index)
-                    )
-                gene = fields[location_indexes["gene_id"]].strip()
-                chromosome = fields[location_indexes["chromosome"]].strip()
-                try:
-                    start = int(fields[location_indexes["start"]])
-                    end = int(fields[location_indexes["end"]])
-                except ValueError as exc:
-                    raise MagmaError(
-                        "nMAGMA gene-location reference contains a non-integer "
-                        "interval at line %d: %s" % (line_number, location_source)
-                    ) from exc
-                if (
-                    not gene
-                    or chromosome in input_config.invalid_chromosome_labels
-                    or start < 1
-                    or end < start
-                ):
-                    raise MagmaError(
-                        "nMAGMA gene-location reference contains an invalid gene or "
-                        "interval at line %d: %s" % (line_number, location_source)
-                    )
-                # MAGMA's public .genes.annot contract represents intervals as
-                # chromosome:start:end; this is a protocol invariant.
-                location = "%s:%d:%d" % (chromosome, start, end)
-                if coordinate.fullmatch(location) is None:
-                    raise MagmaError(
-                        "nMAGMA gene-location reference produced a coordinate that "
-                        "does not match annotation_validation.coordinate_pattern at "
-                        "line %d: %s" % (line_number, location)
-                    )
-                if gene in gene_locations:
-                    raise MagmaError(
-                        "nMAGMA gene-location reference repeats gene identifier %s "
-                        "at line %d" % (gene, line_number)
-                    )
-                gene_locations[gene] = location
-    except (OSError, UnicodeError) as exc:
-        raise MagmaError(
-            "Cannot read nMAGMA gene-location reference %s: %s"
-            % (location_source, exc)
-        ) from exc
-    if not gene_locations:
-        raise MagmaError("nMAGMA gene-location reference contains no genes")
+    gene_locations = {
+        gene: "%s:%d:%d" % values[:3]
+        for gene, values in source_locations.items()
+    }
 
     genes: dict[str, tuple[list[str], set[str]]] = {}
     source_assignments = []
@@ -286,7 +302,7 @@ def merge_gene_annotations(
     )
     result = {
         "annotation_components": source_assignments,
-        "gene_location_file": str(location_source),
+        "gene_location_file": str(Path(gene_location_file).expanduser().resolve()),
         "canonical_gene_locations": len(gene_locations),
         "genes": len(retained_genes),
         "unique_gene_variant_assignments": sum(

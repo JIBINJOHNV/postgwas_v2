@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+GLOBAL_RUNTIME_OVERRIDES = {
+    "show_screen": "logging.show_screen",
+    "resume": "run.resume",
+    "overwrite": "run.overwrite",
+}
+
+
 def get_dotted(value: Any, dotted_path: str) -> Any:
     current = value
     for part in dotted_path.split("."):
@@ -14,18 +21,15 @@ def get_dotted(value: Any, dotted_path: str) -> Any:
     return current
 
 
-def help_with_default(description: str, defaults: Any, dotted_path: str) -> str:
-    value = get_dotted(defaults, dotted_path)
-    return "%s Packaged default: %s." % (description.rstrip(". "), value)
-
-
 def explicit_overrides(
     namespace: argparse.Namespace, destination_to_path: Mapping[str, str]
 ) -> dict[str, Any]:
     """Return explicit CLI values in their YAML-compatible representation."""
+    paths = dict(GLOBAL_RUNTIME_OVERRIDES)
+    paths.update(destination_to_path)
     return {
         dotted_path: str(value) if isinstance(value, Path) else value
-        for destination, dotted_path in destination_to_path.items()
+        for destination, dotted_path in paths.items()
         if hasattr(namespace, destination)
         for value in (getattr(namespace, destination),)
     }

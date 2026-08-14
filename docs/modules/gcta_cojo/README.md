@@ -47,7 +47,7 @@ lead variants while testing other eligible variants. Use
 `--joint-snps model_snps.txt` when the objective is instead to estimate the
 effects of a specified SNP set simultaneously.
 
-## Scientific requirements
+## Input and reference requirements
 
 The GWAS and LD reference must use the same genome build, ancestry, variant IDs,
 and compatible alleles. PostGWAS requires the user to declare build and reference

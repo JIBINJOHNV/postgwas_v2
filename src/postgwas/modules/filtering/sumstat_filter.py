@@ -16,7 +16,11 @@ import polars as pl
 from postgwas.core.execution.runtime import run_cmd
 from postgwas.core.paths import configured_output_path, validate_filename_component
 from postgwas.core.ui.screen import screen_field, screen_line
-from postgwas.core.vcf import VCF_TAG
+from postgwas.core.vcf import (
+    VCF_TAG,
+    read_vcf_header,
+    validate_vcf_header_contract,
+)
 
 
 MISSING_CHOICES = ("keep", "remove")
@@ -48,6 +52,7 @@ def _filtering_summary_lines(
     condition_checks: List[Dict[str, Any]],
     variants_before: Optional[int],
     variants_after: Optional[int],
+    terminal_label_width: int,
     reason_statistics: Optional[Dict[str, Any]] = None,
     reason_report: Optional[str] = None,
     data_flow: Optional[Dict[str, Any]] = None,
@@ -61,7 +66,7 @@ def _filtering_summary_lines(
             "info", "Attribution method",
             "a variant can fail more than one rule. To avoid double-counting, each removed "
             "variant is assigned to the first rule it fails; the assignment order is saved in the report",
-            indent=6, label_width=22,
+            indent=8, label_width=terminal_label_width,
         ),
         "",
         screen_line("count", "Variant flow", indent=6),
@@ -82,16 +87,16 @@ def _filtering_summary_lines(
                 "loss" if "removed" in label.lower() or "invalid" in label.lower()
                 else "count",
                 label, _fmt_count(data_flow.get(key)),
-                indent=8, label_width=31,
+                indent=8, label_width=terminal_label_width,
             ))
     lines.extend([
         screen_field(
             "count", "VCF before filtering", _fmt_count(variants_before),
-            indent=8, label_width=31,
+            indent=8, label_width=terminal_label_width,
         ),
         screen_field(
             "count", "VCF after filtering", _fmt_count(variants_after),
-            indent=8, label_width=31,
+            indent=8, label_width=terminal_label_width,
         ),
         "",
         screen_line("genetic", "Missing values used by active filters", indent=6),
@@ -106,7 +111,7 @@ def _filtering_summary_lines(
                     _fmt_count(check.get("primary_count")),
                     check.get("action"),
                 ),
-                indent=8, label_width=20,
+                indent=8, label_width=terminal_label_width,
             ).splitlines())
     else:
         lines.append(screen_line(
@@ -118,9 +123,6 @@ def _filtering_summary_lines(
         screen_line("analysis", "Active filtering conditions", indent=6),
     ])
     if condition_checks:
-        label_width = max(
-            [56] + [len(str(check["label"])) for check in condition_checks]
-        )
         for check in condition_checks:
             lines.extend(screen_field(
                 "loss", check["label"],
@@ -128,7 +130,7 @@ def _filtering_summary_lines(
                     _fmt_count(check.get("count")),
                     _fmt_count(check.get("primary_count")),
                 ),
-                indent=8, label_width=label_width,
+                indent=8, label_width=terminal_label_width,
             ).splitlines())
     else:
         lines.append(screen_line(
@@ -141,12 +143,12 @@ def _filtering_summary_lines(
         screen_field(
             "analysis", "Multiple failed rules",
             _fmt_count(reason_statistics.get("overlap_variants")),
-            indent=8, label_width=28,
+            indent=8, label_width=terminal_label_width,
         ),
         screen_field(
             "analysis", "Overlapping rule matches",
             _fmt_count(reason_statistics.get("extra_rule_matches")),
-            indent=8, label_width=28,
+            indent=8, label_width=terminal_label_width,
         ),
     ])
     removed = None
@@ -154,7 +156,7 @@ def _filtering_summary_lines(
         removed = variants_before - variants_after
     lines.append(screen_field(
         "loss", "Removed by all filters", _fmt_count(removed),
-        indent=8, label_width=28,
+        indent=8, label_width=terminal_label_width,
     ))
 
     attributed = reason_statistics.get("primary_removed_total")
@@ -169,17 +171,17 @@ def _filtering_summary_lines(
                 _fmt_count(attributed), "=" if reconciled else "!=",
                 _fmt_count(removed),
             ),
-            indent=8, label_width=28,
+            indent=8, label_width=terminal_label_width,
         ))
     else:
         lines.append(screen_field(
             "warning", "Removal count check", "unavailable",
-            indent=8, label_width=28,
+            indent=8, label_width=terminal_label_width,
         ))
     if reason_report:
         lines.append(screen_field(
             "info", "Detailed reason report", os.path.basename(reason_report),
-            indent=8, label_width=28,
+            indent=8, label_width=terminal_label_width,
         ))
     return lines
 
@@ -378,66 +380,24 @@ def _write_filter_reason_report(
 
 
 def _read_vcf_header(vcf_path: Path, bcftools_bin: str) -> str:
-    """Read a VCF header with the configured bcftools executable."""
-    result = run_cmd(
-        [bcftools_bin, "view", "--header-only", str(vcf_path)],
-        shell=False,
-    )
-    header = result.stdout or ""
-    if not header.strip():
-        raise ValueError("bcftools returned an empty VCF header for %s" % vcf_path)
-    return header
-
-
-def _declared_vcf_tags(header: str, category: str) -> set[str]:
-    return set(re.findall(r"^##%s=<ID=([^,>]+)" % category, header, re.MULTILINE))
+    """Compatibility wrapper around the shared VCF contract reader."""
+    return read_vcf_header(vcf_path, bcftools_bin, error_type=ValueError)
 
 
 def _validate_vcf_contract(
     *,
     header: str,
-    genome_build: str,
-    genome_build_header_tokens: Mapping[str, List[str]],
+    genome_build_header: str,
+    supported_genome_builds: List[str],
     required_fields: List[str],
-) -> List[str]:
-    """Validate genome build and active INFO/FORMAT fields before filtering."""
-    tokens = list(genome_build_header_tokens.get(genome_build) or ())
-    if not tokens:
-        raise ValueError(
-            "No VCF header tokens are configured for genome build %s" % genome_build
-        )
-    build_declarations = []
-    for line in header.splitlines():
-        lower_line = line.lower()
-        if re.match(r"^##(?:reference|assembly|genome_build)\s*=", line, re.I):
-            build_declarations.append(lower_line)
-        elif lower_line.startswith("##contig=<") and re.search(
-            r"(?:^|[,\s])assembly\s*=", line, re.I,
-        ):
-            build_declarations.append(lower_line)
-    declared_build_text = "\n".join(build_declarations)
-    if not any(token.lower() in declared_build_text for token in tokens):
-        raise ValueError(
-            "Input VCF header does not declare configured genome build %s. "
-            "Expected one of these configured header tokens: %s"
-            % (genome_build, ", ".join(tokens))
-        )
-
-    declared = {
-        "FORMAT": _declared_vcf_tags(header, "FORMAT"),
-        "INFO": _declared_vcf_tags(header, "INFO"),
-    }
-    missing = []
-    for field in dict.fromkeys(required_fields):
-        category, tag = field.split("/", 1)
-        if tag not in declared[category]:
-            missing.append(field)
-    if missing:
-        raise ValueError(
-            "Input VCF header is missing fields required by active filters: %s"
-            % ", ".join(missing)
-        )
-    return re.findall(r"^##contig=<ID=([^,>]+)", header, re.MULTILINE)
+) -> tuple[str, List[str]]:
+    """Compatibility wrapper around the shared VCF contract validator."""
+    return validate_vcf_header_contract(
+        header=header,
+        genome_build_header=genome_build_header,
+        supported_genome_builds=supported_genome_builds,
+        required_fields=required_fields,
+    )
 
 
 def filter_gwas_vcf_bcftools(
@@ -445,8 +405,8 @@ def filter_gwas_vcf_bcftools(
     output_folder: str,
     output_prefix: str,
     *,
-    genome_build: str,
-    genome_build_header_tokens: Mapping[str, List[str]],
+    genome_build_header: str,
+    supported_genome_builds: List[str],
     pval_cutoff: Optional[float],
     maf_cutoff: Optional[float],
     allelefreq_diff_cutoff: Optional[float],
@@ -459,9 +419,7 @@ def filter_gwas_vcf_bcftools(
     palindromic_af_lower: float,
     palindromic_af_upper: float,
     remove_mhc: bool,
-    mhc_chrom: str,
-    mhc_start: int,
-    mhc_end: int,
+    mhc_regions: Mapping[str, Mapping[str, Any]],
     threads: int,
     max_mem: str,
     lp_missing: str,
@@ -475,6 +433,7 @@ def filter_gwas_vcf_bcftools(
     bash_bin: str,
     resolved_configuration: Mapping[str, Any],
     report_missing_counts: bool,
+    terminal_label_width: int,
 ) -> Dict[str, Any]:
     """Filter a GWAS-VCF and report, honestly, how many variants each rule cost.
 
@@ -531,21 +490,10 @@ def filter_gwas_vcf_bcftools(
 
     step_dir = Path(output_folder).expanduser().resolve()
     step_dir.mkdir(parents=True, exist_ok=True)
-    path_values = {"dataset_id": output_prefix, "genome_build": genome_build}
-    output_vcf = configured_output_path(
-        step_dir, output_layout["filtered_vcf"], **path_values
-    )
     log_file = configured_output_path(
-        step_dir, output_layout["log_file"], **path_values
+        step_dir, output_layout["preflight_log"], dataset_id=output_prefix
     )
-    reason_report_path = configured_output_path(
-        step_dir, output_layout["reason_summary"], **path_values
-    )
-    mhc_bed = configured_output_path(
-        step_dir, output_layout["mhc_exclusion_bed"], **path_values
-    )
-    for path in (output_vcf, log_file, reason_report_path, mhc_bed):
-        path.parent.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     log_buffer = io.StringIO()
 
     def log_print(*args):
@@ -602,13 +550,31 @@ def filter_gwas_vcf_bcftools(
             required_fields.append(imputation_quality_format)
         if allelefreq_diff_cutoff is not None:
             required_fields.extend((study_af_info, external_af_info))
-        contigs = _validate_vcf_contract(
+        genome_build, contigs = _validate_vcf_contract(
             header=header,
-            genome_build=genome_build,
-            genome_build_header_tokens=genome_build_header_tokens,
+            genome_build_header=genome_build_header,
+            supported_genome_builds=supported_genome_builds,
             required_fields=required_fields,
         )
+        mhc_chrom = None
+        mhc_start = None
+        mhc_end = None
         if remove_mhc:
+            mhc_region = mhc_regions.get(genome_build)
+            if mhc_region is None:
+                raise ValueError(
+                    "MHC removal is enabled, but modules.filtering.mhc_regions "
+                    "does not define %s" % genome_build
+                )
+            try:
+                mhc_chrom = str(mhc_region["chromosome"])
+                mhc_start = int(mhc_region["start"])
+                mhc_end = int(mhc_region["end"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "The configured MHC region for %s is incomplete or invalid"
+                    % genome_build
+                ) from exc
             mhc_chrom = _match_contig_naming(
                 str(mhc_chrom), contigs, log_warn,
             )
@@ -621,6 +587,26 @@ def filter_gwas_vcf_bcftools(
         "✅ VCF contract validated: genome_build=%s; active_fields=%s"
         % (genome_build, ", ".join(required_fields) or "none")
     )
+    if remove_mhc:
+        log_print(
+            "✅ Build-specific MHC region selected: %s:%d-%d (%s)"
+            % (mhc_chrom, mhc_start, mhc_end, genome_build)
+        )
+    path_values = {"dataset_id": output_prefix, "genome_build": genome_build}
+    log_file = configured_output_path(
+        step_dir, output_layout["log_file"], **path_values
+    )
+    output_vcf = configured_output_path(
+        step_dir, output_layout["filtered_vcf"], **path_values
+    )
+    reason_report_path = configured_output_path(
+        step_dir, output_layout["reason_summary"], **path_values
+    )
+    mhc_bed = configured_output_path(
+        step_dir, output_layout["mhc_exclusion_bed"], **path_values
+    )
+    for path in (log_file, output_vcf, reason_report_path, mhc_bed):
+        path.parent.mkdir(parents=True, exist_ok=True)
     for label, executable in (
         ("bcftools", bcftools_bin),
         ("tabix", tabix_bin),
@@ -1143,6 +1129,7 @@ def filter_gwas_vcf_bcftools(
         condition_checks,
         pre_variants,
         post_variants,
+        terminal_label_width,
         reason_statistics=reason_statistics,
         reason_report=str(reason_report_path),
     )
@@ -1188,6 +1175,7 @@ def filter_gwas_vcf_bcftools(
         print(line)
     print("")
     return {
+        "genome_build": genome_build,
         "filtered_vcf": str(output_vcf),
         "filtered_vcf_index": str(Path(str(output_vcf) + ".tbi")),
         "filter_log": str(log_file),
@@ -1246,7 +1234,7 @@ def _match_contig_naming(
 
     raise ValueError(
         "MHC contig %r is absent from the input VCF header (contigs seen: %s%s). "
-        "Set modules.filtering.mhc.chromosome to a matching contig."
+        "Set the matching modules.filtering.mhc_regions.<build>.chromosome value."
         % (
             mhc_chrom,
             ", ".join(contigs[:10]),

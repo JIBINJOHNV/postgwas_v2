@@ -66,13 +66,14 @@ postgwas imputation \
 
 ## Parameters
 
-Only `pred_ld` is implemented in direct mode. The direct defaults are minimum
-LD r² 0.8, reference MAF 0.001, population EUR, and reference mode `TOP_LD`. The
-runner applies additional memory-aware scheduling; begin with conservative
-parallel settings for a new system.
+Only `pred_ld` is implemented in direct mode. Canonical
+`modules.imputation` YAML supplies minimum LD r² 0.8, reference MAF 0.001,
+population EUR, reference mode `TOP_LD`, and Pearson correlation. CLI options
+override those values. The runner applies additional memory-aware scheduling;
+begin with conservative parallel settings for a new system.
 
-`--correlation-method` is currently accepted by the parser but is not delivered
-to the post-processing step, so the value has no effect. Do not rely on it.
+`--correlation-method` controls the observed-versus-imputed post-processing
+correlation and overrides `engines.pred_ld.correlation_method`.
 
 ## Processing steps
 

@@ -227,9 +227,11 @@ bcftools --version
 bcftools plugin -l | grep '^liftover$'
 ```
 
-After creating and activating the conda environment, install the pinned plugin
-with `tools/setup/install_bcftools_liftover.sh`. Optional first and second
-arguments override the bcftools version and plugin source revision.
+The recommended `tools/setup/install_postgwas.sh` installer builds the pinned
+plugin inside the environment automatically. For a manual installation, first
+activate the environment and run `tools/setup/install_bcftools_liftover.sh`.
+Optional first and second arguments override the bcftools version and plugin
+source revision.
 
 The command verifies these requirements before reading a summary-statistics
 file. A missing program or plugin therefore produces an actionable preflight
@@ -260,10 +262,10 @@ Normal terminal output is always copied incrementally to the configured
 `<output>/<dataset_id>/harmonisation/<dataset_id>_screen_report.txt`. Shared
 run preparation and final summary blocks are copied to every selected dataset;
 dataset processing blocks are written only to the dataset they describe.
-`runtime.display_screen` defaults to `true`. Use `--hide-screen` to suppress
-normal progress on stdout while continuing to write the reports, or
-`--show-screen` to override a run configuration that disabled display. Fatal
-command errors remain visible on stderr.
+The shared `logging.show_screen` setting defaults to `true`. Use
+`--hide-screen` to suppress normal terminal output while continuing to write
+both these dataset reports and the shared `logging.screen_log_file`, or use
+`--show-screen` to override a run configuration that disabled display.
 
 Each dataset also receives its own run metadata and complete dataset/chromosome
 logs. Success, permanent failure, configuration failure, and user interruption
@@ -416,9 +418,9 @@ rejection provenance, explicit count reconciliation, and separate chromosome,
 merged-VCF and output integrity. “QC-passed” is a virtual assessment; the raw
 merged VCF remains unchanged.
 
-The existing merged-VCF rule assessment then runs its own `bcftools query` data
-pass against the build selected by `qc.target_build`, extracting only the fields
-required for that assessment into a temporary TSV. A streaming Polars
+The QC module then runs its shared `bcftools query` data pass against the build
+selected by `modules.qc_summary.target_build`, extracting only the configured
+fields into a temporary TSV. A streaming Polars
 aggregation performs four related calculations without rereading its VCF:
 
 1. summary-statistic flow before VCF creation;
@@ -433,14 +435,15 @@ The same extraction includes the configured effective-sample-size FORMAT field
 (default `FORMAT/NEF`). For both the raw records and the final virtual subset,
 PostGWAS reports usable and missing/invalid values, minimum, maximum, mean,
 sample standard deviation, and the number above that stage's mean plus
-`qc.sample_size_outlier_standard_deviations` standard deviations. The default is
+`modules.qc_summary.rules.sample_size_outlier_standard_deviations` standard
+deviations. The default is
 5, matching
 [MungeSumstats `N_std`](https://www.bioconductor.org/packages/release/bioc/manuals/MungeSumstats/man/MungeSumstats.pdf).
 This is descriptive QC: unusually large Neff values are reported but are not
 silently removed.
 
 “QC-passed” means that a raw-VCF record passed every active rule under
-`policies.filter`. It does not identify another output VCF. The terminal report
+`modules.qc_summary.rules`. It does not identify another output VCF. The terminal report
 shows how many raw records fail each independent condition and explicitly notes
 that these counts can overlap. Only the final combined mask determines the
 excluded and QC-passed totals.
@@ -460,10 +463,20 @@ Persistent reports are written to the dataset's `qc_summary/` directory:
 
 The temporary extracted TSV is always removed, including when assessment fails.
 The raw merged VCF is unchanged and remains the VCF returned by harmonisation.
-The bcftools query expressions are declared under `vcf_processing.qc_fields`,
-and the three persistent report paths plus the temporary-file prefix are
-declared under `output_layout`. Screen labels are derived from the resolved VCF
-mapping, so a configured tag change is reflected in both analysis and reporting.
+The bcftools query expressions, scientific rules, report paths, and
+temporary-file settings are all declared under `modules.qc_summary`. The
+harmonisation resolved-configuration report includes that module because it is
+an internal dependency. Screen labels are derived from the resolved VCF mapping,
+so a configured tag change is reflected in both analysis and reporting.
+
+`vcf_processing.genome_build_header` configures the explicit VCF metadata line
+written during final chromosome concatenation. Its `{build}` placeholder is
+resolved separately for each output: the detected input build for source, raw,
+and not-lifted records, and the target build for successfully lifted records.
+PostGWAS validates that each merged output contains exactly one matching line.
+The default is `##genome_build={build}`. It is appended with
+[`bcftools annotate --header-line`](https://samtools.github.io/bcftools/bcftools#annotate)
+inside the existing uncompressed-BCF merge stream.
 
 The supported comparison-frequency panel names and their resource examples are
 declared under `comparison_af.available_sources` and

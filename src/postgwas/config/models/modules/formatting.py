@@ -1,9 +1,14 @@
+from pathlib import Path
 import re
 from typing import Literal, get_args
 
 from pydantic import Field, RootModel, field_validator, model_validator
 
-from postgwas.config.models.common import ModuleConfig, StrictModel
+from postgwas.config.models.common import (
+    DelimitedTableReadConfig,
+    ModuleConfig,
+    StrictModel,
+)
 from postgwas.core.variant_identifiers import (
     IDENTIFIER_TEMPLATE_FIELDS,
     VariantIdentifierType,
@@ -17,6 +22,19 @@ FormattingTarget = Literal[
 StudyDesignTarget = Literal["ldsc", "mixer"]
 FormattingTransform = Literal[
     "negative_log10_to_raw_p", "effect_frequency_to_minor_frequency",
+]
+FormattingDuplicatePolicy = Literal[
+    "exclude_all",
+    "error",
+    "most_significant",
+    "highest_maf",
+    "highest_info",
+]
+FormattingSampleSizeRole = Literal[
+    "total_sample_size",
+    "effective_sample_size",
+    "case_sample_size",
+    "control_sample_size",
 ]
 FormattingCustomField = Literal[
     "id", "chr", "pos", "ref", "alt", "beta", "se", "z", "lp", "p",
@@ -155,6 +173,78 @@ class FormattingCanonicalColumns(StrictModel):
     reference_allele: str
     alternate_allele: str
     resolved_variant_id: str
+    negative_log10_p_value: str
+    effect_allele_frequency: str
+    imputation_quality: str
+    total_sample_size: str
+    effective_sample_size: str
+    case_sample_size: str
+    control_sample_size: str
+
+    @model_validator(mode="after")
+    def distinct_sample_size_columns(self):
+        columns = [
+            getattr(self, role)
+            for role in get_args(FormattingSampleSizeRole)
+        ]
+        if len(columns) != len(set(columns)):
+            raise ValueError(
+                "sample-size roles must reference distinct canonical columns"
+            )
+        return self
+
+
+class FormattingTraitDescription(StrictModel):
+    """Trait-aware text resolved for one scientific reporting concept."""
+
+    default: str
+    binary: str | None = None
+    quantitative: str | None = None
+
+    @field_validator("default", "binary", "quantitative")
+    @classmethod
+    def nonempty_description(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    def resolve(self, trait_type: str | None) -> str:
+        if trait_type in ("binary", "quantitative"):
+            specific = getattr(self, trait_type)
+            if specific is not None:
+                return specific
+        return self.default
+
+
+class FormattingSampleSizeReportingConfig(StrictModel):
+    """Canonical semantic descriptions used by screen and log reporting."""
+
+    source_semantics: dict[
+        FormattingSampleSizeRole, FormattingTraitDescription
+    ]
+    target_notes: dict[FormattingTarget, FormattingTraitDescription]
+
+    @field_validator("source_semantics")
+    @classmethod
+    def complete_source_semantics(cls, values):
+        expected = set(get_args(FormattingSampleSizeRole))
+        if set(values) != expected:
+            raise ValueError(
+                "must describe every sample-size role exactly once: %s"
+                % ", ".join(sorted(expected))
+            )
+        return values
+
+    @field_validator("target_notes")
+    @classmethod
+    def complete_target_notes(cls, values):
+        expected = set(get_args(FormattingTarget))
+        if set(values) != expected:
+            raise ValueError(
+                "must describe every formatter target exactly once: %s"
+                % ", ".join(sorted(expected))
+            )
+        return values
 
 
 class FormattingChromosomeLabels(StrictModel):
@@ -188,6 +278,11 @@ class FormattingVariantIdentifierConfig(StrictModel):
 
     default_type: VariantIdentifierType
     target_types: dict[FormattingTarget, VariantIdentifierType]
+    default_duplicate_policy: FormattingDuplicatePolicy
+    target_duplicate_policies: dict[
+        FormattingTarget, FormattingDuplicatePolicy
+    ]
+    duplicate_rank_tolerance: float = Field(ge=0, allow_inf_nan=False)
     rsid_pattern: str
     rsid_extraction_pattern: str
     unique_id_template: str
@@ -233,6 +328,42 @@ class FormattingVariantIdentifierConfig(StrictModel):
         ):
             raise ValueError("must not use conversions or format specifiers")
         return value
+
+
+class FormattingLdscReferenceColumns(StrictModel):
+    """Column roles in the LDSC ``--merge-alleles`` reference table."""
+
+    variant_id: str
+    allele_1: str
+    allele_2: str
+
+    @field_validator("*")
+    @classmethod
+    def nonempty_column(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @model_validator(mode="after")
+    def unique_columns(self):
+        values = list(self.model_dump().values())
+        if len(values) != len(set(values)):
+            raise ValueError("reference column names must be unique")
+        return self
+
+
+class FormattingLdscReferenceConfig(DelimitedTableReadConfig):
+    """Optional HapMap3 reference used before the LDSC table is written."""
+
+    merge_alleles_file: Path | None
+    columns: FormattingLdscReferenceColumns
+    maximum_columns: int = Field(ge=3)
+
+
+class FormattingLdscSamplePrevalenceConfig(StrictModel):
+    """Reduction applied to valid per-variant case fractions for LDSC."""
+
+    aggregation: Literal["median", "mean"]
 
 
 class FormattingCustomFieldContract(StrictModel):
@@ -390,6 +521,7 @@ class FormattingResolvedConfig(StrictModel):
     """Configuration paths retained in target-scoped formatter metadata."""
 
     common_fields: list[str]
+    reporting_fields: list[str]
     format_fields: dict[FormattingTarget, list[str]]
     custom_fields: list[str]
 
@@ -398,6 +530,13 @@ class FormattingResolvedConfig(StrictModel):
     def unique_common_fields(cls, values: list[str]) -> list[str]:
         if not values or len(values) != len(set(values)):
             raise ValueError("common_fields must contain unique values")
+        return values
+
+    @field_validator("reporting_fields")
+    @classmethod
+    def unique_reporting_fields(cls, values: list[str]) -> list[str]:
+        if not values or len(values) != len(set(values)):
+            raise ValueError("reporting_fields must contain unique values")
         return values
 
     @field_validator("format_fields")
@@ -440,8 +579,11 @@ class FormattingConfig(ModuleConfig):
     vcf_fields: FormattingVcfFields
     numeric_columns: list[str]
     canonical_columns: FormattingCanonicalColumns
+    sample_size_reporting: FormattingSampleSizeReportingConfig
     chromosome_labels: FormattingChromosomeLabels
     variant_identifiers: FormattingVariantIdentifierConfig
+    ldsc_reference: FormattingLdscReferenceConfig
+    ldsc_sample_prevalence: FormattingLdscSamplePrevalenceConfig
     custom_output: FormattingCustomOutputConfig
     study_design: FormattingStudyDesign
     runtime: FormattingRuntimeConfig
@@ -466,18 +608,31 @@ class FormattingConfig(ModuleConfig):
         if set(self.format_order) != expected:
             raise ValueError("format_order must contain every formatter target exactly once")
         available = self.model_dump(mode="python", exclude={"resolved_config"})
+        common_or_reporting = (
+            set(self.resolved_config.common_fields)
+            | set(self.resolved_config.reporting_fields)
+        )
+        common_reporting_overlap = (
+            set(self.resolved_config.common_fields)
+            & set(self.resolved_config.reporting_fields)
+        )
+        if common_reporting_overlap:
+            raise ValueError(
+                "resolved_config reporting paths repeat common paths: %s"
+                % ", ".join(sorted(common_reporting_overlap))
+            )
         custom_overlap = (
             set(self.resolved_config.custom_fields)
-            & set(self.resolved_config.common_fields)
+            & common_or_reporting
         )
         if custom_overlap:
             raise ValueError(
-                "resolved_config custom paths repeat common paths: %s"
+                "resolved_config custom paths repeat common/reporting paths: %s"
                 % ", ".join(sorted(custom_overlap))
             )
         for target, paths in self.resolved_config.format_fields.items():
             overlap = set(paths) & (
-                set(self.resolved_config.common_fields)
+                common_or_reporting
                 | set(self.resolved_config.custom_fields)
             )
             if overlap:
@@ -487,6 +642,7 @@ class FormattingConfig(ModuleConfig):
                 )
         for path in [
             *self.resolved_config.common_fields,
+            *self.resolved_config.reporting_fields,
             *self.resolved_config.custom_fields,
             *(
                 path

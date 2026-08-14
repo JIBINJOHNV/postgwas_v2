@@ -31,6 +31,7 @@ def run_multisource_enrichment_pipeline(
     biogrid_access_key,
     david_email,
     dsigdb_gmt,
+    reference_set,
     score_threshold=400,
     fdr_thr=0.999,
 ):
@@ -77,7 +78,7 @@ def run_multisource_enrichment_pipeline(
             gmt_file=dsigdb_gmt,
             output_dir=out,
             background_genes=None,
-            reference_set="genome_protein-coding",
+            reference_set=reference_set,
             project_name=None,  # avoid zip bug
             fdr_thr=fdr_thr,
         )

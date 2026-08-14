@@ -188,6 +188,20 @@ def build_gcta_scientific_summary(
             "were excluded before GCTA."
             % format(unresolved, ",")
         )
+    direct_input_unmodified = bool(metrics.get("direct_input_unmodified", False))
+    absent_from_reference = int(
+        metrics.get("input_variants_absent_from_reference", 0)
+    )
+    if direct_input_unmodified and absent_from_reference:
+        variant_label = (
+            "variant is" if absent_from_reference == 1 else "variants are"
+        )
+        warnings.append(
+            "%s direct-input GWAS %s absent from PLINK BIM column 2 "
+            "and will not be used by GCTA. PostGWAS passed the original "
+            "summary-statistics input without rewriting or filtering it."
+            % (format(absent_from_reference, ","), variant_label)
+        )
     omitted_empty = int(metrics.get("omitted_empty_sets", 0))
     if omitted_empty:
         warnings.append(
@@ -220,6 +234,12 @@ def build_gcta_scientific_summary(
         "input_variants": input_variants,
         "resolved_variants": resolved_variants,
         "overlap_fraction": overlap_fraction,
+        "direct_input_unmodified": direct_input_unmodified,
+        "reference_variants": int(metrics.get("reference_variants", 0)),
+        "input_variants_absent_from_reference": absent_from_reference,
+        "reference_variants_absent_from_input": int(
+            metrics.get("reference_variants_absent_from_input", 0)
+        ),
         "expected_chromosomes": expected_chromosomes,
         "result_chromosomes": result_chromosomes,
         "missing_result_chromosomes": missing_result_chromosomes,
@@ -310,6 +330,10 @@ def render_gcta_scientific_summary(
 ) -> str:
     """Render the validated scientific summary for terminal monitoring."""
     precision = module_config.reporting.p_value_significant_digits
+    # Nested report fields are indented four cells farther than the report
+    # metadata and output paths. Widen the outer label column by the same
+    # amount so every separator and wrapped value begins in one terminal cell.
+    outer_label_width = label_width + 4
     status = (
         "COMPLETED WITH SCIENTIFIC WARNINGS"
         if summary["warnings"] else "COMPLETED"
@@ -324,11 +348,18 @@ def render_gcta_scientific_summary(
     lines = [
         "",
         screen_line("analysis", _METHOD_TITLES[summary["method"]], indent=2),
-        screen_field("info", "Dataset", dataset, indent=6, label_width=label_width),
-        screen_field("analysis", "Method", summary["method"], indent=6, label_width=label_width),
+        screen_field(
+            "info", "Dataset", dataset, indent=6,
+            label_width=outer_label_width,
+        ),
+        screen_field(
+            "analysis", "Method", summary["method"], indent=6,
+            label_width=outer_label_width,
+        ),
         screen_field(
             "warning" if summary["warnings"] else "success",
-            "Analysis status", status, indent=6, label_width=label_width,
+            "Analysis status", status, indent=6,
+            label_width=outer_label_width,
         ),
         "",
         screen_line("genetic", "Scientific findings", indent=6),
@@ -352,11 +383,34 @@ def render_gcta_scientific_summary(
             ),
             indent=10, label_width=label_width,
         ))
+    lines.append(screen_field(
+        "count", "GWAS variants supplied", format(summary["input_variants"], ","),
+        indent=10, label_width=label_width,
+    ))
+    if summary["direct_input_unmodified"]:
+        lines.extend([
+            screen_field(
+                "count", "PLINK BIM variants supplied",
+                format(summary["reference_variants"], ","),
+                indent=10, label_width=label_width,
+            ),
+            screen_field(
+                (
+                    "warning"
+                    if summary["input_variants_absent_from_reference"]
+                    else "success"
+                ),
+                "Summary IDs absent from BIM",
+                format(summary["input_variants_absent_from_reference"], ","),
+                indent=10, label_width=label_width,
+            ),
+            screen_field(
+                "count", "BIM IDs absent from summary",
+                format(summary["reference_variants_absent_from_input"], ","),
+                indent=10, label_width=label_width,
+            ),
+        ])
     lines.extend([
-        screen_field(
-            "count", "GWAS variants supplied", format(summary["input_variants"], ","),
-            indent=10, label_width=label_width,
-        ),
         screen_field(
             "count", "LD-reference-resolved variants", overlap,
             indent=10, label_width=label_width,
@@ -459,20 +513,24 @@ def render_gcta_scientific_summary(
         "",
         screen_field(
             "success", "Complete normalized results",
-            artifacts["normalized_results"].path, indent=6, label_width=label_width,
+            artifacts["normalized_results"].path, indent=6,
+            label_width=outer_label_width,
         ),
         screen_field(
             "info", "Original GCTA results", artifacts["raw_results"].path,
-            indent=6, label_width=label_width,
+            indent=6, label_width=outer_label_width,
         ),
     ])
     if "frequency_qc" in artifacts:
         lines.append(screen_field(
             "info", "GCTA frequency-QC report", artifacts["frequency_qc"].path,
-            indent=6, label_width=label_width,
+            indent=6, label_width=outer_label_width,
         ))
     lines.extend([
-        screen_field("info", "Full log", log_path, indent=6, label_width=label_width),
+        screen_field(
+            "info", "Full log", log_path, indent=6,
+            label_width=outer_label_width,
+        ),
         "",
     ])
     return "\n".join(lines)

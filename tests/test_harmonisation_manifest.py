@@ -152,7 +152,7 @@ def test_post_chromosome_failures_leave_a_terminal_manifest(tmp_path, failure_st
             "chromosome": ["1"], "key": ["snp_id_col"], "num_rows": [1],
         }),
     ), patch(
-        "postgwas.modules.harmonisation.service.run_vcf_qc_assessment",
+        "postgwas.modules.harmonisation.service.run_qc_assessment",
         return_value=_assessment(),
         side_effect=assessment_effect,
     ), patch(
