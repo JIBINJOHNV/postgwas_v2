@@ -7,9 +7,11 @@ harmonised GWAS-VCF.
 
 ## Is `pip install` enough for every analysis?
 
-No. It installs the Python package, not the complete external bioinformatics
-stack or scientific reference data. The Dockerfile is the repository's complete
-software environment definition.
+No. It installs the Python package, not the complete external-tool stack or
+reference data. Use the [complete Mamba installer](../getting-started/installation.md#install-the-complete-software-stack)
+or the [local Docker build](../getting-started/installation.md#docker-installation)
+for the software stack. Both routes still require analysis-specific reference
+files; see the installation guide for platform support and validation limits.
 
 ## Does PostGWAS download reference data automatically?
 

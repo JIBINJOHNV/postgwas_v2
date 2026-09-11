@@ -29,6 +29,24 @@ analysis.
 [Results](#results-logging-and-reproducibility) ·
 [Full user guide](docs/wiki/home.md)
 
+## Workflow at a glance
+
+```text
+Raw summary statistics + reviewed sample sheet
+  → standalone harmonisation → GRCh37 and GRCh38 GWAS-VCFs + QC
+                                 ↓ choose one compatible build
+                         Selected downstream pipeline
+                           ├─ Variant and locus analyses
+                           ├─ Gene, gene-set and cell-type analyses
+                           └─ Heritability, polygenicity and plots
+```
+
+You supply the study data and the selected methods' reference/resource files.
+The pipeline prepares tool-specific inputs and connects the required analysis
+steps. Select one or more branches; not every module needs to run.
+Compatible existing tool-specific inputs can instead enter a direct module;
+gene-list pathway enrichment is also a separate direct workflow.
+
 > Check genome build, ancestry, allele and gene identifiers, sample-size
 > definitions, reference resources and QC before interpreting results. A
 > successful command alone does not establish that an analysis is appropriate
@@ -36,11 +54,15 @@ analysis.
 
 ## Installation
 
-### Install PostGWAS and its analysis tools
+Choose a local Mamba installation or build the Linux Docker image. Both routes
+require the reference data for your selected analyses separately.
 
-The complete installer targets Apple-silicon macOS and glibc Linux x86-64.
-Install and initialise [Miniforge with Mamba](https://github.com/conda-forge/miniforge)
-first. macOS also requires Apple Command Line Tools and Rosetta 2.
+### Option 1: install locally with Mamba
+
+The full installer installs PostGWAS and its analysis tools on Apple-silicon
+Macs and glibc-based x86-64 Linux systems. Before running it, install and
+initialise [Miniforge with Mamba](https://github.com/conda-forge/miniforge).
+Apple-silicon Macs also require Apple Command Line Tools and Rosetta 2.
 
 ```bash
 git clone https://github.com/JIBINJOHNV/postgwas_v2.git
@@ -57,7 +79,7 @@ environments. Not every tool runs natively on Apple silicon.
 Intel macOS supports the portable subset, not the complete installer. Native
 Windows and Linux ARM64 are not supported by these installation paths.
 
-### Verify the installation
+### Verify the local installation
 
 The complete installer runs the repository's software verifier. These additional
 checks confirm Python dependency consistency and public-command availability:
@@ -71,9 +93,47 @@ Software checks are not an analysis-readiness certificate. Reference panels,
 expression data, annotation caches and service credentials must be prepared
 separately for the analyses you select.
 
+### Option 2: build and run with Docker
+
+Install and start [Docker Desktop on macOS](https://docs.docker.com/desktop/setup/install/mac-install/)
+or [Docker Engine on Linux](https://docs.docker.com/engine/install/). From a
+clean checkout of this repository, build the supplied [Dockerfile](Dockerfile):
+
+```bash
+docker build --platform linux/amd64 --load --tag postgwas:local .
+docker run --rm --platform linux/amd64 postgwas:local postgwas --help
+```
+
+No host Mamba environment is needed for this route. The image targets Linux
+x86-64; Apple-silicon Macs require amd64 emulation, which can be slower. It is
+not a native ARM64 image. See [Docker's platform guidance](https://docs.docker.com/build/building/multi-platform/).
+The Dockerfile runs software checks during the build; these are not end-to-end
+analysis tests, and current CI does not build or test the Docker image.
+
+Mount input/reference folders and a writable output folder when running an
+analysis. Paths in commands, sample sheets and YAML must refer to locations
+inside the container. The guide explains persistent results, permissions,
+build-context privacy and third-party image redistribution restrictions:
+
+[Docker setup and running analyses](docs/wiki/getting-started/installation.md#docker-installation)
+
 [Complete installation guide and platform table](docs/wiki/getting-started/installation.md) ·
 [Resource setup](docs/wiki/getting-started/resource-setup.md) ·
 [Troubleshooting](docs/wiki/help/troubleshooting.md)
+
+### Before your first analysis
+
+- **Software:** complete one installation route and its software checks.
+- **Study inputs:** keep the original statistics and study documentation; review
+  a sample sheet for raw inputs, or check the existing VCF's provenance and index.
+- **References:** prepare the build-, population- and method-matched resources
+  listed in the selected module guides. They are separate from the software.
+- **Storage and compute:** use a writable output location with room for results,
+  intermediates and logs, and fit thread/memory settings to the host or container.
+
+The [resource checklist](docs/wiki/getting-started/resource-setup.md#preflight-checklist)
+and [connected tutorial](docs/wiki/getting-started/quick-start.md) take you from
+installation to a first analysis using your own data.
 
 ## Available analyses
 
@@ -162,15 +222,60 @@ requirements even when another program produced those inputs.
 
 [Running modules independently](docs/wiki/core/running-modules-independently.md)
 
+### Quick start: from raw statistics to results
+
+The connected example uses one dataset, `STUDY`, throughout:
+
+1. [Prepare the inputs and sample sheet](#generate-and-review-the-sample-sheet),
+   including the study's real sample sizes and compatible references.
+2. [Run harmonisation](#run-harmonisation) and review both build outputs,
+   rejected variants and concordance evidence.
+3. [Assess the resulting VCF with QC](docs/wiki/getting-started/quick-start.md#4-review-qc-without-changing-the-vcf).
+   QC creates an assessment, not a filtered VCF.
+4. [Run positional MAGMA in pipeline mode](#pipeline-mode-start-from-a-harmonised-vcf).
+   The pipeline prepares the MAGMA inputs; review the gene results and exclusions.
+
+Follow the [full walkthrough](docs/wiki/getting-started/quick-start.md) for the
+connected commands and output paths. Its paths are placeholders for your study
+and references, not a bundled demonstration dataset.
+
 ## Harmonise your summary statistics
 
-### Prepare the sample sheet and resources
+### Generate and review the sample sheet
 
 A version-2 CSV/TSV sample sheet maps each study's columns and metadata to
 PostGWAS concepts. It is separate from the run-configuration YAML, which
-controls processing policies and resources. Complete the required EAF, INFO,
-effect and sample-size source choices before running; generated drafts still
-require your review.
+controls processing policies and resources. Generate a draft from the headers
+of files in your raw-data directory:
+
+```bash
+python -m postgwas.modules.harmonisation.sample_sheet_generator \
+  --input-directory raw_data \
+  --output studies.csv
+```
+
+Review every generated row against the original study documentation. The
+generator can leave fields unresolved or omit files it cannot map; inspect its
+warnings and `studies.csv.rejected_files.tsv` report. Successful draft generation
+does not mean the studies are ready to run. Alternatively, copy a maintained
+[quantitative template](examples/configs/harmonisation/sample_sheet_quantitative.csv)
+or [case-control template](examples/configs/harmonisation/sample_sheet_case_control.csv)
+and replace all placeholder values.
+
+### Complete the study information
+
+| Information | What to provide or check |
+|---|---|
+| Identity and file | `config_version` set to `2`, a unique `dataset_id`, and `input_file`; relative file paths resolve from the sample-sheet directory. |
+| Coordinates and alleles | Chromosome/position columns (or a combined column), effect allele and other allele. Check that the effect and frequency refer to the declared effect allele. |
+| Effect and P value | An effect estimate or Z score, a P-value column and its representation (`raw`, `neglog10` or `auto`). Map supplied SE when available; recovery of missing statistics is conditional. |
+| Allele frequency | Exactly one internal `effect_allele_frequency_column` or external file/column pair. The default comparison AF panel does not replace this study-frequency source. |
+| Imputation quality | Internal INFO takes priority over an external INFO file/column pair. With neither source, explicitly choose `--fixed-info VALUE`; an external proxy or fixed value is not study-measured quality. |
+| Sample size | For quantitative traits, `control_count_column` or `control_count` represents total N. For case-control traits, provide real control and case counts through their corresponding column or fixed-count fields. |
+
+Do not invent missing counts, frequencies or quality measurements. External
+per-chromosome tables need explicit `{chromosome}` path templates, not just a
+filename prefix. Prepare the harmonisation reference tree before running.
 
 [Sample-sheet requirements](docs/wiki/harmonisation/sample-sheet.md) ·
 [Configuration guide](docs/modules/harmonisation/configuration.md) ·
@@ -277,11 +382,64 @@ plans registered upstream modules and passes their artifacts between stages.
 [MAGMA methods and interpretation](docs/wiki/modules/magma.md) ·
 [Direct-mode guide](docs/wiki/core/running-modules-independently.md)
 
-### Inspect the selected workflow
+### Pipeline targets and execution order
+
+Select the final analyses you want; PostGWAS adds their registered prerequisites.
+All public pipeline targets are listed below. Each row shows a single-target
+plan without optional workflow stages; arrows show scheduled order, not a claim
+that each stage consumes only the immediately preceding stage's output.
+
+For the `finemap`, `caldera` and `flames` rows, explicitly select
+`--clumping-methods standard` and either `--finemap-method susie` or
+`--finemap-method finemap`. The engines use the same stage order but different
+tool-specific inputs and resources.
+
+| Selected target and method | Execution order |
+|---|---|
+| `sumstat_filter` | `sumstat_filter` |
+| `qc_summary` | `qc_summary` |
+| `formatter` | `formatter` |
+| `imputation` | `formatter → imputation` |
+| `annot_ldblock` | `annot_ldblock` |
+| `ld_clump`, `standard` only | `ld_clump` |
+| `ld_clump`, `region` | `annot_ldblock → ld_clump` |
+| `ld_clump`, `cojo-slct` | `formatter → ld_clump` |
+| `finemap`, standard clumping | `ld_clump → formatter → finemap` |
+| `magma` | `formatter → magma` |
+| `gcta_gene` | `formatter → gcta_gene` |
+| `gcta_cojo` | `formatter → gcta_cojo` |
+| `magmacovar` | `formatter → magma → magmacovar` |
+| `single_cell`, `magma_celltype` or `scdrs` | `formatter → magma → single_cell` |
+| `single_cell`, `ldsc_celltype` only | `formatter → single_cell` |
+| `pops` | `formatter → magma → pops` |
+| `kpops` | `formatter → magma → kpops` |
+| `caldera`, standard clumping | `formatter → ld_clump → magma → pops → finemap → caldera` |
+| `flames`, standard clumping | `ld_clump → formatter → magma → magmacovar → pops → finemap → flames` |
+| `heritability` | `formatter → heritability` |
+| `mixer` | `formatter → mixer` |
+| `manhattan` | `manhattan` |
+
+FLAMES combines fine-mapping, MAGMA, MAGMAcovar and PoPS evidence. CALDERA
+combines PoPS with fine-mapped credible sets; it does not run MAGMAcovar or
+K-POPS, and its pipeline currently requires GRCh37. Harmonisation and pathway
+enrichment remain standalone-only, and
+`qc_summary` is the pipeline target for the direct `qc` command.
+
+The packaged clumping selection is `region` plus `standard`, which also
+schedules `annot_ldblock`. The standard-only rows above deliberately omit that
+stage. Fine-mapping needs the standard-clumping locus artifact; adding region
+or COJO analyses can change prerequisites and order, but neither replaces that
+artifact. Always inspect the plan for your actual method combination.
+
+For multiple targets, use the combined plan rather than concatenating table
+rows. Shared prerequisites normally run once. Formatting before and after imputation
+uses different data and can therefore appear twice. Inspect contextual help for
+the methods you intend to use:
 
 ```bash
 postgwas magma --help
 postgwas pipeline --modules magma --help
+postgwas pipeline --modules flames --clumping-methods standard --finemap-method susie --help
 ```
 
 Dependencies change with the selected method: region clumping needs LD-block
@@ -292,6 +450,21 @@ several branches; selecting one does not mean every module runs.
 
 [Pipeline dependencies and execution order](docs/wiki/core/pipeline-workflow.md) ·
 [Single-cell methods](docs/wiki/modules/single-cell.md)
+
+### Optional pipeline stages
+
+| Switch | Stage added |
+|---|---|
+| `--apply-filter` | Variant filtering; when combined with imputation, also a separate post-imputation filter. |
+| `--apply-imputation` | Input formatting, PRED-LD imputation and internal re-harmonisation; requires PRED-LD and harmonisation resources. |
+| `--apply-manhattan` | Manhattan plots for the pipeline's resulting study VCF. |
+| `--heritability` | LDSC heritability estimation; requires the merge-allele file, LD scores and weights. |
+
+These switches add work and may add resource requirements. They are not needed
+for every analysis. MAGMA and some clumping/fine-mapping combinations currently
+conflict with `--apply-filter`; read the
+[supported combinations and separate-filter workaround](docs/wiki/core/pipeline-workflow.md#optional-workflow-stages)
+before combining switches.
 
 ## Reference data and configuration
 
@@ -314,6 +487,20 @@ postgwas resources prepare magma --output-directory reference/magma_mappings
 
 [Resource setup](docs/wiki/getting-started/resource-setup.md) ·
 [Reference requirements](docs/wiki/reference/reference-resources.md)
+
+### Check reference compatibility
+
+- Match the study and reference genome builds, chromosome labels and coordinate
+  conventions; a filename alone is not evidence of compatibility.
+- Match the LD/frequency reference population to the analysis and study design.
+- Check variant IDs and allele conventions across summary statistics and LD
+  resources, and gene IDs across gene locations, gene sets and expression data.
+- Keep required indexes and companion files together; record reference sources,
+  releases and checksums. Review overlap and exclusion counts after each join.
+
+Use the [module-by-module reference checklist](docs/wiki/reference/reference-resources.md)
+and [input contracts](docs/wiki/core/input-output-contracts.md) for the exact
+requirements. Validation does not make an unsuitable reference appropriate.
 
 ### Use CLI options or a run configuration
 
@@ -351,6 +538,18 @@ association p-values.
 
 [Output structure and archiving](docs/wiki/reference/output-structure.md)
 
+### Check that the run succeeded
+
+1. Confirm successful completion in the canonical log and completion records,
+   including every requested pipeline stage. A file's existence is not enough.
+2. Check the module's primary results and required companions, then open its
+   HTML report where available. Compare input, retained and excluded counts.
+3. Review warnings, native-tool diagnostics and join/allele checks. For
+   harmonisation, inspect rejected records, the reason matrix and liftover losses.
+4. Retain that evidence with the resolved configuration, commands and
+   software/reference versions. Review whether the method and references fit
+   the study before interpreting associations or rankings.
+
 ### Monitor, resume or restart an analysis
 
 Terminal display is on by default. `--hide-screen` hides the terminal copy but
@@ -383,8 +582,8 @@ report before changing thresholds. Important current boundaries include:
   GRCh38 has additional identifier requirements described in its guide.
 - Heritability and MiXeR currently expose single-trait analyses, not genetic
   correlation or bivariate MiXeR. The Manhattan module does not generate QQ plots.
-- Some clumping/fine-mapping combinations with `--apply-filter` currently fail
-  during argument parsing because of a duplicate `--remove-mhc` option.
+- MAGMA and some clumping/fine-mapping combinations with `--apply-filter`
+  currently fail during argument parsing because of duplicate MHC options.
   This is not a general prohibition on filtering all pipelines. See the
   [specific limitation and separate-filter workaround](docs/wiki/core/pipeline-workflow.md).
 - Enrichment providers require network access and sometimes credentials;
@@ -394,6 +593,14 @@ report before changing thresholds. Important current boundaries include:
 [Troubleshooting](docs/wiki/help/troubleshooting.md) ·
 [Error messages](docs/wiki/help/error-messages.md) ·
 [Frequently asked questions](docs/wiki/help/faq.md)
+
+### Moving from the previous PostGWAS version
+
+Do not reuse an older installation command, sample sheet, YAML or result path
+without checking the current interface. The
+[migration guide](docs/wiki/getting-started/migrating-from-v1.md) maps the main
+changes and explains how to rebuild a reviewed configuration. Keep the old run
+separate; old outputs are not automatically valid version-2 checkpoints.
 
 ### Full documentation and method references
 

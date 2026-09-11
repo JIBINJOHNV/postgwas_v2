@@ -61,19 +61,52 @@ replace them with a different build or ancestry.
 
 The planner resolves method-dependent prerequisites, expands them recursively,
 rejects unavailable targets or cycles, and produces a deterministic execution
-order. There is no mandatory all-module chain. Examples without optional
-workflow switches are:
+order. There is no mandatory all-module chain. This table covers every public
+pipeline target as a separate invocation without optional workflow switches.
+Arrows give the scheduled order, not an exclusive input/output relationship
+between adjacent stages.
 
-| Requested result | Relevant plan |
+For `finemap`, `caldera` and `flames`, the table explicitly selects
+`--clumping-methods standard` and either `--finemap-method susie` or
+`--finemap-method finemap`. The stage names are shared across these engines;
+the formatter contracts, executables and reference requirements are not.
+
+| Selected target and method | Execution order |
 |---|---|
+| `sumstat_filter` | `sumstat_filter` |
+| `qc_summary` | `qc_summary` |
+| `formatter` | `formatter` |
+| `imputation` | `formatter → imputation` |
+| `annot_ldblock` | `annot_ldblock` |
+| `ld_clump`, `standard` only | `ld_clump` |
+| `ld_clump`, `region` | `annot_ldblock → ld_clump` |
+| `ld_clump`, `cojo-slct` | `formatter → ld_clump` |
+| `finemap`, standard clumping | `ld_clump → formatter → finemap` |
 | `magma` | `formatter → magma` |
+| `gcta_gene` | `formatter → gcta_gene` |
+| `gcta_cojo` | `formatter → gcta_cojo` |
+| `magmacovar` | `formatter → magma → magmacovar` |
+| `single_cell`, `magma_celltype` or `scdrs` | `formatter → magma → single_cell` |
+| `single_cell`, `ldsc_celltype` only | `formatter → single_cell` |
 | `pops` | `formatter → magma → pops` |
-| `heritability` or `mixer` | `formatter → selected target` |
-| `ld_clump` with `standard` only | `ld_clump`; no LD-block annotation |
-| `ld_clump` with `region` | `annot_ldblock → ld_clump` |
-| `ld_clump` with `cojo-slct` | `formatter → ld_clump` |
-| `single_cell` with `magma_celltype` or `scdrs` | `formatter → magma → single_cell` |
-| `single_cell` with `ldsc_celltype` only | `formatter → single_cell` |
+| `kpops` | `formatter → magma → kpops` |
+| `caldera`, standard clumping | `formatter → ld_clump → magma → pops → finemap → caldera` |
+| `flames`, standard clumping | `ld_clump → formatter → magma → magmacovar → pops → finemap → flames` |
+| `heritability` | `formatter → heritability` |
+| `mixer` | `formatter → mixer` |
+| `manhattan` | `manhattan` |
+
+FLAMES receives evidence from fine-mapping, MAGMA, MAGMAcovar and PoPS.
+CALDERA consumes PoPS and credible sets, not K-POPS or MAGMAcovar outputs.
+Its pipeline currently requires GRCh37; GRCh38 direct-mode support does not
+imply GRCh38 pipeline support.
+The planner currently schedules formatter before clumping for CALDERA and
+after standard clumping for FLAMES because their prerequisite traversal differs.
+
+The packaged clumping choice is `region` plus `standard`, so using it also
+adds `annot_ldblock`; the standard-only rows above are explicit alternatives.
+Harmonisation and pathway enrichment are not pipeline targets.
+For multiple targets, inspect the combined plan rather than concatenating rows.
 
 Combined clumping methods combine their prerequisites. Fine-mapping requires
 standard clumping for its pipeline locus artifact and an engine-specific
@@ -119,8 +152,9 @@ one physical step.
 There is a current CLI-composition limitation: adding `--apply-filter` to
 `ld_clump`, or to `finemap` including explicit standard/SuSiE selection, can
 fail before analysis with an argparse conflict for `--remove-mhc` /
-`--no-remove-mhc`. This is not a general prohibition on combining filtering
-with any module that has a genome-build setting; the `gcta_cojo` and `qc_summary`
+`--no-remove-mhc`. MAGMA with `--apply-filter` also fails during help assembly,
+with a duplicate `--mhc-chrom` option. This is not a general prohibition on
+combining filtering with any module that has a genome-build setting; the `gcta_cojo` and `qc_summary`
 help combinations do construct successfully. For the affected routes, run
 `postgwas sumstat_filter` separately and pass its validated filtered VCF to the
 pipeline. This documentation workaround does not fix the parser defect.

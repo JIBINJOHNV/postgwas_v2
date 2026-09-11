@@ -4,16 +4,20 @@ PostGWAS has three separate readiness layers:
 
 1. the PostGWAS package and its Python/R libraries;
 2. third-party command-line programs used by selected modules; and
-3. genome-build-, population-, and method-specific scientific resources.
+3. genome-build-, population-, and method-specific reference resources.
 
 The complete Mamba installer installs and checks the first two layers. A
 successful installation is not a test of every analysis on your study data.
-Scientific resources remain explicit inputs because build, ancestry, release,
+Reference resources remain explicit inputs because build, ancestry, release,
 allele convention, credentials, and licensing differ by analysis. A module is
 ready only after every item in its row of the
 [module requirements table](#module-requirements) is present and compatible.
 
 ## Supported installation paths
+
+The table describes local Mamba/Conda installations. The repository also supplies
+a [Linux-amd64 Docker build recipe](#docker-installation), with separate
+platform requirements and validation limits described below.
 
 | Host | Portable environment | Complete Mamba environment |
 |---|---|---|
@@ -27,7 +31,7 @@ The environment uses [CEP-24 platform selectors](https://conda.org/learn/ceps/ce
 Use a current Mamba or Conda release that understands dictionary selectors;
 older clients may reject entries such as `sel(linux)`.
 
-## Prerequisites
+## Prerequisites for local installation
 
 - Git and a complete checkout of this repository.
 - [Miniforge](https://github.com/conda-forge/miniforge) with Mamba for the
@@ -181,7 +185,115 @@ The environment isolates its R library from per-user R packages, preventing an
 incompatible package in `~/Library/R` or an equivalent user library from
 shadowing the tested R stack.
 
-## Verify the installation
+## Docker installation
+
+The repository includes a [Dockerfile](https://github.com/JIBINJOHNV/postgwas_v2/blob/main/Dockerfile)
+that builds PostGWAS, its external programs and isolated runtimes into one local
+image. You do not need Mamba, Python or R installed on the host for this route.
+Reference panels, annotation/cache data and service credentials are not included.
+
+### Prepare Docker and choose the platform
+
+Install and start [Docker Desktop on macOS](https://docs.docker.com/desktop/setup/install/mac-install/)
+or [Docker Engine on Linux](https://docs.docker.com/engine/install/), then check
+that `docker info` succeeds. Git is needed to obtain the build sources.
+
+The recipe targets **Linux x86-64 (`linux/amd64`)**, including its MiXeR
+compiler settings and FINEMAP/LDstore binaries. It is not a native ARM64 build.
+Apple-silicon Macs require amd64 emulation; Docker supports this, but compilation
+and analyses can be slower and need platform-specific testing. See
+[Docker's emulation guidance](https://docs.docker.com/build/building/multi-platform/).
+Allocate sufficient RAM, CPU and disk space to Docker for the build and study;
+PostGWAS compute settings must fit within those allocations.
+
+### Build and check the image
+
+Use a clean checkout with no private study files, credentials or local notes.
+The Dockerfile copies the build context into the image: `.gitignore` does not
+replace [Docker's `.dockerignore` rules](https://docs.docker.com/build/concepts/context/#dockerignore-files).
+Keep study data outside the checkout and mount it only when running analyses.
+
+```console
+git clone https://github.com/JIBINJOHNV/postgwas_v2.git
+cd postgwas_v2
+docker build --platform linux/amd64 --load --tag postgwas:local .
+docker run --rm --platform linux/amd64 postgwas:local postgwas --help
+```
+
+`postgwas:local` is the image you build, not a published image to pull. Record
+the source commit and resulting image ID with the analysis. Rebuild after
+updating the checkout; an existing image does not change when local files change.
+The Dockerfile has no PostGWAS entrypoint, so commands after the image name must
+include `postgwas`, as above.
+
+The build runs `tools/setup/verify_all_tools.sh`, checking program availability,
+selected imports, dependency consistency, versions and required model/library
+files. You can repeat those checks after a successful build:
+
+```console
+docker run --rm --platform linux/amd64 postgwas:local \
+  bash /opt/postgwas/tools/setup/verify_all_tools.sh
+```
+
+Current installation CI tests the Mamba route, not Docker builds or full module
+analyses in the image. A Docker build recipe and passing software checks are
+not a guarantee that every analysis works on every host; validate a representative
+study before a full run. Review all third-party licences before sharing the
+image, especially the [MAGMA redistribution terms](https://cncr.nl/research/magma/).
+
+### Mount files and run an analysis
+
+Replace the three host paths below with existing directories. The input folder
+must contain the indexed PostGWAS-harmonised VCF used in the example. Prepare
+reference files and their indexes before mounting them read-only. Create a
+separate writable output directory on the host first.
+
+Start an interactive container shell from a macOS or Linux terminal:
+
+```console
+docker run --rm -it --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=/absolute/path/to/inputs,dst=/input,readonly" \
+  --mount "type=bind,src=/absolute/path/to/references,dst=/reference,readonly" \
+  --mount "type=bind,src=/absolute/path/to/outputs,dst=/output" \
+  --workdir /output \
+  postgwas:local bash
+```
+
+Inside that shell, run ordinary PostGWAS commands. For example, assess the VCF
+through pipeline mode (QC itself does not use the mounted reference folder):
+
+```console
+postgwas pipeline --modules qc_summary \
+  --vcf /input/STUDY_GRCh37_merged.vcf.gz \
+  --dataset-id STUDY \
+  --output-directory /output/qc
+```
+
+Use `/input`, `/reference` and `/output` paths in commands, sample sheets and
+run YAML. Host paths such as `/Users/...` are unavailable unless mounted at
+those same locations. Use absolute container paths to avoid differences in
+command, sample-sheet and configuration path resolution.
+The host user/group selection avoids root-owned output on Linux; ensure that
+user can read the inputs and write the output folder. Docker Desktop must be
+allowed to share the selected folders. See [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/).
+
+Results and logs written under `/output` remain in the host output directory
+when you exit. `--rm` removes the container, so do not store required results
+only in its unmounted filesystem. Use the module guides for additional inputs,
+references and parameters; the image does not remove those requirements.
+
+### Full image versus MiXeR's Docker backend
+
+The full PostGWAS image already includes a MiXeR runtime. Use
+`--mixer-backend native` when selecting MiXeR inside this image; “native” here
+means inside the running container. Do not request nested Docker execution.
+
+A host-installed PostGWAS can separately select `--mixer-backend docker` to run
+only MiXeR in the configured GSA-MiXeR image. That backend does not install or
+containerise the other PostGWAS modules. See the [MiXeR guide](../modules/mixer.md).
+
+## Verify the local installation
 
 The complete installer runs this automatically after every tool is installed:
 

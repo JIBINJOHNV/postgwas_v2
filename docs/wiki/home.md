@@ -14,6 +14,7 @@ GitHub Wiki deployment.
 | A PostGWAS-harmonised VCF | [Pipeline workflow](core/pipeline-workflow.md) or a VCF-consuming module in the index below |
 | Compatible tool-specific results | [Running modules independently](core/running-modules-independently.md), then the selected module's input requirements |
 | No installation or reference data yet | [Installation](getting-started/installation.md) and [resource setup](getting-started/resource-setup.md) |
+| A workflow from the previous repository | [Migration guide](getting-started/migrating-from-v1.md) before reusing old commands or sample sheets |
 
 Pipeline entry requires an indexed, single-sample PostGWAS-harmonised VCF with
 provenance, not an arbitrary VCF. Direct commands accept their documented file
@@ -66,6 +67,7 @@ branches, conditional dependencies and current limitations.
 
 - [Installation](getting-started/installation.md)
 - [Quick Start](getting-started/quick-start.md)
+- [Migrating from the Previous Version](getting-started/migrating-from-v1.md)
 - [Resource Setup](getting-started/resource-setup.md)
 
 ### Core Concepts

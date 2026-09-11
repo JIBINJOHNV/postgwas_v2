@@ -517,7 +517,11 @@ def validate_fine_mapping_index(fine_mapping_directory, module):
 
 def _validated_gene_ids(values: pd.Series, pattern: re.Pattern, label: str) -> set[str]:
     identifiers = values.astype(str).str.strip()
-    if identifiers.eq("").any() or identifiers.duplicated().any():
+    if (
+        values.isna().any()
+        or identifiers.eq("").any()
+        or identifiers.duplicated().any()
+    ):
         raise FlamesError("%s gene identifiers must be non-empty and unique" % label)
     invalid = identifiers[~identifiers.str.fullmatch(pattern)]
     if not invalid.empty:
@@ -744,30 +748,36 @@ def _feature_names(path: Path) -> list[str]:
 
 def _validate_annotations(paths, resources: dict, module) -> dict:
     schema = module.result_schema
+    gene_pattern = re.compile(module.input_schema.ensembl_gene_pattern)
     features = _feature_names(resources["features"])
     required = [schema.gene_column, schema.symbol_column, *features]
     genes = 0
     zero_features = set(features)
+    missing_magma_gene_ids = set()
+    missing_pops_gene_ids = set()
+    missing_magma_rows = 0
+    missing_pops_rows = 0
     for path in paths:
         table = _read_table(
             path, "FLAMES annotated locus", module.input_schema.table_delimiter
         )
         require_table_columns(table, required, "FLAMES annotated locus", error_type=FlamesError)
-        gene_ids = table[schema.gene_column].astype(str).str.strip()
+        gene_ids = _validated_gene_ids(
+            table[schema.gene_column], gene_pattern,
+            "FLAMES annotated locus %s" % path,
+        )
         symbols = table[schema.symbol_column].astype(str).str.strip()
-        if gene_ids.eq("").any() or symbols.eq("").any() or gene_ids.duplicated().any():
+        if symbols.eq("").any():
             raise FlamesError(
                 "FLAMES annotated loci require unique non-empty genes and symbols: %s"
                 % path
             )
-        missing_magma = sorted(set(gene_ids) - resources["magma_genes"])
-        missing_pops = sorted(set(gene_ids) - resources["pops_genes"])
-        if missing_magma or missing_pops:
-            raise FlamesError(
-                "Annotated FLAMES genes are absent from compatible upstream inputs "
-                "(%d missing MAGMA, %d missing PoPS): %s"
-                % (len(missing_magma), len(missing_pops), path)
-            )
+        missing_magma = gene_ids - resources["magma_genes"]
+        missing_pops = gene_ids - resources["pops_genes"]
+        missing_magma_gene_ids.update(missing_magma)
+        missing_pops_gene_ids.update(missing_pops)
+        missing_magma_rows += len(missing_magma)
+        missing_pops_rows += len(missing_pops)
         numeric = table[features].apply(pd.to_numeric, errors="coerce")
         if numeric.isna().any().any() or not np.isfinite(numeric.to_numpy()).all():
             raise FlamesError("FLAMES model features must all be finite: %s" % path)
@@ -782,6 +792,10 @@ def _validate_annotations(paths, resources: dict, module) -> dict:
         "annotated_genes": genes,
         "features": len(features),
         "features_zero_in_every_locus": sorted(zero_features),
+        "gene_rows_without_magma_evidence": int(missing_magma_rows),
+        "gene_rows_without_pops_evidence": int(missing_pops_rows),
+        "genes_without_magma_evidence": sorted(missing_magma_gene_ids),
+        "genes_without_pops_evidence": sorted(missing_pops_gene_ids),
     }
 
 
@@ -1286,6 +1300,28 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                             annotation_metrics["features"],
                         ),
                         (
+                            (
+                                "warning"
+                                if annotation_metrics[
+                                    "gene_rows_without_magma_evidence"
+                                ]
+                                else "success"
+                            ),
+                            "Rows without MAGMA evidence",
+                            annotation_metrics["gene_rows_without_magma_evidence"],
+                        ),
+                        (
+                            (
+                                "warning"
+                                if annotation_metrics[
+                                    "gene_rows_without_pops_evidence"
+                                ]
+                                else "success"
+                            ),
+                            "Rows without PoPS evidence",
+                            annotation_metrics["gene_rows_without_pops_evidence"],
+                        ),
+                        (
                             "success", "Checkpoint fingerprints",
                             "validated and unchanged",
                         ),
@@ -1442,6 +1478,28 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                         (
                             (
                                 "warning"
+                                if annotation_metrics[
+                                    "gene_rows_without_magma_evidence"
+                                ]
+                                else "success"
+                            ),
+                            "Rows assigned zero MAGMA evidence",
+                            annotation_metrics["gene_rows_without_magma_evidence"],
+                        ),
+                        (
+                            (
+                                "warning"
+                                if annotation_metrics[
+                                    "gene_rows_without_pops_evidence"
+                                ]
+                                else "success"
+                            ),
+                            "Rows assigned zero PoPS evidence",
+                            annotation_metrics["gene_rows_without_pops_evidence"],
+                        ),
+                        (
+                            (
+                                "warning"
                                 if annotation_metrics["features_zero_in_every_locus"]
                                 else "success"
                             ),
@@ -1460,8 +1518,9 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                     ]
                     step.set_rows(annotation_metrics["annotated_genes"])
                     step.outcome(
-                        "Every expected locus annotation passed schema, "
-                        "gene-universe, and finite-feature validation.",
+                        "Every expected locus annotation passed schema and "
+                        "finite-feature validation; absent MAGMA/PoPS evidence "
+                        "was counted explicitly.",
                         fields=annotation_fields,
                         **annotation_metrics,
                     )

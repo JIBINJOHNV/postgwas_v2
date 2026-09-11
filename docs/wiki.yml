@@ -13,6 +13,10 @@ wiki:
       slug: Quick-Start
       source: docs/wiki/getting-started/quick-start.md
       section: Getting Started
+    - title: Migrating from the Previous Version
+      slug: Migrating-from-the-Previous-Version
+      source: docs/wiki/getting-started/migrating-from-v1.md
+      section: Getting Started
     - title: Resource Setup
       slug: Resource-Setup
       source: docs/wiki/getting-started/resource-setup.md

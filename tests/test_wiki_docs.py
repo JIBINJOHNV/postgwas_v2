@@ -11,7 +11,13 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
+from postgwas.config import load_configuration
+from postgwas.config.models.modules.single_cell import single_cell_pipeline_dependencies
 from postgwas.modules.harmonisation.sample_sheet import HarmonisationSampleSheetRow
+from postgwas.pipeline.planner import (
+    build_pipeline_plan,
+    resolve_pipeline_dependency_overrides,
+)
 from postgwas.pipeline.registry import REGISTRY
 
 
@@ -293,6 +299,127 @@ def test_readme_prioritises_installation_and_routes_to_detailed_guides():
     assert guide.count("<!-- END GENERATED HARMONISATION POLICY REFERENCE -->") == 1
 
 
+def test_readme_connects_preparation_execution_and_result_review():
+    text = ROOT_README.read_text(encoding="utf-8")
+    headings = (
+        "## Workflow at a glance",
+        "### Before your first analysis",
+        "### Quick start: from raw statistics to results",
+        "### Generate and review the sample sheet",
+        "### Complete the study information",
+        "### Pipeline targets and execution order",
+        "### Optional pipeline stages",
+        "### Check reference compatibility",
+        "### Check that the run succeeded",
+        "### Moving from the previous PostGWAS version",
+    )
+    positions = [text.index(heading) for heading in headings]
+    assert positions == sorted(positions)
+    for link in (
+        "docs/wiki/getting-started/quick-start.md#4-review-qc-without-changing-the-vcf",
+        "examples/configs/harmonisation/sample_sheet_quantitative.csv",
+        "examples/configs/harmonisation/sample_sheet_case_control.csv",
+        "docs/wiki/getting-started/migrating-from-v1.md",
+    ):
+        assert f"]({link})" in text
+    assert "not a bundled demonstration dataset" in text
+    assert "QC creates an assessment, not a filtered VCF" in text
+    assert "A file's existence is not enough" in text
+    for flag in (
+        "--apply-filter", "--apply-imputation", "--apply-manhattan", "--heritability",
+    ):
+        assert f"| `{flag}` |" in text
+
+
+def test_readme_sample_sheet_summary_preserves_source_requirements():
+    text = " ".join(ROOT_README.read_text(encoding="utf-8").split())
+    assert (
+        "python -m postgwas.modules.harmonisation.sample_sheet_generator"
+        " \\ --input-directory raw_data \\ --output studies.csv"
+    ) in text
+    assert "Successful draft generation does not mean the studies are ready to run" in text
+    assert "Exactly one internal `effect_allele_frequency_column` or external file/column pair" in text
+    assert "Internal INFO takes priority over an external INFO file/column pair" in text
+    assert "With neither source, explicitly choose `--fixed-info VALUE`" in text
+    assert "`control_count_column` or `control_count` represents total N" in text
+    assert "provide real control and case counts" in text
+
+
+def test_readme_dependency_table_matches_method_aware_planner():
+    text = ROOT_README.read_text(encoding="utf-8")
+    section = text.split("### Pipeline targets and execution order", 1)[1].split(
+        "### Optional pipeline stages", 1,
+    )[0]
+    rows = {}
+    for line in section.splitlines():
+        if line.startswith("| `"):
+            label, plan = [cell.strip() for cell in line.strip("|").split("|")]
+            rows[label] = plan.strip("`")
+    public_targets = {
+        name for name in REGISTRY.names()
+        if REGISTRY.get(name).pipeline_enabled and REGISTRY.get(name).runner
+    }
+    documented_targets = {re.findall(r"`([^`]+)`", label)[0] for label in rows}
+    assert documented_targets == public_targets
+    guide = (REPOSITORY_ROOT / "docs/wiki/core/pipeline-workflow.md").read_text(
+        encoding="utf-8",
+    )
+    for label, plan in rows.items():
+        assert f"| {label} | `{plan}` |" in guide
+
+    # Select the same methods named in the tables, not the packaged defaults.
+    cases = [
+        ("`ld_clump`, `standard` only", "ld_clump", ("--clumping-methods", "standard")),
+        ("`ld_clump`, `region`", "ld_clump", ("--clumping-methods", "region")),
+        ("`ld_clump`, `cojo-slct`", "ld_clump", ("--clumping-methods", "cojo-slct")),
+        ("`single_cell`, `magma_celltype` or `scdrs`", "single_cell", ("--tools", "magma_celltype")),
+        ("`single_cell`, `magma_celltype` or `scdrs`", "single_cell", ("--tools", "scdrs")),
+        ("`single_cell`, `ldsc_celltype` only", "single_cell", ("--tools", "ldsc_celltype")),
+    ]
+    cases.extend(
+        (
+            f"`{target}`, standard clumping", target,
+            ("--clumping-methods", "standard", "--finemap-method", engine),
+        )
+        for target in ("finemap", "caldera", "flames")
+        for engine in ("susie", "finemap")
+    )
+    method_dependent_targets = {target for _label, target, _arguments in cases}
+    cases.extend(
+        (f"`{target}`", target, ())
+        for target in sorted(public_targets - method_dependent_targets)
+    )
+    assert {label for label, _target, _arguments in cases} == set(rows)
+    configuration = load_configuration()
+    for label, target, arguments in cases:
+        overrides = resolve_pipeline_dependency_overrides(arguments, configuration)
+        if target == "single_cell":
+            # The CLI resolves --tools with this shared helper after the factories.
+            overrides[target] = single_cell_pipeline_dependencies(arguments[1:])
+        plan = build_pipeline_plan([target], dependency_overrides=overrides)
+        assert rows[label] == " → ".join(plan.steps)
+
+
+def test_migration_guide_distinguishes_legacy_examples_from_current_contracts():
+    guide = (
+        REPOSITORY_ROOT / "docs/wiki/getting-started/migrating-from-v1.md"
+    ).read_text(encoding="utf-8")
+    text = " ".join(guide.split())
+    for required in (
+        "https://github.com/JIBINJOHNV/postgwas#readme",
+        "`--config` for the harmonisation CSV | `--sample-sheet`",
+        "`--defaults` for the harmonisation YAML | `--run-config`",
+        "`config_version` equal to `2`",
+        "`external_eaf_file` and `external_eaf_column`",
+        "explicit `{chromosome}` path template",
+        "The legacy `jibinjv/postgwas:1.3` image is not the current v2 build",
+        "file existence alone is insufficient",
+        "do not add headers manually",
+        "does not establish numerical equivalence",
+    ):
+        assert required in text, required
+
+
 def test_harmonisation_policy_guide_preserves_decisions_and_resource_contracts():
     text = HARMONISATION_POLICY_SOURCE.read_text(encoding="utf-8")
     for heading in (
@@ -314,6 +441,52 @@ def test_harmonisation_policy_guide_preserves_decisions_and_resource_contracts()
     assert "](processing-order.md)" in text
     assert "](sample-sheet.md)" in text
     assert "](../../modules/harmonisation/configuration.md)" in text
+
+
+def test_installation_docs_include_the_local_docker_build_and_runtime_contract():
+    guide = REPOSITORY_ROOT / "docs/wiki/getting-started/installation.md"
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    for source in (ROOT_README, guide):
+        text = source.read_text(encoding="utf-8")
+        assert "docker build --platform linux/amd64 --load --tag postgwas:local ." in text
+        assert "docker run --rm --platform linux/amd64 postgwas:local postgwas --help" in text
+        assert "emulation" in text
+        # Syntax validation only: never build an image or run an analysis here.
+        blocks = re.findall(r"```(?:console|bash|shell)\n(.*?)```", text, re.DOTALL)
+        for block in blocks:
+            if "docker " in block:
+                completed = subprocess.run(
+                    ["bash", "-n"], input=block, capture_output=True,
+                    text=True, check=False,
+                )
+                assert completed.returncode == 0, (source, completed.stderr)
+    assert "ENTRYPOINT []" in dockerfile
+    assert 'CMD ["postgwas", "--help"]' in dockerfile
+    assert "RUN bash /opt/postgwas/tools/setup/verify_all_tools.sh" in dockerfile
+    assert "](docs/wiki/getting-started/installation.md#docker-installation)" in (
+        ROOT_README.read_text(encoding="utf-8")
+    )
+
+
+def test_docker_guide_explains_mounts_resources_and_validation_limits():
+    guide = (REPOSITORY_ROOT / "docs/wiki/getting-started/installation.md").read_text(
+        encoding="utf-8",
+    )
+    for required in (
+        "## Docker installation",
+        "dst=/input,readonly",
+        "dst=/reference,readonly",
+        "dst=/output",
+        '--user "$(id -u):$(id -g)"',
+        "--output-directory /output/qc",
+        "not a published image to pull",
+        "not Docker builds or full module",
+        "`.gitignore` does not",
+        "--mixer-backend native",
+        "--mixer-backend docker",
+        "MAGMA redistribution terms",
+    ):
+        assert required in guide, required
 
 
 def test_readme_local_links_exist():

@@ -361,6 +361,142 @@ def test_score_validation_accepts_no_prioritized_genes(tmp_path):
     assert metrics["prioritized_genes"] == 0
 
 
+def _annotation_inputs(tmp_path, module, gene_ids):
+    features = tmp_path / "features.txt"
+    features.write_text("MAGMA_Z\nPoPS_Score\n", encoding="utf-8")
+    annotation = tmp_path / "annotation.tsv"
+    pd.DataFrame([
+        {
+            module.result_schema.gene_column: gene,
+            module.result_schema.symbol_column: "GENE%d" % (number + 1),
+            "MAGMA_Z": 2.0 if number == 0 else 0.0,
+            "PoPS_Score": 0.3 if number == 0 else 0.0,
+        }
+        for number, gene in enumerate(gene_ids)
+    ]).to_csv(annotation, sep=module.input_schema.table_delimiter, index=False)
+    resources = {
+        "features": features,
+        "magma_genes": {gene_ids[0]},
+        "pops_genes": {gene_ids[0]},
+    }
+    return annotation, resources
+
+
+@pytest.mark.parametrize("missing_gene", ("ENSG000002", "ENSG000002.7"))
+@pytest.mark.parametrize("missing_sources", (("magma", "pops"), ("magma",), ("pops",)))
+def test_annotation_validation_audits_genes_without_magma_or_pops_evidence(
+    tmp_path, missing_gene, missing_sources,
+):
+    module = _module()
+    annotation, resources = _annotation_inputs(
+        tmp_path, module, ["ENSG000001", missing_gene],
+    )
+    for source in ("magma", "pops"):
+        if source not in missing_sources:
+            resources["%s_genes" % source].add(missing_gene)
+
+    metrics = flames_service._validate_annotations(
+        [annotation], resources, module,
+    )
+
+    assert metrics["annotated_genes"] == 2
+    for source in ("magma", "pops"):
+        expected = [missing_gene] if source in missing_sources else []
+        assert metrics["gene_rows_without_%s_evidence" % source] == len(expected)
+        assert metrics["genes_without_%s_evidence" % source] == expected
+
+
+@pytest.mark.parametrize(
+    "invalid_gene",
+    ("", "   ", None, float("nan"), "NOT_AN_ENSEMBL_ID"),
+    ids=("blank", "whitespace", "none", "nan", "malformed"),
+)
+def test_annotation_validation_rejects_invalid_gene_ids(tmp_path, invalid_gene):
+    module = _module()
+    annotation, resources = _annotation_inputs(
+        tmp_path, module, ["ENSG000001", invalid_gene],
+    )
+
+    with pytest.raises(FlamesError, match="gene identifiers|non-empty genes"):
+        flames_service._validate_annotations([annotation], resources, module)
+
+
+def test_annotation_validation_rejects_duplicate_valid_gene_ids(tmp_path):
+    module = _module()
+    annotation, resources = _annotation_inputs(
+        tmp_path, module, ["ENSG000001", "ENSG000001"],
+    )
+
+    with pytest.raises(FlamesError, match="unique"):
+        flames_service._validate_annotations([annotation], resources, module)
+
+
+def test_annotation_validation_counts_missing_gene_rows_across_loci(tmp_path):
+    module = _module()
+    annotation, resources = _annotation_inputs(
+        tmp_path, module, ["ENSG000001", "ENSG000002.7"],
+    )
+    second_annotation = tmp_path / "second_locus.tsv"
+    second_annotation.write_bytes(annotation.read_bytes())
+
+    metrics = flames_service._validate_annotations(
+        [annotation, second_annotation], resources, module,
+    )
+
+    assert metrics["annotation_files"] == 2
+    assert metrics["annotated_genes"] == 4
+    for source in ("magma", "pops"):
+        assert metrics["gene_rows_without_%s_evidence" % source] == 2
+        assert metrics["genes_without_%s_evidence" % source] == ["ENSG000002.7"]
+
+
+@pytest.mark.parametrize(
+    ("missing_gene", "accepted"),
+    (("ENSG000002.99", True), ("ENSG000002.98", False)),
+)
+def test_annotation_validation_uses_configured_gene_pattern(
+    tmp_path, missing_gene, accepted,
+):
+    config_file = tmp_path / "flames.yaml"
+    config_file.write_text(
+        "input_schema:\n  ensembl_gene_pattern: '^ENSG[0-9]+[.]99$'\n",
+        encoding="utf-8",
+    )
+    module = load_module_configuration("flames", config_file)
+    annotation, resources = _annotation_inputs(
+        tmp_path, module, ["ENSG000001.99", missing_gene],
+    )
+
+    if not accepted:
+        with pytest.raises(FlamesError, match="Ensembl gene identifiers"):
+            flames_service._validate_annotations([annotation], resources, module)
+        return
+
+    metrics = flames_service._validate_annotations([annotation], resources, module)
+
+    assert metrics["gene_rows_without_magma_evidence"] == 1
+    assert metrics["gene_rows_without_pops_evidence"] == 1
+    assert metrics["genes_without_magma_evidence"] == [missing_gene]
+    assert metrics["genes_without_pops_evidence"] == [missing_gene]
+
+
+@pytest.mark.parametrize("missing_gene", (None, float("nan")))
+def test_annotation_validation_rejects_null_ids_with_permissive_pattern(
+    tmp_path, missing_gene,
+):
+    config_file = tmp_path / "flames.yaml"
+    config_file.write_text(
+        "input_schema:\n  ensembl_gene_pattern: '.*'\n", encoding="utf-8",
+    )
+    module = load_module_configuration("flames", config_file)
+    annotation, resources = _annotation_inputs(
+        tmp_path, module, ["ENSG000001", missing_gene],
+    )
+
+    with pytest.raises(FlamesError, match="non-empty"):
+        flames_service._validate_annotations([annotation], resources, module)
+
+
 def test_score_validation_rejects_incorrect_raw_score_normalization(tmp_path):
     module = _module()
     schema = module.result_schema

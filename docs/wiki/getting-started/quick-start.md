@@ -20,7 +20,9 @@ and configuration; do not relabel a reference to make it fit the example.
 
 ## 1. Install and prepare the inputs
 
-Complete [Installation](installation.md) and activate the installed environment.
+Complete [Installation](installation.md), then activate the local environment
+or enter the documented Docker shell with input/reference/output mounts. For
+Docker, use paths inside the container in all commands and sample-sheet rows.
 Before running this example, replace the following paths with your real inputs:
 
 | Example path | What must be present |
@@ -48,7 +50,12 @@ examples/configs/harmonisation/sample_sheet_quantitative.csv
 examples/configs/harmonisation/sample_sheet_case_control.csv
 ```
 
-Copy the appropriate template into `studies.csv`, change its dataset ID to
+You can instead [generate a draft from the study headers](../harmonisation/sample-sheet.md#generate-a-draft-from-gwas-headers)
+and review all mappings and missing fields. Successful draft generation is not
+proof of analysis readiness.
+
+Copy and complete the appropriate template, or edit the generated `studies.csv`;
+change the selected row's dataset ID to
 `STUDY`, and replace all example values. Relative input paths are resolved from
 the sample sheet's directory. Follow the [sample-sheet contract](../harmonisation/sample-sheet.md)
 for INFO-source choices, external sources, missing statistics, and accepted

@@ -41,7 +41,14 @@ Use FLAMES after compatible fine-mapping, MAGMA gene association, MAGMA
 gene-property analysis, and PoPS scoring have completed. The credible-set
 coordinates and all declared module genome builds must agree. MAGMA and PoPS
 must use compatible Ensembl gene identifiers; PostGWAS matches identifiers
-exactly and does not strip versions or silently remap genes.
+exactly and does not strip versions or silently remap genes. The FLAMES
+annotation bundle can contain locus genes absent from the study-specific MAGMA
+or PoPS universe. The published implementation assigns zero to that absent
+evidence. PostGWAS preserves that model behavior while recording the affected
+gene IDs and locus-gene row counts in validation metrics and the completion
+manifest. Missing, malformed or duplicate annotation gene identifiers still
+fail validation against the configured gene-ID contract; they are not treated
+as absent evidence.
 
 ## Input requirements
 
@@ -186,11 +193,13 @@ would require a separately validated model.
 1. Resolve and validate YAML plus explicit CLI overrides once.
 2. Verify cross-module genome builds, runtime dependencies, annotation-bundle
    structure, model, and feature manifest.
-3. Validate the indexed credible sets and exact MAGMA/PoPS gene compatibility.
+3. Validate the indexed credible sets and the shared MAGMA/PoPS identifier
+   universe.
 4. Write the resolved configuration and a staged index with explicit annotation
    destinations.
-5. Run upstream annotation, then verify every expected feature is finite and
-   every annotated gene exists in both scientific input sets.
+5. Run upstream annotation, verify every expected feature is finite, and audit
+   annotated genes whose MAGMA or PoPS evidence was assigned zero because that
+   gene was absent from the corresponding study-specific input.
 6. Run upstream scoring; verify schemas, ranges, binary indicators, per-locus
    score normalization, and exact agreement between prioritized and causal rows.
 7. Rewrite staged annotation paths to published paths, publish validated files,
@@ -216,7 +225,8 @@ Files without a valid completion manifest are incomplete and are not resumed.
 ## QC and logs
 
 Review cumulative PIP per credible set (including valid sums above one for
-multi-effect marginal PIPs); chromosome and build declarations;
+multi-effect marginal PIPs); chromosome and build declarations; locus-gene rows
+assigned zero because the gene was absent from MAGMA or PoPS;
 MAGMA, PoPS, and shared-gene counts; annotation and feature counts; features
 that are zero across every locus; scored and prioritized gene counts; resolved
 API/local annotation modes; and the completion manifest. A feature that is zero
