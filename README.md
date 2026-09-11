@@ -1583,9 +1583,8 @@ pages, not generated copies. When adding a page, follow the contract in
 [docs/wiki/README.md](docs/wiki/README.md) and start module pages from
 [docs/templates/module-page.md](docs/templates/module-page.md).
 
-Repository development must follow [AGENTS.md](AGENTS.md), including method
-validation, focused regression tests, cumulative-diff review, and protection of
-the bundled harmonisation adapters.
+Repository development requires method validation, focused regression tests,
+cumulative-diff review, and protection of the bundled harmonisation adapters.
 
 ## Licensing status
 

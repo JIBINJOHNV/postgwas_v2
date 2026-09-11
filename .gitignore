@@ -1,5 +1,6 @@
 # Local hand-off and assistant backup files
 .claude_transfer/
+/AGENTS.md
 
 # PostGWAS runtime output and local scientific data
 /cache/
