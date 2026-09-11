@@ -61,7 +61,7 @@ lead variants while testing other eligible variants. Use
 `--joint-snps model_snps.txt` when the objective is instead to estimate the
 effects of a specified SNP set simultaneously.
 
-## Input and reference requirements
+## Input requirements
 
 The GWAS and LD reference must use the same genome build, ancestry, variant IDs,
 and compatible alleles. PostGWAS requires the user to declare build and reference
@@ -208,7 +208,12 @@ workers but increases the risk of memory pressure. When the complete output
 contract is requested, the final genome-wide conditional reconstruction is
 deliberately sequential.
 
-Direct mode:
+## Direct mode
+
+Each example consumes the complete `.ma` input and a matching PLINK
+BED/BIM/FAM prefix. Separate output directories keep the four analyses distinct.
+
+### Stepwise selection
 
 ```bash
 postgwas gcta_cojo \
@@ -217,33 +222,116 @@ postgwas gcta_cojo \
   --genome-build GRCh37 \
   --cojo-reference-population EUR \
   --dataset-id STUDY \
-  --output-directory results
+  --output-directory results/cojo_slct
 ```
 
-Conditional mode:
+### Fixed-count selection
 
 ```bash
 postgwas gcta_cojo \
   --cojo-file study.ma \
+  --cojo-mode top_snps \
+  --cojo-top-snps 10 \
+  --cojo-reference-prefix reference/EUR_ld \
+  --genome-build GRCh37 \
+  --cojo-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/cojo_top_snps
+```
+
+Here `10` is the requested maximum number of selected signals, not a
+significance threshold; choose a count justified by the analysis.
+
+### Joint model for a specified SNP list
+
+```bash
+postgwas gcta_cojo \
+  --cojo-file study.ma \
+  --cojo-mode joint \
+  --joint-snps model_snps.txt \
+  --cojo-reference-prefix reference/EUR_ld \
+  --genome-build GRCh37 \
+  --cojo-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/cojo_joint
+```
+
+### Conditional association
+
+```bash
+postgwas gcta_cojo \
+  --cojo-file study.ma \
+  --cojo-mode cond \
   --condition-snps lead_snps.txt \
   --cojo-reference-prefix reference/EUR_ld \
   --genome-build GRCh37 \
   --cojo-reference-population EUR \
   --dataset-id STUDY \
-  --output-directory results
+  --output-directory results/cojo_cond
 ```
 
-Pipeline mode starts from VCF and prepares the `.ma` input:
+## Pipeline mode
+
+Supply an indexed, single-sample PostGWAS-harmonised VCF, the compatible PLINK
+reference, and any analysis-specific SNP list. The pipeline inspects BIM IDs
+and prepares the `.ma` input; do not pass `--cojo-file` in this mode.
+
+### Stepwise selection
 
 ```bash
 postgwas pipeline \
   --modules gcta_cojo \
-  --vcf study.vcf.gz \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
   --cojo-reference-prefix reference/EUR_ld \
   --genome-build GRCh37 \
   --cojo-reference-population EUR \
   --dataset-id STUDY \
-  --output-directory results
+  --output-directory results/cojo_slct_pipeline
+```
+
+### Fixed-count selection
+
+```bash
+postgwas pipeline \
+  --modules gcta_cojo \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --cojo-mode top_snps \
+  --cojo-top-snps 10 \
+  --cojo-reference-prefix reference/EUR_ld \
+  --genome-build GRCh37 \
+  --cojo-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/cojo_top_snps_pipeline
+```
+
+### Joint model for a specified SNP list
+
+```bash
+postgwas pipeline \
+  --modules gcta_cojo \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --cojo-mode joint \
+  --joint-snps model_snps.txt \
+  --cojo-reference-prefix reference/EUR_ld \
+  --genome-build GRCh37 \
+  --cojo-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/cojo_joint_pipeline
+```
+
+### Conditional association
+
+```bash
+postgwas pipeline \
+  --modules gcta_cojo \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --cojo-mode cond \
+  --condition-snps lead_snps.txt \
+  --cojo-reference-prefix reference/EUR_ld \
+  --genome-build GRCh37 \
+  --cojo-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/cojo_cond_pipeline
 ```
 
 The formatter runs once and passes its checked `.ma` artifact to the COJO step.
@@ -254,6 +342,8 @@ identify the resolved downstream analysis—for example, `GCTA-COJO top-SNP
 selection (10 SNPs requested)`—instead of displaying only the generic GCTA
 schema name.
 
+## Configuration
+
 Every default is owned by
 `src/postgwas/config/defaults/modules/gcta_cojo.yaml`. Export a reusable file
 with:
@@ -261,6 +351,8 @@ with:
 ```bash
 postgwas config export --module gcta_cojo --style full --output gcta_cojo.yaml
 ```
+
+## Outputs
 
 Each run writes the resolved configuration, a checksummed completion manifest,
 the normalized TSV, GCTA raw results and GCTA log, and a PostGWAS log. Successful

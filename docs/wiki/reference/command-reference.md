@@ -15,7 +15,7 @@ inventory. The current public commands map to Wiki pages as follows.
 | `finemap` | SuSiE-RSS or FINEMAP | [Fine Mapping](../modules/fine-mapping.md) |
 | `magma` | MAGMA gene/gene-set analysis | [MAGMA](../modules/magma.md) |
 | `gcta_gene` | GCTA fastBAT/mBAT-combo | [GCTA Gene Analysis](../modules/gcta-gene.md) |
-| `gcta_cojo` | GCTA-COJO conditional and joint analysis | `docs/modules/gcta_cojo/README.md` in the repository |
+| `gcta_cojo` | GCTA-COJO conditional and joint analysis | [GCTA-COJO](../../modules/gcta_cojo/README.md) |
 | `magmacovar` | MAGMA gene-property analysis | [MAGMAcovar](../modules/magmacovar.md) |
 | `single_cell` | MAGMA cell typing, scDRS, LDSC cell-type analysis | [Single-Cell Integration](../modules/single-cell.md) |
 | `pops` | PoPS gene prioritization | [PoPS](../modules/pops.md) |
@@ -31,11 +31,24 @@ inventory. The current public commands map to Wiki pages as follows.
 | `resources` | Install and revalidate pinned resource bundles | [Reference Resources](reference-resources.md) |
 | `--validate` | Input-to-VCF concordance | [Validation Reference](validation.md) |
 
-The command name is not always the configuration module name. `sumstat_filter`
-resolves to `filtering`, `formatter` to `formatting`, `annot_ldblock` to
-`ld_annotation`, `ld_clump` to `ld_clumping`, `finemap` to `fine_mapping`,
-`heritability` to `ldsc`, `qc` to `qc_summary`, and `pathway_enrichment` to
-`enrichment`. Use the configuration name with `postgwas config --module`.
+## Command, pipeline target and configuration names
+
+The command name is not always the configuration module name. These are the
+exceptions; other analysis commands use their name for both. The configuration
+column identifies the section below `modules` and the value supplied to
+`--module` when exporting configuration with `postgwas config export`.
+
+| Direct command | Pipeline target | Configuration module |
+|---|---|---|
+| `harmonisation` | Standalone only | `harmonisation` |
+| `sumstat_filter` | `sumstat_filter` | `filtering` |
+| `formatter` | `formatter` | `formatting` |
+| `annot_ldblock` | `annot_ldblock` | `ld_annotation` |
+| `ld_clump` | `ld_clump` | `ld_clumping` |
+| `finemap` | `finemap` | `fine_mapping` |
+| `heritability` | `heritability` | `ldsc` |
+| `qc` | `qc_summary` | `qc_summary` |
+| `pathway_enrichment` | Standalone only | `enrichment` |
 
 For any command:
 

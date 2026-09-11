@@ -52,9 +52,9 @@ four columns are used and `LDBLOCK_1` is ignored.
 > Chromosome labels must also match the VCF exactly: `1` matches `1`, and
 > `chr1` matches `chr1`, but `1` does not match `chr1`.
 
-## Command
+## Direct mode
 
-```console
+```text
 postgwas annot_ldblock --vcf PATH --ld-region-dir PATH [options]
 ```
 
@@ -62,7 +62,7 @@ postgwas annot_ldblock --vcf PATH --ld-region-dir PATH [options]
 instead be supplied by the canonical LD-annotation run configuration. An
 explicit command-line value overrides the corresponding YAML value.
 
-## Minimal example
+### One population
 
 ```console
 postgwas annot_ldblock \
@@ -73,7 +73,7 @@ postgwas annot_ldblock \
   --output-directory results
 ```
 
-## Full example
+### Multiple populations
 
 ```console
 postgwas annot_ldblock \
@@ -85,7 +85,43 @@ postgwas annot_ldblock \
   --threads 4
 ```
 
+## Pipeline mode
+
+The same BED requirements apply. The pipeline reads the build from the
+indexed, single-sample PostGWAS-harmonised input and supplies the annotated VCF
+to any later step that needs it:
+
+```console
+postgwas pipeline \
+  --modules annot_ldblock \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --ld-region-dir reference/ld_blocks \
+  --ld-block-populations EUR \
+  --dataset-id STUDY \
+  --output-directory results/ld_annotation_pipeline
+```
+
+For multi-population annotation:
+
+```console
+postgwas pipeline \
+  --modules annot_ldblock \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --ld-region-dir reference/ld_blocks \
+  --ld-block-populations EUR AFR EAS \
+  --dataset-id STUDY \
+  --output-directory results/ld_annotation_multi_pipeline
+```
+
+To proceed directly to region clumping, use its
+[pipeline recipe](ld-clumping.md#pipeline-mode); annotation is then inserted
+automatically. Variants outside the BED blocks remain in the annotated VCF.
+
 ## Parameters
+
+```console
+postgwas config export --module ld_annotation --style full --output ld_annotation.yaml
+```
 
 Canonical `modules.ld_annotation.inputs.ld_region_dir` supplies the shared
 directory containing build- and population-specific BED files. For example:

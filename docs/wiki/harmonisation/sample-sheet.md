@@ -31,6 +31,13 @@ non-finite, zero, negative, and unreadable positions are rejected as
 Allele order is scientifically meaningful: the effect estimate and effect
 allele frequency refer to `effect_allele_column`.
 
+Before running a generated or copied sheet, compare its declarations with the
+study's data dictionary: trait design, effect type and scale, P-value scale,
+allele order, frequency meaning and sample-size definition. Set known
+`trait_type`, `effect_type` and `p_value_type` explicitly; retain `auto` only
+when inference is actually needed. An automatically recognized column name is
+not evidence that its values have the intended meaning.
+
 ## Effect and P-value mappings
 
 Provide `effect_column` or `z_score_column`. `effect_type` accepts `beta`,
@@ -51,12 +58,14 @@ below:
 | Concept | Internal source | External source | Resolution rule |
 |---|---|---|---|
 | Study effect-allele frequency | `effect_allele_frequency_column` | `external_eaf_file` plus `external_eaf_column` | Exactly one source is required. |
-| Study imputation quality | `imputation_info_column` | `external_info_file` plus `external_info_column` | Internal INFO takes priority when both are listed; otherwise use external INFO. With neither, explicitly supply `--fixed-info VALUE` or preflight fails. |
+| INFO value and provenance | `imputation_info_column` | `external_info_file` plus `external_info_column` | Internal INFO takes priority when both are listed; otherwise use external INFO. With neither, explicitly supply `--fixed-info VALUE` or preflight fails. |
 
-An external path without its column name is incomplete. The comparison AF
-panel configured for harmonisation is not a substitute for either study source.
-An ignored external INFO source is reported rather than silently combined with
-the internal values.
+A selected external source needs both its path and column name. The comparison
+AF panel configured for harmonisation is not a substitute for either study
+source. An ignored external INFO source is reported rather than silently
+combined with the internal values. External INFO is a reference proxy, and
+fixed INFO is a user-assigned value; neither establishes the study's measured
+imputation quality. Read their provenance before applying an INFO filter.
 
 An external EAF or INFO source may be either one existing table containing all
 chromosomes or an explicit per-chromosome path template. Use `{chromosome}` for

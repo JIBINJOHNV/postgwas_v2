@@ -5,6 +5,9 @@
 /urgent_attention_needed.md
 /HARMONISATION_REVIEW.md
 
+# Local regression suite: deliberately not published in the Git repository
+/tests/
+
 # PostGWAS runtime output and local scientific data
 /cache/
 /logs/

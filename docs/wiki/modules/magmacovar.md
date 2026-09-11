@@ -87,11 +87,13 @@ method does not bypass the missingness threshold.
 
 ## Command
 
-```console
+```text
 postgwas magmacovar --magma-gene-results-file PATH --covariates PATH [options]
 ```
 
-## Minimal example
+## Direct mode
+
+### Marginal gene-property tests
 
 Run the default two-sided marginal tests:
 
@@ -102,8 +104,6 @@ postgwas magmacovar \
   --dataset-id STUDY \
   --output-directory results
 ```
-
-## Full example
 
 ### Original FLAMES
 
@@ -146,7 +146,61 @@ example `.gsa.out` nevertheless records `CONDITIONED_HIDDEN = Average` and a
 positive one-sided covariate test, so the bundled result and README command are
 internally inconsistent.
 
-### Pipeline input and ordered progress
+The following are distinct model designs. Replace property names with exact
+headers in your covariate table and prespecify the tested family. For the
+file-based joint example, `property_models.txt` contains one whitespace-separated
+list of properties per model, one model per line. It is not a list of genes.
+`analyse` restricts the tested properties; it is not a significance filter.
+Technical corrections remain at the configured MAGMA default unless explicitly
+changed with `correct`.
+
+### Conditional properties
+
+```console
+postgwas magmacovar \
+  --magma-gene-results-file STUDY.genes.raw \
+  --covariates gene_covariates.tsv \
+  --covariate-model analyse=list,CellType_A condition=CellType_B \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Residualized outcome
+
+```console
+postgwas magmacovar \
+  --magma-gene-results-file STUDY.genes.raw \
+  --covariates gene_covariates.tsv \
+  --covariate-model analyse=list,BiologicalScore condition-residualize=TechnicalScore \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Joint models from a file
+
+```console
+postgwas magmacovar \
+  --magma-gene-results-file STUDY.genes.raw \
+  --covariates gene_covariates.tsv \
+  --covariate-model joint=property_models.txt \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Pairwise joint models
+
+```console
+postgwas magmacovar \
+  --magma-gene-results-file STUDY.genes.raw \
+  --covariates gene_covariates.tsv \
+  --covariate-model analyse=list,CellType_A,CellType_B joint-pairs \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+## Pipeline mode
+
+### Marginal gene-property tests
 
 When `magmacovar` is the requested pipeline target, PostGWAS starts from the
 summary-statistics GWAS-VCF and runs its MAGMA dependency before gene-property
@@ -197,6 +251,87 @@ the MAGMAcovar canonical log records each of its four stages and outcomes. If a
 pathway file is configured elsewhere in reusable MAGMA settings, it is outside
 the MAGMAcovar gene-only execution contract and is not validated or used in a
 MAGMA command.
+
+These examples use the packaged GRCh37/EUR positional MAGMA reference
+contract and an Entrez-compatible covariate table. For a different primary gene
+identifier system, supply a matching MAGMA reference and its
+[source declarations](magma.md#gene-identifiers-and-source-declarations).
+The model meanings and property-file requirements are the same as in direct mode.
+
+### Tissue specificity
+
+```console
+postgwas pipeline \
+  --modules magmacovar \
+  --vcf study_GRCh37.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --covariates gene_covariates.tsv \
+  --covariate-model condition-hide=Average \
+  --covariate-direction greater \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Conditional properties
+
+```console
+postgwas pipeline \
+  --modules magmacovar \
+  --vcf study_GRCh37.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --covariates gene_covariates.tsv \
+  --covariate-model analyse=list,CellType_A condition=CellType_B \
+  --covariate-direction two-sided \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Residualized outcome
+
+```console
+postgwas pipeline \
+  --modules magmacovar \
+  --vcf study_GRCh37.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --covariates gene_covariates.tsv \
+  --covariate-model analyse=list,BiologicalScore condition-residualize=TechnicalScore \
+  --covariate-direction two-sided \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Joint models from a file
+
+```console
+postgwas pipeline \
+  --modules magmacovar \
+  --vcf study_GRCh37.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --covariates gene_covariates.tsv \
+  --covariate-model joint=property_models.txt \
+  --covariate-direction two-sided \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Pairwise joint models
+
+```console
+postgwas pipeline \
+  --modules magmacovar \
+  --vcf study_GRCh37.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --covariates gene_covariates.tsv \
+  --covariate-model analyse=list,CellType_A,CellType_B joint-pairs \
+  --covariate-direction two-sided \
+  --dataset-id STUDY \
+  --output-directory results
+```
 
 ## Parameters
 

@@ -32,8 +32,12 @@ Before running this example, replace the following paths with your real inputs:
 | `reference/GRCh37_EUR_reference` | A compatible PLINK prefix with `.bed`, `.bim`, and `.fam` companions; the BIM identifiers must match the formatter's selected identifier convention |
 | `reference/NCBI37.3.gene.loc` | The NCBI37.3 MAGMA gene-location annotation with Entrez gene IDs |
 
-The [resource setup guide](resource-setup.md) explains what the software installer
-does not provide. These are placeholders, not a bundled demonstration dataset.
+The [resource setup guide](resource-setup.md) separates upstream downloads from
+PostGWAS-specific preparation and gives a
+[positional MAGMA acquisition route](resource-setup.md#prepare-the-positional-magma-example).
+These are placeholders, not a bundled demonstration dataset. The complete
+harmonisation resource tree still needs manual preparation; stop here if any
+required component is unavailable.
 
 ## 2. Prepare the sample sheet
 
@@ -42,6 +46,16 @@ and allele columns, effect estimate or Z score, P-value representation, exactly
 one study-frequency source, and the real sample-size sources. Quantitative and
 case-control studies have different sample-size requirements. Do not invent
 case counts, control counts, allele frequencies, or imputation-quality values.
+
+Check the study publication or data dictionary before accepting `auto` values:
+set `trait_type` to the documented study design, `effect_type` to `beta` or
+`odds_ratio` when known, and `p_value_type` to `raw` or `neglog10` when known.
+Confirm that the effect allele, effect estimate and frequency describe the same
+allele, and whether SE is on the beta/log-odds scale or the raw odds-ratio scale.
+Header recognition does not establish these meanings. A case-control study's
+total N alone is not enough to reconstruct its effective N; supply the real
+cases and controls or
+review the [documented Neff-only limitation](../harmonisation/sample-sheet.md#a-case-control-file-containing-only-precomputed-neff).
 
 Repository templates are available at:
 
@@ -78,10 +92,28 @@ postgwas harmonisation \
 Harmonisation is a standalone preparation command, not a pipeline target. It
 validates and prepares each dataset, processes chromosomes, then merges and
 assesses the results. It can reject variants; it does not promise to preserve
-every input row. Build conversion may also lose records that cannot be lifted.
+every input row. Build conversion can also lose records through failed liftover
+or configured exclusions after a successful lift.
 `--dataset-id STUDY` selects that sample-sheet row; omit it to process all rows.
 The optional `--validate` used here compares the original study with its
 same-build final VCF and records concordance evidence after harmonisation.
+
+### Review the decisions used by this example
+
+The commands use packaged policies unless you explicitly override them. The
+following choices affect interpretation, not just file layout:
+
+| Decision | Packaged behaviour to review |
+|---|---|
+| Frequency reference | ALFA EUR is used by both the default tabular comparison and VCF population comparison; choose a suitable panel/population for your study rather than assuming EUR is appropriate. |
+| Dataset-wide inference | Inspect the logged `DECIDE` records for build, effect type, SE scale, P-value scale, frequency interpretation and strand consensus. Insufficient evidence can stop the run rather than force a decision. |
+| Variant retention | Invalid records, duplicate groups, unresolved strand cases and reference-unmatched variants can be rejected before VCF export. The default does not preserve every input row. |
+| Opposite-build VCF | `policies.vcf.liftover_swap: exclude` removes successfully lifted REF/ALT-swapped records. These policy exclusions are distinct from plugin lift failures; inspect both counts. |
+
+Use the [harmonisation configuration guide](../../modules/harmonisation/configuration.md)
+to review or export the actual policies. The
+[processing order](../harmonisation/processing-order.md) explains each decision
+and rejection boundary; do not change a threshold only to improve retention.
 
 After a successful run, inspect:
 
@@ -89,6 +121,11 @@ After a successful run, inspect:
 - the dataset's `rejected/` records and `qc_summary/STUDY_reject_reasons.tsv`;
 - the run-level summary and HTML report under
   `results/harmonisation/run_metadata/`.
+
+Compare retained/rejected counts with the original study, read the reasons for
+large losses, and inspect source-build versus target-build liftover accounting.
+The two final VCFs need not contain identical numbers of variants. QC rule counts
+can overlap; adding them does not give the number of distinct rejected variants.
 
 With the packaged output layout, the GRCh37 VCF for the next steps is:
 
@@ -148,11 +185,27 @@ policy. It is not a coordinate liftover or a substitute for compatible alleles,
 build, and ancestry. Review the reported overlap and exclusions before
 interpreting the gene results.
 
-The pipeline writes numbered step directories. Consult the MAGMA
-[outputs and interpretation](../modules/magma.md#outputs) for the primary gene
-table, native results, report, and exclusions. A gene-set file is not needed for
-this gene-only example; competitive gene-set analysis is a separate option with
-its own gene-ID compatibility requirements.
+For this positional example, the packaged gene window is 35 kb upstream and
+10 kb downstream; the packaged MHC policy excludes both MHC SNPs and genes.
+Review these choices, the tested chromosomes, and the gene-exclusion audit in
+the resolved MAGMA configuration and report before interpreting association
+results.
+
+With this two-step plan and the packaged layout, inspect:
+
+| File below `results/magma_pipeline/02_magma/` | What it tells you |
+|---|---|
+| `04_reports/STUDY_magma_report.html` | Run status, reference overlap, mapping and gene-analysis summaries, and exclusions |
+| `03_results/positional/STUDY_magma_genes_annotated.tsv` | Tested genes, native association results and configured multiple-testing corrections |
+| `02_intermediates/positional/` | Annotation, native MAGMA results and supporting execution evidence |
+
+Read both unadjusted and corrected association results, check the number of
+tested genes and the correction family, and account for excluded genes. A
+significant gene association is not proof that the gene causes the trait.
+There are no expected example hits because this walkthrough uses your study.
+The [MAGMA guide](../modules/magma.md#outputs) gives the complete output contract.
+A gene-set file is not needed for this gene-only example; competitive gene-set
+analysis is a separate option with its own gene-ID compatibility requirements.
 
 ## 6. Choose the next analysis or a different execution mode
 

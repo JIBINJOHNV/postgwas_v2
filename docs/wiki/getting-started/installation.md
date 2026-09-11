@@ -322,7 +322,11 @@ Every command must resolve inside the activated environment and exit
 successfully. `postgwas --help` only proves that the public interface imports;
 it does not prove that scientific resources for a selected module are ready.
 
-For a development checkout, run the focused installation contracts:
+The test suite is retained locally in maintainer copies and is not included in
+a public Git clone. If your development checkout has that local-only suite,
+you can also run the focused installation contracts below. Users without it
+should use the shipped verification scripts and manual checks above; a missing
+`tests/` directory is not an installation failure.
 
 ```console
 PYTHONDONTWRITEBYTECODE=1 \

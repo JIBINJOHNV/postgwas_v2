@@ -24,13 +24,23 @@ explicit genome build and reference population; gene list for gene-based
 fastBAT, mBAT-combo, and GMT conversion; method-specific set input when
 applicable; GCTA 1.94.1 or newer.
 
+Under the packaged formatter schema, the headered `.ma` columns are `SNP A1 A2
+freq BETA SE P N`. `A1` is the effect allele, `freq` its frequency and `P` is a
+raw probability, not minus-log10(p). Use formatter output rather than renaming
+an unrelated table. The GCTA gene list is headerless with four whitespace-
+separated fields: `chromosome start end gene`. It is not the differently ordered
+MAGMA gene-location format. Coordinates must be integers in the declared build;
+GMT membership must use the gene identifiers in that reference.
+
 ## Command
 
-```console
+```text
 postgwas gcta_gene --gcta-input-file PATH --method METHOD [options]
 ```
 
-## Minimal example
+## Direct mode
+
+### Gene-based fastBAT
 
 ```console
 postgwas gcta_gene \
@@ -41,10 +51,10 @@ postgwas gcta_gene \
   --genome-build GRCh37 \
   --gcta-reference-population EUR \
   --dataset-id STUDY \
-  --output-directory results
+  --output-directory results/gcta_fastbat_gene_direct
 ```
 
-## Full example
+### Pathway fastBAT from a GMT
 
 ```console
 postgwas gcta_gene \
@@ -59,7 +69,133 @@ postgwas gcta_gene \
   --gcta-reference-maf-min 0.01 \
   --fastbat-ld-cutoff 0.9 \
   --dataset-id STUDY \
-  --output-directory results
+  --output-directory results/gcta_fastbat_set_gmt_direct
+```
+
+### Fixed-segment fastBAT
+
+```console
+postgwas gcta_gene \
+  --method fastbat_segment \
+  --gcta-input-file formatted/STUDY_gcta.ma \
+  --gcta-reference-prefix reference/1000G_EUR \
+  --genome-build GRCh37 \
+  --gcta-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/gcta_fastbat_segment_direct
+```
+
+### Prepared SNP-set fastBAT
+
+```console
+postgwas gcta_gene \
+  --method fastbat_set \
+  --gcta-input-file formatted/STUDY_gcta.ma \
+  --gcta-reference-prefix reference/1000G_EUR \
+  --fastbat-set-list pathways.fastbat.set \
+  --genome-build GRCh37 \
+  --gcta-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/gcta_fastbat_set_prepared_direct
+```
+
+### Gene-based mBAT-combo
+
+```console
+postgwas gcta_gene \
+  --method mbat_combo \
+  --gcta-input-file formatted/STUDY_gcta.ma \
+  --gcta-reference-prefix reference/1000G_EUR \
+  --gene-list genes_grch37.txt \
+  --genome-build GRCh37 \
+  --gcta-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/gcta_mbat_combo_direct
+```
+
+## Pipeline mode
+
+The pipeline creates the GCTA `.ma` table from a harmonised GWAS-VCF. Supply
+external LD and method-specific annotations; do not supply `--gcta-input-file`.
+All examples below assume GRCh37 coordinates and a compatible EUR reference.
+Prepared set files list a set identifier followed by its BIM-matching SNP IDs;
+GMT files instead list pathway genes and therefore require a gene-coordinate
+reference in a compatible identifier system. Fixed-segment analysis needs no
+gene list. Choose the configured segment size before running the analysis.
+
+### Gene-based fastBAT
+
+```console
+postgwas pipeline \
+  --modules gcta_gene \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --method fastbat_gene \
+  --gcta-reference-prefix reference/1000G_EUR \
+  --gene-list genes_grch37.txt \
+  --genome-build GRCh37 \
+  --gcta-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/gcta_fastbat_gene_pipeline
+```
+
+### Fixed-segment fastBAT
+
+```console
+postgwas pipeline \
+  --modules gcta_gene \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --method fastbat_segment \
+  --gcta-reference-prefix reference/1000G_EUR \
+  --genome-build GRCh37 \
+  --gcta-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/gcta_fastbat_segment_pipeline
+```
+
+### Prepared SNP-set fastBAT
+
+```console
+postgwas pipeline \
+  --modules gcta_gene \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --method fastbat_set \
+  --gcta-reference-prefix reference/1000G_EUR \
+  --fastbat-set-list pathways.fastbat.set \
+  --genome-build GRCh37 \
+  --gcta-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/gcta_fastbat_set_prepared_pipeline
+```
+
+### Pathway fastBAT from a GMT
+
+```console
+postgwas pipeline \
+  --modules gcta_gene \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --method fastbat_set \
+  --gcta-reference-prefix reference/1000G_EUR \
+  --gene-list genes_grch37.txt \
+  --gmt pathways.gmt \
+  --genome-build GRCh37 \
+  --gcta-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/gcta_fastbat_set_gmt_pipeline
+```
+
+### Gene-based mBAT-combo
+
+```console
+postgwas pipeline \
+  --modules gcta_gene \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --method mbat_combo \
+  --gcta-reference-prefix reference/1000G_EUR \
+  --gene-list genes_grch37.txt \
+  --genome-build GRCh37 \
+  --gcta-reference-population EUR \
+  --dataset-id STUDY \
+  --output-directory results/gcta_mbat_combo_pipeline
 ```
 
 ## Parameters

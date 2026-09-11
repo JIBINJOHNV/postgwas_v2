@@ -6,11 +6,19 @@ reference bundle. Some packaged methods include code or models, and the resource
 command can download the supported MAGMA functional-mapping bundle; neither
 replaces the other study-matched inputs required by a selected analysis.
 
-Use [Resource Setup](../getting-started/resource-setup.md) for the harmonisation
-directory layout and supported MAGMA downloader. A complete all-module reference
+Use [Resource Setup](../getting-started/resource-setup.md) for upstream download
+sources, the harmonisation directory layout, a positional MAGMA acquisition
+route, and the supported functional-mapping downloader. A complete all-module reference
 download URL and checksum manifest is not currently published. Where acquisition
 instructions are incomplete, obtain and document the required upstream release
 before running the analysis; PostGWAS does not silently substitute a panel.
+
+For raw study input, begin with
+[harmonisation source acquisition and remaining preparation](../getting-started/resource-setup.md#acquire-harmonisation-source-data).
+For an existing valid PostGWAS VCF and the first gene-analysis example, begin
+with [positional MAGMA references](../getting-started/resource-setup.md#prepare-the-positional-magma-example).
+Neither route supplies references for unrelated modules, and neither replaces
+reviewing the study's build, ancestry and sample-size metadata.
 
 ## Record for every resource
 
@@ -33,7 +41,7 @@ and any filters. A directory name such as `EUR` is not sufficient provenance.
 | MAGMA | Matching PLINK genotypes and gene mapping; matching-ID gene sets for competitive gene-set analysis | [MAGMA](../modules/magma.md#input-requirements) |
 | GCTA gene/segment/set tests | Matching PLINK genotypes; gene coordinates for gene tests/GMT conversion; a native SNP-set list or GMT for set tests; fixed segments need no gene list | [GCTA gene analysis](../modules/gcta-gene.md#input-requirements) |
 | MAGMAcovar / single-cell integration | Gene-property matrices, an H5AD atlas and ID mapping for scDRS, or cell-type LD scores and `.ldcts` inputs for LDSC cell-type analysis | [MAGMAcovar](../modules/magmacovar.md#input-requirements), [Single-cell](../modules/single-cell.md#input-requirements) |
-| PoPS / K-POPS | Matching gene annotation and feature matrix or kernel resources | [PoPS](../modules/pops.md#input-requirements), [K-POPS](../../modules/kpops.md#inputs) |
+| PoPS / K-POPS | Matching gene annotation and feature matrix or kernel resources | [PoPS](../modules/pops.md#input-requirements), [K-POPS](../../modules/kpops.md#input-requirements) |
 | CALDERA / FLAMES | Compatible upstream results and method-specific annotations; selected FLAMES local modes also need VEP/CADD data | [CALDERA](../../modules/caldera.md), [FLAMES](../modules/flames.md#input-requirements) |
 | MiXeR / GSA-MiXeR | Complete BIM/LD patterns; GSA annotation and GO tables for GSA analysis | [MiXeR](../modules/mixer.md#input-requirements) |
 | Pathway enrichment | Gene symbols, network access, BioGRID key, registered DAVID email, and DSigDB GMT when that provider is needed | [Pathway enrichment](../modules/pathway-enrichment.md#input-requirements) |

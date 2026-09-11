@@ -2,7 +2,7 @@
 
 PostGWAS integrates [CALDERA](https://github.com/kheilbron/caldera/tree/81a8a0308741ae986660f711bbf6a7abbd3bca19), which prioritises causal genes within GWAS loci using PoPS score, distance, coding posterior inclusion probability, and a trained logistic model. The Docker build pins upstream commit `81a8a0308741ae986660f711bbf6a7abbd3bca19` in the main `postgwas` conda environment.
 
-## Scientific contract
+## Input requirements
 
 CALDERA consumes:
 
@@ -37,7 +37,29 @@ postgwas caldera \
   --output-directory results
 ```
 
-For GRCh38, include `c_gene` or `rsid` in the credible-set table. Column names are controlled by `modules.caldera.input_schema`.
+### GRCh38 with coding-gene or rsID annotation
+
+```console
+postgwas caldera \
+  --pops-file pops/STUDY_GRCh38_pops.preds \
+  --credible-set-file finemap/STUDY_credible_sets_GRCh38_with_rsid.tsv \
+  --caldera-genome-build GRCh38 \
+  --dataset-id STUDY \
+  --output-directory results/caldera_GRCh38
+```
+
+The tabular contract is:
+
+| Column | Required value |
+|---|---|
+| `locus` | Nonempty locus label, consistent across its variants |
+| `chr`, `bp` | Chromosome and positive integer position in the declared build |
+| `pip` | Fine-mapping PIP between zero and one; required cumulative coverage per locus |
+| `rsid` or `c_gene` | GRCh38 additionally needs rsID-based coding annotation or the upstream coding-gene annotation column |
+
+Supply correctly mapped identifiers/annotations, not a dummy column to bypass
+the build check. Column names are controlled by `modules.caldera.input_schema`.
+The GRCh37 coding-position resource is not a GRCh38 coordinate reference.
 
 ## Pipeline mode
 
@@ -91,13 +113,53 @@ converts that artifact to `locus/chr/bp/pip`, using the configured index
 filenames, column names, variant-ID pattern, and locus separator. The converted
 table is retained with the result for provenance.
 
+### FINEMAP instead of SuSiE
+
+This alternative uses the same GRCh37/EUR, gene-identifier and resource-manifest
+assumptions. FINEMAP requires PLINK 2 for its LD preparation; changing only the
+engine while retaining `--plink plink` is not sufficient.
+
+```console
+postgwas pipeline \
+  --modules caldera \
+  --vcf study_GRCh37.vcf.gz \
+  --genome-build GRCh37 \
+  --clumping-methods standard \
+  --ld-folder reference/ld \
+  --population EUR \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/pops/PoPS_GRCh37_strand_aware.loc \
+  --magma-positional-gene-id-type ensembl \
+  --magma-positional-source-name GENE_LOCATION_SOURCE \
+  --magma-positional-source-version SOURCE_RELEASE \
+  --magma-positional-source-url https://example.org/GENE_LOCATION_SOURCE_RECORD \
+  --magma-positional-context GENE_LOCATION_CONTEXT \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 116 \
+  --pops-gene-location-file reference/pops/GRCh37_gene_annot.tsv \
+  --pops-genome-build GRCh37 \
+  --finemap-method finemap \
+  --finemap-ld-reference reference/1000G_EUR \
+  --plink plink2 \
+  --caldera-genome-build GRCh37 \
+  --dataset-id STUDY \
+  --output-directory results/caldera_finemap
+```
+
 ## Outputs
 
 - `results/{dataset_id}_caldera.tsv`: gene probabilities and component evidence;
 - `inputs/{dataset_id}_caldera_credible_sets.tsv`: pipeline conversion, when applicable;
 - resolved configuration, completion manifest, and canonical log.
 
-CALDERA `caldera` probabilities are validated to sum to one per locus. The `multi` column is the upstream unnormalised probability.
+## Interpretation
+
+CALDERA `caldera` probabilities are validated to sum to one per locus. The
+`multi` column is the upstream unnormalised probability. Interpret the normalized
+values relative to the candidate genes and evidence available in that locus,
+not as proof of a causal gene. Review distance, coding evidence, PoPS scores and
+the imputed-PoPS indicator alongside the ranking. Missing or incompatible
+upstream gene evidence can affect the result even when its normalization passes.
 
 ## Sources
 

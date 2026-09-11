@@ -24,17 +24,31 @@ Formatter `<dataset>_mixer.sumstats.gz`; per-chromosome BIM and LD patterns
 containing `@`; MiXeR software or container. GSA also needs annotation patterns
 plus baseline, model, and test GO tables, optionally load-library files.
 
-## Command
+The pipeline instead starts from an indexed, single-sample PostGWAS-harmonised
+VCF and produces the formatter table automatically. All references must match
+the study build and population, and each pattern must cover the configured
+chromosomes. The `@` is the chromosome placeholder, not a shell wildcard.
+For the exact `SNP CHR BP A1 A2 N Z` contract, sample-size semantics and resource
+compatibility, see the [MiXeR runtime and resource details](https://github.com/JIBINJOHNV/postgwas_v2/blob/main/docs/modules/mixer.md#scientific-input-contract).
 
-```console
+| Analysis | Required external references |
+|---|---|
+| `univariate` | BIM and MiXeR LD patterns |
+| `gsa` | BIM and SNP-annotation patterns; baseline, model and test GO tables; LD pattern or a compatible GSA load-library pattern |
+| `all` | Both sets above; LD remains required for univariate fitting even when GSA uses load-library files |
+
+## Direct mode
+
+```text
 postgwas mixer --mixer-input-file PATH [--analysis {univariate,gsa,all}] [options]
 ```
 
-## Minimal example
+### Univariate architecture
 
 ```console
 postgwas mixer \
   --analysis univariate \
+  --genome-build GRCh37 \
   --mixer-input-file formatted/STUDY_mixer.sumstats.gz \
   --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
   --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
@@ -42,7 +56,24 @@ postgwas mixer \
   --output-directory results
 ```
 
-## Full example
+### GSA gene-set analysis
+
+```console
+postgwas mixer \
+  --analysis gsa \
+  --genome-build GRCh37 \
+  --mixer-input-file formatted/STUDY_mixer.sumstats.gz \
+  --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
+  --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
+  --gsa-annotation-file-pattern 'reference/1000G.EUR.QC.@.annot.gz' \
+  --gsa-baseline-go-file baseline.tsv \
+  --gsa-model-go-file genes.tsv \
+  --gsa-test-go-file gene_sets.tsv \
+  --dataset-id STUDY \
+  --output-directory results/gsa
+```
+
+### Architecture and GSA together
 
 ```console
 postgwas mixer \
@@ -60,7 +91,103 @@ postgwas mixer \
   --seed 10
 ```
 
+For GSA-only execution with precomputed load-library files, replace the
+`--ld-file-pattern` argument with
+`--gsa-loadlib-file-pattern 'reference/loadlib.@.bin'`. Keep BIM, SNP annotation
+and all three GO tables. Do not remove the LD pattern from `--analysis all`.
+
+## Pipeline mode
+
+The planner inserts formatter and selects its MiXeR export. Do not pass
+`--mixer-input-file` in these VCF-based commands.
+
+### Univariate architecture
+
+```console
+postgwas pipeline \
+  --modules mixer \
+  --analysis univariate \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --genome-build GRCh37 \
+  --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
+  --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
+  --dataset-id STUDY \
+  --output-directory results/mixer_pipeline
+```
+
+### GSA gene-set analysis
+
+```console
+postgwas pipeline \
+  --modules mixer \
+  --analysis gsa \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --genome-build GRCh37 \
+  --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
+  --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
+  --gsa-annotation-file-pattern 'reference/1000G.EUR.QC.@.annot.gz' \
+  --gsa-baseline-go-file baseline.tsv \
+  --gsa-model-go-file genes.tsv \
+  --gsa-test-go-file gene_sets.tsv \
+  --dataset-id STUDY \
+  --output-directory results/gsa_pipeline
+```
+
+### GSA with precomputed load-library files
+
+```console
+postgwas pipeline \
+  --modules mixer \
+  --analysis gsa \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --genome-build GRCh37 \
+  --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
+  --gsa-loadlib-file-pattern 'reference/loadlib.@.bin' \
+  --gsa-annotation-file-pattern 'reference/1000G.EUR.QC.@.annot.gz' \
+  --gsa-baseline-go-file baseline.tsv \
+  --gsa-model-go-file genes.tsv \
+  --gsa-test-go-file gene_sets.tsv \
+  --dataset-id STUDY \
+  --output-directory results/gsa_loadlib_pipeline
+```
+
+### Architecture and GSA together
+
+```console
+postgwas pipeline \
+  --modules mixer \
+  --analysis all \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --genome-build GRCh37 \
+  --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
+  --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
+  --gsa-annotation-file-pattern 'reference/1000G.EUR.QC.@.annot.gz' \
+  --gsa-baseline-go-file baseline.tsv \
+  --gsa-model-go-file genes.tsv \
+  --gsa-test-go-file gene_sets.tsv \
+  --dataset-id STUDY \
+  --output-directory results/mixer_and_gsa_pipeline
+```
+
 ## Parameters
+
+```console
+postgwas config export --module mixer --style full --output mixer.yaml
+```
+
+The same backend selectors apply to every direct and pipeline recipe:
+
+- `--mixer-backend auto` uses the local software when available, otherwise the
+  configured container; this is the packaged default.
+- `--mixer-backend native` requires a working local installation. Use `--mixer`
+  and `--mixer-figures` to identify nonstandard script locations.
+- `--mixer-backend docker` uses the configured container and requires a working
+  container runtime. Its image, runtime and platform can be overridden through
+  the corresponding `--mixer-container-*` options or canonical YAML.
+
+These choices select execution software, not a different statistical analysis.
+The run records the resolved backend and software identity. Quote all chromosome
+patterns, and ensure container execution can access every input/reference path.
 
 See the generated [Configuration Defaults](../reference/configuration-defaults.md)
 for the current analysis mode, backend, genome build, chromosome selection,
@@ -86,7 +213,11 @@ Univariate raw fit/test JSON and logs are under `results/raw/univariate/`;
 summaries are `results/<dataset>_mixer_summary.yaml/.tsv`; figures are under
 `plots/`. GSA raw outputs are under `results/raw/gsa/`; summaries are
 `<dataset>_gsa_mixer_summary.yaml` and
-`<dataset>_gsa_mixer_top_results.tsv`. Logs are run-ID scoped.
+`<dataset>_gsa_mixer_top_results.tsv`. Logs are run-ID scoped. See the
+[detailed output structure and interpretation](https://github.com/JIBINJOHNV/postgwas_v2/blob/main/docs/modules/mixer.md#output-structure)
+for the native files and the distinction between the complete GSA enrichment
+table and the evidence-screened compact summary; the latter is not an FDR or
+p-value significance table.
 
 ## QC and logs
 

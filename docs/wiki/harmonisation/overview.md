@@ -13,9 +13,13 @@ creates GWAS-VCF, annotates variants against configured references, creates the
 opposite-build VCF by liftover, merges chromosome outputs, and writes QC,
 rejection, provenance, and optional input-to-VCF concordance reports.
 
-Study EAF and INFO must come from the study table or an explicitly supplied
-external file. The comparison-frequency panel is used for validation and
-orientation checks; it is not a silent replacement for missing study values.
+Study EAF requires exactly one declared source: a study column or an explicit
+external file/column pair. INFO has a different rule: internal INFO takes
+priority over an external source; when neither is supplied, the public command
+requires an explicit `--fixed-info VALUE` choice. External proxy and fixed INFO
+are recorded as such, not presented as study-measured imputation quality. The
+comparison-frequency panel is used for validation and orientation checks; it
+is not a silent replacement for missing study values.
 
 ## When to use it
 
@@ -36,13 +40,12 @@ population frequency source, or scientifically material policy changes.
 See [Harmonisation Sample Sheet](sample-sheet.md) and
 [Reference Resources](../reference/reference-resources.md).
 
-## Command
+## Direct mode
 
-```console
-postgwas harmonisation --sample-sheet PATH [options]
-```
+Run harmonisation directly with a reviewed sample sheet and complete reference
+tree. Replace the paths below with your own files.
 
-## Minimal example
+### Minimal example
 
 ```console
 postgwas harmonisation \
@@ -51,7 +54,7 @@ postgwas harmonisation \
   --output-directory /absolute/path/to/results
 ```
 
-## Full example
+### Full example
 
 ```console
 postgwas harmonisation \
@@ -74,6 +77,16 @@ with values appropriate to the dataset. `--validate` is optional and is off
 unless requested in CLI or YAML. `--keep_gwas2vcf_intermediate` is also
 optional; without it, a successful run deletes the raw merged adapter VCF after
 final validation while retaining both annotated build-specific VCFs.
+
+## Pipeline mode
+
+Harmonisation is standalone-only: `harmonisation` is not a supported
+`postgwas pipeline --modules` target. Run it first, inspect its reports and
+validated final GWAS-VCF, then pass that VCF to a supported downstream pipeline.
+The [connected Quick Start](../getting-started/quick-start.md) shows the complete
+raw-data → harmonisation → QC → MAGMA route, including the required references.
+Pipeline orchestration does not generate the sample sheet or download the
+harmonisation reference tree for you.
 
 ## Parameters
 
@@ -119,13 +132,21 @@ required intermediate, then deleted after successful finalization unless
 See
 [Harmonisation Outputs and QC](outputs-and-qc.md).
 
+The source-build and lifted-build VCFs can have different record counts. Under
+the packaged `policies.vcf.liftover_swap: exclude` policy, successfully lifted
+REF/ALT-swapped records are excluded separately from plugin lift failures.
+Inspect both categories, along with earlier rejected variants, before choosing
+the build-specific VCF for downstream analysis.
+
 ## QC and logs
 
 Review dataset status, inferred build, chromosome failures, counts at each
 transformation, rejected reasons, frequency concordance, liftover loss, VCF
 metrics, virtual filter counts, effective sample-size summaries, and optional
-input-to-VCF concordance. The raw merged VCF is not replaced by the virtual
-QC-passed subset.
+input-to-VCF concordance. Post-merge QC is report-only; earlier harmonisation
+steps can already have rejected variants, including unresolvable palindromic
+variants. The merged VCF is not replaced by the virtual QC-passed subset. A
+record can fail multiple QC rules, so their individual counts are not additive.
 
 ## Interpretation
 

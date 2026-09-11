@@ -38,13 +38,13 @@ formatter to create PRED-LD input tables. The validated resource identities are
 rechecked before imputation so a replaced reference cannot be consumed without
 restarting validation.
 
-## Command
+## Direct mode
 
-```console
+```text
 postgwas imputation --pred-ld-input-directory PATH [options]
 ```
 
-## Minimal example
+### PRED-LD from prepared chromosome tables
 
 ```console
 postgwas imputation \
@@ -57,7 +57,7 @@ postgwas imputation \
   --output-directory results
 ```
 
-## Full example
+### Explicit PRED-LD settings
 
 ```console
 postgwas imputation \
@@ -75,7 +75,46 @@ postgwas imputation \
   --threads 2
 ```
 
+The input directory must first be created with
+[formatter's `pred_ld` export](formatting.md#direct-mode). It is not a directory
+of raw GWAS files. The resource root must also satisfy the
+[harmonisation resource requirements](../reference/reference-resources.md),
+because a successful PRED-LD invocation is followed by re-harmonisation.
+
+## Pipeline mode
+
+The pipeline accepts an indexed, single-sample PostGWAS-harmonised VCF and
+creates its own PRED-LD chromosome tables. Do not pass
+`--pred-ld-input-directory` in this mode:
+
+```console
+postgwas pipeline \
+  --modules imputation \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --imputation-engine pred_ld \
+  --imputation-ld-reference reference/pred_ld \
+  --resource-directory resources \
+  --genome-build GRCh37 \
+  --population EUR \
+  --ref TOP_LD \
+  --imputation-r2-threshold 0.8 \
+  --imputation-minimum-maf 0.001 \
+  --dataset-id STUDY \
+  --output-directory results/imputation_pipeline
+```
+
+`reference/pred_ld` is the complete compatible PRED-LD panel; `resources` is the
+PostGWAS reference root used by re-harmonisation. They are different resource
+roles even when installed beneath one parent directory. Subsequent pipeline
+analyses consume the validated re-harmonised GWAS-VCF, not the unharmonised
+`PREDLD_allchr` table. Review imputation and re-harmonisation QC before treating
+the additional records as usable downstream inputs.
+
 ## Parameters
+
+```console
+postgwas config export --module imputation --style full --output imputation.yaml
+```
 
 Only `pred_ld` is implemented in direct mode. PostGWAS currently supports its
 `TOP_LD` handoff because the bundled post-processor consumes the corresponding

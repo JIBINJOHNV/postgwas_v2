@@ -33,6 +33,20 @@ python tools/docs/build_wiki.py --check
 Validation rejects malformed manifest fields, unsafe or missing source paths,
 duplicate slugs, broken local links, links to unpublished Markdown pages, and
 local assets that do not yet have a defined publication rule.
+It also checks the README's local destinations and the four stable navigation
+sections for every published analysis guide, including guides outside `wiki/`.
+
+```console
+python tools/docs/validate_wiki_cli.py
+```
+
+The CLI checker inspects live help for accepted options/choices and usage
+arguments also labelled `Required:`, and reuses the method-aware planner/registry for pipeline
+resource requirements. Inline command names are navigation, not complete
+recipes. Fenced CLI-only examples must supply the declared requirements;
+examples using a placeholder `--run-config` require manual configuration review.
+This check does not open references, validate every conditional input/schema,
+execute analyses or establish that their outputs are correct.
 
 Pull requests and pushes to the default branch run the same contract through
 `.github/workflows/wiki-docs.yml`.
@@ -82,7 +96,7 @@ user-guide index must remain the source of truth.
 5. Add its canonical source link to the complete index in `docs/wiki/home.md`
    in manifest order. Add or update its README catalogue entry when introducing
    a public analysis command.
-6. Run the documentation validation tests.
+6. Run the documentation validation tools listed above.
 7. Inspect the source page and optional generated navigation.
 
 For module documentation, begin with
@@ -103,6 +117,16 @@ python tools/docs/update_harmonisation_policies.py --check
 
 After an intentional change to policy documentation or schema, run the same
 command without `--check`, review the generated diff, and run the documentation
-tests. The tests retain complete sample-sheet field coverage and the seven-stage,
+checks. The local tests retain complete sample-sheet field coverage and the seven-stage,
 29-step processing-order contract in the detailed guide while checking the
 README's introductory navigation separately.
+
+## Local regression suite
+
+`tests/` is deliberately excluded from Git and preserved only in maintainer
+working copies. A fresh clone does not contain it. Maintainers with those files
+can run `python -m pytest -q`; do not describe that as a command available from
+every public checkout. Published CI uses the documentation tools above,
+installer shell-syntax checks and the complete Linux installation job. Removing
+the tracked tests reduces published regression coverage; these remaining checks
+are not a replacement for the full suite or reference-backed analysis tests.

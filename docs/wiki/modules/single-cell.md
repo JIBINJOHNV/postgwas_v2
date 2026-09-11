@@ -7,42 +7,6 @@ evidence with cell-type data: FUMA-compatible MAGMA cell typing, scDRS cell
 scoring, and LDSC-SEG cell-type-specific heritability analysis. Select one or
 more in execution order with `--tools magma_celltype scdrs ldsc_celltype`.
 
-### Implementation architecture
-
-The module uses a registry-backed method hierarchy so each integration method
-owns its command-line options, preflight, execution, validation, and result
-publication:
-
-```text
-single_cell/
-├── cli.py
-├── service.py
-└── methods/
-    ├── base.py
-    ├── registry.py
-    ├── magma_celltype/
-    │   ├── cli.py
-    │   ├── analysis.py
-    │   └── method.py
-    ├── scdrs/
-    │   ├── cli.py
-    │   ├── method.py
-    │   └── runner.py
-    └── ldsc_celltype/
-        ├── cli.py
-        ├── analysis.py
-        ├── method.py
-        └── runner.py
-```
-
-The shared service resolves configuration once, executes registered methods in
-the order given by `modules.single_cell.tools`, and combines non-colliding
-artifacts. MAGMA cell typing delegates native execution to the existing
-`magmacovar` module. LDSC cell typing reuses the existing formatter's LDSC
-contract and the existing LDSC command builders and munging policy. New methods
-must implement the common method contract and be added to the registry and
-schema; all method defaults remain in the canonical `single_cell.yaml`.
-
 ## What the analysis does
 
 For `magma_celltype`, the pipeline reuses PostGWAS MAGMA to convert
@@ -176,7 +140,7 @@ processing, alignment, study-level cell QC, clustering, or annotation.
 
 ## Command
 
-```console
+```text
 postgwas single_cell --tools magma_celltype --magma-gene-results-file PATH \
   --single-cell-covariates PATH [options]
 
@@ -195,7 +159,9 @@ postgwas single_cell --tools ldsc_celltype \
   --ldsc-celltype-weights-prefix reference/weights. [options]
 ```
 
-## Minimal example
+## Direct mode
+
+### MAGMA cell typing
 
 ```console
 postgwas single_cell \
@@ -209,9 +175,7 @@ postgwas single_cell \
 MAGMA is resolved from `resources.executables.magma` (default `magma`) and
 validated on `PATH` before analysis.
 
-## Full example
-
-### Direct mode: scDRS from an existing gene set
+### scDRS from an existing gene set
 
 This example assumes human gene symbols in the `.gs` and H5AD, raw counts in
 `adata.X`, and a `cell_type` annotation in `adata.obs`. Declare the actual matrix
@@ -228,7 +192,28 @@ postgwas single_cell \
   --output-directory results
 ```
 
-### Direct mode: LDSC cell typing from munged statistics
+### scDRS from existing MAGMA gene statistics
+
+This direct mode constructs the disease gene set from a completed, headered
+`.genes.out`, not the `.genes.raw` used by MAGMA cell typing. The example assumes
+Entrez MAGMA identifiers, a one-to-one tab-delimited crosswalk with `ENTREZID`
+and `SYMBOL` headers, human gene symbols in `adata.var_names`, and raw counts
+in `adata.X`. Keep the crosswalk release and MAGMA gene universe consistent.
+
+```console
+postgwas single_cell \
+  --tools scdrs \
+  --scdrs-gene-set-source magma \
+  --scdrs-magma-gene-results-file STUDY.genes.out \
+  --scdrs-h5ad-file brain_atlas.h5ad \
+  --scdrs-gene-id-map entrez_to_symbol.tsv \
+  --scdrs-matrix-state raw_counts \
+  --scdrs-group-analysis cell_type \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### LDSC cell typing from munged statistics
 
 Use a matched GRCh37/EUR reference release for this example. The direct input
 is already munged; a formatter table is not interchangeable with it.
@@ -246,7 +231,9 @@ postgwas single_cell \
   --output-directory results
 ```
 
-### Pipeline mode: MAGMA cell typing
+## Pipeline mode
+
+### MAGMA cell typing
 
 This example uses the packaged GRCh37/EUR MAGMA settings and NCBI/Entrez gene
 locations. The expression matrix must use matching Entrez IDs. For an Ensembl
@@ -274,7 +261,7 @@ creates MAGMA SNP and p-value tables from the GWAS-VCF; MAGMA produces one
 validated primary `.genes.raw`; and the single-cell stage runs and normalizes
 the cell-type gene-property analysis.
 
-### Pipeline mode: scDRS
+### scDRS
 
 For pipeline scDRS, the same stages are used, but the final stage consumes
 MAGMA's headered gene output and creates a weighted disease gene set first:
@@ -302,7 +289,7 @@ configured in YAML under `modules.single_cell.scdrs.magma_gene_set`. Keep these
 settings consistent with the actual crosswalk. Set `mapping_mode: exact` only
 when MAGMA and `adata.var_names` genuinely use the same identifiers.
 
-### Pipeline mode: LDSC cell typing
+### LDSC cell typing
 
 For LDSC cell typing, pipeline mode schedules `formatter` and `single_cell`
 without MAGMA. It creates the LDSC input from the harmonised GWAS-VCF, mungs it,
@@ -563,6 +550,42 @@ For the complete software setup, follow the
 `pip install -e '.[analysis,single-cell]'` installs the declared Python extras;
 it does not by itself install the MAGMA/LDSC executables or download the atlases,
 crosswalks, and LD-score reference panels described above.
+
+### Implementation architecture
+
+The module uses a registry-backed method hierarchy so each integration method
+owns its command-line options, preflight, execution, validation, and result
+publication:
+
+```text
+single_cell/
+├── cli.py
+├── service.py
+└── methods/
+    ├── base.py
+    ├── registry.py
+    ├── magma_celltype/
+    │   ├── cli.py
+    │   ├── analysis.py
+    │   └── method.py
+    ├── scdrs/
+    │   ├── cli.py
+    │   ├── method.py
+    │   └── runner.py
+    └── ldsc_celltype/
+        ├── cli.py
+        ├── analysis.py
+        ├── method.py
+        └── runner.py
+```
+
+The shared service resolves configuration once, executes registered methods in
+the order given by `modules.single_cell.tools`, and combines non-colliding
+artifacts. MAGMA cell typing delegates native execution to the existing
+`magmacovar` module. LDSC cell typing reuses the existing formatter's LDSC
+contract and the existing LDSC command builders and munging policy. New methods
+must implement the common method contract and be added to the registry and
+schema; all method defaults remain in the canonical `single_cell.yaml`.
 
 ## Scientific references
 

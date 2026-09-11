@@ -18,20 +18,26 @@ is exploratory evidence and does not replace formal multiple-testing analysis.
 
 ## Input requirements
 
-An indexed single-sample GWAS-VCF with a supported genome-build declaration;
+An indexed single-sample PostGWAS-harmonised GWAS-VCF with a supported genome-build declaration;
 R with compatible optparse, data.table and ggplot2 packages; `bcftools`; and
 the required dataset ID/output directory. LP must be numeric Number=1 or
 Number=A for biallelic records. Coding highlighting additionally requires
 structured CSQ annotations and a working split-vep plugin. An explicit
 `--genome-build` or `--pheno` must agree with the VCF declaration.
 
-## Command
+Allelic-shift mode replaces the association-LP input with the configured
+two-count `INFO/AS` field (`Number=2`, numeric header type). Counts must be
+finite, nonnegative integers. The two counts must describe the intended allelic
+comparison; they are not reconstructed from ordinary GWAS beta, SE or EAF.
+Zero-total counts are not plotted. `--min-af` must remain zero in this mode.
 
-```console
+## Direct mode
+
+```text
 postgwas manhattan --vcf PATH [--png PATH | --pdf PATH] [options]
 ```
 
-## Minimal example
+### Association plot
 
 ```console
 postgwas manhattan \
@@ -41,7 +47,10 @@ postgwas manhattan \
   --output-directory results
 ```
 
-## Full example
+For PDF output, replace `--png STUDY_manhattan.png` with
+`--pdf STUDY_manhattan.pdf`; do not supply both flags.
+
+### Consequence-highlighted associations
 
 ```console
 postgwas manhattan \
@@ -59,7 +68,66 @@ postgwas manhattan \
   --fontsize 12
 ```
 
+### Allelic-shift associations
+
+Use an input that already satisfies the two-count INFO contract:
+
+```console
+postgwas manhattan \
+  --vcf STUDY_GRCh37_allelic_counts.vcf.gz \
+  --pdf STUDY_allelic_shift.pdf \
+  --allelic-shift \
+  --min-af 0 \
+  --dataset-id STUDY \
+  --output-directory results/allelic_shift
+```
+
+## Pipeline mode
+
+The pipeline passes its current validated VCF to the plotting step; it does
+not create missing CSQ or allelic-count annotations.
+
+### Association plot
+
+```console
+postgwas pipeline \
+  --modules manhattan \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --png STUDY_manhattan.png \
+  --dataset-id STUDY \
+  --output-directory results/manhattan_pipeline
+```
+
+### Consequence-highlighted associations
+
+```console
+postgwas pipeline \
+  --modules manhattan \
+  --vcf STUDY_GRCh37_csq.vcf.gz \
+  --png STUDY_csq.png \
+  --csq \
+  --dataset-id STUDY \
+  --output-directory results/manhattan_csq_pipeline
+```
+
+### Allelic-shift associations
+
+```console
+postgwas pipeline \
+  --modules manhattan \
+  --vcf STUDY_GRCh37_allelic_counts.vcf.gz \
+  --pdf STUDY_allelic_shift.pdf \
+  --allelic-shift \
+  --min-af 0 \
+  --dataset-id STUDY \
+  --output-directory results/allelic_shift_pipeline
+```
+
 ## Parameters
+
+```console
+postgwas config export --module manhattan --style full --output manhattan.yaml
+```
 
 The canonical `modules.manhattan` YAML supplies 22 autosomes, minimum AF 0,
 minimum LP 2, log-log switch at LP 10, cytoband ratio 25, chromosome spacing

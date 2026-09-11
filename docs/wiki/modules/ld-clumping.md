@@ -18,10 +18,10 @@ PostGWAS supports one or more configured methods:
   preserves every selected signal and its marginal and joint statistics, and
   groups nearby selected signals into physical loci after model fitting.
 
-The `region` and `standard` methods rank variants by `LP` (-log10 P) rather than by a recovered P
-value. `10 ** -LP` is exactly `0.0` for anything stronger than about 1e-308,
-which is the range lead SNPs occupy, so a P-based ranking would tie the
-strongest variants and break the tie arbitrarily.
+The `region` and `standard` methods rank variants by `LP` (-log10 P) rather than
+by a recovered P value. For sufficiently large LP, conversion to a Float64 raw
+P value underflows to `0.0`. Ranking directly by LP preserves distinctions
+between those extreme associations instead of creating artificial ties.
 
 Every selected method is required to succeed. A failed method makes the command
 fail, and analysis outputs created or changed during the attempt are renamed
@@ -87,7 +87,7 @@ BIM identifier convention so the canonical GCTA `.ma` export uses matching SNP
 IDs. GCTA's exact ID, allele, frequency, overlap, sample-count, executable, and
 version checks remain unchanged.
 
-## Command
+## Direct mode
 
 Inspect the current command and accepted options:
 
@@ -107,7 +107,7 @@ postgwas config export \
 CLI values override canonical YAML values. Argparse supplies no independent
 scientific defaults.
 
-## Minimal example
+### Region-based pruning
 
 Run annotated-region pruning only:
 
@@ -121,19 +121,22 @@ postgwas ld_clump \
   --output-directory results
 ```
 
-## Full example
+### Region and standard clumping
 
-Run both configured methods:
+Run both packaged methods explicitly:
 
 ```console
 postgwas ld_clump \
   --vcf study_ldblock.vcf.gz \
+  --clumping-methods region standard \
   --ld-folder reference/ld \
   --genome-build GRCh37 \
   --population EUR \
   --dataset-id STUDY \
   --output-directory results
 ```
+
+### Standard r² clumping
 
 Run standard r² clumping only:
 
@@ -148,7 +151,10 @@ postgwas ld_clump \
   --output-directory results
 ```
 
-Run GCTA stepwise selection and group its signals at 250 kb:
+### GCTA-COJO selection
+
+Run GCTA stepwise selection and group its signals at the configured distance
+(250 kb by default):
 
 ```console
 postgwas ld_clump \
@@ -160,6 +166,87 @@ postgwas ld_clump \
   --dataset-id STUDY \
   --output-directory results
 ```
+
+## Pipeline mode
+
+Every recipe starts from an indexed, single-sample PostGWAS-harmonised VCF.
+Choose the method explicitly so its required resources and preceding steps are
+unambiguous:
+
+| Method | Pipeline prepares | External resource supplied by you |
+|---|---|---|
+| `region` | LD-block annotation | Population/build-matched BED directory |
+| `standard` | No annotation or formatter prerequisite | Prepared indexed pairwise-LD directory with its manifest and inventories |
+| `cojo-slct` | GCTA formatter table, with BIM-compatible IDs | PLINK BED/BIM/FAM reference prefix and GCTA executable |
+
+### Region-based pruning
+
+```console
+postgwas pipeline \
+  --modules ld_clump \
+  --clumping-methods region \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --ld-region-dir reference/ld_blocks \
+  --ld-block-populations EUR \
+  --genome-build GRCh37 \
+  --population EUR \
+  --dataset-id STUDY \
+  --output-directory results/region_pipeline
+```
+
+### Standard r² clumping
+
+```console
+postgwas pipeline \
+  --modules ld_clump \
+  --clumping-methods standard \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --ld-folder reference/pairwise_ld \
+  --genome-build GRCh37 \
+  --population EUR \
+  --dataset-id STUDY \
+  --output-directory results/standard_pipeline
+```
+
+### GCTA-COJO selection
+
+```console
+postgwas pipeline \
+  --modules ld_clump \
+  --clumping-methods cojo-slct \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --cojo-reference-prefix reference/EUR_plink \
+  --genome-build GRCh37 \
+  --population EUR \
+  --dataset-id STUDY \
+  --output-directory results/cojo_clumping_pipeline
+```
+
+### Region and standard clumping together
+
+```console
+postgwas pipeline \
+  --modules ld_clump \
+  --clumping-methods region standard \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --ld-region-dir reference/ld_blocks \
+  --ld-block-populations EUR \
+  --ld-folder reference/pairwise_ld \
+  --genome-build GRCh37 \
+  --population EUR \
+  --dataset-id STUDY \
+  --output-directory results/combined_clumping_pipeline
+```
+
+The BED directory, pairwise-LD directory and PLINK prefix are different resource
+contracts, not interchangeable paths. Do not supply the pipeline-generated
+annotated VCF or GCTA `.ma` as additional CLI inputs. Keep the outputs labelled
+by method: only standard-clumping loci supply the current fine-mapping pipeline.
+
+The current combined `--apply-filter` interface can fail on duplicate MHC
+options. Run [Filtering](filtering.md#pipeline-mode) separately first, then use
+its validated filtered VCF as `--vcf` here; do not assume help success or a
+different resource path repairs that parser conflict.
 
 ## Parameters
 

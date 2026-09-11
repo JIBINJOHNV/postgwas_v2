@@ -58,12 +58,14 @@ establish a resource's build, gene identifier system, or release.
 
 ## Command
 
-```console
+```text
 postgwas magma --snp-location-file PATH --p-value-file PATH [options]
 postgwas pipeline --modules magma --help
 ```
 
-## Minimal example
+## Direct mode
+
+### Positional gene association
 
 ```console
 postgwas magma \
@@ -75,9 +77,7 @@ postgwas magma \
   --output-directory results
 ```
 
-## Full example
-
-### Direct mode: gene and gene-set association
+### Gene and gene-set association
 
 ```console
 postgwas magma \
@@ -99,7 +99,43 @@ postgwas magma \
   --output-directory results
 ```
 
-### Pipeline mode: start from GWAS-VCF
+### Functional mappings from prepared definitions
+
+Functional annotation definitions are configuration-only resources, so this
+workflow uses the generated YAML alongside CLI study inputs. First follow
+[resource preparation](../getting-started/resource-setup.md#prepare-magma-functional-mapping-resources)
+with `--output-directory reference/magma/functional_mapping`. Its generated
+configuration is `configs/magma_functional_mapping.yaml` below that directory.
+The pinned bundle is GRCh37/EUR; these example contexts demonstrate different
+methods, not a recommendation to combine unrelated tissues in one study.
+
+```console
+postgwas magma \
+  --run-config reference/magma/functional_mapping/configs/magma_functional_mapping.yaml \
+  --magma-mapping positional emagma_brain_amygdala h_magma_adult_brain n_magma_cortex chrom_magma_ovarian_h3k27ac \
+  --primary-magma-mapping positional \
+  --snp-location-file formatted/STUDY_magma_snp_loc.tsv \
+  --p-value-file formatted/STUDY_magma_p_values.tsv \
+  --magma-ld-reference reference/magma/functional_mapping/base/ld_reference/g1000_eur/g1000_eur \
+  --gene-location-file reference/magma/functional_mapping/base/gene_locations/NCBI37.3/NCBI37.3.gene.loc \
+  --dataset-id STUDY \
+  --output-directory results/magma_mappings_direct
+```
+
+Use only the definition names appropriate to the prespecified question. To run
+one definition, give that name to both `--magma-mapping` and
+`--primary-magma-mapping`. The same rule applies in pipeline mode below.
+
+| Example definition | Method and target identifiers | Interpretation |
+|---|---|---|
+| `emagma_brain_amygdala` | eQTL-informed eMAGMA; Entrez | Gene-association p-values |
+| `h_magma_adult_brain` | Chromatin-informed H-MAGMA; Ensembl | Gene-association p-values |
+| `n_magma_cortex` | Combined nMAGMA; symbols | Gene-association p-values |
+| `chrom_magma_ovarian_h3k27ac` | Regulatory-element chromMAGMA; mixed targets | Minimum-element-p ranking, not calibrated gene significance |
+
+## Pipeline mode
+
+### Positional gene and gene-set association
 
 This positional example uses GRCh37/EUR resources and the packaged NCBI37.3
 gene-location declaration. The gene-set identifiers must match a supported
@@ -119,13 +155,27 @@ postgwas pipeline \
 
 ### Functional mapping analyses
 
-Prepare the [functional-mapping resources](../getting-started/resource-setup.md)
-and use their generated configuration with `--run-config`. Select its definition
-names with `--magma-mapping` and choose the downstream handoff with
-`--primary-magma-mapping`. These definitions carry annotation paths, build,
-population, identifier system, tissue/context, and source provenance; selecting
-a method name alone does not supply those resources. Downstream consumers that
-require calibrated gene statistics reject a chromMAGMA primary result.
+With the same prepared GRCh37/EUR bundle and prespecified mappings:
+
+```console
+postgwas pipeline \
+  --modules magma \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --run-config reference/magma/functional_mapping/configs/magma_functional_mapping.yaml \
+  --magma-mapping positional emagma_brain_amygdala h_magma_adult_brain n_magma_cortex chrom_magma_ovarian_h3k27ac \
+  --primary-magma-mapping positional \
+  --magma-ld-reference reference/magma/functional_mapping/base/ld_reference/g1000_eur/g1000_eur \
+  --gene-location-file reference/magma/functional_mapping/base/gene_locations/NCBI37.3/NCBI37.3.gene.loc \
+  --dataset-id STUDY \
+  --output-directory results/magma_mappings_pipeline
+```
+
+The definitions supply annotation paths, build, population, identifier system,
+tissue/context and source provenance; selecting a method name alone does not
+supply these resources. The formatter creates the paired MAGMA input tables.
+Each mapping retains its own hypothesis family. Downstream consumers requiring
+calibrated gene statistics reject a chromMAGMA primary result; selecting it
+cannot turn its ranking statistic into a calibrated gene p-value.
 
 ## Parameters
 

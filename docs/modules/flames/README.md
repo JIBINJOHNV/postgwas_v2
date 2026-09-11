@@ -1,3 +1,10 @@
+> Upstream reference material, not the PostGWAS installation or command guide.
+> For supported PostGWAS direct/pipeline commands, input validation and outputs,
+> use the [PostGWAS FLAMES guide](../../wiki/modules/flames.md). Install through
+> the [PostGWAS installer](../../wiki/getting-started/installation.md); the separate
+> FLAMES environment and raw upstream commands below document the original tool.
+> PostGWAS-specific handoff notes are identified separately.
+
 FLAMES version 1.1.2. \
 Please note that the version found in the FLAMES preprint can be found under release 1.0.0
 

@@ -71,32 +71,14 @@ as absent evidence.
 
 ## Command
 
-```console
+```text
 postgwas flames [--run-config PATH] [overrides]
 postgwas pipeline --modules flames [pipeline options]
 ```
 
-## Minimal example
+## Direct mode
 
-Export and edit the canonical schema-validated configuration:
-
-```console
-postgwas config export \
-  --module flames \
-  --style full \
-  --output flames.yaml
-
-postgwas flames --run-config flames.yaml
-```
-
-At minimum, set `run.dataset_id`, `run.output_directory`, and these FLAMES
-module keys in the exported YAML: `credible_sets_directory`,
-`magma_gene_results_file`, `magma_covariate_results_file`, `pops_scores_file`,
-and `annotation_resource_directory`.
-
-## Full example
-
-### Direct mode
+### API annotation
 
 Run FLAMES from validated existing upstream outputs. Values not shown remain
 resolved from canonical YAML. Direct mode validates the `.gsa.out` structure but
@@ -115,7 +97,39 @@ postgwas flames \
   --output-directory results
 ```
 
-### Pipeline mode
+### Versioned local annotation
+
+Use a compatible VEP installation/cache and the published CADD release expected
+by the model. The CADD file must have its tabix index beside it. Pin the resource
+versions and checksums; declaring a build does not lift or verify the biological
+origin of an arbitrary annotation file.
+
+```console
+postgwas flames \
+  --credible-sets-directory finemap/downstream_inputs/flames \
+  --magma-gene-results-file magma/STUDY.genes.out \
+  --magma-covariate-results-file magma/STUDY.gsa.out \
+  --pops-scores-file pops/STUDY.preds \
+  --flames-annotation-directory reference/FLAMES/Annotation_data \
+  --flames-genome-build GRCh37 \
+  --flames-vep-mode local \
+  --vep-command /path/to/vep \
+  --vep-cache reference/vep_cache \
+  --vep-cache-genome-build GRCh37 \
+  --flames-cadd-mode local \
+  --cadd-file reference/CADD/GRCh37_v1.6.tsv.gz \
+  --cadd-genome-build GRCh37 \
+  --tabix tabix \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+VEP and CADD modes can be selected independently. For mixed local/API use,
+remove only the local resource arguments for the component switched to `api`.
+
+## Pipeline mode
+
+### SuSiE with API annotation
 
 The pipeline creates the fine-mapping, MAGMA, gene-property, and PoPS inputs
 consumed by FLAMES. This GRCh37/EUR example explicitly selects standard
@@ -177,7 +191,67 @@ condition-hide=Average --covariate-direction greater` and use the corresponding
 Use `--dry-run` to perform configuration, input, annotation-resource, model,
 runtime, and command validation without invoking either upstream analysis stage.
 
+### FINEMAP with versioned local annotation
+
+The resource and identifier assumptions are the same as in the SuSiE example.
+This command also demonstrates local VEP/CADD resources. Fine-mapping engine
+and annotation mode are independent: the local options work with SuSiE too;
+API annotation works with FINEMAP. FINEMAP uses PLINK 2, not PLINK 1.9.
+
+```console
+postgwas pipeline \
+  --modules flames \
+  --vcf study_GRCh37.vcf.gz \
+  --genome-build GRCh37 \
+  --clumping-methods standard \
+  --ld-folder reference/pairwise_ld \
+  --population EUR \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/FUMA/ENSGv102.coding.genes.txt \
+  --magma-positional-gene-id-type ensembl \
+  --magma-positional-source-name GENE_LOCATION_SOURCE \
+  --magma-positional-source-version SOURCE_RELEASE \
+  --magma-positional-source-url https://example.org/GENE_LOCATION_SOURCE_RECORD \
+  --magma-positional-context GENE_LOCATION_CONTEXT \
+  --covariates reference/GTEx/gtex_v8_ts_avg_log2TPM.txt \
+  --feature-matrix-prefix reference/FLAMES/pops_features_full_FUMA_compatible/features_munged/pops_features \
+  --feature-matrix-chunks 116 \
+  --pops-gene-location-file reference/FLAMES/pops_features_full_FUMA_compatible/gene_annots.txt \
+  --control-features-file reference/FLAMES/pops_features_full_FUMA_compatible/control.features \
+  --pops-genome-build GRCh37 \
+  --finemap-method finemap \
+  --finemap-ld-reference reference/1000G_EUR \
+  --plink plink2 \
+  --flames-annotation-directory reference/FLAMES/Annotation_data \
+  --flames-genome-build GRCh37 \
+  --flames-vep-mode local \
+  --vep-command /path/to/vep \
+  --vep-cache reference/vep_cache \
+  --vep-cache-genome-build GRCh37 \
+  --flames-cadd-mode local \
+  --cadd-file reference/CADD/GRCh37_v1.6.tsv.gz \
+  --cadd-genome-build GRCh37 \
+  --tabix tabix \
+  --dataset-id STUDY \
+  --output-directory results/flames_finemap_local
+```
+
 ## Parameters
+
+CLI commands above need no run YAML. To retain reusable settings, export:
+
+```console
+postgwas config export \
+  --module flames \
+  --style full \
+  --output flames.yaml
+```
+
+Before using `postgwas flames --run-config flames.yaml`, set
+`run.dataset_id`, `run.output_directory` and the FLAMES input keys
+`credible_sets_directory`, `magma_gene_results_file`,
+`magma_covariate_results_file`, `pops_scores_file` and
+`annotation_resource_directory`. An unedited export supplies no study files.
 
 Canonical defaults are defined only in
 `config/defaults/modules/flames.yaml` and its typed schema. Omitted CLI options

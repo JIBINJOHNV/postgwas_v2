@@ -73,7 +73,7 @@ VCF remains the pipeline output used by downstream modules.
 - A filename-safe dataset ID and an output directory.
 - The correct reference-population INFO tag when AF concordance is active.
 
-## Command
+## Direct mode
 
 The standalone entry point is `postgwas sumstat_filter`. The same filtering
 service is also available through a configured PostGWAS pipeline.
@@ -82,14 +82,13 @@ Filtering resolves bcftools from `resources.executables.bcftools`, whose
 packaged value is `bcftools`. There is no filtering-specific `--bcftools`
 option; set a nonstandard executable in the run configuration when necessary.
 
-## Minimal example
+### Hard-filtered VCF
 
 ```console
 postgwas sumstat_filter \
   --vcf STUDY_GRCh37_merged.vcf.gz \
   --dataset-id STUDY \
-  --output-directory results \
-  --run-config filtering.yaml
+  --output-directory results/filtering
 ```
 
 Each filtering switch is enabled by writing the option itself, for example
@@ -102,14 +101,13 @@ trailing `true`/`false` value. The packaged filtering defaults for
 run configuration remains authoritative when its value is not overridden by a
 presence flag.
 
-## Full example
+### Explicit filtering policy
 
 ```console
 postgwas sumstat_filter \
   --vcf STUDY_GRCh37_merged.vcf.gz \
   --dataset-id STUDY \
-  --output-directory results \
-  --run-config filtering.yaml \
+  --output-directory results/filtering \
   --minimum-maf 0.01 \
   --minimum-info 0.7 \
   --minimum-neglog10-p 7.30103 \
@@ -140,10 +138,44 @@ for MaCH Rsq).
 
 Filtering and QC summary consume the same validated scientific-policy contract
 and have parity regression coverage when the same values are selected. Their
-packaged defaults are intentionally not forced to match: filtering keeps
-`info_max: null` and makes palindromic and MHC removal opt-in because it
-physically removes records, whereas the report-only QC virtual subset uses the
-stricter `1.05`, palindromic-removal, and MHC-removal diagnostic defaults.
+packaged upper-INFO defaults differ: filtering keeps `info_max: null`, whereas
+the report-only QC virtual subset uses `info_max: 1.05`. Palindromic and MHC
+removal are opt-in in both modules; neither is enabled by the packaged defaults.
+
+## Pipeline mode
+
+Start from an indexed, single-sample PostGWAS-harmonised VCF. Selecting
+`sumstat_filter` runs filtering as the requested pipeline analysis:
+
+```console
+postgwas pipeline \
+  --modules sumstat_filter \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --minimum-maf 0.01 \
+  --minimum-info 0.7 \
+  --dataset-id STUDY \
+  --output-directory results/filtering_pipeline
+```
+
+For both the hard-filtered downstream VCF and the additional all-record audit:
+
+```console
+postgwas pipeline \
+  --modules sumstat_filter \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --minimum-maf 0.01 \
+  --minimum-info 0.7 \
+  --write-soft-filter-vcf \
+  --dataset-id STUDY \
+  --output-directory results/filtering_audit_pipeline
+```
+
+The pipeline supplies the hard-filtered VCF to subsequent analyses, never the
+soft-filtered audit. `--apply-filter` instead requests filtering before another
+pipeline target. Some current target combinations, including LD clumping and
+fine-mapping, have conflicting MHC CLI options; use a separate filtering run
+and supply its validated output to the next pipeline. See
+[Pipeline Workflow](../core/pipeline-workflow.md) for the current limitation.
 
 ## Parameters
 

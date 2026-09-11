@@ -190,8 +190,9 @@ inconsistent final probabilities, coverage targets, row counts, or required
 audit files stop report publication rather than producing a misleading page.
 
 Report structure, membership, escaping, boundary probabilities and configuration
-are tested by `tests/test_fine_mapping_reporting.py`. To check search and
-expansion behavior in an emitted report, run
+are tested by the maintainer-local `tests/test_fine_mapping_reporting.py`.
+The `tests/` directory is not included in public Git clones. Maintainers with
+that local suite can check search and expansion behavior in an emitted report using
 `node tests/test_fine_mapping_report_interactions.cjs /path/to/report.html`.
 This uses a DOM fixture and does not replace visual or native-keyboard checks
 in a real browser.

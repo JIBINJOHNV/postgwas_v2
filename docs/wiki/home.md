@@ -13,6 +13,7 @@ GitHub Wiki deployment.
 | Raw summary statistics | [Quick start](getting-started/quick-start.md), then [sample-sheet preparation](harmonisation/sample-sheet.md) and [harmonisation](harmonisation/overview.md) |
 | A PostGWAS-harmonised VCF | [Pipeline workflow](core/pipeline-workflow.md) or a VCF-consuming module in the index below |
 | Compatible tool-specific results | [Running modules independently](core/running-modules-independently.md), then the selected module's input requirements |
+| A prespecified gene list | [Pathway enrichment](modules/pathway-enrichment.md#direct-mode), including provider resources and background assumptions |
 | No installation or reference data yet | [Installation](getting-started/installation.md) and [resource setup](getting-started/resource-setup.md) |
 | A workflow from the previous repository | [Migration guide](getting-started/migrating-from-v1.md) before reusing old commands or sample sheets |
 
@@ -55,8 +56,10 @@ branches, conditional dependencies and current limitations.
 
 - For a first run, use the [connected tutorial](getting-started/quick-start.md).
 - To understand harmonisation decisions, read the [processing walkthrough](harmonisation/processing-order.md), then the [complete policy reference](harmonisation/policies.md).
-- For an analysis, open its module guide: required inputs and resources come
-  before commands; outputs and interpretation follow them.
+- For an analysis, open its module guide: **Input requirements**, **Direct
+  mode**, **Pipeline mode** and **Outputs** are shared navigation sections.
+  The pipeline section identifies generated intermediates versus references
+  you still supply, or states explicitly that the command is standalone-only.
 - To investigate a result, start with [output structure](reference/output-structure.md), [validation](reference/validation.md) and [troubleshooting](help/troubleshooting.md).
 
 ## Complete documentation index

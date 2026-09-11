@@ -6,8 +6,6 @@ on:
       - "README.md"
       - "docs/**"
       - "tools/docs/**"
-      - "tests/test_wiki_docs.py"
-      - "tests/test_wiki_cli_validation.py"
       - ".github/workflows/wiki-docs.yml"
   push:
     branches:
@@ -16,8 +14,6 @@ on:
       - "README.md"
       - "docs/**"
       - "tools/docs/**"
-      - "tests/test_wiki_docs.py"
-      - "tests/test_wiki_cli_validation.py"
       - ".github/workflows/wiki-docs.yml"
   workflow_dispatch:
 
@@ -36,11 +32,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install documentation test dependencies
-        run: python -m pip install -e ".[analysis]" "pytest>=8"
+      - name: Install documentation validation dependencies
+        run: python -m pip install -e ".[analysis]"
 
       - name: Validate Wiki sources and generated navigation
-        run: python -m pytest -p no:cacheprovider tests/test_wiki_docs.py tests/test_wiki_cli_validation.py -q
+        run: python tools/docs/build_wiki.py --check
+
+      - name: Validate canonical harmonisation policy documentation
+        run: python tools/docs/update_harmonisation_policies.py --check
 
       - name: Validate documented commands and options
         run: python tools/docs/validate_wiki_cli.py

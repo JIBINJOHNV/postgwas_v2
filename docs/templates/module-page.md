@@ -50,15 +50,19 @@ are implemented.
 postgwas command --help
 ```
 
-## Minimal example
+## Direct mode
 
-<Provide the smallest valid command. Label placeholders clearly and do not use
-development-machine paths.>
+<Provide complete CLI-first commands for every distinct analysis and input
+route. Include every required input/reference; show the expected table schema.
+Group extended settings beneath the corresponding method. Label placeholders
+clearly; do not use development-machine paths or omit arguments with ellipses.>
 
-## Full example
+## Pipeline mode
 
-<Provide a realistic command with important options. Include only options
-accepted by the current CLI.>
+<Provide complete commands for each supported pipeline route. Include the entry
+VCF, external resources and required method choices; omit intermediates generated
+by the planner. Explain the dependency chain and direct/pipeline input difference.
+If standalone-only, say so explicitly instead of inventing a pipeline command.>
 
 ## Parameters
 
@@ -71,6 +75,10 @@ Use this table shape for information that cannot yet be generated:
 
 | Parameter | Required? | Default | Description | Allowed values/notes |
 |---|---:|---|---|---|
+
+The Input requirements, Direct mode, Pipeline mode and Outputs headings are
+stable navigation anchors used by the README. Keep one canonical module guide;
+link specialised recipes instead of maintaining competing installation paths.
 
 Do not copy defaults manually. Clearly distinguish required user inputs, CLI
 overrides, user-configurable values, and internal algorithm invariants.

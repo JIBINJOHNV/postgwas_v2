@@ -23,6 +23,7 @@ analysis.
 
 [Install](#installation) · [Available analyses](#available-analyses) ·
 [Start here](#choose-your-starting-point) ·
+[First analysis](#first-complete-analysis) ·
 [Harmonisation](#harmonise-your-summary-statistics) ·
 [Pipeline and direct mode](#run-downstream-analyses) ·
 [Resources](#reference-data-and-configuration) ·
@@ -135,63 +136,6 @@ The [resource checklist](docs/wiki/getting-started/resource-setup.md#preflight-c
 and [connected tutorial](docs/wiki/getting-started/quick-start.md) take you from
 installation to a first analysis using your own data.
 
-## Available analyses
-
-Every module below has a direct command. The **Pipeline target** column gives
-the name accepted after `postgwas pipeline --modules`. Click a module for its
-required inputs, resources, methods, commands, outputs and interpretation.
-
-### Data preparation and quality control
-
-| Module | Purpose | Pipeline target |
-|---|---|---|
-| [`harmonisation`](docs/wiki/harmonisation/overview.md) | Standardise raw summary statistics and produce harmonised GWAS-VCFs | Standalone only |
-| [`sumstat_filter`](docs/wiki/modules/filtering.md) | Apply variant filters and record exclusions | `sumstat_filter` |
-| [`qc`](docs/wiki/modules/qc-summary.md) | Assess VCF quality without creating a filtered VCF | `qc_summary` |
-| [`formatter`](docs/wiki/modules/formatting.md) | Create MAGMA, GCTA, SuSiE, FINEMAP, PRED-LD, LDSC and MiXeR inputs | `formatter` |
-| [`imputation`](docs/wiki/modules/imputation.md) | Impute summary statistics using PRED-LD/TOP_LD and re-harmonise the results | `imputation` |
-
-### Locus analysis and fine-mapping
-
-| Module | Available analyses | Pipeline target |
-|---|---|---|
-| [`annot_ldblock`](docs/wiki/modules/ld-annotation.md) | LD-block annotation | `annot_ldblock` |
-| [`ld_clump`](docs/wiki/modules/ld-clumping.md) | Region-based, standard and COJO-selection clumping | `ld_clump` |
-| [`gcta_cojo`](docs/modules/gcta_cojo/README.md) | Stepwise selection, top-SNP, joint and conditional analysis | `gcta_cojo` |
-| [`finemap`](docs/wiki/modules/fine-mapping.md) | SuSiE-RSS and FINEMAP | `finemap` |
-
-### Gene, gene-set and cell-type analysis
-
-| Module | Available analyses | Pipeline target |
-|---|---|---|
-| [`magma`](docs/wiki/modules/magma.md) | Positional MAGMA, eMAGMA, H-MAGMA, nMAGMA and chromMAGMA mappings; optional gene-set tests | `magma` |
-| [`gcta_gene`](docs/wiki/modules/gcta-gene.md) | fastBAT gene, segment and set tests; mBAT-combo | `gcta_gene` |
-| [`magmacovar`](docs/wiki/modules/magmacovar.md) | MAGMA gene-property and conditional analyses | `magmacovar` |
-| [`single_cell`](docs/wiki/modules/single-cell.md) | MAGMA cell-type analysis, scDRS and LDSC cell-type analysis | `single_cell` |
-
-### Gene prioritisation
-
-| Module | Approach | Pipeline target |
-|---|---|---|
-| [`pops`](docs/wiki/modules/pops.md) | Feature-based gene prioritisation | `pops` |
-| [`kpops`](docs/modules/kpops.md) | Kernel-based gene prioritisation | `kpops` |
-| [`caldera`](docs/modules/caldera.md) | Integrate PoPS predictions and credible sets | `caldera` |
-| [`flames`](docs/wiki/modules/flames.md) | Integrate fine-mapping, MAGMA, gene-property and PoPS evidence | `flames` |
-
-### Heritability, polygenicity and interpretation
-
-| Module | Available analyses | Pipeline target |
-|---|---|---|
-| [`heritability`](docs/wiki/modules/ldsc.md) | Single-trait LDSC heritability, with optional liability conversion | `heritability` |
-| [`mixer`](docs/wiki/modules/mixer.md) | Univariate MiXeR, GSA-MiXeR, or both | `mixer` |
-| [`pathway_enrichment`](docs/wiki/modules/pathway-enrichment.md) | Gene-list enrichment and interaction services | Standalone only |
-| [`manhattan`](docs/wiki/modules/manhattan.md) | Manhattan plots | `manhattan` |
-
-Harmonisation and pathway enrichment are **standalone-only**. `qc` is the direct
-command and `qc_summary` is its pipeline target. Supporting interfaces are
-`postgwas config`, `postgwas resources`, `postgwas pipeline`, and
-`postgwas --validate`; see the [command reference](docs/wiki/reference/command-reference.md).
-
 ## Choose your starting point
 
 ### I have raw GWAS summary statistics
@@ -222,7 +166,76 @@ requirements even when another program produced those inputs.
 
 [Running modules independently](docs/wiki/core/running-modules-independently.md)
 
-### Quick start: from raw statistics to results
+### I have a gene list
+
+Run [pathway enrichment directly](docs/wiki/modules/pathway-enrichment.md#direct-mode).
+Review gene identifiers, provider-specific backgrounds, network access and any
+required GMT resources; this is not a VCF pipeline target.
+
+## Available analyses
+
+Every module below has a direct command. The **Pipeline target** column gives
+the name accepted after `postgwas pipeline --modules`. Use the links to open a
+complete execution recipe, required external resources
+or output interpretation. Pipeline links for standalone modules explain their
+place outside the downstream planner.
+
+Examples are alternative analyses, not a script to execute every block in
+sequence. Use separate output directories when comparing methods, and replace
+all study/resource placeholders with validated files for your own study.
+
+### Data preparation and quality control
+
+| Module | Purpose | Pipeline target | Instructions |
+|---|---|---|---|
+| [`harmonisation`](docs/wiki/harmonisation/overview.md) | Standardise raw summary statistics and produce harmonised GWAS-VCFs | Standalone only | [Direct](docs/wiki/harmonisation/overview.md#direct-mode) · [Pipeline](docs/wiki/harmonisation/overview.md#pipeline-mode) · [Resources](docs/wiki/harmonisation/overview.md#input-requirements) · [Outputs](docs/wiki/harmonisation/overview.md#outputs) |
+| [`sumstat_filter`](docs/wiki/modules/filtering.md) | Apply variant filters and record exclusions | `sumstat_filter` | [Direct](docs/wiki/modules/filtering.md#direct-mode) · [Pipeline](docs/wiki/modules/filtering.md#pipeline-mode) · [Resources](docs/wiki/modules/filtering.md#input-requirements) · [Outputs](docs/wiki/modules/filtering.md#outputs) |
+| [`qc`](docs/wiki/modules/qc-summary.md) | Assess VCF quality without creating a filtered VCF | `qc_summary` | [Direct](docs/wiki/modules/qc-summary.md#direct-mode) · [Pipeline](docs/wiki/modules/qc-summary.md#pipeline-mode) · [Resources](docs/wiki/modules/qc-summary.md#input-requirements) · [Outputs](docs/wiki/modules/qc-summary.md#outputs) |
+| [`formatter`](docs/wiki/modules/formatting.md) | Create MAGMA, GCTA, SuSiE, FINEMAP, PRED-LD, LDSC and MiXeR inputs | `formatter` | [Direct](docs/wiki/modules/formatting.md#direct-mode) · [Pipeline](docs/wiki/modules/formatting.md#pipeline-mode) · [Resources](docs/wiki/modules/formatting.md#input-requirements) · [Outputs](docs/wiki/modules/formatting.md#outputs) |
+| [`imputation`](docs/wiki/modules/imputation.md) | Impute summary statistics using PRED-LD/TOP_LD and re-harmonise the results | `imputation` | [Direct](docs/wiki/modules/imputation.md#direct-mode) · [Pipeline](docs/wiki/modules/imputation.md#pipeline-mode) · [Resources](docs/wiki/modules/imputation.md#input-requirements) · [Outputs](docs/wiki/modules/imputation.md#outputs) |
+
+### Locus analysis and fine-mapping
+
+| Module | Available analyses | Pipeline target | Instructions |
+|---|---|---|---|
+| [`annot_ldblock`](docs/wiki/modules/ld-annotation.md) | LD-block annotation | `annot_ldblock` | [Direct](docs/wiki/modules/ld-annotation.md#direct-mode) · [Pipeline](docs/wiki/modules/ld-annotation.md#pipeline-mode) · [Resources](docs/wiki/modules/ld-annotation.md#input-requirements) · [Outputs](docs/wiki/modules/ld-annotation.md#outputs) |
+| [`ld_clump`](docs/wiki/modules/ld-clumping.md) | Region-based, standard and COJO-selection clumping | `ld_clump` | [Direct](docs/wiki/modules/ld-clumping.md#direct-mode) · [Pipeline](docs/wiki/modules/ld-clumping.md#pipeline-mode) · [Resources](docs/wiki/modules/ld-clumping.md#input-requirements) · [Outputs](docs/wiki/modules/ld-clumping.md#outputs) |
+| [`gcta_cojo`](docs/modules/gcta_cojo/README.md) | Stepwise selection, top-SNP, joint and conditional analysis | `gcta_cojo` | [Direct](docs/modules/gcta_cojo/README.md#direct-mode) · [Pipeline](docs/modules/gcta_cojo/README.md#pipeline-mode) · [Resources](docs/modules/gcta_cojo/README.md#input-requirements) · [Outputs](docs/modules/gcta_cojo/README.md#outputs) |
+| [`finemap`](docs/wiki/modules/fine-mapping.md) | SuSiE-RSS and FINEMAP | `finemap` | [Direct](docs/wiki/modules/fine-mapping.md#direct-mode) · [Pipeline](docs/wiki/modules/fine-mapping.md#pipeline-mode) · [Resources](docs/wiki/modules/fine-mapping.md#input-requirements) · [Outputs](docs/wiki/modules/fine-mapping.md#outputs) |
+
+### Gene, gene-set and cell-type analysis
+
+| Module | Available analyses | Pipeline target | Instructions |
+|---|---|---|---|
+| [`magma`](docs/wiki/modules/magma.md) | Positional MAGMA, eMAGMA, H-MAGMA, nMAGMA and chromMAGMA mappings; optional gene-set tests | `magma` | [Direct](docs/wiki/modules/magma.md#direct-mode) · [Pipeline](docs/wiki/modules/magma.md#pipeline-mode) · [Resources](docs/wiki/modules/magma.md#input-requirements) · [Outputs](docs/wiki/modules/magma.md#outputs) |
+| [`gcta_gene`](docs/wiki/modules/gcta-gene.md) | fastBAT gene, segment and set tests; mBAT-combo | `gcta_gene` | [Direct](docs/wiki/modules/gcta-gene.md#direct-mode) · [Pipeline](docs/wiki/modules/gcta-gene.md#pipeline-mode) · [Resources](docs/wiki/modules/gcta-gene.md#input-requirements) · [Outputs](docs/wiki/modules/gcta-gene.md#outputs) |
+| [`magmacovar`](docs/wiki/modules/magmacovar.md) | MAGMA gene-property and conditional analyses | `magmacovar` | [Direct](docs/wiki/modules/magmacovar.md#direct-mode) · [Pipeline](docs/wiki/modules/magmacovar.md#pipeline-mode) · [Resources](docs/wiki/modules/magmacovar.md#input-requirements) · [Outputs](docs/wiki/modules/magmacovar.md#outputs) |
+| [`single_cell`](docs/wiki/modules/single-cell.md) | MAGMA cell-type analysis, scDRS and LDSC cell-type analysis | `single_cell` | [Direct](docs/wiki/modules/single-cell.md#direct-mode) · [Pipeline](docs/wiki/modules/single-cell.md#pipeline-mode) · [Resources](docs/wiki/modules/single-cell.md#input-requirements) · [Outputs](docs/wiki/modules/single-cell.md#outputs) |
+
+### Gene prioritisation
+
+| Module | Approach | Pipeline target | Instructions |
+|---|---|---|---|
+| [`pops`](docs/wiki/modules/pops.md) | Feature-based gene prioritisation | `pops` | [Direct](docs/wiki/modules/pops.md#direct-mode) · [Pipeline](docs/wiki/modules/pops.md#pipeline-mode) · [Resources](docs/wiki/modules/pops.md#input-requirements) · [Outputs](docs/wiki/modules/pops.md#outputs) |
+| [`kpops`](docs/modules/kpops.md) | Kernel-based gene prioritisation | `kpops` | [Direct](docs/modules/kpops.md#direct-mode) · [Pipeline](docs/modules/kpops.md#pipeline-mode) · [Resources](docs/modules/kpops.md#input-requirements) · [Outputs](docs/modules/kpops.md#outputs) |
+| [`caldera`](docs/modules/caldera.md) | Integrate PoPS predictions and credible sets | `caldera` | [Direct](docs/modules/caldera.md#direct-mode) · [Pipeline](docs/modules/caldera.md#pipeline-mode) · [Resources](docs/modules/caldera.md#input-requirements) · [Outputs](docs/modules/caldera.md#outputs) |
+| [`flames`](docs/wiki/modules/flames.md) | Integrate fine-mapping, MAGMA, gene-property and PoPS evidence | `flames` | [Direct](docs/wiki/modules/flames.md#direct-mode) · [Pipeline](docs/wiki/modules/flames.md#pipeline-mode) · [Resources](docs/wiki/modules/flames.md#input-requirements) · [Outputs](docs/wiki/modules/flames.md#outputs) |
+
+### Heritability, polygenicity and interpretation
+
+| Module | Available analyses | Pipeline target | Instructions |
+|---|---|---|---|
+| [`heritability`](docs/wiki/modules/ldsc.md) | Single-trait LDSC heritability, with optional liability conversion | `heritability` | [Direct](docs/wiki/modules/ldsc.md#direct-mode) · [Pipeline](docs/wiki/modules/ldsc.md#pipeline-mode) · [Resources](docs/wiki/modules/ldsc.md#input-requirements) · [Outputs](docs/wiki/modules/ldsc.md#outputs) |
+| [`mixer`](docs/wiki/modules/mixer.md) | Univariate MiXeR, GSA-MiXeR, or both | `mixer` | [Direct](docs/wiki/modules/mixer.md#direct-mode) · [Pipeline](docs/wiki/modules/mixer.md#pipeline-mode) · [Resources](docs/wiki/modules/mixer.md#input-requirements) · [Outputs](docs/wiki/modules/mixer.md#outputs) |
+| [`pathway_enrichment`](docs/wiki/modules/pathway-enrichment.md) | Gene-list enrichment and interaction services | Standalone only | [Direct](docs/wiki/modules/pathway-enrichment.md#direct-mode) · [Pipeline](docs/wiki/modules/pathway-enrichment.md#pipeline-mode) · [Resources](docs/wiki/modules/pathway-enrichment.md#input-requirements) · [Outputs](docs/wiki/modules/pathway-enrichment.md#outputs) |
+| [`manhattan`](docs/wiki/modules/manhattan.md) | Manhattan plots | `manhattan` | [Direct](docs/wiki/modules/manhattan.md#direct-mode) · [Pipeline](docs/wiki/modules/manhattan.md#pipeline-mode) · [Resources](docs/wiki/modules/manhattan.md#input-requirements) · [Outputs](docs/wiki/modules/manhattan.md#outputs) |
+
+Harmonisation and pathway enrichment are **standalone-only**. `qc` is the direct
+command and `qc_summary` is its pipeline target. Supporting interfaces are
+`postgwas config`, `postgwas resources`, `postgwas pipeline`, and
+`postgwas --validate`; see the [command reference](docs/wiki/reference/command-reference.md).
+
+## First complete analysis
 
 The connected example uses one dataset, `STUDY`, throughout:
 
@@ -239,9 +252,9 @@ Follow the [full walkthrough](docs/wiki/getting-started/quick-start.md) for the
 connected commands and output paths. Its paths are placeholders for your study
 and references, not a bundled demonstration dataset.
 
-## Harmonise your summary statistics
+### Harmonise your summary statistics
 
-### Generate and review the sample sheet
+#### Generate and review the sample sheet
 
 A version-2 CSV/TSV sample sheet maps each study's columns and metadata to
 PostGWAS concepts. It is separate from the run-configuration YAML, which
@@ -262,7 +275,7 @@ does not mean the studies are ready to run. Alternatively, copy a maintained
 or [case-control template](examples/configs/harmonisation/sample_sheet_case_control.csv)
 and replace all placeholder values.
 
-### Complete the study information
+#### Complete the study information
 
 | Information | What to provide or check |
 |---|---|
@@ -271,6 +284,7 @@ and replace all placeholder values.
 | Effect and P value | An effect estimate or Z score, a P-value column and its representation (`raw`, `neglog10` or `auto`). Map supplied SE when available; recovery of missing statistics is conditional. |
 | Allele frequency | Exactly one internal `effect_allele_frequency_column` or external file/column pair. The default comparison AF panel does not replace this study-frequency source. |
 | Imputation quality | Internal INFO takes priority over an external INFO file/column pair. With neither source, explicitly choose `--fixed-info VALUE`; an external proxy or fixed value is not study-measured quality. |
+| Study design and effect scale | Review `trait_type`, `effect_type` and any automatic decisions against the publication; an odds ratio is not a linear-trait beta. See the sample-sheet guide before using an Neff-only compatibility route. |
 | Sample size | For quantitative traits, `control_count_column` or `control_count` represents total N. For case-control traits, provide real control and case counts through their corresponding column or fixed-count fields. |
 
 Do not invent missing counts, frequencies or quality measurements. External
@@ -281,7 +295,7 @@ filename prefix. Prepare the harmonisation reference tree before running.
 [Configuration guide](docs/modules/harmonisation/configuration.md) ·
 [Complete source, step and policy reference](docs/wiki/harmonisation/policies.md)
 
-### Run harmonisation
+#### Run harmonisation
 
 The connected example uses dataset `STUDY`. Replace `studies.csv` with your
 completed sample sheet containing that identifier, and prepare the referenced
@@ -302,7 +316,7 @@ consensus, effect type, OR SE scale, P-value scale and EAF/MAF interpretation—
 recorded as `DECIDE` entries in the log. Dataset rows currently run sequentially;
 chromosome work uses bounded parallelism.
 
-### Review the results before continuing
+#### Review the results before continuing
 
 Successful runs produce GRCh37 and GRCh38 VCFs with indexes, QC reports and
 rejection evidence. For this example, the GRCh37 file is
@@ -384,72 +398,36 @@ plans registered upstream modules and passes their artifacts between stages.
 
 ### Pipeline targets and execution order
 
-Select the final analyses you want; PostGWAS adds their registered prerequisites.
-All public pipeline targets are listed below. Each row shows a single-target
-plan without optional workflow stages; arrows show scheduled order, not a claim
-that each stage consumes only the immediately preceding stage's output.
+Select the results you want, not every prerequisite. The planner resolves
+method-dependent inputs and shares compatible upstream work across targets.
+For example, MAGMA requires formatting; PoPS additionally requires MAGMA;
+FLAMES combines fine-mapping, MAGMA, gene-property and PoPS evidence. These
+branches are not interchangeable or a mandatory all-module sequence.
 
-For the `finemap`, `caldera` and `flames` rows, explicitly select
-`--clumping-methods standard` and either `--finemap-method susie` or
-`--finemap-method finemap`. The engines use the same stage order but different
-tool-specific inputs and resources.
-
-| Selected target and method | Execution order |
-|---|---|
-| `sumstat_filter` | `sumstat_filter` |
-| `qc_summary` | `qc_summary` |
-| `formatter` | `formatter` |
-| `imputation` | `formatter → imputation` |
-| `annot_ldblock` | `annot_ldblock` |
-| `ld_clump`, `standard` only | `ld_clump` |
-| `ld_clump`, `region` | `annot_ldblock → ld_clump` |
-| `ld_clump`, `cojo-slct` | `formatter → ld_clump` |
-| `finemap`, standard clumping | `ld_clump → formatter → finemap` |
-| `magma` | `formatter → magma` |
-| `gcta_gene` | `formatter → gcta_gene` |
-| `gcta_cojo` | `formatter → gcta_cojo` |
-| `magmacovar` | `formatter → magma → magmacovar` |
-| `single_cell`, `magma_celltype` or `scdrs` | `formatter → magma → single_cell` |
-| `single_cell`, `ldsc_celltype` only | `formatter → single_cell` |
-| `pops` | `formatter → magma → pops` |
-| `kpops` | `formatter → magma → kpops` |
-| `caldera`, standard clumping | `formatter → ld_clump → magma → pops → finemap → caldera` |
-| `flames`, standard clumping | `ld_clump → formatter → magma → magmacovar → pops → finemap → flames` |
-| `heritability` | `formatter → heritability` |
-| `mixer` | `formatter → mixer` |
-| `manhattan` | `manhattan` |
-
-FLAMES combines fine-mapping, MAGMA, MAGMAcovar and PoPS evidence. CALDERA
-combines PoPS with fine-mapped credible sets; it does not run MAGMAcovar or
-K-POPS, and its pipeline currently requires GRCh37. Harmonisation and pathway
-enrichment remain standalone-only, and
-`qc_summary` is the pipeline target for the direct `qc` command.
-
-The packaged clumping selection is `region` plus `standard`, which also
-schedules `annot_ldblock`. The standard-only rows above deliberately omit that
-stage. Fine-mapping needs the standard-clumping locus artifact; adding region
-or COJO analyses can change prerequisites and order, but neither replaces that
-artifact. Always inspect the plan for your actual method combination.
-
-For multiple targets, use the combined plan rather than concatenating table
-rows. Shared prerequisites normally run once. Formatting before and after imputation
-uses different data and can therefore appear twice. Inspect contextual help for
-the methods you intend to use:
+The [complete target/method execution-order table](docs/wiki/core/pipeline-workflow.md#how-the-execution-order-is-decided)
+covers all 19 public targets, including FLAMES and CALDERA. Inspect contextual
+help for the exact methods you intend to run:
 
 ```bash
-postgwas magma --help
 postgwas pipeline --modules magma --help
+postgwas pipeline --modules magma pops --help
 postgwas pipeline --modules flames --clumping-methods standard --finemap-method susie --help
 ```
 
-Dependencies change with the selected method: region clumping needs LD-block
-annotation, standard clumping uses prepared pairwise LD, and COJO selection
-needs formatted statistics and PLINK genotypes. LDSC cell typing does not use
-the MAGMA branch. Fine-mapping and gene-prioritisation targets can combine
-several branches; selecting one does not mean every module runs.
+For a multi-target run, use the complete recipe for each selected method and
+supply the union of their external resources. Do not concatenate intermediate
+file arguments: the pipeline passes those artifacts itself. A combined plan may
+number output directories differently from a single-target run.
 
-[Pipeline dependencies and execution order](docs/wiki/core/pipeline-workflow.md) ·
-[Single-cell methods](docs/wiki/modules/single-cell.md)
+| Input | Direct mode | Pipeline mode |
+|---|---|---|
+| Starting study data | The selected module's documented files | Indexed PostGWAS-harmonised study VCF |
+| Tool-specific intermediate | Supply it when required by the direct workflow | Generated by registered upstream stages |
+| External references/resources | Supply compatible files | Still supply compatible files; not automatically downloaded |
+| Analysis choices | Select the module's method/settings | Select targets and method/settings for the resolved plan |
+
+[Dependency planning and complete execution order](docs/wiki/core/pipeline-workflow.md) ·
+[Running modules independently](docs/wiki/core/running-modules-independently.md)
 
 ### Optional pipeline stages
 
@@ -516,7 +494,8 @@ postgwas config validate --config magma_pipeline.yaml
 Configuration validation checks the schema, not the suitability of all input
 data. Direct `manhattan` and `pathway_enrichment` do not expose `--run-config`;
 consult their CLI options. Configuration module names can differ from public
-commands, such as `formatting` versus `formatter`.
+commands, such as `formatting` versus `formatter`; use the
+[command/target/configuration crosswalk](docs/wiki/reference/command-reference.md#command-pipeline-target-and-configuration-names).
 
 [Configuration guide](docs/wiki/core/configuration.md) ·
 [Packaged settings](docs/wiki/reference/configuration-defaults.md)
@@ -620,7 +599,6 @@ Cite the methods, software and reference datasets used in your analysis.
 ### Documentation and development checks
 
 ```bash
-python -m pytest -q
 python tools/docs/build_wiki.py --check
 python tools/docs/validate_wiki_cli.py
 python tools/docs/update_harmonisation_policies.py --check
@@ -628,8 +606,12 @@ python tools/docs/update_harmonisation_policies.py --check
 
 Edit canonical documentation sources, not generated Wiki copies. Navigation
 comes from `docs/wiki.yml`; the full index lives in the user-guide home page.
-Repository changes require method validation, regression tests and protection
-of the bundled harmonisation adapters.
+The public checkout does not include the local regression suite: `tests/` is
+excluded from Git. Maintainers with that local directory can still run
+`python -m pytest -q`. Published CI checks documentation and installer syntax,
+and retains the complete Linux environment-installation job; these checks do
+not replace the omitted regression suite or full analysis validation. Preserve
+the bundled harmonisation adapters.
 
 [Documentation maintenance](docs/wiki/README.md) ·
 [Module-page template](docs/templates/module-page.md)

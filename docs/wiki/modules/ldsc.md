@@ -39,13 +39,13 @@ traits with defensible prevalence values.
 - Matching per-chromosome reference LD scores and regression weights.
 - Installed `munge_sumstats.py` and `ldsc.py` entry points.
 
-## Command
+## Direct mode
 
-```console
+```text
 postgwas heritability --ldsc-input PATH [options]
 ```
 
-## Minimal example
+### Observed-scale heritability
 
 ```console
 postgwas heritability \
@@ -57,7 +57,11 @@ postgwas heritability \
   --output-directory results
 ```
 
-## Full example
+### Observed and liability scales
+
+The prevalence values below illustrate a study with 20% cases and 1% population
+prevalence. Replace them with justified values for the study and target
+population; they are not recommended defaults.
 
 ```console
 postgwas heritability \
@@ -73,7 +77,13 @@ postgwas heritability \
   --output-directory results
 ```
 
-### Pipeline example
+## Pipeline mode
+
+The pipeline begins with an indexed, single-sample PostGWAS-harmonised VCF and
+creates the LDSC formatter table. Supply the merge-alleles list, reference
+LD-score directory and weight directory; do not supply `--ldsc-input`.
+
+### Observed-scale heritability
 
 ```console
 postgwas pipeline \
@@ -86,7 +96,34 @@ postgwas pipeline \
   --output-directory results
 ```
 
+### Observed and liability scales
+
+For a binary GWAS whose case/control counts support formatter sample-prevalence
+calculation, supply the population prevalence and let the pipeline pass the
+validated formatter value:
+
+```console
+postgwas pipeline \
+  --modules heritability \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --merge-alleles reference/w_hm3.snplist \
+  --ref-ld-chr reference/eur_w_ld_chr \
+  --w-ld-chr reference/eur_w_ld_chr \
+  --pop-prev 0.01 \
+  --dataset-id STUDY \
+  --output-directory results/heritability_liability_pipeline
+```
+
+Replace `0.01` with a defensible population prevalence. If the study design
+requires an explicit sample prevalence, add `--samp-prev VALUE`; that value is
+used after validation and compared with the formatter's case fraction as
+described below. Population prevalence is not inferred from sample prevalence.
+
 ## Parameters
+
+```console
+postgwas config export --module ldsc --style full --output ldsc.yaml
+```
 
 `src/postgwas/config/defaults/modules/ldsc.yaml` is the only source of LDSC
 analysis defaults. Formatter-specific sample-prevalence aggregation remains in
@@ -274,10 +311,13 @@ uninformative for low-heritability traits or mismatched LD references.
 
 Missing merge-alleles path, incompatible HapMap3 IDs/alleles, wrong reference
 population/build, missing chromosome LD-score files, invalid prevalence, or
-LDSC entry points absent from the active environment. When validated LDSC
-outputs already exist, direct mode stops without modifying them and prints an
-actionable message: review the listed files, then use `--overwrite` to replace
-them or select a different `--output-directory`. Expected user/configuration
+LDSC entry points absent from the active environment. Default resume reuses a
+completed direct run only when its shared checkpoint and outputs validate.
+Existing files that cannot be reused or safely restarted through that
+checkpoint may instead stop execution before the LDSC service changes them.
+Review the reported files and restart decision; use `--overwrite` for an
+intentional restart under the shared ownership safeguards, or choose another
+`--output-directory`. Expected user/configuration
 errors are reported without a Python traceback; unexpected internal errors keep
 their traceback for diagnosis.
 

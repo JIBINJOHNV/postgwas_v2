@@ -58,8 +58,22 @@ The module guide names the required outputs for the selected analysis:
 | Analysis | What to inspect first | Detailed output guide |
 |---|---|---|
 | Harmonisation | Dataset/run HTML, merged VCFs, rejected records and reason matrix | [Harmonisation outputs](../harmonisation/outputs-and-qc.md) |
+| Filtering | Passing VCF/index, exclusion counts and optional all-record soft-filter audit | [Filtering outputs](../modules/filtering.md#outputs) |
 | QC | Self-contained HTML plus its reconciled machine-readable assessment | [QC outputs](../modules/qc-summary.md#outputs) |
+| Formatter | Requested tool-specific tables, schemas and duplicate/reference-matching counts | [Formatter outputs](../modules/formatting.md#outputs) |
+| Imputation | Imputation quality evidence and the final re-harmonised VCF, not only raw imputed statistics | [Imputation outputs](../modules/imputation.md#outputs) |
+| LD annotation | Annotated VCF/index and block-assignment coverage | [Annotation outputs](../modules/ld-annotation.md#outputs) |
+| LD clumping | Method-labelled lead signals, loci and retained/excluded variants; methods are not interchangeable | [Clumping outputs](../modules/ld-clumping.md#outputs) |
+| Fine-mapping | Per-locus status, PIPs, credible sets and engine diagnostics; successful loci do not imply every locus succeeded | [Fine-mapping outputs](../modules/fine-mapping.md#outputs) |
 | MAGMA | Gene/mapping results, native outputs, exclusions, and generated report | [MAGMA outputs](../modules/magma.md#outputs) |
+| GCTA gene | Method-specific association tables, native logs and the tested gene/segment/set universe | [GCTA gene outputs](../modules/gcta-gene.md#outputs) |
+| GCTA-COJO | Selected/model/conditioned SNPs and their conditional or joint statistics, labelled by mode | [COJO outputs](../../modules/gcta_cojo/README.md#outputs) |
+| MAGMAcovar | Property coefficients/tests, model conditions, tested family and gene overlap | [Gene-property outputs](../modules/magmacovar.md#outputs) |
+| Single-cell | Tool-labelled cell-type/cell-level results, gene matching and model-specific QC | [Single-cell outputs](../modules/single-cell.md#outputs) |
+| PoPS | Gene scores, model and gene-universe diagnostics; scores rank genes, not calibrated association p-values | [PoPS outputs](../modules/pops.md#outputs) |
+| K-POPS | Gene scores, kernel/training design and gene-universe compatibility | [K-POPS outputs](../../modules/kpops.md#outputs) |
+| CALDERA | Locus-relative probabilities and component evidence; inspect candidate genes and missing evidence | [CALDERA outputs](../../modules/caldera.md#outputs) |
+| FLAMES | Prioritised genes, component evidence, annotation coverage and model/run validation | [FLAMES outputs](../modules/flames.md#outputs) |
 | LDSC heritability | Observed/liability result logs, munged input, and canonical findings | [LDSC outputs](../modules/ldsc.md#outputs) |
 | MiXeR | Native fit/test results, YAML/TSV summaries, and enabled QQ/power diagnostics | [MiXeR outputs](../modules/mixer.md#outputs) |
 | Manhattan | PNG/PDF, exact plotted-point TSV, and R transcript; this module does not produce QQ plots | [Manhattan outputs](../modules/manhattan.md#outputs) |
@@ -69,6 +83,22 @@ The pathway-enrichment command runs a fixed provider workflow and tolerates
 individual provider failures. Check the provider-specific evidence rather than
 interpreting a final command message as confirmation that every service returned
 usable results.
+
+### Read harmonisation counts at the correct boundary
+
+The input-row count, final source-build VCF count, lifted-build VCF count and
+QC-passed count describe different stages. Earlier validation can reject rows;
+liftover can fail or exclude successfully lifted records under the configured
+swap policy; later QC describes a virtual subset without rewriting the VCF.
+Use the stage-specific accounting in the report instead of expecting both builds
+to contain all original rows. Individual QC rule counts can overlap.
+
+Retain the rejected records and reason matrix when reviewing loss. Successful
+completion means the configured processing and required validations succeeded,
+not that every input record survived or every retained record is suitable for
+every downstream analysis. The [Quick Start](../getting-started/quick-start.md#5-run-magma-in-pipeline-mode)
+names the exact first MAGMA outputs for its two-step plan and explains what to
+review before interpreting the gene associations.
 
 ## How to interpret completion
 

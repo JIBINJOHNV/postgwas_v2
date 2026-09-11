@@ -109,12 +109,14 @@ For a standard MAGMA-backed PoPS run, supply:
 
 ## Command
 
-```console
+```text
 postgwas pops --magma-association-prefix PREFIX [options]
 postgwas pipeline --modules pops --help
 ```
 
-## Minimal example
+## Direct mode
+
+### Existing MAGMA results
 
 ```console
 postgwas pops \
@@ -129,9 +131,7 @@ postgwas pops \
   --output-directory results
 ```
 
-## Full example
-
-### Direct mode: existing MAGMA results
+### Explicit model settings
 
 ```console
 postgwas pops \
@@ -152,7 +152,88 @@ postgwas pops \
   --output-directory results
 ```
 
-### Pipeline mode: GWAS-VCF to MAGMA and PoPS
+### Custom gene scores
+
+This direct-only alternative replaces the MAGMA input; do not supply a MAGMA
+prefix with it. The packaged schema is a tab-delimited table with `ENSGID` and
+`Score` headers, one unique compatible gene per row, and finite numeric scores.
+For example, the following illustrates the columns, not a sufficient training
+dataset:
+
+```text
+ENSGID	Score
+ENSG00000139618	2.1
+ENSG00000141510	1.7
+```
+
+Supply the full prespecified gene-score dataset aligned to the annotation and
+feature rows, not a significant-gene-only list. Custom scores cannot use the
+MAGMA `intersect` policy. Optional `--target-covariates-file` uses the same
+unique `ENSGID` set plus finite numeric covariates; optional
+`--target-error-covariance-file` is a finite symmetric `.npy`/sparse `.npz`
+matrix in the score table's gene order. Their derivation and score scale need
+independent justification; an arbitrary score is not equivalent to MAGMA ZSTAT.
+
+```console
+postgwas pops \
+  --target-score-file target_scores.tsv \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 2 \
+  --pops-gene-location-file reference/pops/gene_annot.tsv \
+  --genome-build GRCh37 \
+  --method ridge \
+  --dataset-id STUDY \
+  --output-directory results/pops_custom
+```
+
+### Alternative regression models
+
+`ridge` is the packaged default; `lasso` and `linreg` are also supported.
+Prespecify the model rather than choosing whichever yields preferred genes.
+These alternatives use the same input validation, feature-selection and
+chromosome policies; changing the fit can change rankings.
+
+```console
+postgwas pops \
+  --magma-association-prefix magma/STUDY \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 2 \
+  --pops-gene-location-file reference/pops/gene_annot.tsv \
+  --genome-build GRCh37 \
+  --method lasso \
+  --dataset-id STUDY \
+  --output-directory results/pops_lasso
+```
+
+```console
+postgwas pops \
+  --magma-association-prefix magma/STUDY \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 2 \
+  --pops-gene-location-file reference/pops/gene_annot.tsv \
+  --genome-build GRCh37 \
+  --method linreg \
+  --dataset-id STUDY \
+  --output-directory results/pops_linreg
+```
+
+### Optional MAGMA gene-universe intersection
+
+Use this only after reviewing why the MAGMA and PoPS gene releases differ:
+
+```console
+postgwas pops \
+  --magma-association-prefix magma/STUDY \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 116 \
+  --pops-gene-location-file reference/pops/gene_annot.tsv \
+  --gene-universe-policy intersect \
+  --genome-build GRCh37 \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+## Pipeline mode
 
 Use a strand-aware MAGMA gene-location file from the same Ensembl gene universe
 as the PoPS annotation and feature rows. An NCBI/Entrez location file is not an
@@ -186,20 +267,52 @@ is `--genome-build`; the PoPS-specific pipeline option is `--pops-genome-build`.
 For non-default MAGMA builds or mappings, also provide compatible MAGMA settings
 as described in the [MAGMA guide](magma.md#gene-identifiers-and-source-declarations).
 
-### Optional MAGMA gene-universe intersection
+The preceding pipeline uses the default `ridge` model. Complete alternatives
+for the same GRCh37/EUR, 116-chunk resource contract follow. Replace all source
+metadata and resource placeholders exactly as above.
 
-Use this only after reviewing why the MAGMA and PoPS gene releases differ:
+### lasso regression
 
 ```console
-postgwas pops \
-  --magma-association-prefix magma/STUDY \
+postgwas pipeline \
+  --modules pops \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/pops/PoPS_GRCh37_strand_aware.loc \
+  --magma-positional-gene-id-type ensembl \
+  --magma-positional-source-name GENE_LOCATION_SOURCE \
+  --magma-positional-source-version SOURCE_RELEASE \
+  --magma-positional-source-url https://example.org/GENE_LOCATION_SOURCE_RECORD \
+  --magma-positional-context GENE_LOCATION_CONTEXT \
   --feature-matrix-prefix reference/pops/features_munged/pops_features \
   --feature-matrix-chunks 116 \
-  --pops-gene-location-file reference/pops/gene_annot.tsv \
-  --gene-universe-policy intersect \
-  --genome-build GRCh37 \
+  --pops-gene-location-file reference/pops/GRCh37_gene_annot.tsv \
+  --pops-genome-build GRCh37 \
+  --method lasso \
   --dataset-id STUDY \
-  --output-directory results
+  --output-directory results/pops_lasso
+```
+
+### linreg regression
+
+```console
+postgwas pipeline \
+  --modules pops \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/pops/PoPS_GRCh37_strand_aware.loc \
+  --magma-positional-gene-id-type ensembl \
+  --magma-positional-source-name GENE_LOCATION_SOURCE \
+  --magma-positional-source-version SOURCE_RELEASE \
+  --magma-positional-source-url https://example.org/GENE_LOCATION_SOURCE_RECORD \
+  --magma-positional-context GENE_LOCATION_CONTEXT \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 116 \
+  --pops-gene-location-file reference/pops/GRCh37_gene_annot.tsv \
+  --pops-genome-build GRCh37 \
+  --method linreg \
+  --dataset-id STUDY \
+  --output-directory results/pops_linreg
 ```
 
 ## Parameters

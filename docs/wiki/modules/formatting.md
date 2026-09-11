@@ -50,9 +50,9 @@ dataset ID controls output naming only. The VCF must contain exactly one sample
 column. A lone sample ID that differs from the run dataset ID is used with a
 warning; zero-sample and multi-sample VCFs fail before extraction.
 
-## Command
+## Direct mode
 
-```console
+```text
 postgwas formatter --vcf PATH --output-directory PATH \
   [--format FORMAT [FORMAT ...]] [--custom-output FILE] [options]
 ```
@@ -62,7 +62,7 @@ formatter does not silently select a destination. Pipeline runs continue to
 use the pipeline's required output directory and create a formatter step
 subdirectory within it.
 
-## Minimal example
+### LDSC input with optional reference matching
 
 ```console
 postgwas formatter \
@@ -116,7 +116,7 @@ postgwas formatter \
   --variant-id-type unique
 ```
 
-## Full example
+### All seven built-in formats
 
 ```console
 postgwas formatter \
@@ -124,14 +124,44 @@ postgwas formatter \
   --dataset-id STUDY \
   --output-directory results \
   --format magma gcta_gene susie finemap pred_ld ldsc mixer \
-  --duplicate-id-policy exclude_all \
-  --run-config formatting.yaml \
-  --resume
+  --duplicate-id-policy exclude_all
 ```
 
 The formatter resolves `resources.executables.bcftools` (default `bcftools`)
 from the run configuration and validates that command on `PATH` before reading
 the VCF.
+
+## Pipeline mode
+
+To create the built-in tables without running their downstream analyses:
+
+```console
+postgwas pipeline \
+  --modules formatter \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --format magma gcta_gene susie finemap pred_ld ldsc mixer \
+  --duplicate-id-policy exclude_all \
+  --dataset-id STUDY \
+  --output-directory results/formatter_pipeline
+```
+
+Select fewer names after `--format` when only those contracts are needed.
+The pipeline entry must be indexed and single-sample, with PostGWAS
+harmonisation provenance. No LD panel is needed merely to export these tables;
+the analysis consuming them has its own reference requirements.
+
+When another target needs formatter input, select that analysis instead of
+supplying its intermediate table. The planner inserts the required formatter
+target automatically; for example, the
+[heritability pipeline](ldsc.md#pipeline-mode) supplies the same required
+merge-alleles file to formatter and LDSC. A formatter-only pipeline does not
+expose that analysis's `--merge-alleles` option: use direct LDSC formatting above
+for optional reference matching without running heritability.
+
+The custom-column CLI options (`--custom-output`, `--id`, `--beta`, and related
+flags) belong to the direct formatter command. For a pipeline custom table,
+configure `modules.formatting.custom_output` in the run YAML; these direct-only
+flags must not be passed to `postgwas pipeline`.
 
 ## Parameters
 
@@ -145,7 +175,7 @@ for different outputs. MAGMA pipeline mode inspects BIM field 2 and sets only
 the MAGMA target automatically.
 
 Duplicate-ID handling is shared by every built-in format and the custom table.
-`--duplicate-id-policy` accepts `exclude_all`, `error`, `most_significant`,
+`--duplicate-id-policy` accepts `exclude_all`, `error`, `lowest_p`, `most_significant`,
 `highest_maf`, or `highest_info`. Argparse owns no default: when the option is
 omitted, each target uses `variant_identifiers.target_duplicate_policies` and
 then the canonical `variant_identifiers.default_duplicate_policy`. The packaged
@@ -155,7 +185,8 @@ Exact repeated records are collapsed first. Supported formatter-side reference
 matching—currently LDSC `--merge-alleles`—runs next when supplied. Other modules
 retain their own downstream reference reconciliation. The resolved policy then
 handles only conflicting duplicate-ID groups that remain. `exclude_all` removes the
-complete group, and `error` stops. Ranked policies retain a row only when it has
+complete group, and `error` stops. `most_significant`, `highest_maf`, and
+`highest_info` retain a row only when it has
 one strictly greatest valid ranking value: largest configured `-log10(P)`,
 largest `min(EAF, 1-EAF)`, or largest configured INFO value. A tied maximum or
 missing ranking value excludes the complete group; the schema-validated
@@ -164,6 +195,13 @@ as ties, and input order is never a fallback. `most_significant` is an explicit
 user choice rather than the default
 because selecting association results by P value can introduce ascertainment
 bias. Every target records the policy and its exact resolution counts.
+
+`lowest_p` is a separate, explicitly selected policy: it retains the row with
+the largest valid LP, using input order for exact ties and for groups with no
+valid LP. Target-specific required-field checks still apply afterwards. Unlike
+`most_significant`, it does not exclude a group merely because its best ranks
+tie. Prefer the conservative default unless the analysis protocol justifies
+another rule; record the selected policy when reporting results.
 
 `--merge-alleles PATH` is an optional LDSC-formatting reference, normally
 `w_hm3.snplist`. When supplied, the formatter retains only records whose rsID

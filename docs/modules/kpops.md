@@ -28,7 +28,7 @@ Direct and pipeline execution report six validated K-POPS stages. PostGWAS first
 
 During stage 5, a separate `K-POPS model-fitting progress` counter reports observed upstream model completions when detailed progress is enabled. PostGWAS enables the pinned program's verbose messages internally and captures them rather than printing duplicate native output. Each upstream `Computing PoPS scores.` event occurs after the corresponding coefficient solve and advances the measured counter. LOCO analysis uses the exact number of distinct chromosomes in the validated K-POPS annotation as its total; `all` and explicitly selected training chromosomes each fit one model. This measured counter is distinct from the six-stage PostGWAS bar: for example, `5/6` identifies the active PostGWAS stage, while `4/6 67%` means four stages have completed validation. The measured counter reaches 100% only after the K-POPS process exits successfully and its declared files pass the checked-command output contract. Full scientific result validation remains stage 6. A failed run retains its last observed count below 100%. Enabling verbose capture changes logging only, not the K-POPS scientific arguments or calculations.
 
-## Inputs
+## Input requirements
 
 - `magma_association_prefix`: prefix for `.genes.out` and `.genes.raw`.
 - `gene_annotation_file`: K-POPS annotation containing the configured columns.
@@ -123,6 +123,25 @@ K-POPS results are staged and published only after validation:
 - optional attribution matrix and row/column gene files;
 - with `gene_universe_policy: intersect`, a gene-level compatibility TSV and YAML report;
 - resolved configuration, completion manifest, and canonical log.
+
+## Interpretation
+
+Use `PoPS_Score` to rank genes under the chosen kernel and training design; it
+is neither a p-value nor a calibrated causal probability. LOCO predictions
+exclude the prediction chromosome from model fitting; `all` and selected
+training-chromosome designs answer different prediction questions and should
+not be presented as interchangeable validation. Review finite-score coverage
+and the gene-universe compatibility report before comparing rankings.
+Contributor genes explain the fitted kernel prediction, not a demonstrated
+regulatory interaction or a set of selected biological features.
+
+## Common problems
+
+Check exact gene identifiers, shared-gene chromosome agreement, kernel row order
+and dimensions, declared build, and adequate training genes. A symbol-based
+MAGMA file or a numerically encoded TSS in the gene-location strand column is
+not repaired by adding an Ensembl metadata label. Follow the explicit resource
+contract above; PostGWAS does not offer a general gene-location conversion CLI.
 
 ## Sources
 

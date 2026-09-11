@@ -296,6 +296,7 @@ def render_sidebar(site: WikiSite) -> str:
 
 
 def render_wiki(site: WikiSite) -> dict[str, str | bytes]:
+    validate_readme_navigation(site)
     source_to_slug = {page.source.resolve(): page.slug for page in site.pages}
     assets: dict[str, Path] = {}
     rendered = {
@@ -314,6 +315,31 @@ def render_wiki(site: WikiSite) -> dict[str, str | bytes]:
             )
         rendered[filename] = source.read_bytes()
     return rendered
+
+
+def validate_readme_navigation(site: WikiSite) -> None:
+    """Protect the README-to-module user journey, including non-Wiki sources."""
+    readme = REPOSITORY_ROOT / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    for _image, _label, target in MARKDOWN_LINK_PATTERN.findall(text):
+        if target.startswith(("#", "https://", "http://", "mailto:")):
+            continue
+        raw_path, _anchor = _split_link_target(target)
+        if not (REPOSITORY_ROOT / raw_path).exists():
+            raise WikiBuildError(f"Broken README link: {target}")
+    # These four stable anchors are a documentation interface, not analysis
+    # defaults. Keep them in the module template and every catalogue destination.
+    for page in site.pages:
+        if page.section != "Analysis Modules" and page.slug != "Harmonisation":
+            continue
+        source = page.source.read_text(encoding="utf-8")
+        for heading in ("Input requirements", "Direct mode", "Pipeline mode", "Outputs"):
+            anchor = heading.lower().replace(" ", "-")
+            if f"## {heading}" not in source.splitlines():
+                raise WikiBuildError(f"Missing module navigation heading in {page.source_relative}: {heading}")
+            link = f"({page.source_relative.as_posix()}#{anchor})"
+            if link not in text:
+                raise WikiBuildError(f"README must link to module section: {link}")
 
 
 def write_wiki(rendered: dict[str, str | bytes], output: Path) -> None:

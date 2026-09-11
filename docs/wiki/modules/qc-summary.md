@@ -79,7 +79,7 @@ build, or liftover history. The harmonisation output-build header is still
 checked internally, and QC stops before analysis if it conflicts with the
 assessed VCF's `##genome_build` declaration.
 
-## Command
+## Direct mode
 
 The standalone command is `postgwas qc`; the pipeline target is `qc_summary`.
 Inspect the current direct options with:
@@ -88,7 +88,7 @@ Inspect the current direct options with:
 postgwas qc --help
 ```
 
-## Minimal example
+### Report the configured QC policy
 
 ```console
 postgwas qc \
@@ -97,7 +97,7 @@ postgwas qc \
   --output-directory results
 ```
 
-## Full example
+### Explicit policy and reusable configuration
 
 Export and edit the canonical YAML, then supply only the run-specific inputs on
 the command line:
@@ -144,6 +144,29 @@ from the VCF header and resolves bcftools from `resources.executables.bcftools`.
 When QC and filtering are selected in the same pipeline, an explicit shared
 CLI policy option applies to both modules; use their separate YAML sections
 when the two modules should use different values.
+
+## Pipeline mode
+
+Use the pipeline target `qc_summary`, not the direct command name `qc`.
+The entry VCF must be indexed, single-sample and PostGWAS-harmonised:
+
+```console
+postgwas pipeline \
+  --modules qc_summary \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --reference-af-column EUR \
+  --minimum-maf 0.01 \
+  --minimum-info 0.7 \
+  --maximum-info 1.05 \
+  --dataset-id STUDY \
+  --output-directory results/qc_pipeline
+```
+
+QC writes reports for the VCF reaching its planned step. It does not create a
+passing VCF or replace the VCF supplied to another pipeline analysis. Use
+[Filtering](filtering.md#pipeline-mode) when physical variant removal is needed.
+The reference-AF column above must already exist as a compatible INFO tag;
+this command does not download or add population frequencies.
 
 ## Parameters
 

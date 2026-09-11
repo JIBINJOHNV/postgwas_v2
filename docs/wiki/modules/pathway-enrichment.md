@@ -37,11 +37,16 @@ This is a standalone command, not a selectable pipeline target. It consumes a
 gene-symbol list, not a GWAS-VCF or the complete output table of another module.
 Select and document the intended genes before exporting the one-column input.
 
-```console
+```text
 postgwas pathway_enrichment --gene-input-file PATH [options]
 ```
 
-## Minimal example
+## Direct mode
+
+### Without DSigDB
+
+This command can query the other providers, but DSigDB cannot run without its
+GMT. Its failure is reported independently; this is not an all-provider example.
 
 ```console
 postgwas pathway_enrichment \
@@ -52,7 +57,7 @@ postgwas pathway_enrichment \
   --output-directory results
 ```
 
-## Full example
+### With the DSigDB gene-set resource
 
 ```console
 postgwas pathway_enrichment \
@@ -64,6 +69,12 @@ postgwas pathway_enrichment \
   --dataset-id STUDY \
   --output-directory results
 ```
+
+## Pipeline mode
+
+Not supported: this is a standalone-only command. `pathway_enrichment` accepts a prespecified gene-symbol list,
+not a pipeline-generated GWAS-VCF input. Use the direct command above after
+selecting genes and documenting the selection criteria.
 
 ## Parameters
 

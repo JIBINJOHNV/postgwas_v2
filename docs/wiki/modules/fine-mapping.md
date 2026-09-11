@@ -26,32 +26,18 @@ build, ancestry, alleles, sample size, and locus variants are compatible.
 - SuSiE: PLINK plus the required R/susieR environment.
 - FINEMAP: PLINK 2, bgenix, LDstore, and FINEMAP executables.
 
-## Command
+Direct mode requires the two prepared tables above. Pipeline mode instead
+requires an indexed, single-sample PostGWAS-harmonised VCF and **both** a
+prepared pairwise-LD directory for standard clumping and a PLINK reference for
+fine-mapping. See [LD Clumping](ld-clumping.md#input-requirements) for the
+pairwise-LD contract. The two resources must describe compatible ancestry and
+coordinates but are not the same file format.
 
-```console
+## Direct mode
+
+```text
 postgwas finemap --finemap-method {susie,finemap} [options]
 ```
-
-Pipeline help is method-aware. First display the available selectors:
-
-```console
-postgwas pipeline --modules finemap --help
-```
-
-Then request the complete options for one valid workflow, for example:
-
-```console
-postgwas pipeline --modules finemap --clumping-methods standard --finemap-method susie --help
-```
-
-Fine-mapping currently requires `standard` among the selected clumping methods
-because its genomic-risk-locus table supplies the model boundaries. `region`
-and `cojo-slct` may be added for parallel locus summaries but do not replace
-that locus source. With `standard` alone, the pipeline runs standard LD
-clumping, creates the engine-specific formatter table, and then fine-maps the
-resulting loci. LD-block annotation and its BED resources are added only when
-`region` is selected. When `cojo-slct` is selected, formatter runs before LD
-clumping because the COJO analysis consumes its GCTA table.
 
 ### Locus boundaries
 
@@ -69,7 +55,7 @@ does not accept a separate locus-file override: it uses the validated
 genomic-risk-locus table produced by its required standard-clumping step, then
 applies the resolved `--window-kb`/`locus_window_kb` flank.
 
-## Minimal example
+### SuSiE-RSS with predefined intervals
 
 ```console
 postgwas finemap \
@@ -84,7 +70,7 @@ postgwas finemap \
   --output-directory results
 ```
 
-## Full example
+### FINEMAP with predefined intervals
 
 ```console
 postgwas finemap \
@@ -104,7 +90,127 @@ postgwas finemap \
   --output-directory results
 ```
 
+### Point-defined loci
+
+For a `CHR POS LP` locus table, select `point` explicitly. These examples apply
+500-kb flanks; replace that value only according to the analysis protocol.
+
+```console
+postgwas finemap \
+  --finemap-method susie \
+  --susie-input-file formatted/STUDY_susie.tsv \
+  --locus-file lead_points.tsv \
+  --locus-type point \
+  --window-kb 500 \
+  --finemap-ld-reference reference/1000G_EUR \
+  --plink plink \
+  --dataset-id STUDY \
+  --output-directory results/susie_points
+```
+
+```console
+postgwas finemap \
+  --finemap-method finemap \
+  --finemap-in-files formatted/STUDY_finemap.tsv \
+  --locus-file lead_points.tsv \
+  --locus-type point \
+  --window-kb 500 \
+  --finemap-ld-reference reference/1000G_EUR \
+  --plink plink2 \
+  --dataset-id STUDY \
+  --output-directory results/finemap_points
+```
+
+## Pipeline mode
+
+Pipeline help is method-aware. Select both the clumping methods and engine:
+
+```console
+postgwas pipeline --modules finemap --clumping-methods standard --finemap-method susie --help
+```
+
+Fine-mapping requires `standard` among the selected clumping methods because
+its genomic-risk-locus table supplies the model boundaries. The pipeline
+creates the engine-specific formatter table and locus file; do not supply
+`--susie-input-file`, `--finemap-in-files`, or `--locus-file` here.
+
+The following recipes use coordinate-and-allele IDs. Use a PLINK BIM with the
+matching configured ID convention; choose `--variant-id-type rsid` instead
+when the reference and intended formatter contract use rsIDs.
+
+### Standard clumping followed by SuSiE-RSS
+
+```console
+postgwas pipeline \
+  --modules finemap \
+  --clumping-methods standard \
+  --finemap-method susie \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --genome-build GRCh37 \
+  --population EUR \
+  --ld-folder reference/pairwise_ld \
+  --variant-id-type unique \
+  --finemap-ld-reference reference/1000G_EUR \
+  --plink plink \
+  --dataset-id STUDY \
+  --output-directory results/susie_pipeline
+```
+
+### Standard clumping followed by FINEMAP
+
+```console
+postgwas pipeline \
+  --modules finemap \
+  --clumping-methods standard \
+  --finemap-method finemap \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --genome-build GRCh37 \
+  --population EUR \
+  --ld-folder reference/pairwise_ld \
+  --variant-id-type unique \
+  --finemap-ld-reference reference/1000G_EUR \
+  --plink plink2 \
+  --dataset-id STUDY \
+  --output-directory results/finemap_pipeline
+```
+
+### Additional region and COJO summaries
+
+`region` and `cojo-slct` can add parallel summaries, but do not replace the
+standard locus source. Region clumping adds LD-block annotation and its BED
+resources. COJO adds a PLINK/GCTA reference and requires formatter before
+clumping. For example:
+
+```console
+postgwas pipeline \
+  --modules finemap \
+  --clumping-methods region standard cojo-slct \
+  --finemap-method susie \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --genome-build GRCh37 \
+  --population EUR \
+  --ld-region-dir reference/ld_blocks \
+  --ld-block-populations EUR \
+  --ld-folder reference/pairwise_ld \
+  --cojo-reference-prefix reference/EUR_cojo_plink \
+  --variant-id-type unique \
+  --finemap-ld-reference reference/1000G_EUR \
+  --plink plink \
+  --dataset-id STUDY \
+  --output-directory results/susie_with_locus_summaries
+```
+
+The current combined `--apply-filter` interface can fail on duplicate MHC
+options. If filtering is needed, first run
+[Filtering](filtering.md#pipeline-mode) separately and use its validated VCF as
+the entry input. The pipeline uses its standard-clumping intervals; use direct
+mode for an independent point-locus file.
+
 ## Parameters
+
+```console
+postgwas config export --module fine_mapping --style full --output fine_mapping.yaml
+```
 
 The canonical YAML defaults to SuSiE, range loci, 500-kb flanks, LP 7.3, 14 GB per
 worker, and skipping chr6:25–35 Mb. SuSiE defaults to 10 components and 180-s
