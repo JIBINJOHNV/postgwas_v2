@@ -365,6 +365,20 @@ _MIXER_COMMENTS = {
     "test_arguments": (
         "Additional official test1 options. Protected and trait-2 options are rejected.",
     ),
+    "univariate": (
+        "Official real-data fit/test replication and pruned fitting resources.",
+    ),
+    "univariate.fit_extract_file_pattern": (
+        "Random, MAF/LD-pruned SNP lists using the configured replicate placeholder.",
+        "Each list restricts fit1 only; test1 remains on all reference-compatible SNPs.",
+    ),
+    "univariate.replicate_indices": (
+        "Replicate indices fitted, tested and combined by the official MiXeR utility.",
+    ),
+    "reporting.figure_statistics": (
+        "Combined-result statistics requested from the official plotting utility.",
+        "The first value is the architecture summary statistic; use mean first for the official workflow.",
+    ),
     "gsa": (
         "Reference inputs, analysis options, schemas, and reporting policy for single-trait GSA-MiXeR.",
     ),

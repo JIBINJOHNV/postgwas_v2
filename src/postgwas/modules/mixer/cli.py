@@ -59,6 +59,22 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
             % (chromosome_placeholder, chromosome_placeholder)
         ),
     )
+    inputs.add_argument(
+        "--mixer-fit-extract-file-pattern",
+        metavar="PATTERN",
+        default=argparse.SUPPRESS,
+        help=help_with_conditional_requirement(
+            "MiXeR random, MAF/LD-pruned SNP-list pattern containing %s as "
+            "the replicate index, for example reference/pruned.rep%s.snps. "
+            "PostGWAS applies each list to fit1 only and evaluates test1 on "
+            "the full reference-compatible SNP set."
+            % (
+                mixer_defaults.workflow.replicate_placeholder,
+                mixer_defaults.workflow.replicate_placeholder,
+            ),
+            "for univariate/all",
+        ),
+    )
     gsa = parser.add_argument_group("GSA-MiXeR reference inputs")
     gsa.add_argument(
         "--gsa-annotation-file-pattern",
@@ -130,8 +146,8 @@ def get_mixer_parser(add_help=False, *, direct_controls=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Path to mixer_figures.py, used for official univariate QQ and "
-            "power diagnostics",
+            "Path to mixer_figures.py, required to combine replicated "
+            "univariate results and generate official diagnostics",
             defaults.resources.executables.mixer_figures,
         ),
     )
@@ -213,6 +229,9 @@ def build_parser():
                     "--output-directory results",
                     "--bim-file-pattern 'reference/chr%s.bim'" % chromosome_placeholder,
                     "--ld-file-pattern 'reference/chr%s.ld'" % chromosome_placeholder,
+                    "--mixer-fit-extract-file-pattern "
+                    "'reference/pruned.rep%s.snps'"
+                    % mixer.workflow.replicate_placeholder,
                 ),
             ),
             (
@@ -233,12 +252,47 @@ def build_parser():
                 ),
             ),
             (
+                "Run GSA-MiXeR with precomputed load-library files:",
+                "postgwas mixer",
+                (
+                    "--analysis gsa",
+                    "--mixer-input-file formatted/%s" % example_input,
+                    "--dataset-id STUDY",
+                    "--output-directory results",
+                    "--bim-file-pattern 'reference/chr%s.bim'" % chromosome_placeholder,
+                    "--gsa-loadlib-file-pattern 'reference/loadlib.chr%s.bin'"
+                    % chromosome_placeholder,
+                    "--gsa-annotation-file-pattern 'reference/chr%s.annot.gz'"
+                    % chromosome_placeholder,
+                    "--gsa-baseline-go-file baseline.tsv",
+                    "--gsa-model-go-file genes.tsv",
+                    "--gsa-test-go-file gene_sets.tsv",
+                ),
+            ),
+            (
+                "Run architecture and GSA-MiXeR together:",
+                "postgwas mixer",
+                (
+                    "--analysis all",
+                    "--mixer-input-file formatted/%s" % example_input,
+                    "--dataset-id STUDY",
+                    "--output-directory results",
+                    "--bim-file-pattern 'reference/chr%s.bim'" % chromosome_placeholder,
+                    "--ld-file-pattern 'reference/chr%s.ld'" % chromosome_placeholder,
+                    "--mixer-fit-extract-file-pattern "
+                    "'reference/pruned.rep%s.snps'"
+                    % mixer.workflow.replicate_placeholder,
+                    "--gsa-annotation-file-pattern 'reference/chr%s.annot.gz'"
+                    % chromosome_placeholder,
+                    "--gsa-baseline-go-file baseline.tsv",
+                    "--gsa-model-go-file genes.tsv",
+                    "--gsa-test-go-file gene_sets.tsv",
+                ),
+            ),
+            (
                 "Export a complete reloadable MiXeR configuration:",
                 "postgwas config export",
                 ("--module mixer", "--style full", "--output mixer.yaml"),
-            ),
-            notes=(
-                "Set analysis: all in mixer.yaml to run normal MiXeR and GSA-MiXeR together.",
             ),
         ),
         formatter_class=AlignedRichHelpFormatter,
@@ -263,6 +317,91 @@ def build_parser():
     return parser
 
 
+def get_mixer_pipeline_examples():
+    """Return complete mode-specific MiXeR pipeline examples."""
+    mixer = load_configuration().modules.mixer
+    chromosome = mixer.workflow.chromosome_placeholder
+    replicate = mixer.workflow.replicate_placeholder
+    return (
+        (
+            "Run replicated single-trait architecture analysis:",
+            "postgwas pipeline",
+            (
+                "--modules mixer",
+                "--analysis univariate",
+                "--vcf STUDY_GRCh37_merged.vcf.gz",
+                "--genome-build GRCh37",
+                "--bim-file-pattern 'reference/chr%s.bim'" % chromosome,
+                "--ld-file-pattern 'reference/chr%s.ld'" % chromosome,
+                "--mixer-fit-extract-file-pattern "
+                "'reference/pruned.rep%s.snps'" % replicate,
+                "--dataset-id STUDY",
+                "--output-directory results",
+            ),
+        ),
+        (
+            "Run single-trait GSA-MiXeR:",
+            "postgwas pipeline",
+            (
+                "--modules mixer",
+                "--analysis gsa",
+                "--vcf STUDY_GRCh37_merged.vcf.gz",
+                "--genome-build GRCh37",
+                "--bim-file-pattern 'reference/chr%s.bim'" % chromosome,
+                "--ld-file-pattern 'reference/chr%s.ld'" % chromosome,
+                "--gsa-annotation-file-pattern 'reference/chr%s.annot.gz'"
+                % chromosome,
+                "--gsa-baseline-go-file baseline.tsv",
+                "--gsa-model-go-file genes.tsv",
+                "--gsa-test-go-file gene_sets.tsv",
+                "--dataset-id STUDY",
+                "--output-directory results",
+            ),
+        ),
+        (
+            "Run GSA-MiXeR with precomputed load-library files:",
+            "postgwas pipeline",
+            (
+                "--modules mixer",
+                "--analysis gsa",
+                "--vcf STUDY_GRCh37_merged.vcf.gz",
+                "--genome-build GRCh37",
+                "--bim-file-pattern 'reference/chr%s.bim'" % chromosome,
+                "--gsa-loadlib-file-pattern 'reference/loadlib.chr%s.bin'"
+                % chromosome,
+                "--gsa-annotation-file-pattern 'reference/chr%s.annot.gz'"
+                % chromosome,
+                "--gsa-baseline-go-file baseline.tsv",
+                "--gsa-model-go-file genes.tsv",
+                "--gsa-test-go-file gene_sets.tsv",
+                "--dataset-id STUDY",
+                "--output-directory results",
+            ),
+        ),
+        (
+            "Run architecture and GSA-MiXeR together:",
+            "postgwas pipeline",
+            (
+                "--modules mixer",
+                "--analysis all",
+                "--vcf STUDY_GRCh37_merged.vcf.gz",
+                "--genome-build GRCh37",
+                "--bim-file-pattern 'reference/chr%s.bim'" % chromosome,
+                "--ld-file-pattern 'reference/chr%s.ld'" % chromosome,
+                "--mixer-fit-extract-file-pattern "
+                "'reference/pruned.rep%s.snps'" % replicate,
+                "--gsa-annotation-file-pattern 'reference/chr%s.annot.gz'"
+                % chromosome,
+                "--gsa-baseline-go-file baseline.tsv",
+                "--gsa-model-go-file genes.tsv",
+                "--gsa-test-go-file gene_sets.tsv",
+                "--dataset-id STUDY",
+                "--output-directory results",
+            ),
+        ),
+    )
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -278,4 +417,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["build_parser", "get_mixer_parser", "main"]
+__all__ = [
+    "build_parser",
+    "get_mixer_parser",
+    "get_mixer_pipeline_examples",
+    "main",
+]

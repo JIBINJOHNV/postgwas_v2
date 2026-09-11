@@ -608,6 +608,9 @@ MODULES = (
             "postgwas.cli.common:get_pipeline_genome_build_parser",
             "postgwas.modules.mixer.cli:get_mixer_parser",
         ),
+        pipeline_example_factory=(
+            "postgwas.modules.mixer.cli:get_mixer_pipeline_examples"
+        ),
         genome_build_config_path="modules.mixer.genome_build",
         pipeline_supplied_options=("mixer_input_file",),
         required_options=PIPELINE_REQUIRED_OPTIONS,

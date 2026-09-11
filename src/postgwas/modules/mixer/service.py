@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any, Callable, Mapping, Sequence
 
 from postgwas.config import (
@@ -14,6 +15,8 @@ from postgwas.config import (
 )
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.core.execution.runtime import validate_path
+from postgwas.core.input_validation import record_file_validation, validate_once
+from postgwas.core.io.delimiters import open_text
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
 from postgwas.core.paths import configured_output_path, expand_token_path, resolve_executable
 from postgwas.core.reference_resources import require_file_inventory
@@ -32,7 +35,10 @@ from postgwas.core.required_arguments import (
 )
 from postgwas.core.ui import MeasuredProgress, PipelineStageController, StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
-from postgwas.core.validation_reporting import register_file_availability_bundle
+from postgwas.core.validation_reporting import (
+    register_file_availability_bundle,
+    register_file_validation_bundle,
+)
 from postgwas.modules.mixer.results import (
     build_gsa_summary,
     build_mixer_summary,
@@ -64,6 +70,7 @@ class MixerPipelineResources:
     configuration: Any
     bim_file_pattern: str
     ld_file_pattern: str | None
+    fit_extract_files: tuple[Path, ...] | None
     gsa_resources: Mapping[str, str] | None
     tool: tuple[str, ...]
     figures_tool: tuple[str, ...] | None
@@ -79,6 +86,8 @@ class _MixerNativeProgress:
         "Load chromosome LD reference data",
         "Optimize and validate the MiXeR model",
     )
+    _FIT_SEQUENCE_PATTERN = re.compile(r"--fit-sequence:\s*\[([^]]*)\]")
+    _FIT_SEQUENCE_ITEM_PATTERN = re.compile(r"['\"]([-A-Za-z0-9_.]+)['\"]")
 
     def __init__(
         self,
@@ -105,6 +114,7 @@ class _MixerNativeProgress:
         self.optimizer_progress: MeasuredProgress | None = None
         self.optimizer_evaluations = 0
         self.optimizer_phase: str | None = None
+        self.optimizer_sequence: tuple[str, ...] = ()
         self.optimizer_title: str | None = None
         self.closed = False
 
@@ -154,12 +164,49 @@ class _MixerNativeProgress:
             self.ld_progress = None
         self._advance(3)
 
+    @classmethod
+    def _fit_sequence(cls, line: str) -> tuple[str, ...]:
+        """Read only the optimizer names announced by the native log."""
+        match = cls._FIT_SEQUENCE_PATTERN.search(line)
+        if match is None:
+            return ()
+        return tuple(cls._FIT_SEQUENCE_ITEM_PATTERN.findall(match.group(1)))
+
+    @staticmethod
+    def _optimizer_progress_title(
+        phase: str | None,
+        sequence: Sequence[str],
+    ) -> str:
+        title = "Observed MiXeR cost-function evaluations"
+        if phase and phase in sequence:
+            title += " · %s (%d/%d: %s)" % (
+                phase,
+                tuple(sequence).index(phase) + 1,
+                len(sequence),
+                " → ".join(sequence),
+            )
+        elif phase:
+            title += " · %s" % phase
+        elif sequence:
+            title += " · sequence: %s" % " → ".join(sequence)
+        return title
+
     def _observe_optimizer(self, lines: Sequence[str]) -> None:
         added_evaluations = sum(
             "<calc_" in line and ", cost=" in line for line in lines
         )
         phase = self.optimizer_phase
+        sequence = self.optimizer_sequence
         for line in lines:
+            observed_sequence = self._fit_sequence(line)
+            if observed_sequence and observed_sequence != sequence:
+                sequence = observed_sequence
+                self.logger.record(
+                    "OBSERVED",
+                    "mixer_optimizer_sequence",
+                    purpose=self.purpose,
+                    optimization_sequence=list(sequence),
+                )
             marker = "fit_type=="
             if marker in line and " done " not in line:
                 candidate = line.split(marker, 1)[1].split("...", 1)[0].strip()
@@ -167,24 +214,27 @@ class _MixerNativeProgress:
                     phase = candidate
             elif "Calculate AIC/BIC w.r.t. infinitesimal model" in line:
                 phase = "infinitesimal comparison"
+        title = self._optimizer_progress_title(phase, sequence)
         if not added_evaluations:
+            if self.optimizer_progress is not None and title != self.optimizer_title:
+                self.optimizer_progress.set_phase(title)
             self.optimizer_phase = phase
+            self.optimizer_sequence = sequence
+            self.optimizer_title = title
             return
         self._advance(3)
         self.optimizer_evaluations += added_evaluations
-        title = "Observed MiXeR cost-function evaluations"
-        if phase:
-            title += " · %s" % phase
         if self.optimizer_progress is None:
             self.optimizer_progress = MeasuredProgress(
                 "MiXeR optimizer activity",
                 enabled=self.progress.enabled,
             )
             self.optimizer_progress.start(title)
-        elif phase != self.optimizer_phase:
+        elif title != self.optimizer_title:
             self.optimizer_progress.set_phase(title)
         self.optimizer_progress.update(self.optimizer_evaluations, title=title)
         self.optimizer_phase = phase
+        self.optimizer_sequence = sequence
         self.optimizer_title = title
         self.logger.record(
             "OBSERVED",
@@ -193,6 +243,7 @@ class _MixerNativeProgress:
             completed_cost_evaluations=self.optimizer_evaluations,
             total_cost_evaluations="unknown_until_convergence",
             optimization_phase=phase,
+            optimization_sequence=list(sequence) or None,
         )
 
     def observe(self) -> None:
@@ -330,12 +381,135 @@ def validate_standard_reference(
     )
 
 
+def validate_fit_extract_pattern(
+    pattern: str,
+    replicate_indices: Sequence[int],
+    placeholder: str,
+) -> tuple[Path, ...]:
+    """Validate the official one-identifier-per-line fit subsets."""
+    paths = tuple(
+        expand_token_path(
+            pattern, placeholder, str(index), error_type=MixerError,
+        )
+        for index in replicate_indices
+    )
+    require_file_inventory(
+        paths,
+        "MiXeR fit extract file",
+        missing_message="Missing or empty MiXeR fit extract files",
+        error_type=MixerError,
+    )
+    counts = []
+    for path in paths:
+        checks = ("one unique SNP identifier per non-empty line",)
+
+        def inspect_extract_file(current_path=path):
+            identifiers = set()
+            try:
+                with open_text(current_path) as handle:
+                    for line_number, line in enumerate(handle, 1):
+                        identifier = line.strip()
+                        if not identifier:
+                            continue
+                        if any(character.isspace() for character in identifier):
+                            raise MixerError(
+                                "MiXeR fit extract file must contain exactly one "
+                                "SNP identifier per non-empty line; invalid line "
+                                "%d: %s" % (line_number, current_path)
+                            )
+                        if identifier in identifiers:
+                            raise MixerError(
+                                "MiXeR fit extract file contains duplicate SNP "
+                                "identifier %s at line %d: %s"
+                                % (identifier, line_number, current_path)
+                            )
+                        identifiers.add(identifier)
+            except MixerError as exc:
+                record_file_validation(
+                    current_path,
+                    "MiXeR fit extract file",
+                    checks=checks,
+                    status="failed",
+                    message=str(exc),
+                )
+                raise
+            except (OSError, UnicodeError) as exc:
+                message = "Cannot read MiXeR fit extract file %s: %s" % (
+                    current_path,
+                    exc,
+                )
+                record_file_validation(
+                    current_path,
+                    "MiXeR fit extract file",
+                    checks=checks,
+                    status="failed",
+                    message=message,
+                )
+                raise MixerError(message) from exc
+            if not identifiers:
+                message = (
+                    "MiXeR fit extract file contains no SNP identifiers: %s"
+                    % current_path
+                )
+                record_file_validation(
+                    current_path,
+                    "MiXeR fit extract file",
+                    checks=checks,
+                    status="failed",
+                    message=message,
+                )
+                raise MixerError(message)
+            count = len(identifiers)
+            record_file_validation(
+                current_path,
+                "MiXeR fit extract file",
+                checks=checks,
+                metrics={"snp_identifiers": count},
+                message=(
+                    "Identifier syntax and within-file uniqueness were validated; "
+                    "the reference bundle must supply the MAF/LD-pruning provenance."
+                ),
+            )
+            return count
+
+        counts.append(validate_once(
+            (path,),
+            {"validator": "mixer_fit_extract_identifiers", "version": 1},
+            inspect_extract_file,
+            error_type=MixerError,
+        ))
+    register_file_validation_bundle(
+        paths,
+        "MiXeR replicated fit extract bundle",
+        (
+            ("count", "mixer_fit_replicates", len(paths)),
+            (
+                "count",
+                "mixer_fit_snp_identifiers_minimum",
+                min(counts),
+            ),
+            (
+                "count",
+                "mixer_fit_snp_identifiers_maximum",
+                max(counts),
+            ),
+            ("info", "mixer_pattern", pattern, True),
+        ),
+        covered_checks=("one unique SNP identifier per non-empty line",),
+        covered_metric_keys=("snp_identifiers",),
+    )
+    return paths
+
+
 def _resolved_configuration(args):
     module_overrides = explicit_overrides(args, {
         "analysis": "analysis",
         "genome_build": "genome_build",
         "bim_file_pattern": "bim_file_pattern",
         "ld_file_pattern": "ld_file_pattern",
+        "mixer_fit_extract_file_pattern": (
+            "univariate.fit_extract_file_pattern"
+        ),
         "mixer_backend": "execution_backend",
         "gsa_annotation_file_pattern": "gsa.annotation_file_pattern",
         "gsa_loadlib_file_pattern": "gsa.loadlib_file_pattern",
@@ -524,9 +698,11 @@ def _run_univariate(
     configuration,
     logger: PipelineLogger,
     tool: Sequence[str],
+    figures_tool: Sequence[str],
     backend: str,
     input_metrics,
     input_warnings,
+    fit_extract_files: Sequence[Path],
     *,
     first_step: int,
     progress_first_step: int,
@@ -536,6 +712,12 @@ def _run_univariate(
 ) -> dict:
     module = configuration.modules.mixer
     layout = module.output_layout
+    replicate_indices = tuple(module.univariate.replicate_indices)
+    if len(fit_extract_files) != len(replicate_indices):
+        raise MixerError(
+            "MiXeR fit extract-file count does not match the configured "
+            "replicate-index count"
+        )
     reference = MixerReference(
         _absolute_pattern(module.bim_file_pattern),
         _absolute_pattern(module.ld_file_pattern),
@@ -555,9 +737,7 @@ def _run_univariate(
     fit_prefix.parent.mkdir(parents=True, exist_ok=True)
     test_prefix.parent.mkdir(parents=True, exist_ok=True)
     fit_json = _result_path(fit_prefix, ".json")
-    fit_log = _result_path(fit_prefix, ".log")
     test_json = _result_path(test_prefix, ".json")
-    test_log = _result_path(test_prefix, ".log")
     seed = str(configuration.execution.random_seed)
     ld_files = tuple(
         expand_chromosome_pattern(
@@ -568,72 +748,264 @@ def _run_univariate(
         for chromosome in module.chromosomes
     )
 
+    fit_replicates = []
+    test_replicates = []
+    replicate_total = len(replicate_indices)
+
     progress.start(progress_first_step)
+    fit_progress = MeasuredProgress(
+        "MiXeR replicated fit progress",
+        enabled=configuration.logging.show_progress,
+    )
+    fit_title = "Fit random MAF/LD-pruned SNP subsets"
+    fit_progress.start(fit_title, total=replicate_total)
     try:
         with logger.step(
-            first_step, total_steps, "Fit single-trait MiXeR model", "mixer.fit1",
+            first_step,
+            total_steps,
+            "Fit replicated single-trait MiXeR models",
+            "mixer.fit1_replicates",
         ) as step:
             step.input("mixer_input", path=str(trait_file))
-            _run_step(
-                [
-                    *tool, module.workflow.fit_command, *common,
-                    *module.fit_arguments, "--trait1-file", str(trait_file),
-                    "--seed", seed, "--out", str(fit_prefix),
-                ],
-                "MiXeR fit1",
-                [fit_json, fit_log],
-                configuration,
-                logger,
-                dry_run=dry_run,
-                progress_factory=lambda: _MixerNativeProgress(
-                    fit_log, "MiXeR fit1", ld_files, configuration, logger,
-                ),
+            for ordinal, (replicate, extract_file) in enumerate(
+                zip(replicate_indices, fit_extract_files), 1,
+            ):
+                replicate_prefix = configured_output_path(
+                    output,
+                    layout.fit_replicate_prefix,
+                    error_type=MixerError,
+                    dataset_id=dataset_id,
+                    replicate=replicate,
+                )
+                replicate_prefix.parent.mkdir(parents=True, exist_ok=True)
+                replicate_json = _result_path(replicate_prefix, ".json")
+                replicate_log = _result_path(replicate_prefix, ".log")
+                logger.record(
+                    "PARAM",
+                    "mixer_fit_replicate",
+                    replicate_index=replicate,
+                    fit_extract_file=str(extract_file),
+                    fit_uses_extract=True,
+                    test_uses_extract=False,
+                )
+                _run_step(
+                    [
+                        *tool,
+                        module.workflow.fit_command,
+                        *common,
+                        *module.fit_arguments,
+                        "--extract",
+                        str(extract_file),
+                        "--trait1-file",
+                        str(trait_file),
+                        "--seed",
+                        seed,
+                        "--out",
+                        str(replicate_prefix),
+                    ],
+                    "MiXeR fit1 replicate %s" % replicate,
+                    [replicate_json, replicate_log],
+                    configuration,
+                    logger,
+                    dry_run=dry_run,
+                    progress_factory=lambda path=replicate_log, index=replicate: (
+                        _MixerNativeProgress(
+                            path,
+                            "MiXeR fit1 replicate %s" % index,
+                            ld_files,
+                            configuration,
+                            logger,
+                        )
+                    ),
+                )
+                fit_replicates.append({
+                    "index": replicate,
+                    "extract_file": str(extract_file),
+                    "json": str(replicate_json),
+                    "log": str(replicate_log),
+                })
+                fit_progress.update(ordinal, total=replicate_total, title=fit_title)
+            step.output(
+                "fit_replicates",
+                files=[item["json"] for item in fit_replicates],
             )
-            step.output("fit_parameters", path=str(fit_json))
-            step.output("fit_log", path=str(fit_log))
     except BaseException:
+        fit_progress.fail(title=fit_title)
         progress.fail_active()
         raise
     else:
+        fit_progress.complete(replicate_total, total=replicate_total, title=fit_title)
         progress.complete(progress_first_step)
 
     progress.start(progress_first_step + 1)
+    test_progress = MeasuredProgress(
+        "MiXeR replicated test progress",
+        enabled=configuration.logging.show_progress,
+    )
+    test_title = "Evaluate fitted models on the full SNP set"
+    test_progress.start(test_title, total=replicate_total)
     try:
         with logger.step(
             first_step + 1,
             total_steps,
-            "Evaluate single-trait MiXeR model",
-            "mixer.test1",
+            "Evaluate replicated single-trait MiXeR models",
+            "mixer.test1_replicates",
+        ) as step:
+            for ordinal, fit_replicate in enumerate(fit_replicates, 1):
+                replicate = fit_replicate["index"]
+                replicate_prefix = configured_output_path(
+                    output,
+                    layout.test_replicate_prefix,
+                    error_type=MixerError,
+                    dataset_id=dataset_id,
+                    replicate=replicate,
+                )
+                replicate_prefix.parent.mkdir(parents=True, exist_ok=True)
+                replicate_json = _result_path(replicate_prefix, ".json")
+                replicate_log = _result_path(replicate_prefix, ".log")
+                _run_step(
+                    [
+                        *tool,
+                        module.workflow.test_command,
+                        *common,
+                        *module.test_arguments,
+                        "--trait1-file",
+                        str(trait_file),
+                        "--load-params",
+                        fit_replicate["json"],
+                        "--seed",
+                        seed,
+                        "--out",
+                        str(replicate_prefix),
+                    ],
+                    "MiXeR test1 replicate %s" % replicate,
+                    [replicate_json, replicate_log],
+                    configuration,
+                    logger,
+                    dry_run=dry_run,
+                    progress_factory=lambda path=replicate_log, index=replicate: (
+                        _MixerNativeProgress(
+                            path,
+                            "MiXeR test1 replicate %s" % index,
+                            ld_files,
+                            configuration,
+                            logger,
+                        )
+                    ),
+                )
+                test_replicates.append({
+                    "index": replicate,
+                    "json": str(replicate_json),
+                    "log": str(replicate_log),
+                })
+                test_progress.update(
+                    ordinal, total=replicate_total, title=test_title,
+                )
+            step.output(
+                "test_replicates",
+                files=[item["json"] for item in test_replicates],
+            )
+    except BaseException:
+        test_progress.fail(title=test_title)
+        progress.fail_active()
+        raise
+    else:
+        test_progress.complete(
+            replicate_total, total=replicate_total, title=test_title,
+        )
+        progress.complete(progress_first_step + 1)
+
+    replicate_placeholder = module.workflow.replicate_placeholder
+    replicate_selection = ",".join(str(value) for value in replicate_indices)
+    fit_json_pattern = _result_path(configured_output_path(
+        output,
+        layout.fit_replicate_prefix,
+        error_type=MixerError,
+        dataset_id=dataset_id,
+        replicate=replicate_placeholder,
+    ), ".json")
+    test_json_pattern = _result_path(configured_output_path(
+        output,
+        layout.test_replicate_prefix,
+        error_type=MixerError,
+        dataset_id=dataset_id,
+        replicate=replicate_placeholder,
+    ), ".json")
+
+    progress.start(progress_first_step + 2)
+    try:
+        with logger.step(
+            first_step + 2,
+            total_steps,
+            "Combine replicated MiXeR fit estimates",
+            "mixer.combine_fit1",
         ) as step:
             _run_step(
                 [
-                    *tool, module.workflow.test_command, *common,
-                    *module.test_arguments, "--trait1-file", str(trait_file),
-                    "--load-params", str(fit_json), "--seed", seed,
-                    "--out", str(test_prefix),
+                    *figures_tool,
+                    module.workflow.combine_command,
+                    "--json",
+                    str(fit_json_pattern),
+                    "--rep2use",
+                    replicate_selection,
+                    "--out",
+                    str(fit_prefix),
                 ],
-                "MiXeR test1",
-                [test_json, test_log],
+                "Combine MiXeR fit1 replicates",
+                [fit_json],
                 configuration,
                 logger,
                 dry_run=dry_run,
-                progress_factory=lambda: _MixerNativeProgress(
-                    test_log, "MiXeR test1", ld_files, configuration, logger,
-                ),
             )
-            step.output("test_statistics", path=str(test_json))
-            step.output("test_log", path=str(test_log))
+            step.output("combined_fit_parameters", path=str(fit_json))
     except BaseException:
         progress.fail_active()
         raise
     else:
-        progress.complete(progress_first_step + 1)
+        progress.complete(progress_first_step + 2)
+
+    progress.start(progress_first_step + 3)
+    try:
+        with logger.step(
+            first_step + 3,
+            total_steps,
+            "Combine replicated MiXeR test diagnostics",
+            "mixer.combine_test1",
+        ) as step:
+            _run_step(
+                [
+                    *figures_tool,
+                    module.workflow.combine_command,
+                    "--json",
+                    str(test_json_pattern),
+                    "--rep2use",
+                    replicate_selection,
+                    "--out",
+                    str(test_prefix),
+                ],
+                "Combine MiXeR test1 replicates",
+                [test_json],
+                configuration,
+                logger,
+                dry_run=dry_run,
+            )
+            step.output("combined_test_statistics", path=str(test_json))
+    except BaseException:
+        progress.fail_active()
+        raise
+    else:
+        progress.complete(progress_first_step + 3)
+
     return {
         "mixer_input": str(trait_file),
         "fit": str(fit_json),
-        "fit_log": str(fit_log),
         "test": str(test_json),
-        "test_log": str(test_log),
+        "fit_replicates": fit_replicates,
+        "test_replicates": test_replicates,
+        "fit_extract_file_pattern": _absolute_pattern(
+            module.univariate.fit_extract_file_pattern
+        ),
+        "replicate_indices": list(replicate_indices),
         "genome_build": module.genome_build,
         "execution_backend": backend,
         "input_metrics": input_metrics,
@@ -672,6 +1044,12 @@ def _require_mixer_pipeline_arguments(configuration) -> None:
         requirements.append(RequiredArgument(
             "--ld-file-pattern", "modules.mixer.ld_file_pattern",
             module.ld_file_pattern,
+        ))
+    if run_univariate:
+        requirements.append(RequiredArgument(
+            "--mixer-fit-extract-file-pattern",
+            "modules.mixer.univariate.fit_extract_file_pattern",
+            module.univariate.fit_extract_file_pattern,
         ))
     if run_gsa:
         requirements.extend([
@@ -752,6 +1130,15 @@ def preflight_mixer_pipeline(
             ld_pattern, "LD", module.chromosomes, placeholder,
         ))
 
+    fit_extract_files = None
+    if run_univariate:
+        fit_extract_files = validate_fit_extract_pattern(
+            _absolute_pattern(module.univariate.fit_extract_file_pattern),
+            module.univariate.replicate_indices,
+            module.workflow.replicate_placeholder,
+        )
+        resource_files.extend(fit_extract_files)
+
     gsa_resources = None
     if run_gsa:
         gsa_resources = _gsa_resources(module)
@@ -779,16 +1166,12 @@ def preflight_mixer_pipeline(
         validate=not dry_run,
     )
     figures_tool = None
-    if (
-        run_univariate
-        and module.reporting.enabled
-        and module.reporting.generate_figures
-        and not dry_run
-    ):
+    if run_univariate:
         figures_tool, figures_backend = _tool_command(
             configuration,
             figures=True,
             mount_directories=sorted(mount_directories, key=str),
+            validate=not dry_run,
         )
         if figures_backend != backend:
             raise MixerError(
@@ -804,6 +1187,7 @@ def preflight_mixer_pipeline(
         configuration=configuration,
         bim_file_pattern=bim_pattern,
         ld_file_pattern=ld_pattern,
+        fit_extract_files=fit_extract_files,
         gsa_resources=gsa_resources,
         tool=tuple(tool),
         figures_tool=None if figures_tool is None else tuple(figures_tool),
@@ -1015,8 +1399,10 @@ def _mixer_progress_stages(module, *, include_reporting: bool) -> tuple[str, ...
     stages = ["Validate the MiXeR input and resolved resources"]
     if module.analysis in {"univariate", "all"}:
         stages.extend((
-            "Fit the single-trait MiXeR model",
-            "Evaluate the fitted single-trait MiXeR model",
+            "Fit replicated single-trait MiXeR models",
+            "Evaluate replicated models on the full SNP set",
+            "Combine replicated MiXeR fit estimates",
+            "Combine replicated MiXeR test diagnostics",
         ))
     if module.analysis in {"gsa", "all"}:
         stages.extend((
@@ -1088,6 +1474,20 @@ def _run_single_trait_mixer_impl(
                 module.chromosomes, placeholder,
             )
 
+    fit_extract_files = (
+        None
+        if not run_univariate
+        else (
+            pipeline_resources.fit_extract_files
+            if pipeline_resources is not None
+            else validate_fit_extract_pattern(
+                _absolute_pattern(module.univariate.fit_extract_file_pattern),
+                module.univariate.replicate_indices,
+                module.workflow.replicate_placeholder,
+            )
+        )
+    )
+
     gsa_resources = (
         None
         if not run_gsa
@@ -1115,6 +1515,8 @@ def _run_single_trait_mixer_impl(
     mount_directories = {trait_file.parent, output, Path(bim_pattern).parent}
     if module.ld_file_pattern and (run_univariate or not module.gsa.loadlib_file_pattern):
         mount_directories.add(Path(_absolute_pattern(module.ld_file_pattern)).parent)
+    if fit_extract_files:
+        mount_directories.update(path.parent for path in fit_extract_files)
     if gsa_resources:
         mount_directories.update(Path(value).parent for value in gsa_resources.values())
     if pipeline_resources is None:
@@ -1127,6 +1529,24 @@ def _run_single_trait_mixer_impl(
     else:
         tool = list(pipeline_resources.tool)
         backend = pipeline_resources.backend
+    if run_univariate:
+        if pipeline_resources is not None and pipeline_resources.figures_tool is not None:
+            figures_tool = list(pipeline_resources.figures_tool)
+            figures_backend = pipeline_resources.backend
+        else:
+            figures_tool, figures_backend = _tool_command(
+                configuration,
+                figures=True,
+                mount_directories=sorted(mount_directories, key=str),
+                work_directory=output,
+                validate=not dry_run,
+            )
+        if figures_backend != backend:
+            raise MixerError(
+                "MiXeR and mixer_figures resolved to different execution backends"
+            )
+    else:
+        figures_tool = []
     logger.record(
         "PARAM", "mixer_backend", analysis=module.analysis,
         requested=module.execution_backend, selected=backend,
@@ -1142,7 +1562,7 @@ def _run_single_trait_mixer_impl(
             ("success", "Execution backend", backend),
         ],
     )
-    total_steps = (2 if run_univariate else 0) + (3 if run_gsa else 0)
+    total_steps = (4 if run_univariate else 0) + (3 if run_gsa else 0)
     result = {
         "analysis": module.analysis,
         "mixer_input": str(trait_file),
@@ -1155,13 +1575,14 @@ def _run_single_trait_mixer_impl(
     next_progress_step = 2
     if run_univariate:
         result["univariate"] = _run_univariate(
-            trait_file, output, dataset_id, configuration, logger, tool, backend,
-            input_metrics, input_warnings, first_step=next_step,
+            trait_file, output, dataset_id, configuration, logger, tool,
+            figures_tool, backend, input_metrics, input_warnings,
+            fit_extract_files, first_step=next_step,
             progress_first_step=next_progress_step,
             total_steps=total_steps, progress=progress, dry_run=dry_run,
         )
-        next_step += 2
-        next_progress_step += 2
+        next_step += 4
+        next_progress_step += 4
     if run_gsa:
         result["gsa"] = _run_gsa(
             trait_file, output, dataset_id, configuration, logger, tool, backend,
@@ -1401,6 +1822,16 @@ def run_mixer_direct(
             if "univariate" in result:
                 univariate = result["univariate"]
                 univariate["log_file"] = str(log_path)
+                summary = build_mixer_summary(
+                    dataset_id=dataset_id,
+                    run_id=run_id,
+                    result=univariate,
+                    input_metrics=result["input_metrics"],
+                    input_warnings=result["input_warnings"],
+                    formatter_metrics=formatter_metrics,
+                    configuration=configuration,
+                    error_type=MixerError,
+                )
                 figures = (
                     _generate_figures(
                         univariate, output_directory, dataset_id, configuration, logger,
@@ -1416,16 +1847,6 @@ def run_mixer_direct(
                         ),
                     )
                     if configuration.modules.mixer.reporting.generate_figures else []
-                )
-                summary = build_mixer_summary(
-                    dataset_id=dataset_id,
-                    run_id=run_id,
-                    result=univariate,
-                    input_metrics=result["input_metrics"],
-                    input_warnings=result["input_warnings"],
-                    formatter_metrics=formatter_metrics,
-                    configuration=configuration,
-                    error_type=MixerError,
                 )
                 summary_yaml = configured_output_path(
                     output_directory, layout.summary_yaml,
@@ -1534,5 +1955,6 @@ __all__ = [
     "run_mixer_direct",
     "run_single_trait_mixer",
     "validate_reference_pattern",
+    "validate_fit_extract_pattern",
     "validate_standard_reference",
 ]

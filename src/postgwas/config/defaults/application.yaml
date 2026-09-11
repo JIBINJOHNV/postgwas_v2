@@ -148,6 +148,10 @@ logging:
       mixer_resource_type: Resource type
       mixer_chromosome_files: Chromosome files
       mixer_pattern: Configured file pattern
+      snp_identifiers: SNP identifiers
+      mixer_fit_replicates: Fit replicates
+      mixer_fit_snp_identifiers_minimum: Minimum SNP identifiers
+      mixer_fit_snp_identifiers_maximum: Maximum SNP identifiers
       flames_annotation_directories: Annotation directories
       flames_annotation_inventory_files: Inventoried annotation files
       flames_named_annotation_files: Required named annotation files
@@ -164,6 +168,7 @@ logging:
       LDSC cell-type reference bundle: LDSC cell-type reference resources
       PRED-LD chromosome reference bundle: PRED-LD chromosome reference resources
       MiXeR chromosome resource bundle: MiXeR chromosome resources
+      MiXeR replicated fit extract bundle: MiXeR replicated fit-extract resources
       FLAMES annotation resource bundle: FLAMES annotation resources
       PoPS feature matrix bundle: PoPS feature-matrix resources
       LD block BED file missing or empty: LD-block intervals

@@ -138,6 +138,27 @@ def _final_optimisation(result: Mapping[str, Any], field: str) -> dict[str, Any]
 def _model_assessment(
     fit: Mapping[str, Any], error_type: Type[Exception],
 ) -> dict[str, Any]:
+    combined = fit.get("modelselection") or {}
+    if combined:
+        delta_aic = combined.get("mixture_vs_inft_AIC")
+        delta_bic = combined.get("mixture_vs_inft_BIC")
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(float(value))
+            for value in (delta_aic, delta_bic)
+        ):
+            raise error_type(
+                "Combined MiXeR fit result does not contain finite model-selection "
+                "AIC/BIC differences"
+            )
+        return {
+            "converged": True,
+            "mixture_aic": None,
+            "mixture_bic": None,
+            "infinitesimal_aic": None,
+            "infinitesimal_bic": None,
+            "mixture_vs_infinitesimal_delta_aic": float(delta_aic),
+            "mixture_vs_infinitesimal_delta_bic": float(delta_bic),
+        }
     mixture = _final_optimisation(fit, "optimize")
     infinitesimal = _final_optimisation(fit, "inft_optimize")
     if mixture.get("success") is not True or infinitesimal.get("success") is not True:
@@ -222,19 +243,55 @@ def build_mixer_summary(
     statistic = reporting.figure_statistics[0]
     fit = _load_result(result["fit"], "fit", "univariate", error_type)
     test = _load_result(result["test"], "test", "univariate", error_type)
-    fit_options = fit.get("options") or {}
-    test_options = test.get("options") or {}
-    fit_seed, test_seed = fit_options.get("seed"), test_options.get("seed")
-    log_metrics = _log_metrics(result["fit_log"])
+    fit_replicates = result.get("fit_replicates") or []
+    test_replicates = result.get("test_replicates") or []
+    if not fit_replicates or len(fit_replicates) != len(test_replicates):
+        raise error_type(
+            "MiXeR requires matching non-empty fit1 and test1 replicate results"
+        )
+    if [item.get("index") for item in fit_replicates] != [
+        item.get("index") for item in test_replicates
+    ]:
+        raise error_type("MiXeR fit1 and test1 replicate indices do not match")
+    raw_fits = [
+        _load_result(item["json"], "fit replicate", "univariate", error_type)
+        for item in fit_replicates
+    ]
+    raw_tests = [
+        _load_result(item["json"], "test replicate", "univariate", error_type)
+        for item in test_replicates
+    ]
+    for raw_fit in raw_fits:
+        _model_assessment(raw_fit, error_type)
+    fit_options = [value.get("options") or {} for value in raw_fits]
+    test_options = [value.get("options") or {} for value in raw_tests]
+    fit_seeds = [value.get("seed") for value in fit_options]
+    test_seeds = [value.get("seed") for value in test_options]
+    log_metrics_by_replicate = [
+        _log_metrics(item["log"]) for item in fit_replicates
+    ]
+    log_metrics = log_metrics_by_replicate[0]
+    for name in _LOG_PATTERNS:
+        values = {
+            metrics.get(name)
+            for metrics in log_metrics_by_replicate
+            if metrics.get(name) is not None
+        }
+        if len(values) > 1:
+            raise error_type(
+                "MiXeR fit logs disagree on pre-extract reference metric %s"
+                % name
+            )
     qq_nonfinite = _nonfinite_count(test.get("qqplot") or {})
     model = _model_assessment(fit, error_type)
 
     warnings = list(input_warnings)
     quality = reporting.quality
-    if fit_seed != test_seed:
+    if fit_seeds != test_seeds:
         _quality_issue(
             warnings, quality.seed_mismatch_action,
-            "MiXeR fit1 and test1 did not use the same configured seed", error_type,
+            "MiXeR fit1 and test1 replicates did not use matching configured seeds",
+            error_type,
         )
     if qq_nonfinite:
         _quality_issue(
@@ -242,9 +299,15 @@ def build_mixer_summary(
             "MiXeR QQ diagnostics contain %d nonfinite values" % qq_nonfinite,
             error_type,
         )
-    required_log_metrics = ("reference_unmatched", "strand_ambiguous")
+    required_log_metrics = (
+        "reference_unmatched",
+        "strand_ambiguous",
+        "well_defined_variants",
+    )
     unavailable_log_metrics = [
-        name for name in required_log_metrics if log_metrics.get(name) is None
+        name
+        for name in required_log_metrics
+        if any(metrics.get(name) is None for metrics in log_metrics_by_replicate)
     ]
     if unavailable_log_metrics:
         _quality_issue(
@@ -289,26 +352,54 @@ def build_mixer_summary(
         ),
         "uncertainty": fit.get("ci"),
     }
-    variants_analysed = int(
-        fit_options.get("num_tag") or log_metrics.get("well_defined_variants") or 0
-    )
+    try:
+        fit_tag_variants = [int(options.get("num_tag")) for options in fit_options]
+        test_tag_variants = [int(options.get("num_tag")) for options in test_options]
+    except (TypeError, ValueError) as exc:
+        raise error_type(
+            "MiXeR replicate results do not contain integer num_tag values"
+        ) from exc
+    if any(value <= 0 for value in (*fit_tag_variants, *test_tag_variants)):
+        raise error_type("MiXeR replicate results contain no analysed tag variants")
+    if len(set(test_tag_variants)) != 1:
+        raise error_type(
+            "Full-data MiXeR test1 replicates report inconsistent tag-variant counts"
+        )
+    variants_analysed = test_tag_variants[0]
+    if any(value > variants_analysed for value in fit_tag_variants):
+        raise error_type(
+            "A MiXeR fit subset contains more tag variants than full-data test1"
+        )
     formatted = int(input_metrics["formatted_variants"])
     if variants_analysed <= 0 or variants_analysed > formatted:
         raise error_type(
             "MiXeR reports %d analysed variants from %d formatted variants"
             % (variants_analysed, formatted)
         )
+    reference_compatible = log_metrics.get("well_defined_variants")
+    if reference_compatible is not None:
+        reference_compatible = int(reference_compatible)
+    if reference_compatible is not None and variants_analysed > reference_compatible:
+        raise error_type(
+            "MiXeR test1 reports more analysed variants than the pre-exclusion "
+            "reference-compatible count"
+        )
+    post_matching_excluded = (
+        reference_compatible - variants_analysed
+        if reference_compatible is not None
+        else None
+    )
     if not unavailable_log_metrics:
         accounted = (
-            variants_analysed
+            reference_compatible
             + int(log_metrics["reference_unmatched"])
             + int(log_metrics["strand_ambiguous"])
         )
         if accounted != formatted:
             raise error_type(
-                "MiXeR input accounting failed: %d analysed + unmatched + "
-                "strand-ambiguous variants does not equal %d formatted variants"
-                % (accounted, formatted)
+                "MiXeR input accounting failed: %d reference-compatible + "
+                "unmatched + strand-ambiguous variants does not equal %d "
+                "formatted variants" % (reference_compatible, formatted)
             )
     input_qc = {
         **dict(input_metrics),
@@ -322,6 +413,11 @@ def build_mixer_summary(
         "reference_unmatched": log_metrics.get("reference_unmatched"),
         "strand_ambiguous": log_metrics.get("strand_ambiguous"),
         "alleles_flipped": log_metrics.get("alleles_flipped"),
+        "reference_compatible_variants": reference_compatible,
+        "post_matching_excluded_variants": post_matching_excluded,
+        "fit_tag_variants_mean": sum(fit_tag_variants) / len(fit_tag_variants),
+        "fit_tag_variants_minimum": min(fit_tag_variants),
+        "fit_tag_variants_maximum": max(fit_tag_variants),
         "variants_analysed": variants_analysed,
         "analysed_fraction": variants_analysed / formatted if formatted else None,
     }
@@ -338,13 +434,19 @@ def build_mixer_summary(
                 configuration.resources.containers.mixer.image
                 if result["execution_backend"] == "docker" else None
             ),
-            "fit_seed": fit_seed,
-            "test_seed": test_seed,
-            "threads": fit_options.get("threads", configuration.execution.threads),
+            "replicates": len(fit_replicates),
+            "replicate_indices": [item["index"] for item in fit_replicates],
+            "replicate_seeds": fit_seeds,
+            "threads_per_replicate": fit_options[0].get(
+                "threads", configuration.execution.threads,
+            ),
         },
         "input_qc": input_qc,
         "architecture": architecture,
-        "model_fit": {**model, "model_selection_source": "fit"},
+        "model_fit": {
+            **model,
+            "model_selection_source": "official_combined_fit_replicates",
+        },
         "diagnostics": {
             "qq_nonfinite_values": qq_nonfinite,
             "qq_variants": (test.get("qqplot") or {}).get("n_snps"),
@@ -355,10 +457,11 @@ def build_mixer_summary(
         },
         "artifacts": {
             "mixer_input": result["mixer_input"],
+            "fit_extract_file_pattern": result["fit_extract_file_pattern"],
             "fit_json": result["fit"],
             "test_json": result["test"],
-            "fit_log": result["fit_log"],
-            "test_log": result["test_log"],
+            "fit_replicates": list(fit_replicates),
+            "test_replicates": list(test_replicates),
             "canonical_log": result["log_file"],
         },
     }
@@ -382,8 +485,13 @@ def _summary_records(summary: Mapping[str, Any]) -> list[dict[str, Any]]:
         ("strand_ambiguous", "variants", "fit log", "Strand-ambiguous variants excluded by MiXeR"),
         ("coordinate_fallback_matches", "variants", "fit log", "Variants matched by chromosome, position and alleles"),
         ("alleles_flipped", "variants", "fit log", "Variants whose A1/A2 orientation and Z sign were flipped"),
-        ("variants_analysed", "variants", "fit JSON", "Reference-compatible tag variants analysed"),
-        ("analysed_fraction", "proportion", "fit JSON and input", "Fraction of formatted variants analysed"),
+        ("reference_compatible_variants", "variants", "fit log", "Reference-compatible variants before configured range exclusions"),
+        ("post_matching_excluded_variants", "variants", "fit log and test JSON", "Reference-compatible variants removed by MiXeR filters or exclusions before full-data test1"),
+        ("fit_tag_variants_mean", "variants", "fit replicate JSON", "Mean tag variants in the pruned fit subsets"),
+        ("fit_tag_variants_minimum", "variants", "fit replicate JSON", "Minimum tag variants in a pruned fit subset"),
+        ("fit_tag_variants_maximum", "variants", "fit replicate JSON", "Maximum tag variants in a pruned fit subset"),
+        ("variants_analysed", "variants", "test replicate JSON", "Reference-compatible tag variants evaluated without the fit extraction"),
+        ("analysed_fraction", "proportion", "test JSON and input", "Fraction of formatted variants evaluated by test1"),
     ):
         add("input_qc", metric, qc.get(metric), unit, "reported", source, description)
     add("input_qc", "chromosomes_missing", qc["chromosomes_missing"], "chromosomes", "warning" if qc["chromosomes_missing"] else "pass", "formatter input", "Configured chromosomes absent from input")
@@ -655,7 +763,9 @@ def render_mixer_summary(summary: Mapping[str, Any]) -> str:
         screen_field("count", "Formatted variants", format_count(qc["formatted_variants"]), indent=10, label_width=30),
         screen_field("loss", "Unmatched to reference", format_count(qc.get("reference_unmatched"), missing="not available"), indent=10, label_width=30),
         screen_field("loss", "Strand-ambiguous variants", format_count(qc.get("strand_ambiguous"), missing="not available"), indent=10, label_width=30),
-        screen_field("count", "Variants analysed", "%s  (%s)" % (format_count(qc["variants_analysed"]), format_fraction_percentage(qc.get("analysed_fraction"))), indent=10, label_width=30),
+        screen_field("count", "Fit replicates", format_count(run["replicates"]), indent=10, label_width=30),
+        screen_field("count", "Mean fit tag variants", format_number(qc["fit_tag_variants_mean"], "%.0f"), indent=10, label_width=30),
+        screen_field("count", "Full-data test variants", "%s  (%s)" % (format_count(qc["variants_analysed"]), format_fraction_percentage(qc.get("analysed_fraction"))), indent=10, label_width=30),
         "",
         screen_line("decision", "Estimated genetic architecture", indent=6),
         screen_field("info", "Polygenicity", format_number(architecture["polygenicity_pi"], "%.4f"), indent=10, label_width=30),

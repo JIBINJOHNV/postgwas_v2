@@ -21,10 +21,12 @@ MixerLoglikeMethod = Literal["fast", "full"]
 class MixerWorkflowConfig(StrictModel):
     fit_command: str
     test_command: str
+    combine_command: str
     split_sumstats_command: str
     gsa_command: str
     figure_command: str
     chromosome_placeholder: str
+    replicate_placeholder: str
     run_id_format: str
 
     @field_validator("*")
@@ -48,6 +50,8 @@ class MixerOutputLayout(StrictModel):
     resolved_config_file: str
     fit_prefix: str
     test_prefix: str
+    fit_replicate_prefix: str
+    test_replicate_prefix: str
     summary_yaml: str
     summary_tsv: str
     figure_prefix: str
@@ -142,6 +146,31 @@ class MixerGsaResultColumns(StrictModel):
         if len(values) != len(set(values)):
             raise ValueError("result column names must be unique")
         return self
+
+
+class MixerUnivariateConfig(StrictModel):
+    fit_extract_file_pattern: str | None = None
+    replicate_indices: list[int]
+
+    @field_validator("fit_extract_file_pattern")
+    @classmethod
+    def nonempty_optional_pattern(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("must be null or a non-empty path pattern")
+        return value
+
+    @field_validator("replicate_indices")
+    @classmethod
+    def positive_unique_replicates(cls, values: list[int]) -> list[int]:
+        if (
+            not values
+            or len(values) != len(set(values))
+            or any(value < 1 for value in values)
+        ):
+            raise ValueError(
+                "must contain one or more unique positive replicate indices"
+            )
+        return values
 
 
 class MixerGsaConfig(StrictModel):
@@ -239,6 +268,7 @@ class MixerConfig(ModuleConfig):
     chromosomes: list[str]
     fit_arguments: list[str]
     test_arguments: list[str]
+    univariate: MixerUnivariateConfig
     gsa: MixerGsaConfig
     workflow: MixerWorkflowConfig
     output_layout: MixerOutputLayout
@@ -260,10 +290,19 @@ class MixerConfig(ModuleConfig):
                     "%s must contain the chromosome placeholder %r"
                     % (name, placeholder)
                 )
+        replicate_placeholder = self.workflow.replicate_placeholder
+        extract_pattern = self.univariate.fit_extract_file_pattern
+        if extract_pattern is not None and replicate_placeholder not in extract_pattern:
+            raise ValueError(
+                "univariate.fit_extract_file_pattern must contain the replicate "
+                "placeholder %r" % replicate_placeholder
+            )
         required_output_tokens = {
             "log_file": ("{dataset_id}", "{run_id}"),
             "fit_prefix": ("{dataset_id}",),
             "test_prefix": ("{dataset_id}",),
+            "fit_replicate_prefix": ("{dataset_id}", "{replicate}"),
+            "test_replicate_prefix": ("{dataset_id}", "{replicate}"),
             "summary_yaml": ("{dataset_id}",),
             "summary_tsv": ("{dataset_id}",),
             "figure_prefix": ("{dataset_id}",),
@@ -283,6 +322,14 @@ class MixerConfig(ModuleConfig):
                 )
         if len(self.chromosomes) != len(set(self.chromosomes)):
             raise ValueError("chromosomes must not contain duplicate values")
+        if (
+            self.analysis in {"univariate", "all"}
+            and self.reporting.figure_statistics[0] not in {"mean", "median"}
+        ):
+            raise ValueError(
+                "reporting.figure_statistics must begin with an aggregate "
+                "location statistic for replicated univariate MiXeR results"
+            )
         try:
             chromosomes = [int(value) for value in self.chromosomes]
         except (TypeError, ValueError) as exc:
@@ -299,7 +346,8 @@ class MixerConfig(ModuleConfig):
 
         protected = {
             "--bim-file", "--chr2use", "--ld-file", "--load-params", "--out",
-            "--seed", "--threads", "--trait1-file",
+            "--seed", "--threads", "--trait1-file", "--extract", "--json",
+            "--rep2use",
         }
         for field in ("fit_arguments", "test_arguments"):
             arguments = getattr(self, field)

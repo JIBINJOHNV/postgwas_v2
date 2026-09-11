@@ -9,9 +9,10 @@ cross-trait analysis.
 ## What the analysis does
 
 PostGWAS validates formatter input and complete chromosome reference patterns,
-selects native or Docker execution, runs `fit1`/`test1` for univariate analysis,
-or splits statistics and fits baseline/full `plsa` models for GSA. It validates
-official results, writes summary YAML/TSV, and generates diagnostics if enabled.
+selects native or Docker execution, and runs the official replicated
+`fit1`/full-data `test1`/combine procedure for univariate analysis. For GSA it
+splits statistics and fits baseline/full `plsa` models. It validates official
+results, writes summary YAML/TSV, and generates diagnostics if enabled.
 
 ## When to use it
 
@@ -21,19 +22,23 @@ model-based gene-set enrichment with build- and ancestry-matched references.
 ## Input requirements
 
 Formatter `<dataset>_mixer.sumstats.gz`; per-chromosome BIM and LD patterns
-containing `@`; MiXeR software or container. GSA also needs annotation patterns
-plus baseline, model, and test GO tables, optionally load-library files.
+containing `@`; MiXeR software or container. Univariate analysis also requires
+the matching 20 random MAF/LD-pruned SNP lists, normally addressed as
+`...rep@.snps`. GSA instead needs annotation patterns plus baseline, model, and
+test GO tables, optionally load-library files.
 
 The pipeline instead starts from an indexed, single-sample PostGWAS-harmonised
 VCF and produces the formatter table automatically. All references must match
 the study build and population, and each pattern must cover the configured
-chromosomes. The `@` is the chromosome placeholder, not a shell wildcard.
+chromosomes. In BIM, LD, annotation, and load-library patterns, `@` is the
+chromosome placeholder; in the fit-extract pattern it is the replicate
+placeholder. It is not a shell wildcard.
 For the exact `SNP CHR BP A1 A2 N Z` contract, sample-size semantics and resource
 compatibility, see the [MiXeR runtime and resource details](https://github.com/JIBINJOHNV/postgwas_v2/blob/main/docs/modules/mixer.md#scientific-input-contract).
 
 | Analysis | Required external references |
 |---|---|
-| `univariate` | BIM and MiXeR LD patterns |
+| `univariate` | BIM and MiXeR LD patterns; matching random MAF/LD-pruned `rep@.snps` pattern |
 | `gsa` | BIM and SNP-annotation patterns; baseline, model and test GO tables; LD pattern or a compatible GSA load-library pattern |
 | `all` | Both sets above; LD remains required for univariate fitting even when GSA uses load-library files |
 
@@ -52,6 +57,8 @@ postgwas mixer \
   --mixer-input-file formatted/STUDY_mixer.sumstats.gz \
   --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
   --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
+  --mixer-fit-extract-file-pattern \
+    'reference/1000G.EUR.QC.prune_maf0p05_rand2M_r2p8.rep@.snps' \
   --dataset-id STUDY \
   --output-directory results
 ```
@@ -81,6 +88,8 @@ postgwas mixer \
   --mixer-input-file formatted/STUDY_mixer.sumstats.gz \
   --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
   --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
+  --mixer-fit-extract-file-pattern \
+    'reference/1000G.EUR.QC.prune_maf0p05_rand2M_r2p8.rep@.snps' \
   --gsa-annotation-file-pattern 'reference/1000G.EUR.QC.@.annot.gz' \
   --gsa-baseline-go-file baseline.tsv \
   --gsa-model-go-file genes.tsv \
@@ -111,6 +120,8 @@ postgwas pipeline \
   --genome-build GRCh37 \
   --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
   --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
+  --mixer-fit-extract-file-pattern \
+    'reference/1000G.EUR.QC.prune_maf0p05_rand2M_r2p8.rep@.snps' \
   --dataset-id STUDY \
   --output-directory results/mixer_pipeline
 ```
@@ -161,6 +172,8 @@ postgwas pipeline \
   --genome-build GRCh37 \
   --bim-file-pattern 'reference/1000G.EUR.QC.@.bim' \
   --ld-file-pattern 'reference/1000G.EUR.QC.@.ld' \
+  --mixer-fit-extract-file-pattern \
+    'reference/1000G.EUR.QC.prune_maf0p05_rand2M_r2p8.rep@.snps' \
   --gsa-annotation-file-pattern 'reference/1000G.EUR.QC.@.annot.gz' \
   --gsa-baseline-go-file baseline.tsv \
   --gsa-model-go-file genes.tsv \
@@ -195,21 +208,26 @@ resume controls, consistency checks, and GSA settings.
 
 ## Processing steps
 
-Validate input schema/chromosomes and `@` patterns; resolve backend; run selected
-official stages; validate output identity, convergence, finite estimates, seed
-and log evidence; generate diagnostics; write compact summaries.
+Validate input schema/chromosomes and `@` patterns; validate every configured
+fit SNP list; resolve backend; run selected official stages; validate output
+identity, convergence, finite estimates, seed and log evidence; combine
+replicates; generate diagnostics; write compact summaries.
 
 The outer pipeline counter reports completed pipeline modules. MiXeR also shows
-its own validation, `fit1`, `test1`, and reporting stages. During `fit1` and
-`test1`, chromosome LD loading uses the exact configured chromosome count. The
+its own validation, replicated `fit1`, full-data `test1`, combine, and reporting
+stages. During `fit1` and `test1`, chromosome LD loading uses the exact
+configured chromosome count. The
 optimizer shows observed completed cost-function evaluations as `count/?`, not
 a percentage, because the upstream convergence-dependent optimizers do not
-provide a trustworthy total in advance. A command reaches 100% only after its
-exit status and outputs validate successfully.
+provide a trustworthy total in advance. The active phase includes the complete
+fit sequence announced by MiXeR, such as
+`diffevo-fast (1/2: diffevo-fast → neldermead)`. A command reaches 100% only
+after its exit status and outputs validate successfully.
 
 ## Outputs
 
-Univariate raw fit/test JSON and logs are under `results/raw/univariate/`;
+Univariate combined fit/test JSON are under `results/raw/univariate/`; raw
+replicate JSON/log files are under `results/raw/univariate/replicates/`;
 summaries are `results/<dataset>_mixer_summary.yaml/.tsv`; figures are under
 `plots/`. GSA raw outputs are under `results/raw/gsa/`; summaries are
 `<dataset>_gsa_mixer_summary.yaml` and
@@ -232,9 +250,12 @@ enrichment requires uncertainty and multiple-gene-set interpretation.
 
 ## Common problems
 
-Incomplete patterns, build mismatch, missing chromosome, seed mismatch,
+Incomplete patterns, missing replicate SNP lists, applying a reference bundle
+from the wrong ancestry/build, missing chromosome, seed mismatch,
 native/container path differences, low power, non-convergence, or invalid GO
-schema.
+schema. Twenty replicated fits are deliberately expensive; the upstream v1.3
+notes estimate about ten times the aggregate CPU of the old procedure, and two
+threads can require more than a day.
 
 ## Limitations
 
@@ -243,5 +264,7 @@ Multi-trait MiXeR is not available through this command.
 ## Scientific references
 
 - [Frei et al. 2019, MiXeR](https://doi.org/10.1038/s41467-019-10310-0)
+- [Holland et al. 2020, univariate MiXeR](https://doi.org/10.1371/journal.pgen.1008612)
 - [GSA-MiXeR 2024](https://doi.org/10.1038/s41588-024-01771-1)
 - [Official MiXeR implementation](https://github.com/precimed/mixer)
+- [Official real-data job](https://github.com/precimed/mixer/blob/master/usecases/mixer_real/MIXER_REAL.job)
