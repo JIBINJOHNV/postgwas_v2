@@ -28,6 +28,12 @@ def test_canonical_layout_separates_published_qc_handoff_and_intermediate_paths(
     assert paths["susie_qc_file"] == (
         tmp_path / "quality_control" / "study_susie_locus_qc.tsv"
     )
+    assert paths["preflight_validation_file"] == (
+        tmp_path / "quality_control" / "input_and_resource_validation.tsv"
+    )
+    assert paths["html_report_file"] == (
+        tmp_path / "results" / "study_fine_mapping_report.html"
+    )
     assert paths["downstream_flames_directory"] == (
         tmp_path / "downstream_inputs" / "flames"
     )

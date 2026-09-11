@@ -25,6 +25,194 @@ def _default(description: str, value) -> str:
     return help_with_default(description, value)
 
 
+def _add_reference_prefix_argument(
+    group, module, *, conditional_requirement: str | None = None,
+) -> None:
+    description = (
+        "Prefix shared by the ancestry-matched PLINK BED, BIM, and FAM "
+        "LD-reference files"
+    )
+    if conditional_requirement is not None:
+        description = help_with_conditional_requirement(
+            description, conditional_requirement,
+        )
+    group.add_argument(
+        "--cojo-reference-prefix",
+        metavar="PREFIX",
+        default=argparse.SUPPRESS,
+        help=_default(
+            description,
+            module.reference.prefix,
+        ),
+    )
+
+
+def _add_selection_compatibility_arguments(
+    group,
+    configuration,
+    module,
+    *,
+    include_genome_build: bool,
+    include_reference_population: bool,
+) -> None:
+    if include_genome_build:
+        group.add_argument(
+            "--genome-build",
+            choices=list(configuration.resources.genomes),
+            metavar="BUILD",
+            default=argparse.SUPPRESS,
+            help=_default(
+                "Shared genome build of the GWAS summary statistics and PLINK "
+                "LD reference",
+                module.genome_build,
+            ),
+        )
+    if include_reference_population:
+        group.add_argument(
+            "--cojo-reference-population",
+            choices=list(configuration.resources.populations),
+            metavar="CODE",
+            default=argparse.SUPPRESS,
+            help=_default(
+                "Population represented by the LD reference; ancestry is never "
+                "inferred",
+                module.reference.population,
+            ),
+        )
+    group.add_argument(
+        "--cojo-minimum-reference-overlap",
+        type=float,
+        metavar="FRACTION",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "Minimum fraction of GCTA .ma variants that must be usable with the "
+            "BIM: both SNP ID and complete allele pair must match",
+            module.input_validation.minimum_reference_overlap_fraction,
+        ),
+    )
+
+
+def _add_stepwise_selection_settings(group, configuration, module) -> None:
+    group.add_argument(
+        "--cojo-p",
+        type=float,
+        metavar="P",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "Genome-wide significance threshold used by cojo-slct",
+            module.analysis.significance_threshold,
+        ),
+    )
+    group.add_argument(
+        "--cojo-window-kb",
+        type=int,
+        metavar="KB",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "LD-window distance beyond which GCTA assumes complete linkage "
+            "equilibrium; this is not a genomic locus boundary",
+            module.analysis.window_kb,
+        ),
+    )
+    group.add_argument(
+        "--cojo-collinear",
+        type=float,
+        metavar="R2",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "Multiple-regression R-squared collinearity cutoff",
+            module.analysis.collinearity_cutoff,
+        ),
+    )
+    group.add_argument(
+        "--cojo-diff-freq",
+        type=float,
+        metavar="FRACTION",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "Maximum A1-frequency difference between GWAS and LD reference",
+            module.analysis.frequency_difference_max,
+        ),
+    )
+    group.add_argument(
+        "--cojo-maf",
+        type=float,
+        metavar="FRACTION",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "Minimum MAF retained from the LD reference",
+            module.analysis.reference_maf_min,
+        ),
+    )
+    group.add_argument(
+        "--cojo-gc",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "Enable GCTA genomic control for summary-statistic p-values; omit "
+            "this flag to leave genomic control disabled",
+            module.analysis.genomic_control,
+        ),
+    )
+    group.add_argument(
+        "--cojo-gc-lambda",
+        type=float,
+        metavar="LAMBDA",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "Explicit genomic-inflation factor; supplying it enables --cojo-gc",
+            module.analysis.genomic_control_lambda,
+        ),
+    )
+    group.add_argument(
+        "--cojo-chromosome",
+        type=int,
+        metavar="NUMBER",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "Numeric chromosome code from 1 through 100 passed to GCTA --chr",
+            module.analysis.chromosome,
+        ),
+    )
+    group.add_argument(
+        "--gcta",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help=_default(
+            "GCTA executable path or command name",
+            configuration.resources.executables.gcta,
+        ),
+    )
+
+
+def get_gcta_cojo_selection_parser(
+    add_help=False,
+    *,
+    include_genome_build: bool = True,
+    include_reference_population: bool = True,
+    reference_requirement: str | None = None,
+):
+    """Return the shared reference and GCTA stepwise-selection options."""
+    configuration = load_configuration()
+    module = configuration.modules.gcta_cojo
+    parser = argparse.ArgumentParser(add_help=add_help)
+    inputs = parser.add_argument_group("GCTA-COJO inputs")
+    compatibility = parser.add_argument_group("Input and reference compatibility")
+    settings = parser.add_argument_group("GCTA-COJO stepwise selection")
+    _add_reference_prefix_argument(
+        inputs, module, conditional_requirement=reference_requirement,
+    )
+    _add_selection_compatibility_arguments(
+        compatibility,
+        configuration,
+        module,
+        include_genome_build=include_genome_build,
+        include_reference_population=include_reference_population,
+    )
+    _add_stepwise_selection_settings(settings, configuration, module)
+    return parser
+
+
 def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
     defaults = load_configuration()
     module = defaults.modules.gcta_cojo
@@ -55,16 +243,7 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
             default=argparse.SUPPRESS,
             help=argparse.SUPPRESS,
         )
-    inputs.add_argument(
-        "--cojo-reference-prefix",
-        metavar="PREFIX",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Prefix shared by the ancestry-matched PLINK BED, BIM, and FAM "
-            "LD-reference files",
-            module.reference.prefix,
-        ),
-    )
+    _add_reference_prefix_argument(inputs, module)
     inputs.add_argument(
         "--condition-snps",
         type=validate_path(must_exist=True, must_be_file=True, must_not_be_empty=True),
@@ -104,7 +283,10 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         default=argparse.SUPPRESS,
         help=_default(
             "Only test or select SNPs listed in this file, with one BIM SNP "
-            "ID per line. GCTA still reads the full .ma file",
+            "ID per line. GCTA still reads the full .ma file. In cond mode, "
+            "the list must also contain every conditioning SNP. It cannot be "
+            "combined with joint mode because --joint-snps defines that mode's "
+            "GCTA --extract list",
             module.inputs.extract_snps,
         ),
     )
@@ -121,35 +303,12 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
     )
 
     compatibility = parser.add_argument_group("Input and reference compatibility")
-    compatibility.add_argument(
-        "--genome-build",
-        choices=list(defaults.resources.genomes),
-        metavar="BUILD",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Shared genome build of the GWAS summary statistics and PLINK LD reference",
-            module.genome_build,
-        ),
-    )
-    compatibility.add_argument(
-        "--cojo-reference-population",
-        choices=list(defaults.resources.populations),
-        metavar="CODE",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Population represented by the LD reference; ancestry is never inferred",
-            module.reference.population,
-        ),
-    )
-    compatibility.add_argument(
-        "--cojo-minimum-reference-overlap",
-        type=float,
-        metavar="FRACTION",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Minimum fraction of GCTA .ma variants that must exactly match BIM IDs",
-            module.input_validation.minimum_reference_overlap_fraction,
-        ),
+    _add_selection_compatibility_arguments(
+        compatibility,
+        defaults,
+        module,
+        include_genome_build=True,
+        include_reference_population=True,
     )
 
     settings = parser.add_argument_group("GCTA-COJO analysis options")
@@ -164,100 +323,26 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         ),
     )
     settings.add_argument(
-        "--cojo-p",
-        type=float,
-        metavar="P",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Genome-wide significance threshold used by cojo-slct",
-            module.analysis.significance_threshold,
-        ),
-    )
-    settings.add_argument(
         "--cojo-top-snps",
         type=int,
         metavar="N",
         default=argparse.SUPPRESS,
         help=_default(
-            "Fixed number of independent signals selected by GCTA",
+            "Maximum number of independent signals requested from GCTA; fewer "
+            "can be returned after eligibility and collinearity checks. Supplying "
+            "this option selects top_snps mode when --cojo-mode is omitted",
             module.analysis.top_snp_count,
         ),
     )
-    settings.add_argument(
-        "--cojo-window-kb",
-        type=int,
-        metavar="KB",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Distance beyond which GCTA assumes complete linkage equilibrium",
-            module.analysis.window_kb,
-        ),
-    )
-    settings.add_argument(
-        "--cojo-collinear",
-        type=float,
-        metavar="R2",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Multiple-regression R-squared collinearity cutoff",
-            module.analysis.collinearity_cutoff,
-        ),
-    )
-    settings.add_argument(
-        "--cojo-diff-freq",
-        type=float,
-        metavar="FRACTION",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Maximum A1-frequency difference between GWAS and LD reference",
-            module.analysis.frequency_difference_max,
-        ),
-    )
-    settings.add_argument(
-        "--cojo-maf",
-        type=float,
-        metavar="FRACTION",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Minimum MAF retained from the LD reference",
-            module.analysis.reference_maf_min,
-        ),
-    )
-    settings.add_argument(
-        "--cojo-gc",
-        action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Apply GCTA genomic control to summary-statistic p-values",
-            module.analysis.genomic_control,
-        ),
-    )
-    settings.add_argument(
-        "--cojo-gc-lambda",
-        type=float,
-        metavar="LAMBDA",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Explicit genomic-inflation factor; supplying it enables --cojo-gc",
-            module.analysis.genomic_control_lambda,
-        ),
-    )
-    settings.add_argument(
-        "--cojo-chromosome",
-        metavar="CHR",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "Optional chromosome passed to GCTA --chr",
-            module.analysis.chromosome,
-        ),
-    )
+    _add_stepwise_selection_settings(settings, defaults, module)
     settings.add_argument(
         "--cojo-top-results",
         type=int,
         metavar="N",
         default=argparse.SUPPRESS,
         help=_default(
-            "Number of lowest adjusted-p findings displayed at completion",
+            "Number of lowest COJO P-value findings displayed at completion "
+            "(pJ for slct/top_snps/joint; pC for cond)",
             module.reporting.top_result_count,
         ),
     )
@@ -267,7 +352,8 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         metavar="P",
         default=argparse.SUPPRESS,
         help=_default(
-            "Adjusted-p threshold used only for the terminal findings summary",
+            "COJO P-value threshold used only for the terminal findings summary; "
+            "it does not change GCTA model fitting",
             module.reporting.finding_threshold,
         ),
     )
@@ -279,15 +365,6 @@ def get_gcta_cojo_parser(add_help=False, *, direct_controls=False):
         help=_default(
             "Significant digits used for p-values in the terminal summary",
             module.reporting.p_value_significant_digits,
-        ),
-    )
-    settings.add_argument(
-        "--gcta",
-        metavar="PATH",
-        default=argparse.SUPPRESS,
-        help=_default(
-            "GCTA executable path or command name",
-            defaults.resources.executables.gcta,
         ),
     )
     if direct_controls:
@@ -314,6 +391,35 @@ def get_gcta_cojo_pipeline_examples():
             (
                 "--modules gcta_cojo",
                 "--vcf study.vcf.gz",
+                "--cojo-reference-prefix reference/EUR_ld",
+                "--genome-build GRCh37",
+                "--cojo-reference-population EUR",
+                "--dataset-id STUDY",
+                "--output-directory results",
+            ),
+        ),
+        (
+            "Select up to a requested number of independent signals:",
+            "postgwas pipeline",
+            (
+                "--modules gcta_cojo",
+                "--vcf study.vcf.gz",
+                "--cojo-mode top_snps",
+                "--cojo-top-snps 10",
+                "--cojo-reference-prefix reference/EUR_ld",
+                "--genome-build GRCh37",
+                "--cojo-reference-population EUR",
+                "--dataset-id STUDY",
+                "--output-directory results",
+            ),
+        ),
+        (
+            "Estimate a specified SNP set jointly:",
+            "postgwas pipeline",
+            (
+                "--modules gcta_cojo",
+                "--vcf study.vcf.gz",
+                "--joint-snps model_snps.txt",
                 "--cojo-reference-prefix reference/EUR_ld",
                 "--genome-build GRCh37",
                 "--cojo-reference-population EUR",
@@ -378,6 +484,33 @@ def build_parser():
                 ),
             ),
             (
+                "Select up to a requested number of independent signals:",
+                "postgwas gcta_cojo",
+                (
+                    "--cojo-file study.ma",
+                    "--cojo-mode top_snps",
+                    "--cojo-top-snps 10",
+                    "--cojo-reference-prefix reference/EUR_ld",
+                    "--genome-build GRCh37",
+                    "--cojo-reference-population EUR",
+                    "--dataset-id STUDY",
+                    "--output-directory results",
+                ),
+            ),
+            (
+                "Estimate a specified SNP set jointly:",
+                "postgwas gcta_cojo",
+                (
+                    "--cojo-file study.ma",
+                    "--joint-snps model_snps.txt",
+                    "--cojo-reference-prefix reference/EUR_ld",
+                    "--genome-build GRCh37",
+                    "--cojo-reference-population EUR",
+                    "--dataset-id STUDY",
+                    "--output-directory results",
+                ),
+            ),
+            (
                 "Export reusable module settings:",
                 "postgwas config export",
                 ("--module gcta_cojo", "--style full", "--output gcta_cojo.yaml"),
@@ -401,6 +534,13 @@ def build_parser():
             action.help = _default(
                 "Folder where PostGWAS saves COJO results, metadata, and logs",
                 defaults.run.output_directory,
+            )
+            action.default = argparse.SUPPRESS
+        elif action.dest == "seed":
+            action.help = _default(
+                "Generic PostGWAS reproducibility seed; native GCTA-COJO is "
+                "deterministic and does not consume this value",
+                defaults.execution.random_seed,
             )
             action.default = argparse.SUPPRESS
     mark_cli_required_help(
@@ -431,5 +571,9 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "build_parser", "get_gcta_cojo_parser", "get_gcta_cojo_pipeline_examples", "main",
+    "build_parser",
+    "get_gcta_cojo_parser",
+    "get_gcta_cojo_pipeline_examples",
+    "get_gcta_cojo_selection_parser",
+    "main",
 ]

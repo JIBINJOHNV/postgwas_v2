@@ -4,7 +4,9 @@ from FLAMES_scoring import main as FLAMES_scoring
 import os
 import sys
 import argparse
+import json
 import pandas as pd
+import Query_api
 
 import warnings
 warnings.filterwarnings(
@@ -26,6 +28,8 @@ def splash_screen():
 
 def functional_annotation(args):
     parser = argparse.ArgumentParser(description="Annotate finemapped loci")
+    parser.add_argument("--annotation-api-settings", default=argparse.SUPPRESS)
+    parser.add_argument("--annotation-api-log", default=argparse.SUPPRESS)
     parser.add_argument("-c", "--credsets_file", help="File containing credible set")
     parser.add_argument("-o", "--outdir", help="Output directory, if not specifying output filenames in an indexfile", required=False, default = None)
     parser.add_argument(
@@ -110,6 +114,10 @@ def functional_annotation(args):
     )
     parser.add_argument('-c95', '--credset_95', help='Input "FALSE" to not subset to 0.95 credible set', required=False, default=True)
     args = parser.parse_args(args)
+    if not args.cmd_vep or not args.CADD_file:
+        if not hasattr(args, "annotation_api_settings") or not hasattr(args, "annotation_api_log"):
+            parser.error("API annotation requires resolved --annotation-api-settings and --annotation-api-log")
+        Query_api.configure_api(json.loads(args.annotation_api_settings), args.annotation_api_log)
     # At least one of the arguments is required
     if not (args.indexfile or args.credsets_file):
         parser.error("At least one of --credsets_file or --indexfile is required.")

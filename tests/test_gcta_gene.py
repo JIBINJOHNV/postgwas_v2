@@ -1,36 +1,52 @@
 import argparse
 from argparse import Namespace
+from io import StringIO
 from pathlib import Path
 import re
 
 import pytest
 import polars as pl
 from rich.cells import cell_len
+from rich.console import Console
 import yaml
 
 from postgwas.config import load_configuration, load_module_configuration
 from postgwas.core.contracts import RunContext
 from postgwas.core.errors import ConfigurationError
+from postgwas.core.preflight import PipelinePreflightEvidence
 from postgwas.core.resource_preparation import ResourcePreparationError
 from postgwas.core.ui import format_cli_default
 from postgwas.modules.gcta_gene import cli as gcta_gene_cli
 from postgwas.modules.gcta_gene.adapters import build_gcta_command
 from postgwas.modules.gcta_gene.cli import build_parser, get_gcta_gene_parser
 from postgwas.modules.gcta_gene.errors import GctaGeneError
-from postgwas.modules.gcta_gene.reporting import build_gcta_scientific_summary
+from postgwas.modules.gcta_gene.reporting import (
+    build_gcta_scientific_summary,
+    gcta_ma_input_outcome_fields,
+)
 from postgwas.modules.gcta_gene.results import normalize_gcta_results
 from postgwas.modules.gcta_gene.service import (
+    GctaGenePipelineResources,
     _gcta_configuration_digest,
     _prepare_analysis_set_list,
     _resolved_configuration,
+    preflight_gcta_gene_pipeline,
     run_gcta_gene_direct,
 )
+from postgwas.modules.gcta_gene.stages import (
+    build_gcta_gene_pipeline_progress_plan,
+)
+from postgwas.pipeline import runners
+from postgwas.pipeline.executor import execute_pipeline
+from postgwas.pipeline.planner import PipelinePlan
 from postgwas.pipeline.runners import run_gcta_gene_runner
+from postgwas.pipeline.registry import REGISTRY
+from preflight_support import pipeline_input_vcf_evidence
 
 
 def _write_reference(tmp_path, variant="rs1"):
     prefix = tmp_path / "reference"
-    Path(str(prefix) + ".bed").write_bytes(b"BED")
+    Path(str(prefix) + ".bed").write_bytes(bytes((0x6C, 0x1B, 0x01, 0x00)))
     Path(str(prefix) + ".fam").write_text("F1 I1 0 0 0 -9\n", encoding="utf-8")
     Path(str(prefix) + ".bim").write_text(
         "1\t%s\t0\t100\tG\tA\n" % variant, encoding="utf-8",
@@ -264,12 +280,15 @@ def _args(tmp_path, method="fastbat_gene", *, version="1.94.1", variant="rs1"):
     )
 
 
-def _pipeline_context(args):
+def _pipeline_context(args, variant_id_type="rsid"):
     formatted_input = args.gcta_input_file
     del args.gcta_input_file
     return RunContext({
         "formatter": {
-            "gcta_gene": {"summary_statistics_input_file": formatted_input},
+            "gcta_gene": {
+                "summary_statistics_input_file": formatted_input,
+                "variant_id_type": variant_id_type,
+            },
         },
     })
 
@@ -278,9 +297,74 @@ def test_help_exposes_scientific_compatibility_and_configuration():
     parser = build_parser()
     help_text = parser.format_help()
     normalized_help = " ".join(help_text.split())
+    group_destinations = {
+        group.title: [action.dest for action in group._group_actions]
+        for group in parser._action_groups
+    }
+    visible_group_titles = [
+        group.title
+        for group in parser._action_groups
+        if group.description or any(
+            action.help is not argparse.SUPPRESS
+            for action in group._group_actions
+        )
+    ]
+    assert visible_group_titles[:4] == [
+        "options",
+        "Output",
+        "Input files",
+        "Reference files",
+    ]
+    assert group_destinations["Input files"] == [
+        "gcta_input_file",
+        "fastbat_set_list",
+        "gmt",
+    ]
+    assert group_destinations["Reference files"] == [
+        "gcta_reference_prefix",
+        "gene_list",
+    ]
+    assert group_destinations["GCTA reference settings"] == [
+        "genome_build",
+        "gcta_reference_population",
+    ]
+    assert group_destinations["GCTA variant matching"] == [
+        "gcta_chromosome_label_policy",
+        "gcta_allow_strand_complement",
+    ]
+    assert group_destinations["GCTA analysis scope"] == [
+        "mhc_policy",
+        "mhc_chrom",
+        "mhc_start",
+        "mhc_end",
+        "exclude_chromosomes",
+    ]
+    assert group_destinations["GCTA pathway conversion"] == [
+        "gmt_chromosome_label_policy",
+        "gmt_duplicate_gene_policy",
+        "gmt_unmapped_gene_policy",
+        "gcta_minimum_gene_id_overlap",
+        "gmt_empty_pathway_policy",
+        "fastbat_oversized_set_policy",
+    ]
+    assert group_destinations["GCTA result reporting"] == [
+        "gcta_top_results",
+        "gcta_nominal_alpha",
+        "gcta_reporting_alpha",
+        "gcta_fdr_alpha",
+        "gcta_p_value_digits",
+    ]
+    assert "GCTA binary" not in group_destinations
+    assert "GCTA inputs" not in group_destinations
+    assert "GCTA association inputs:" not in help_text
+    assert "GCTA association settings:" not in help_text
     assert (
-        "--method {fastbat_gene,fastbat_segment,fastbat_set,mbat_combo}"
+        "--method METHOD"
         in help_text
+    )
+    assert (
+        "Available options: fastbat_gene, fastbat_segment, fastbat_set, mbat_combo"
+        in normalized_help
     )
     for description in (
         "fastbat_gene: Test SNPs assigned to each gene and its configured window",
@@ -297,19 +381,25 @@ def test_help_exposes_scientific_compatibility_and_configuration():
     assert "--gmt" in help_text
     assert "mutually exclusive with --fastbat-set-list" in normalized_help
     assert "--fastbat-segment-size-kb" in help_text
+    assert "--mhc-policy {include,exclude_snps,exclude_genes,exclude_both}" in help_text
+    assert "--exclude-chromosomes CHROM [CHROM ...]" in help_text
+    assert "(Default: exclude_both)" in normalized_help
+    assert "(Default: Y MT)" in normalized_help
     build_actions = [
         action for action in parser._actions if "--genome-build" in action.option_strings
     ]
     assert len(build_actions) == 1
     help_lines = help_text.splitlines()
     build_line = next(
-        line for line in help_lines if "--genome-build BUILD" in line
+        line
+        for line in help_lines
+        if line.lstrip().startswith("--genome-build BUILD")
     )
     build_description_column = build_line.index("Required:")
     population_index = next(
         index
         for index, line in enumerate(help_lines)
-        if "--gcta-reference-population CODE" in line
+        if line.lstrip().startswith("--gcta-reference-population CODE")
     )
     population_description = next(
         line
@@ -324,12 +414,143 @@ def test_help_exposes_scientific_compatibility_and_configuration():
     assert "--gcta-reference-population" in help_text
     assert "--vcf" not in help_text
     assert "--bcftools" not in help_text
+    assert "--gcta PATH" not in help_text
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--gcta", "gcta64"])
     assert "--gcta-coordinate-fallback" not in help_text
     assert "--gcta-minimum-reference-overlap" not in help_text
     pipeline_help = get_gcta_gene_parser(direct_controls=False).format_help()
-    assert "--gcta-coordinate-fallback" in pipeline_help
+    assert "--gcta-coordinate-fallback" not in pipeline_help
     assert "--gcta-minimum-reference-overlap" in pipeline_help
     assert "postgwas config export" in help_text
+    for label in (
+        "Run gene-based fastBAT:",
+        "Run fixed-segment fastBAT:",
+        "Run custom-set fastBAT from a prepared set list:",
+        "Convert a GMT file and run custom-set fastBAT:",
+        "Run gene-based mBAT-combo:",
+        "Run entirely from exported settings:",
+    ):
+        assert label in help_text
+    for argument in (
+        "--method fastbat_gene",
+        "--method fastbat_segment",
+        "--fastbat-set-list pathways.fastbat.set",
+        "--gmt pathways.gmt",
+        "--method mbat_combo",
+        "--run-config gcta_gene.yaml",
+    ):
+        assert argument in help_text
+
+
+def test_fastbat_set_gmt_pipeline_plan_matches_the_thirteen_stage_contract():
+    module = load_configuration().modules.gcta_gene.model_copy(deep=True)
+    module.method = "fastbat_set"
+    module.set_annotation.file = None
+    module.set_annotation.gmt_file = "pathways.gmt"
+
+    plan = build_gcta_gene_pipeline_progress_plan(module)
+
+    assert plan["variant"] == "fastbat_set_gmt"
+    assert plan["modules"] == {"formatter": (1, 6), "gcta_gene": (7, 13)}
+    assert plan["stages"] == (
+        "Validate the input harmonised GWAS-VCF",
+        "Validate the PLINK LD-reference files and determine the BIM variant-ID format",
+        "Validate the GCTA gene-coordinate file",
+        "Validate the original pathway GMT file",
+        "Compare pathway genes with the gene-coordinate reference and enforce the configured minimum coordinate-reference coverage",
+        "Create and validate the BIM-compatible GCTA .ma input",
+        "Map analyzable BIM variants to matched gene intervals",
+        "Create candidate pathway-to-variant memberships",
+        "Apply duplicate-membership, empty-set and set-size policies and write the final fastBAT sets",
+        "Run GCTA fastBAT-set",
+        "Validate the raw GCTA results",
+        "Add and validate nominal, Bonferroni and Benjamini-Hochberg FDR results",
+        "Validate and publish all outputs and display the scientific summary",
+    )
+
+
+def test_gcta_formatter_outcome_reports_every_ma_source_and_transformation(
+    tmp_path,
+):
+    configuration = load_configuration()
+    fields = gcta_ma_input_outcome_fields(
+        configuration,
+        tmp_path / "study_gcta.ma",
+        {"variants": 100},
+        formatter_result={
+            "rows_in": 100,
+            "rows_out": 99,
+            "rows_excluded": 1,
+            "p_values_bounded": 2,
+            "variant_id_type": "unique",
+        },
+        variant_id_type="unique",
+    )
+    values = [(field[1], field[2]) for field in fields if len(field) == 3]
+
+    assert ("SNP", "CHROM + POS + REF + ALT → CHROM_POS_REF_ALT") in values
+    assert ("A1", "ALT → effect allele") in values
+    assert ("A2", "REF → other allele") in values
+    assert ("freq", "FORMAT/AF → A1 effect-allele frequency") in values
+    assert (
+        "BETA", "FORMAT/ES → copied without numerical transformation",
+    ) in values
+    assert (
+        "SE", "FORMAT/SE → copied without numerical transformation",
+    ) in values
+    assert ("P", "FORMAT/LP → raw P = 10⁻ᴸᴾ") in values
+    assert ("N", "FORMAT/SS → per-variant total N") in values
+    assert ("Variants extracted", 100) in values
+    assert ("Variants written", 99) in values
+    assert ("Variants excluded during formatting", 1) in values
+    assert ("Converted P values bounded at configured minimum", 2) in values
+
+    direct_fields = gcta_ma_input_outcome_fields(
+        configuration,
+        tmp_path / "supplied.ma",
+        {"variants": 100},
+    )
+    assert (
+        "analysis", "Extract and transform GWAS-VCF fields",
+    ) not in direct_fields
+
+
+@pytest.mark.parametrize(
+    ("method", "set_source", "expected_variant", "expected_total"),
+    (
+        ("fastbat_gene", None, "fastbat_gene", 8),
+        ("fastbat_segment", None, "fastbat_segment", 7),
+        ("fastbat_set", "prepared", "fastbat_set_prepared", 9),
+        ("fastbat_set", "gmt", "fastbat_set_gmt", 13),
+        ("mbat_combo", None, "mbat_combo", 8),
+    ),
+)
+def test_gcta_pipeline_plans_reuse_common_validation_and_result_stages(
+    method, set_source, expected_variant, expected_total,
+):
+    module = load_configuration().modules.gcta_gene.model_copy(deep=True)
+    module.method = method
+    module.set_annotation.file = (
+        "pathways.fastbat.set" if set_source == "prepared" else None
+    )
+    module.set_annotation.gmt_file = (
+        "pathways.gmt" if set_source == "gmt" else None
+    )
+
+    plan = build_gcta_gene_pipeline_progress_plan(module)
+
+    assert plan["variant"] == expected_variant
+    assert len(plan["stages"]) == expected_total
+    assert plan["stages"][:2] == (
+        "Validate the input harmonised GWAS-VCF",
+        "Validate the PLINK LD-reference files and determine the BIM variant-ID format",
+    )
+    assert plan["stages"][-3:] == (
+        "Validate the raw GCTA results",
+        "Add and validate nominal, Bonferroni and Benjamini-Hochberg FDR results",
+        "Validate and publish all outputs and display the scientific summary",
+    )
 
 
 def test_configurable_cli_values_do_not_own_defaults():
@@ -339,16 +560,19 @@ def test_configurable_cli_values_do_not_own_defaults():
         "gene_list", "fastbat_set_list", "gmt", "genome_build",
         "gcta_reference_population", "gene_window_kb", "fastbat_segment_size_kb",
         "gmt_chromosome_label_policy", "gmt_duplicate_gene_policy",
-        "gmt_unmapped_gene_policy", "gmt_empty_pathway_policy",
+        "gmt_unmapped_gene_policy", "gcta_minimum_gene_id_overlap",
+        "gmt_empty_pathway_policy",
         "fastbat_oversized_set_policy",
         "gcta_reference_maf_min", "fastbat_ld_cutoff", "mbat_svd_gamma",
         "frequency_difference_max", "print_component_p_values", "write_snpset",
         "gcta_top_results", "gcta_nominal_alpha", "gcta_reporting_alpha",
         "gcta_fdr_alpha", "gcta_p_value_digits",
-        "gcta", "run_config", "resume", "overwrite",
+        "run_config", "resume", "overwrite",
         "dry_run", "dataset_id",
         "output_directory", "threads", "memory_gb", "seed",
         "gcta_chromosome_label_policy", "gcta_allow_strand_complement",
+        "mhc_policy", "mhc_chrom", "mhc_start", "mhc_end",
+        "exclude_chromosomes",
     ):
         action = next(item for item in parser._actions if item.dest == destination)
         assert action.default == argparse.SUPPRESS
@@ -367,7 +591,10 @@ def test_cli_help_defaults_are_read_from_canonical_configuration(monkeypatch):
     module.reporting.fdr_alpha = 0.03
     module.reporting.p_value_significant_digits = 6
     module.set_annotation.conversion.chromosome_label_policy = "strip_chr_prefix"
-    defaults.resources.executables.gcta = "configured-gcta"
+    module.set_annotation.maximum_set_variants = 12_345
+    module.mhc.policy = "exclude_snps"
+    module.chromosomes.exclude = ["Y"]
+    module.reference.required_extensions = [".bim", ".fam", ".bed"]
     monkeypatch.setattr(gcta_gene_cli, "load_configuration", lambda: defaults)
 
     parser = gcta_gene_cli.get_gcta_gene_parser(direct_controls=True)
@@ -382,12 +609,17 @@ def test_cli_help_defaults_are_read_from_canonical_configuration(monkeypatch):
         "gcta_fdr_alpha": 0.03,
         "gcta_p_value_digits": 6,
         "gmt_chromosome_label_policy": "strip_chr_prefix",
+        "gcta_minimum_gene_id_overlap": 0.5,
         "fastbat_oversized_set_policy": "omit",
-        "gcta": "configured-gcta",
+        "mhc_policy": "exclude_snps",
+        "exclude_chromosomes": "Y",
     }
     for destination, expected in expected_by_destination.items():
         action = next(item for item in parser._actions if item.dest == destination)
         assert format_cli_default(expected) in action.help
+    rendered_help = " ".join(parser.format_help().split())
+    assert "configured companion files: .bim, .fam, .bed" in rendered_help
+    assert "configured GCTA limit of 12345 variants" in rendered_help
 
 
 def test_output_help_uses_canonical_run_defaults_without_argparse_defaults():
@@ -460,7 +692,7 @@ def test_missing_direct_inputs_are_reported_together_logged_and_show_help(
     assert gcta_gene_cli.main([]) == 1
 
     captured = capsys.readouterr()
-    terminal = captured.out + captured.err
+    terminal = " ".join((captured.out + captured.err).split())
     required_options = (
         "--gcta-input-file",
         "--gcta-reference-prefix",
@@ -471,7 +703,7 @@ def test_missing_direct_inputs_are_reported_together_logged_and_show_help(
     for option in required_options:
         assert "Required argument not provided: %s." % option in terminal
     assert "usage: postgwas gcta_gene" in terminal.lower()
-    assert "Run standalone fastBAT:" in terminal
+    assert "Run gene-based fastBAT:" in terminal
 
     service_log = (
         tmp_path / "results/logs/postgwas_fastbat_gene_gcta_gene.log"
@@ -491,7 +723,32 @@ def test_missing_direct_inputs_are_reported_together_logged_and_show_help(
 def test_pipeline_runner_defers_complete_cli_validation_to_service(
     tmp_path, monkeypatch,
 ):
-    context = {"formatter": {"gcta_gene": {}}}
+    resources = GctaGenePipelineResources(
+        configuration=load_configuration(),
+        reference_prefix=tmp_path / "reference",
+        reference_paths=(),
+        executable="gcta64",
+        version="1.94.1",
+        identifier_observation={},
+        analysis_scope={},
+        gene_list=None,
+        gene_annotation_metrics=None,
+        gmt=None,
+        pathway_gene_preflight=None,
+        set_list=None,
+        set_source_metrics=None,
+        file_identities=(),
+    )
+    context = RunContext(
+        {"formatter": {"gcta_gene": {}}},
+        validations={
+            "gcta_gene": PipelinePreflightEvidence(
+                module="gcta_gene",
+                input_vcf={},
+                resources=resources,
+            ),
+        },
+    )
     args = Namespace(
         output_directory=str(tmp_path / "pipeline"),
         _step_num="02",
@@ -503,10 +760,11 @@ def test_pipeline_runner_defers_complete_cli_validation_to_service(
     def reject_partial_configuration(*_args, **_kwargs):
         raise AssertionError("runner performed partial GCTA configuration validation")
 
-    def fake_service(service_args, service_context):
+    def fake_service(service_args, service_context, *, pipeline_resources):
         captured["has_input_override"] = hasattr(service_args, "gcta_input_file")
         captured["output_directory"] = service_args.output_directory
         captured["context"] = service_context
+        captured["pipeline_resources"] = pipeline_resources
         return expected
 
     monkeypatch.setattr(
@@ -525,8 +783,296 @@ def test_pipeline_runner_defers_complete_cli_validation_to_service(
         "has_input_override": False,
         "output_directory": str(tmp_path / "pipeline" / "02_gcta_gene"),
         "context": context,
+        "pipeline_resources": resources,
     }
     assert args.output_directory == str(tmp_path / "pipeline")
+
+
+def test_pipeline_preflight_validates_external_resources_before_formatter(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    del args.gcta_input_file
+
+    evidence = preflight_gcta_gene_pipeline(
+        args,
+        preflight_evidence=pipeline_input_vcf_evidence(),
+    )
+
+    assert REGISTRY.get("gcta_gene").preflight.endswith(
+        ":preflight_gcta_gene_pipeline"
+    )
+    assert isinstance(evidence, PipelinePreflightEvidence)
+    assert isinstance(evidence.resources, GctaGenePipelineResources)
+    assert evidence.resources.version == "1.94.1"
+    assert evidence.resources.identifier_observation["variant_id_type"] == "rsid"
+    assert evidence.resources.gene_annotation_metrics["genes"] == 1
+    assert len(evidence.resources.file_identities) == 5
+    assert "formatter-created GCTA .ma" in " ".join(evidence.deferred_checks)
+    assert not (tmp_path / "out").exists()
+
+
+def test_pipeline_preflight_rejects_malformed_gene_resource_before_output(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    del args.gcta_input_file
+    (tmp_path / "genes.txt").write_text(
+        "1\t50\t150\tENSG000001\n1\t60\t160\tENSG000001\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(GctaGeneError, match="duplicate gene ID"):
+        preflight_gcta_gene_pipeline(
+            args,
+            preflight_evidence=pipeline_input_vcf_evidence(),
+        )
+
+    assert not (tmp_path / "out").exists()
+
+
+def test_pipeline_execution_reuses_static_gcta_gene_preflight(
+    tmp_path, monkeypatch,
+):
+    args = _args(tmp_path)
+    evidence = preflight_gcta_gene_pipeline(
+        args,
+        preflight_evidence=pipeline_input_vcf_evidence(),
+    )
+    context = _pipeline_context(args)
+    context.publish_validation("gcta_gene", evidence)
+    monkeypatch.setattr(
+        "postgwas.modules.gcta_gene.service.validate_gcta_reference_files",
+        lambda *_args, **_kwargs: pytest.fail(
+            "PLINK resource validation was repeated"
+        ),
+    )
+    monkeypatch.setattr(
+        "postgwas.modules.gcta_gene.service.require_supported_gcta",
+        lambda *_args, **_kwargs: pytest.fail("GCTA version probe was repeated"),
+    )
+    monkeypatch.setattr(
+        "postgwas.modules.gcta_gene.service._validate_gene_list",
+        lambda *_args, **_kwargs: pytest.fail(
+            "gene-coordinate validation was repeated"
+        ),
+    )
+
+    result = run_gcta_gene_direct(
+        args,
+        context,
+        pipeline_resources=evidence.resources,
+    )
+
+    assert result.metrics["tested_units"] == 1
+
+
+def test_pipeline_rejects_resource_changed_after_gcta_gene_preflight(tmp_path):
+    args = _args(tmp_path)
+    evidence = preflight_gcta_gene_pipeline(
+        args,
+        preflight_evidence=pipeline_input_vcf_evidence(),
+    )
+    context = _pipeline_context(args)
+    context.publish_validation("gcta_gene", evidence)
+    with (tmp_path / "genes.txt").open("a", encoding="utf-8") as handle:
+        handle.write("1\t200\t300\tENSG000002\n")
+
+    with pytest.raises(GctaGeneError, match="changed after pipeline preflight"):
+        run_gcta_gene_direct(
+            args,
+            context,
+            pipeline_resources=evidence.resources,
+        )
+
+    assert not (tmp_path / "out").exists()
+
+
+def test_fastbat_set_gmt_pipeline_reports_all_thirteen_stages_and_log_summaries(
+    tmp_path, monkeypatch,
+):
+    args = _args(tmp_path, "fastbat_set")
+    formatter_input = Path(args.gcta_input_file)
+    del args.gcta_input_file
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text("SET_1\tdescription\tENSG000001\n", encoding="utf-8")
+    args.gmt = str(gmt)
+    args.modules = ["gcta_gene"]
+    args.format = None
+    args.vcf = str(tmp_path / "study.vcf.gz")
+    Path(args.vcf).write_text("vcf\n", encoding="utf-8")
+    args.bcftools = "bcftools"
+    args._step_num = "01"
+    module_values = yaml.safe_load(
+        Path(args.run_config).read_text(encoding="utf-8")
+    )
+    Path(args.run_config).write_text(
+        yaml.safe_dump({"modules": {"gcta_gene": module_values}}),
+        encoding="utf-8",
+    )
+    configuration = _resolved_configuration(args)
+    plan = build_gcta_gene_pipeline_progress_plan(
+        configuration.modules.gcta_gene,
+    )
+    stream = StringIO()
+    progress_console = Console(
+        file=stream,
+        force_terminal=False,
+        color_system=None,
+        width=140,
+    )
+    monkeypatch.setattr(
+        "postgwas.pipeline.executor.console", progress_console,
+    )
+
+    input_evidence = pipeline_input_vcf_evidence()
+    input_evidence["input_vcf"]["harmonised"]["postgwas_dataset_id"] = "STUDY"
+    gcta_evidence = preflight_gcta_gene_pipeline(
+        args,
+        preflight_evidence=input_evidence,
+    )
+    current_evidence = input_evidence["input_vcf"]
+    monkeypatch.setattr(
+        runners,
+        "_validate_current_pipeline_vcf",
+        lambda *_args, **_kwargs: current_evidence,
+    )
+    monkeypatch.setattr(runners, "check_and_resolve_binaries", lambda *_: None)
+
+    def configure_identifiers(namespace, *_args):
+        namespace.variant_id_types = {"gcta_gene": "rsid"}
+        namespace.variant_id_observations = {
+            "gcta_gene": {
+                "variant_id_type": "rsid",
+                "variants": 1,
+                "consumers": ["GCTA gene"],
+            },
+        }
+
+    monkeypatch.setattr(
+        runners,
+        "configure_reference_variant_identifiers",
+        configure_identifiers,
+    )
+
+    def fake_formatter(formatter_args, context):
+        output_file = Path(formatter_args.output_directory) / formatter_input.name
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_bytes(formatter_input.read_bytes())
+        result = {
+            "gcta_gene": {
+                "summary_statistics_input_file": str(output_file),
+                "variant_id_type": "rsid",
+                "rows_in": 1,
+                "rows_out": 1,
+                "rows_excluded": 0,
+                "p_values_bounded": 0,
+            },
+        }
+        context["formatter"] = result
+        return result
+
+    monkeypatch.setattr(
+        "postgwas.modules.formatting.service.run_formatter_direct",
+        fake_formatter,
+    )
+    context = execute_pipeline(
+        args,
+        PipelinePlan(
+            ("gcta_gene",),
+            ("formatter", "gcta_gene"),
+            ("formatter", "gcta_gene"),
+        ),
+        configuration,
+        preflight_evidence={
+            **input_evidence,
+            "current_vcf": current_evidence,
+            "gcta_gene": gcta_evidence,
+        },
+    )
+    result = context["gcta_gene"]
+
+    assert result.metrics["tested_units"] == 1
+    output = stream.getvalue()
+    normalized_output = " ".join(output.split())
+    for number, title in enumerate(plan["stages"], 1):
+        assert "Completed %d/13 · %s" % (number, title) in output
+    for label in (
+        "Input summary-statistics VCF",
+        "PLINK LD reference",
+        "Required companion files",
+        "BIM structural validation",
+        "GCTA gene-coordinate reference",
+        "Coordinate columns",
+        "Original pathway GMT",
+        "Detected format",
+        "Pathway/gene-coordinate compatibility",
+        "Required minimum coordinate-reference coverage",
+        "Prepare GCTA summary statistics from the harmonised GWAS-VCF",
+        "Extract and transform GWAS-VCF fields",
+        "Variants extracted",
+        "Write the GCTA .ma input",
+        "Required columns and non-missing values",
+        "Scientific numeric ranges",
+        "Compare the final .ma input with PLINK BIM",
+        "Compatible shared allele pairs",
+    ):
+        assert label in normalized_output
+    for provenance in (
+        "ID → SNP",
+        "ALT → effect allele",
+        "REF → other allele",
+        "FORMAT/AF → A1 effect-allele frequency",
+        "FORMAT/ES → copied without numerical transformation",
+        "FORMAT/SE → copied without numerical transformation",
+        "FORMAT/LP → raw P = 10⁻ᴸᴾ",
+        "FORMAT/SS → per-variant total N",
+    ):
+        assert provenance in normalized_output
+    assert "All 13 stages completed" in output
+    log = (
+        tmp_path
+        / "out"
+        / "02_gcta_gene"
+        / "logs"
+        / "STUDY_fastbat_set_gcta_gene.log"
+    ).read_text(encoding="utf-8")
+    normalized_log = " ".join(
+        re.sub(r"^\[[^]]+\] RUN\s*", "", line).strip()
+        for line in log.splitlines()
+    )
+    for number, title in enumerate(plan["stages"], 1):
+        assert "step=%d" % number in log
+        assert title in normalized_log
+    assert "gcta_input_validation_summary" in log
+    assert "input_rewritten=false" in log
+    for label in (
+        "Required companion files",
+        "BIM structural validation",
+        "Coordinate columns",
+        "Detected format",
+        "Required minimum coordinate-reference coverage",
+        "Variants extracted",
+        "Required columns and non-missing values",
+        "Compatible shared allele pairs",
+    ):
+        assert label in normalized_log
+    for provenance in (
+        "ID → SNP",
+        "ALT → effect allele",
+        "REF → other allele",
+        "FORMAT/AF → A1 effect-allele frequency",
+        "FORMAT/ES → copied without numerical transformation",
+        "FORMAT/SE → copied without numerical transformation",
+        "FORMAT/LP → raw P = 10⁻ᴸᴾ",
+        "FORMAT/SS → per-variant total N",
+    ):
+        assert provenance in normalized_log
+    assert "status=VALIDATED_PENDING_PIPELINE_CHECKPOINT" in log
+    assert "gcta_pipeline_stage step=13 total=13" in log
+    assert "status=COMPLETED" in log
+    assert not hasattr(args, "_pipeline_progress_completion")
+    assert not hasattr(args, "_pipeline_progress_failure")
 
 
 def test_pipeline_cli_path_values_resolve_as_canonical_configuration(tmp_path):
@@ -542,6 +1088,7 @@ def test_pipeline_cli_path_values_resolve_as_canonical_configuration(tmp_path):
         gmt=gmt,
         genome_build="GRCh37",
         gcta_reference_population="EUR",
+        gcta_minimum_gene_id_overlap=0.75,
         dataset_id="STUDY",
         output_directory=output,
     )
@@ -552,8 +1099,35 @@ def test_pipeline_cli_path_values_resolve_as_canonical_configuration(tmp_path):
     assert module.method == "fastbat_set"
     assert module.gene_annotation.file == str(gene_list)
     assert module.set_annotation.gmt_file == str(gmt)
+    assert (
+        module.set_annotation.conversion.minimum_gene_id_overlap_fraction
+        == 0.75
+    )
     assert configuration.run.dataset_id == "STUDY"
     assert configuration.run.output_directory == output
+
+
+def test_gcta_scope_cli_overrides_canonical_yaml(tmp_path):
+    reference = _write_reference(tmp_path)
+    gene_list = _write_gene_list(tmp_path)
+    configuration = _resolved_configuration(Namespace(
+        gcta_reference_prefix=str(reference),
+        gene_list=gene_list,
+        genome_build="GRCh37",
+        gcta_reference_population="EUR",
+        mhc_policy="exclude_genes",
+        mhc_chrom="chr6",
+        mhc_start=100,
+        mhc_end=200,
+        exclude_chromosomes=["MT"],
+    ))
+
+    module = configuration.modules.gcta_gene
+    assert module.mhc.policy == "exclude_genes"
+    assert module.mhc.region_override.model_dump() == {
+        "chromosome": "chr6", "start": 100, "end": 200,
+    }
+    assert module.chromosomes.exclude == ["MT"]
 
 
 @pytest.mark.parametrize(
@@ -579,11 +1153,29 @@ def test_fastbat_command_uses_only_official_gene_test_options():
         "gcta64", "study.tsv", "reference", "genes.txt", "out/STUDY", 4, module,
     )
     assert command == [
-        "gcta64", "--bfile", "reference", "--maf", "0.01", "--thread-num", "4",
+        "gcta64", "--bfile", "reference", "--maf", "0.01",
+        "--diff-freq", "0.2", "--thread-num", "4",
         "--out", "out/STUDY", "--fastBAT", "study.tsv", "--fastBAT-ld-cutoff",
         "0.9", "--fastBAT-gene-list", "genes.txt", "--fastBAT-wind", "50",
     ]
     assert "--mBAT-combo" not in command
+
+
+def test_gcta_command_uses_documented_exact_id_exclusion_file():
+    module = load_module_configuration("gcta_gene")
+    command = build_gcta_command(
+        "gcta64",
+        "study.tsv",
+        "reference",
+        "genes.txt",
+        "out/STUDY",
+        4,
+        module,
+        exclude_variants_file="excluded.snplist",
+    )
+
+    assert command[command.index("--exclude") + 1] == "excluded.snplist"
+    assert command.index("--exclude") < command.index("--fastBAT")
 
 
 def test_fastbat_segment_command_uses_official_segment_option(tmp_path):
@@ -625,12 +1217,55 @@ def test_mbat_combo_command_includes_every_documented_method_option(tmp_path):
         module,
     )
     assert command == [
-        "gcta64", "--bfile", "reference", "--maf", "0.01", "--thread-num", "4",
+        "gcta64", "--bfile", "reference", "--maf", "0.01",
+        "--diff-freq", "0.2", "--thread-num", "4",
         "--out", "out/STUDY", "--mBAT-combo", "study.ma", "--mBAT-gene-list",
         "genes.txt", "--mBAT-wind", "50", "--mBAT-svd-gamma", "0.9",
-        "--diff-freq", "0.2", "--fastBAT-ld-cutoff", "0.9",
+        "--fastBAT-ld-cutoff", "0.9",
         "--mBAT-print-all-p", "--mBAT-write-snpset",
     ]
+
+
+@pytest.mark.parametrize(
+    "method", ["fastbat_gene", "fastbat_segment", "fastbat_set", "mbat_combo"],
+)
+@pytest.mark.parametrize("threshold", [0.0001, 0.1, 1.0])
+def test_all_gcta_methods_pass_the_configured_frequency_threshold(method, threshold):
+    module = load_module_configuration(
+        "gcta_gene",
+        cli_overrides={"method": method, "frequency_difference_max": threshold},
+    )
+    command = build_gcta_command(
+        "gcta64", "study.ma", "reference", "annotation.txt", "out/STUDY", 2,
+        module,
+    )
+
+    assert command.count("--diff-freq") == 1
+    assert command[command.index("--diff-freq") + 1] == str(threshold)
+
+
+@pytest.mark.parametrize(
+    "method", ["fastbat_gene", "fastbat_segment", "fastbat_set", "mbat_combo"],
+)
+def test_all_gcta_methods_expose_and_record_frequency_threshold(tmp_path, method):
+    parser = get_gcta_gene_parser(direct_controls=False)
+    parser._postgwas_help_arguments = ("--method", method)
+    gcta_gene_cli._customize_gcta_gene_pipeline_help(parser)
+    assert "--frequency-difference-max FRACTION" in parser.format_help()
+
+    args = _args(tmp_path, method)
+    args.frequency_difference_max = 0.1
+    configuration = _resolved_configuration(args)
+    baseline = configuration.model_copy(deep=True)
+    baseline.modules.gcta_gene.frequency_difference_max = 0.2
+    assert _gcta_configuration_digest(configuration) != _gcta_configuration_digest(
+        baseline
+    )
+    result = run_gcta_gene_direct(args)
+    report = result.artifacts["html_report"].path.read_text(encoding="utf-8")
+    assert "<td>Maximum frequency difference</td><td>0.1</td>" in report
+    log = tmp_path / "out" / "logs" / ("STUDY_%s_gcta_gene.log" % method)
+    assert "frequency_difference_max=0.1" in log.read_text(encoding="utf-8")
 
 
 def test_gcta_input_accepts_distinct_nonempty_indel_alleles(tmp_path):
@@ -666,6 +1301,14 @@ def test_mbat_combo_runs_once_and_reports_internal_fastbat(tmp_path, capsys):
     normalized = result.artifacts["normalized_results"].path
     assert raw.name == "STUDY.gene.assoc.mbat" and raw.is_file()
     assert "P_fastBAT" in normalized.read_text(encoding="utf-8").splitlines()[0]
+    html_report = result.artifacts["html_report"].path
+    report_text = html_report.read_text(encoding="utf-8")
+    assert html_report.name == "STUDY_mbat_combo_gcta_gene_report.html"
+    assert "GCTA mBAT-combo gene-association report" in report_text
+    assert "Complete association results" in report_text
+    assert "P_mBATcombo" in report_text
+    assert "P_mBAT" in report_text
+    assert "P_fastBAT" in report_text
     log = tmp_path / "out" / "logs" / "STUDY_mbat_combo_gcta_gene.log"
     log_text = log.read_text(encoding="utf-8")
     assert log_text.count("--mBAT-combo") == 1
@@ -813,6 +1456,7 @@ def test_fastbat_run_validates_and_normalizes_results(tmp_path):
     assert result.metrics["tested_units"] == 1
     assert result.artifacts["raw_results"].path.name == "STUDY.gene.fastbat"
     assert result.artifacts["normalized_results"].path.is_file()
+    assert result.artifacts["html_report"].path.is_file()
     assert result.artifacts["completion_manifest"].path.is_file()
     summary = result.metrics["scientific_summary"]
     assert summary["tested_units"] == 1
@@ -829,6 +1473,102 @@ def test_fastbat_run_validates_and_normalizes_results(tmp_path):
     assert corrected["significant_nominal"].to_list() == [True]
     assert corrected["significant_bonferroni"].to_list() == [True]
     assert corrected["significant_fdr_bh"].to_list() == [True]
+    report_text = result.artifacts["html_report"].path.read_text(encoding="utf-8")
+    for heading in (
+        "Results at a glance",
+        "Multiple-testing results",
+        "Input compatibility and analysis coverage",
+        "Complete association results",
+        "How to interpret",
+        "Analysis parameters and provenance",
+    ):
+        assert heading in report_text
+    assert "All 1 validated genes are included" in report_text
+    assert "ENSG000001" in report_text
+    assert 'data-page-size="50"' in report_text
+
+
+def test_gcta_default_scope_excludes_mhc_and_configured_chromosomes(tmp_path):
+    args = _args(tmp_path)
+    Path(args.gcta_input_file).write_text(
+        "SNP\tA1\tA2\tfreq\tBETA\tSE\tP\tN\n"
+        "rs1\tG\tA\t0.2\t0.1\t0.05\t0.01\t1000\n"
+        "rs_mhc\tG\tA\t0.2\t0.1\t0.05\t0.02\t1000\n"
+        "rs_y\tG\tA\t0.2\t0.1\t0.05\t0.03\t1000\n",
+        encoding="utf-8",
+    )
+    Path(str(tmp_path / "reference") + ".bim").write_text(
+        "1\trs1\t0\t100\tG\tA\n"
+        "6\trs_mhc\t0\t29000000\tG\tA\n"
+        "Y\trs_y\t0\t100\tG\tA\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "genes.txt").write_text(
+        "1\t50\t150\tENSG000001\n"
+        "6\t28450000\t28470000\tENSG_MHC\n"
+        "Y\t50\t150\tENSG_Y\n",
+        encoding="utf-8",
+    )
+
+    result = run_gcta_gene_direct(args)
+
+    assert result.metrics["analyzable_variants"] == 1
+    assert result.metrics["excluded_input_mhc_variants"] == 1
+    assert result.metrics["excluded_input_chromosome_variants"] == 1
+    assert result.metrics["excluded_mhc_genes"] == 1
+    assert result.metrics["excluded_chromosome_genes"] == 1
+    assert result.artifacts["variant_exclusion_list"].path.read_text(
+        encoding="utf-8"
+    ).splitlines() == ["rs_mhc", "rs_y"]
+    assert result.artifacts["scoped_gene_list"].path.read_text(
+        encoding="utf-8"
+    ) == "1\t50\t150\tENSG000001\n"
+    assert result.artifacts["excluded_gene_list"].path.read_text(
+        encoding="utf-8"
+    ).splitlines() == [
+        "6\t28450000\t28470000\tENSG_MHC",
+        "Y\t50\t150\tENSG_Y",
+    ]
+    completion = yaml.safe_load(
+        result.artifacts["completion_manifest"].path.read_text(encoding="utf-8")
+    )
+    assert completion["schema_version"] == 3
+    assert completion["outputs"]["html_report"]["path"] == str(
+        result.artifacts["html_report"].path.resolve()
+    )
+    assert completion["inputs"]["source_annotation"]["path"].endswith(
+        "/genes.txt"
+    )
+    assert completion["inputs"]["analysis_annotation"]["path"] == str(
+        result.artifacts["scoped_gene_list"].path.resolve()
+    )
+    assert completion["inputs"]["variant_exclusion_list"]["path"] == str(
+        result.artifacts["variant_exclusion_list"].path.resolve()
+    )
+    summary = result.metrics["scientific_summary"]
+    assert summary["resolved_variants"] == 1
+    assert summary["excluded_scope_variants"] == 2
+    assert summary["excluded_scope_genes"] == 2
+    assert summary["expected_chromosomes"] == ["1"]
+    assert summary["missing_result_chromosomes"] == []
+
+
+@pytest.mark.parametrize("method", ["fastbat_segment", "fastbat_set"])
+def test_gene_only_mhc_policy_rejects_inputs_without_gene_identities(
+    tmp_path,
+    method,
+):
+    args = _args(tmp_path, method)
+    config_path = Path(args.run_config)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["mhc"] = {"policy": "exclude_genes"}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(
+        GctaGeneError,
+        match="requires a coordinate-defined gene input",
+    ):
+        run_gcta_gene_direct(args)
 
 
 def test_gcta_summary_uses_one_value_column_at_every_indent(tmp_path, capsys):
@@ -964,6 +1704,150 @@ def test_reporting_changes_do_not_invalidate_completed_analysis(
     assert "gcta_multiple_testing_corrections" in log.read_text(encoding="utf-8")
 
 
+def test_html_presentation_change_rebuilds_report_without_rerunning_gcta(
+    tmp_path, monkeypatch,
+):
+    args = _args(tmp_path)
+    first = run_gcta_gene_direct(args)
+    report = first.artifacts["html_report"].path
+    assert 'data-page-size="50"' in report.read_text(encoding="utf-8")
+    config_path = Path(args.run_config)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["html_report"] = {"page_size": 1}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    args.resume = True
+    monkeypatch.setattr(
+        "postgwas.modules.gcta_gene.service.run_gcta_command",
+        lambda *_args, **_kwargs: pytest.fail("HTML change reran GCTA"),
+    )
+
+    resumed = run_gcta_gene_direct(args)
+
+    assert resumed.metrics["resumed"] is True
+    assert 'data-page-size="1"' in report.read_text(encoding="utf-8")
+    manifest = yaml.safe_load(
+        resumed.artifacts["completion_manifest"].path.read_text(encoding="utf-8")
+    )
+    assert manifest["schema_version"] == 3
+    assert manifest["outputs"]["html_report"]["path"] == str(report.resolve())
+
+
+def test_legacy_completion_manifest_adds_html_without_rerunning_gcta(
+    tmp_path, monkeypatch,
+):
+    args = _args(tmp_path)
+    first = run_gcta_gene_direct(args)
+    manifest_path = first.artifacts["completion_manifest"].path
+    report_path = first.artifacts["html_report"].path
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 2
+    manifest.pop("report_configuration_sha256")
+    manifest["outputs"].pop("html_report")
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    report_path.unlink()
+    args.resume = True
+    monkeypatch.setattr(
+        "postgwas.modules.gcta_gene.service.run_gcta_command",
+        lambda *_args, **_kwargs: pytest.fail("legacy report upgrade reran GCTA"),
+    )
+
+    resumed = run_gcta_gene_direct(args)
+
+    assert resumed.metrics["resumed"] is True
+    assert report_path.is_file()
+    upgraded = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["schema_version"] == 3
+    assert upgraded["outputs"]["html_report"]["path"] == str(
+        report_path.resolve()
+    )
+
+
+def test_legacy_completion_manifest_refuses_untracked_html_output(tmp_path):
+    args = _args(tmp_path)
+    first = run_gcta_gene_direct(args)
+    manifest_path = first.artifacts["completion_manifest"].path
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 2
+    manifest.pop("report_configuration_sha256")
+    manifest["outputs"].pop("html_report")
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    args.resume = True
+
+    with pytest.raises(
+        GctaGeneError,
+        match="legacy GCTA completion manifest does not track",
+    ):
+        run_gcta_gene_direct(args)
+
+
+def test_changed_html_path_refuses_untracked_destination(tmp_path):
+    args = _args(tmp_path)
+    run_gcta_gene_direct(args)
+    config_path = Path(args.run_config)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["output_layout"] = {
+        "html_report": "reports/{dataset_id}_{method}_replacement.html",
+    }
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    replacement = (
+        tmp_path / "out/reports/STUDY_fastbat_gene_replacement.html"
+    )
+    replacement.parent.mkdir(parents=True, exist_ok=True)
+    replacement.write_text("user-owned report\n", encoding="utf-8")
+    args.resume = True
+
+    with pytest.raises(
+        GctaGeneError,
+        match="newly configured GCTA HTML-report path already exists",
+    ):
+        run_gcta_gene_direct(args)
+    assert replacement.read_text(encoding="utf-8") == "user-owned report\n"
+
+
+def test_completed_gcta_result_rejects_changed_html_report_on_resume(tmp_path):
+    args = _args(tmp_path)
+    result = run_gcta_gene_direct(args)
+    result.artifacts["html_report"].path.write_text(
+        "changed\n", encoding="utf-8",
+    )
+    args.resume = True
+
+    with pytest.raises(GctaGeneError, match="HTML report changed"):
+        run_gcta_gene_direct(args)
+
+
+def test_failed_report_refresh_restores_completed_resume_outputs(
+    tmp_path, monkeypatch,
+):
+    args = _args(tmp_path)
+    first = run_gcta_gene_direct(args)
+    normalized = first.artifacts["normalized_results"].path
+    report = first.artifacts["html_report"].path
+    manifest = first.artifacts["completion_manifest"].path
+    original = {
+        "normalized": normalized.read_bytes(),
+        "report": report.read_bytes(),
+        "manifest": manifest.read_bytes(),
+    }
+    args.resume = True
+    args.gcta_nominal_alpha = 0.005
+    monkeypatch.setattr(
+        "postgwas.modules.gcta_gene.service.write_gcta_html_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            GctaGeneError("synthetic HTML failure")
+        ),
+    )
+
+    with pytest.raises(GctaGeneError, match="synthetic HTML failure"):
+        run_gcta_gene_direct(args)
+
+    assert normalized.read_bytes() == original["normalized"]
+    assert report.read_bytes() == original["report"]
+    assert manifest.read_bytes() == original["manifest"]
+    assert not list(report.parent.glob(".*.pre_refresh.*"))
+    assert not list(normalized.parent.glob(".*.pre_correction.*"))
+
+
 def test_completed_gcta_result_rejects_changed_output_on_resume(tmp_path):
     args = _args(tmp_path)
     result = run_gcta_gene_direct(args)
@@ -976,7 +1860,7 @@ def test_completed_gcta_result_rejects_changed_output_on_resume(tmp_path):
         run_gcta_gene_direct(args)
 
 
-def test_pipeline_vcf_reconciles_rsid_input_to_exact_bim_identifier(tmp_path):
+def test_pipeline_rejects_formatter_input_that_is_not_bim_compatible(tmp_path):
     args = _args(tmp_path, "fastbat_set", variant="rs1")
     Path(str(tmp_path / "reference") + ".bim").write_text(
         "1\t1_100_A_G\t0\t100\tG\tA\n", encoding="utf-8",
@@ -987,25 +1871,57 @@ def test_pipeline_vcf_reconciles_rsid_input_to_exact_bim_identifier(tmp_path):
     vcf = tmp_path / "study.vcf.gz"
     vcf.write_bytes(b"VCF")
     args.vcf = str(vcf)
-    args.bcftools = str(_write_fake_bcftools(tmp_path))
     context = _pipeline_context(args)
+
+    with pytest.raises(
+        GctaGeneError,
+        match="No GCTA input variant identifiers occur in the PLINK BIM",
+    ):
+        run_gcta_gene_direct(args, context)
+
+
+def test_pipeline_vcf_reproduces_formatter_unique_id_when_vcf_has_rsid(tmp_path):
+    unique_id = "1_100_A_G"
+    args = _args(tmp_path, "fastbat_set", variant=unique_id)
+    Path(str(tmp_path / "reference") + ".bim").write_text(
+        "1\t%s\t0\t100\tG\tA\n" % unique_id, encoding="utf-8",
+    )
+    vcf = tmp_path / "study.vcf.gz"
+    vcf.write_bytes(b"VCF")
+    args.vcf = str(vcf)
+    input_path = Path(args.gcta_input_file)
+    input_bytes = input_path.read_bytes()
+    context = _pipeline_context(args, variant_id_type="unique")
 
     result = run_gcta_gene_direct(args, context)
 
-    assert result.metrics["direct_id_matches"] == 0
-    assert result.metrics["coordinate_and_allele_matches"] == 1
-    assert result.metrics["variant_ids_replaced"] == 1
-    harmonised = result.artifacts["harmonised_input"].path
-    assert harmonised.read_text(encoding="utf-8").splitlines() == [
-        "SNP\tA1\tA2\tfreq\tBETA\tSE\tP\tN",
-        "1_100_A_G\tG\tA\t0.2\t0.1\t0.05\t0.01\t1000",
-    ]
-    assert result.artifacts["analysis_set_list"].path.read_text(
-        encoding="utf-8"
-    ).split() == ["SET_1", "1_100_A_G", "END"]
+    assert result.metrics["formatter_variant_id_type"] == "unique"
+    assert result.metrics["exact_id_matches"] == 1
+    assert result.metrics["variant_ids_replaced"] == 0
+    assert result.metrics["formatter_input_unmodified"] is True
+    assert input_path.read_bytes() == input_bytes
+    assert "harmonised_input" not in result.artifacts
+    log = tmp_path / "out/logs/STUDY_fastbat_set_gcta_gene.log"
+    assert "formatter_variant_id_type=unique" in log.read_text(encoding="utf-8")
 
 
-def test_pipeline_reconciliation_enforces_configured_minimum_overlap(tmp_path):
+def test_pipeline_vcf_requires_formatter_identifier_provenance(tmp_path):
+    args = _args(tmp_path)
+    vcf = tmp_path / "study.vcf.gz"
+    vcf.write_bytes(b"VCF")
+    args.vcf = str(vcf)
+    args.bcftools = str(_write_fake_bcftools(tmp_path))
+    context = _pipeline_context(args)
+    del context["formatter"]["gcta_gene"]["variant_id_type"]
+
+    with pytest.raises(
+        GctaGeneError,
+        match="formatter output is missing variant_id_type provenance",
+    ):
+        run_gcta_gene_direct(args, context)
+
+
+def test_pipeline_exact_bim_matching_enforces_configured_minimum_overlap(tmp_path):
     args = _args(tmp_path)
     input_path = Path(args.gcta_input_file)
     input_path.write_text(
@@ -1030,17 +1946,17 @@ def test_pipeline_reconciliation_enforces_configured_minimum_overlap(tmp_path):
         run_gcta_gene_direct(args, context)
 
 
-def test_pipeline_direct_id_match_rejects_vcf_reference_coordinate_conflict(tmp_path):
+def test_pipeline_rejects_formatter_input_with_bim_allele_conflict(tmp_path):
     args = _args(tmp_path)
+    Path(str(tmp_path / "reference") + ".bim").write_text(
+        "1\trs1\t0\t100\tC\tA\n", encoding="utf-8",
+    )
     vcf = tmp_path / "study.vcf.gz"
     vcf.write_bytes(b"VCF")
     args.vcf = str(vcf)
-    args.bcftools = str(_write_fake_bcftools(
-        tmp_path, rows=(("1", 101, "rs1", "A", "G"),),
-    ))
     context = _pipeline_context(args)
 
-    with pytest.raises(GctaGeneError, match="direct ID matches have different"):
+    with pytest.raises(GctaGeneError, match="1 overlapping.*cannot be matched"):
         run_gcta_gene_direct(args, context)
 
 
@@ -1079,20 +1995,50 @@ def test_direct_input_reports_partial_exact_id_overlap_without_rewriting(
     assert "input_rewritten=false" in log_text
     assert "direct-input GWAS variant is absent" in normalized_log
     assert "scientific_warnings=1" in normalized_log
+    for evidence in (
+        "input_format=gcta_ma",
+        "required_columns_validated=true",
+        "scientific_ranges_validated=true",
+        "unique_variant_identifiers_validated=true",
+        "allele_pairs_validated=true",
+        "declared_genome_build=GRCh37",
+        "declared_population=EUR",
+        "compatible_allele_pairs=1",
+        "bim_structure_validated=true",
+        "coordinate_structure_validated=true",
+    ):
+        assert evidence in log_text
     terminal = " ".join(capsys.readouterr().out.split())
     for label in (
+        "Supplied GCTA summary-statistics input",
+        "GCTA .ma file",
+        "Input format",
+        "Required columns",
+        "Scientific numeric ranges",
+        "Unique non-empty variant identifiers",
+        "Non-empty distinct allele pairs",
+        "PLINK LD reference",
+        "Required companion files",
         "Summary-statistic unique IDs",
         "PLINK BIM unique IDs",
         "Exact IDs shared",
         "Summary IDs absent from BIM",
         "BIM IDs absent from summary",
+        "Compatible shared allele pairs",
+        "Declared genome build",
+        "Declared population",
+        "Build and population provenance",
+        "GCTA gene-coordinate reference",
+        "Coordinate columns",
+        "Unique gene identifiers",
+        "Positive ordered coordinates",
     ):
         assert label in terminal
     assert "1; will not be used by GCTA" in terminal
     assert "COMPLETED WITH SCIENTIFIC WARNINGS" in terminal
 
 
-def test_direct_service_rejects_vcf_reconciliation(tmp_path):
+def test_direct_service_rejects_vcf_input(tmp_path):
     args = _args(tmp_path)
     vcf = tmp_path / "study.vcf.gz"
     vcf.write_bytes(b"VCF")
@@ -1170,7 +2116,11 @@ def test_duplicate_nested_genome_build_declarations_are_rejected(tmp_path):
         "fastbat_ld_cutoff: 1.1\n",
         "mbat_svd_gamma: 0\n",
         "frequency_difference_max: .nan\n",
+        "frequency_difference_max: 0\n",
+        "frequency_difference_max: -0.1\n",
+        "frequency_difference_max: 1.1\n",
         "variant_harmonisation:\n  minimum_overlap_fraction: 0\n",
+        "set_annotation:\n  conversion:\n    minimum_gene_id_overlap_fraction: 0\n",
         "reporting:\n  top_result_count: 0\n",
         "reporting:\n  nominal_alpha: 0\n",
         "reporting:\n  familywise_alpha: 1.1\n",
@@ -1185,6 +2135,28 @@ def test_scientific_ranges_are_schema_validated(tmp_path, text):
     config.write_text(text, encoding="utf-8")
     with pytest.raises(ConfigurationError):
         load_module_configuration("gcta_gene", config)
+
+
+def test_gcta_html_report_configuration_is_schema_validated():
+    module = load_module_configuration("gcta_gene")
+
+    assert module.html_report.page_size == 50
+    assert module.results.schemas["mbat_combo"].p_value_column in (
+        module.html_report.columns["mbat_combo"]
+    )
+    with pytest.raises(ConfigurationError, match="page_size"):
+        load_module_configuration(
+            "gcta_gene", cli_overrides={"html_report.page_size": 0},
+        )
+    with pytest.raises(ConfigurationError, match="html_report"):
+        load_module_configuration(
+            "gcta_gene",
+            cli_overrides={
+                "output_layout.html_report": (
+                    "reports/{dataset_id}_{method}_gcta_gene_report.txt"
+                ),
+            },
+        )
 
 
 def test_reference_and_gene_column_orders_are_configuration_driven(tmp_path):
@@ -1223,7 +2195,26 @@ def test_all_fastbat_analysis_modes_run_and_normalize(
     assert result.metrics["tested_units"] == 1
     assert result.metrics["unit_label"] == unit_label
     assert result.artifacts["normalized_results"].path.is_file()
-    assert "Top associated %s" % unit_label in capsys.readouterr().out
+    assert result.artifacts["html_report"].path.is_file()
+    report_text = result.artifacts["html_report"].path.read_text(encoding="utf-8")
+    assert "All 1 validated %s are included" % unit_label in report_text
+    assert "significant_nominal" in report_text
+    assert "P_bonferroni" in report_text
+    assert "P_fdr_bh" in report_text
+    terminal = capsys.readouterr().out
+    assert "Top associated %s" % unit_label in terminal
+    if method == "fastbat_set":
+        for label in (
+            "Prepared fastBAT set-list input",
+            "Input format",
+            "Unique set identifiers",
+            "Within-set variant uniqueness",
+            "END terminators and non-empty sets",
+            "GWAS/BIM set-membership compatibility",
+            "Unavailable variant memberships",
+            "Final fastBAT set list",
+        ):
+            assert label in terminal
 
 
 def test_fastbat_set_rejects_an_unterminated_set_before_execution(
@@ -1238,7 +2229,10 @@ def test_fastbat_set_rejects_an_unterminated_set_before_execution(
     log = tmp_path / "out" / "logs" / "STUDY_fastbat_set_gcta_gene.log"
     assert "--fastBAT" not in log.read_text(encoding="utf-8")
     terminal = capsys.readouterr().out
-    assert "Failed 4/7 · Restrict fastBAT sets to analyzable variants" in terminal
+    assert (
+        "Failed 3/7 · Validate and prepare the fastBAT set-list input"
+        in terminal
+    )
     assert "All 7 stages completed" not in terminal
 
 
@@ -1265,25 +2259,71 @@ def test_fastbat_set_converts_gmt_with_exact_bim_identifiers(tmp_path, capsys):
     assert "reference_only" not in set_text
     assert result.artifacts["prepared_set_resource"].path == prepared
     assert result.artifacts["analysis_set_list"].path == (
-        prepared / "analysis.fastbat.set"
+        prepared / "pathways.fastbat.set"
     )
     assert result.metrics["matched_set_variants"] == 1
+    summary = result.metrics["scientific_summary"]
+    assert summary["gmt_gene_mappability_fraction"] == 1
+    assert summary["coordinate_reference_coverage_fraction"] == 1
+    assert summary["pathways_with_complete_gene_id_mapping"] == 1
     manifest = yaml.safe_load(
         (prepared / "resource_manifest.yaml").read_text(encoding="utf-8")
     )
     assert manifest["resource"]["genome_build"] == "GRCh37"
     assert manifest["policies"]["variant_identifier_policy"].startswith("copy PLINK BIM")
     terminal = capsys.readouterr().out
+    normalized_terminal = " ".join(terminal.split())
     for title in (
-        "Validate method and formatted GWAS input",
-        "Compare GWAS and PLINK BIM variant IDs",
-        "Prepare the fastBAT set source",
-        "Restrict fastBAT sets to analyzable variants",
-        "Validate the GCTA executable and version",
-        "Run GCTA fastbat_set and validate results",
-        "Build the scientific result summary",
+        "Validate the GCTA summary-statistics input",
+        "Validate the PLINK LD reference and compare it with the GWAS input",
+        "Validate GMT and gene resources and prepare fastBAT sets",
+        "Run GCTA fastbat_set",
+        "Validate the raw GCTA results",
+        "Add and validate multiple-testing corrections",
+        "Publish validated GCTA outputs and build the scientific summary",
     ):
         assert title in terminal
+    for label in (
+        "Original pathway GMT",
+        "Detected format",
+        "Pathway records",
+        "GCTA gene-coordinate reference",
+        "Unique gene identifiers",
+        "Pathway/gene-coordinate compatibility",
+        "GMT gene mappability",
+        "GMT gene mappability criterion",
+        "Coordinate-reference genes absent from GMT",
+        "Coordinate-reference coverage by GMT",
+        "Required minimum coordinate-reference coverage",
+        "Pathways with complete gene-ID mapping",
+        "Pathways with partial gene-ID mapping",
+        "Pathways without gene-ID mapping",
+        "Final fastBAT set resource",
+        "Final sets written",
+        "Published resource validation",
+    ):
+        assert label in normalized_terminal
+    service_log = (
+        tmp_path / "out/logs/STUDY_fastbat_set_gcta_gene.log"
+    ).read_text(encoding="utf-8")
+    for evidence in (
+        "pathway_structure_validated=true",
+        "gene_coordinate_structure_validated=true",
+        "gene_id_compatibility_validated=true",
+        "published_set_resource_validated=true",
+    ):
+        assert evidence in service_log
+    html_report = result.artifacts["html_report"].path.read_text(
+        encoding="utf-8"
+    )
+    for label in (
+        "GMT gene mappability",
+        "GMT gene mappability criterion",
+        "Coordinate-reference coverage by GMT",
+        "Required minimum coordinate-reference coverage",
+        "Pathways with complete gene-ID mapping",
+    ):
+        assert label in html_report
     for title in (
         "Validate inputs and scan GMT pathways",
         "Resolve genes and apply configured boundaries",

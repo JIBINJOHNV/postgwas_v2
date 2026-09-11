@@ -2,34 +2,33 @@
 
 from __future__ import annotations
 
-import functools
-import os, re,subprocess,time,shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import gzip
+import os
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor,ProcessPoolExecutor, as_completed
+import re
+import shutil
+import subprocess
+import threading
+import time
+from typing import List, Optional, Sequence, Tuple
+
 import pandas as pd
 import numpy as np
 import polars as pl
-from scipy.stats import norm
+import psutil
+from scipy.stats import norm, spearmanr
+
 from postgwas.core.execution.runtime import safe_thread_count
-from typing import List, Optional, Tuple
-import threading,psutil,sys
-from datetime import datetime
+from postgwas.core.reference_resources import require_file_inventory
+from postgwas.core.validation_reporting import register_file_availability_bundle
 
-"""
-pred_ld_runner.py — multiprocessing-safe PRED-LD engine for PostGWAS
+"""Resource-bounded chromosome workers and post-processing for PRED-LD.
 
-Designed to run inside Docker AND locally on macOS/Linux.
-
-Features:
----------
-✓ macOS-safe multiprocessing (spawn)
-✓ Linux-safe multiprocessing (fork)
-✓ Worker function defined at top-level (pickle-safe)
-✓ Automatic pred_ld.py discovery
-✓ Interleaved chromosome scheduling (big + small → reduced peak RAM)
-✓ Workspace isolation in HOME (always writable in Docker)
-✓ Merges logs and validates outputs
-✓ Auto thread reduction using safe_thread_count()
+The configured schedule interleaves chromosomes to reduce peak RAM. Workers
+read the validated reference in place, preserve complete per-chromosome logs,
+and require every configured chromosome output before consolidation.
 """
 
 # =====================================================================
@@ -110,57 +109,126 @@ def get_memory_status() -> Tuple[Optional[float], Optional[float]]:
 #  CHROMOSOME HELPERS
 # =============================================================================
 
-BIG_CHROMS = {"1", "2", "3", "4"}
+def _normalise_chromosome(chr_id: str) -> str:
+    return str(chr_id).upper().removeprefix("CHR")
 
 
-def is_big_chr(chr_id: str) -> bool:
+def is_big_chr(chr_id: str, large_chromosomes: Sequence[str]) -> bool:
     """Return True if chromosome is considered 'big' for scheduling."""
-    chr_id = chr_id.upper().replace("CHR", "")
-    try:
-        n = int(chr_id)
-        return str(n) in BIG_CHROMS
-    except ValueError:
-        return False
+    return _normalise_chromosome(chr_id) in {
+        _normalise_chromosome(chromosome)
+        for chromosome in large_chromosomes
+    }
 
 
-def build_interleaved_chr_order(chromosomes: List) -> List[str]:
-    """
-    Use a fixed, RAM-balanced chromosome execution order:
-
-    1, 22, 21, 20, 2, 19, 18, 17, 3, 16, 15, 14,
-    4, 13, 12, 11, 5, 10, 9, 8, 7, 6, X
-
-    - chrX always last (if present)
-    - Missing chromosomes are skipped safely
-    """
-    desired_order = [
-        "1", "22", "21", "20","19","18",
-        "2", "17", "16", "15", "14",
-        "3", "13","12", "11",
-        "4", "10", "9",  "8",
-        "5", "7", "6", "X"
+def build_interleaved_chr_order(
+    chromosomes: Sequence[str],
+    preferred_order: Sequence[str],
+) -> List[str]:
+    """Apply the configured RAM-balanced order without dropping chromosomes."""
+    chroms = list(dict.fromkeys(
+        _normalise_chromosome(chromosome) for chromosome in chromosomes
+    ))
+    available = set(chroms)
+    ordered = [
+        _normalise_chromosome(chromosome)
+        for chromosome in preferred_order
+        if _normalise_chromosome(chromosome) in available
     ]
-    # Normalize input
-    chroms = {str(c).upper().replace("CHR", "") for c in chromosomes}
-    # Preserve order, include only chromosomes the user actually provided
-    final_order = [c for c in desired_order if c in chroms]
-    return final_order
+    ordered_set = set(ordered)
+    return ordered + [
+        chromosome for chromosome in chroms if chromosome not in ordered_set
+    ]
 
 
 # =============================================================================
 #  MAIN PRED-LD PARALLEL RUNNER
 # ============================================================================
+def pred_ld_script_path() -> Path:
+    """Return the bundled PRED-LD entry point or fail before analysis output."""
+    script = Path(__file__).resolve().parent / "pred_ld.py"
+    if not script.is_file() or script.stat().st_size <= 0:
+        raise FileNotFoundError("PRED-LD entry point is missing or empty: %s" % script)
+    return script
+
+
+def validate_pred_ld_reference(
+    reference_directory: str | Path,
+    *,
+    population: str,
+    chromosomes: Sequence[str],
+    mode: str,
+    subdirectory_template: str,
+    file_template: str,
+    file_kinds: Sequence[str],
+) -> tuple[Path, tuple[Path, ...]]:
+    """Validate the exact files consumed by the bundled supported reference mode."""
+    root = Path(reference_directory).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError("PRED-LD reference directory does not exist: %s" % root)
+    if mode != "TOP_LD":
+        raise ValueError(
+            "PostGWAS post-processing currently supports only PRED-LD reference "
+            "mode TOP_LD; resolved mode was %r." % mode
+        )
+    reference_root = root / subdirectory_template.format(
+        mode=mode,
+        population=population,
+    )
+    files = tuple(
+        reference_root / file_template.format(
+            population=population,
+            chromosome=chromosome,
+            kind=kind,
+        )
+        for chromosome in chromosomes
+        for kind in file_kinds
+    )
+    require_file_inventory(
+        files, "PRED-LD TOP_LD reference",
+        missing_message="PRED-LD TOP_LD reference files are missing or empty",
+        error_type=FileNotFoundError,
+    )
+    register_file_availability_bundle(
+        files,
+        "PRED-LD chromosome reference bundle",
+        (
+            ("count", "chromosomes", list(chromosomes)),
+            (
+                "success",
+                "pred_ld_reference_files",
+                "%d / %d" % (len(files), len(files)),
+            ),
+            ("count", "pred_ld_reference_file_kinds", list(file_kinds)),
+            ("analysis", "pred_ld_reference_mode", mode),
+            ("genetic", "population", population),
+            ("info", "pred_ld_reference_directory", reference_root, True),
+        ),
+    )
+    return root, files
+
+
 def run_pred_ld_parallel(
     predld_input_dir: str,
     output_folder: str,
     output_prefix: str,
     pred_ld_ref: str,
-    chromosomes: List = list(range(1, 23)) + ["X"],
-    r2threshold: float = 0.8,
-    maf: float = 0.001,
-    population: str = "EUR",
-    ref: str = "TOP_LD",
-    threads: int = 6,
+    chromosomes: Sequence[str],
+    r2threshold: float,
+    maf: float,
+    population: str,
+    ref: str,
+    threads: int,
+    memory_gb: float,
+    pred_ld_script: str | Path,
+    python_executable: str,
+    memory_gb_per_worker: float,
+    free_memory_threshold_gb: float,
+    free_memory_threshold_fraction: float,
+    memory_poll_seconds: float,
+    worker_poll_seconds: float,
+    large_chromosomes: Sequence[str],
+    preferred_chromosome_order: Sequence[str],
 ) -> bool:
     """
     Parallel PRED-LD runner with logging to files.
@@ -182,13 +250,15 @@ def run_pred_ld_parallel(
         except Exception:
             pass
 
-    # -------------------------------------------------------------------------
-    # 0. Locate pred_ld.py dynamically
-    # -------------------------------------------------------------------------
-    module_root = Path(__file__).resolve().parent
-    pred_ld_script = module_root / "pred_ld.py"
-    if not pred_ld_script.exists():
-        raise FileNotFoundError(f"ERROR: pred_ld.py not found at {pred_ld_script}")
+    max_workers = safe_thread_count(
+        threads,
+        gb_per_thread=memory_gb_per_worker,
+        available_ram_gb=memory_gb,
+        enforce_memory_budget=True,
+    )
+    pred_ld_script = Path(pred_ld_script).expanduser().resolve()
+    if not pred_ld_script.is_file() or pred_ld_script.stat().st_size <= 0:
+        raise FileNotFoundError("PRED-LD entry point is missing or empty: %s" % pred_ld_script)
 
     # -------------------------------------------------------------------------
     # 1. Normalize paths & Setup Master Log
@@ -204,33 +274,25 @@ def run_pred_ld_parallel(
         master_log_file.unlink()
 
     # -------------------------------------------------------------------------
-    # 2. Workspace Setup
+    # 2. Threads / workers & chromosome order
     # -------------------------------------------------------------------------
-    workspace = output_folder / ".predld_work"
-    if workspace.exists():
-        shutil.rmtree(workspace, ignore_errors=True)
-    workspace.mkdir(parents=True, exist_ok=True)
-
-    local_ref = workspace / "ref"
-    shutil.copytree(pred_ld_ref, local_ref, dirs_exist_ok=True)
-
-    # -------------------------------------------------------------------------
-    # 3. Threads / workers & chromosome order
-    # -------------------------------------------------------------------------
-    threads = safe_thread_count(threads, gb_per_thread=30)
-    #max_workers = min(2, max(1, threads))
-    max_workers = threads
-    chr_order = build_interleaved_chr_order(chromosomes)
+    chr_order = build_interleaved_chr_order(
+        chromosomes, preferred_chromosome_order,
+    )
 
     write_log(master_log_file, f"Running PRED-LD with {max_workers} parallel workers")
+    write_log(
+        master_log_file,
+        f"Resolved memory budget: {memory_gb} GB; "
+        f"per-worker reservation: {memory_gb_per_worker} GB",
+    )
     write_log(master_log_file, f"Input dir : {predld_input_dir}")
     write_log(master_log_file, f"Output dir: {output_folder}")
-    write_log(master_log_file, f"Workspace : {workspace}")
     write_log(master_log_file, f"Ref LD    : {pred_ld_ref}")
     write_log(master_log_file, f"Chromosomes: {', '.join(chr_order)}")
 
     # -------------------------------------------------------------------------
-    # 4. Shared state for scheduling
+    # 3. Shared state for scheduling
     # -------------------------------------------------------------------------
     lock = threading.Lock()
     running_chroms: set[str] = set()
@@ -246,13 +308,16 @@ def run_pred_ld_parallel(
                 ram_known = (total_gb is not None and free_gb is not None)
 
                 if ram_known:
-                    threshold = min(20.0, total_gb * 0.80)
+                    threshold = min(
+                        free_memory_threshold_gb,
+                        total_gb * free_memory_threshold_fraction,
+                    )
                     free_ok = free_gb >= threshold
                 else:
                     threshold = None
                     free_ok = True
 
-                this_big = is_big_chr(chr_id)
+                this_big = is_big_chr(chr_id, large_chromosomes)
                 big_ok = (not this_big) or (not running_big)
 
                 if free_ok and big_ok:
@@ -272,18 +337,21 @@ def run_pred_ld_parallel(
                 if this_big and not big_ok:
                     write_log(log_file, "⏳ Waiting: another big chromosome is running.")
 
-            time.sleep(10)
+            time.sleep(memory_poll_seconds)
 
     def release_chr(chr_id: str) -> None:
         nonlocal running_big
         with lock:
             running_chroms.discard(chr_id)
-            if is_big_chr(chr_id):
-                if not any(is_big_chr(c) for c in running_chroms):
+            if is_big_chr(chr_id, large_chromosomes):
+                if not any(
+                    is_big_chr(chromosome, large_chromosomes)
+                    for chromosome in running_chroms
+                ):
                     running_big = False
 
     # -------------------------------------------------------------------------
-    # 5. Worker (SILENT MODE)
+    # 4. Worker (SILENT MODE)
     # -------------------------------------------------------------------------
     def worker(chr_id: str) -> None:
         chr_input = predld_input_dir / f"{output_prefix}_chr{chr_id}_pred_ld_input.tsv"
@@ -293,8 +361,8 @@ def run_pred_ld_parallel(
             log_file.unlink()
         write_log(log_file, f"--- Processing Chromosome {chr_id} ---")
 
-        if not chr_input.exists():
-            msg = f"PRED-LD input missing for chr{chr_id}: {chr_input}"
+        if not chr_input.is_file() or chr_input.stat().st_size <= 0:
+            msg = f"PRED-LD input missing or empty for chr{chr_id}: {chr_input}"
             write_log(log_file, f"⚠️ SKIPPED: {msg}")
             # REMOVED: print(f"⚠️ chr{chr_id} skipped...")
             failed.append((chr_id, msg))
@@ -304,11 +372,11 @@ def run_pred_ld_parallel(
 
         try:
             cmd = [
-                "python", str(pred_ld_script),
+                str(python_executable), str(pred_ld_script),
                 "--file-path", str(chr_input),
                 "--pop", population,
                 "--ref", ref,
-                "--ref_dir", str(local_ref),
+                "--ref_dir", str(pred_ld_ref),
                 "--r2threshold", str(r2threshold),
                 "--maf", str(maf),
                 "--out_dir", str(output_folder),
@@ -327,9 +395,23 @@ def run_pred_ld_parallel(
                 failed.append((chr_id, reason))
                 return
 
-            expected_out = output_folder / f"imputation_results_chr{chr_id}.txt"
-            if not expected_out.exists():
-                reason = f"PRED-LD output missing for chr{chr_id}. See log: {log_file}"
+            expected_outputs = (
+                output_folder / f"imputation_results_chr{chr_id}.txt",
+                output_folder / f"LD_info_TOP_LD_chr{chr_id}.txt",
+            )
+            missing_outputs = [
+                path for path in expected_outputs
+                if not path.is_file() or path.stat().st_size <= 0
+            ]
+            if missing_outputs:
+                reason = (
+                    "PRED-LD output missing or empty for chr%s: %s. See log: %s"
+                    % (
+                        chr_id,
+                        ", ".join(str(path) for path in missing_outputs),
+                        log_file,
+                    )
+                )
                 write_log(log_file, f"❌ {reason}")
                 # REMOVED: print(f"❌ {reason}")
                 failed.append((chr_id, reason))
@@ -347,7 +429,7 @@ def run_pred_ld_parallel(
             release_chr(chr_id)
 
     # -------------------------------------------------------------------------
-    # 6. Launch workers
+    # 5. Launch workers
     # -------------------------------------------------------------------------
     t0 = time.time()
     threads_list: List[threading.Thread] = []
@@ -364,17 +446,41 @@ def run_pred_ld_parallel(
                 t.start()
                 active.append(t)
                 break
-            time.sleep(2)
+            time.sleep(worker_poll_seconds)
 
     for t in threads_list:
         t.join()
 
-    # -------------------------------------------------------------------------
-    # 7. Merge Logs
-    # -------------------------------------------------------------------------
+    elapsed_min = (time.time() - t0) / 60.0
     merged_log = output_folder / f"{output_prefix}_predld_combined.log"
+    failed_ids = sorted(
+        (str(chromosome) for chromosome, _reason in failed),
+        key=lambda value: (
+            (0, int(value)) if value.isdigit() else (1, value)
+        ),
+    )
+    write_log(
+        master_log_file,
+        "PRED-LD chromosome execution finished in %.2f minutes: "
+        "successful=%d failed=%d"
+        % (elapsed_min, len(succeeded), len(failed)),
+    )
+    if failed:
+        write_log(master_log_file, "Failed or missing chromosomes:")
+        for chr_id, reason in sorted(
+            failed,
+            key=lambda item: (
+                (0, int(str(item[0])))
+                if str(item[0]).isdigit()
+                else (1, str(item[0]))
+            ),
+        ):
+            write_log(master_log_file, f"   chr{chr_id}: {reason}")
     write_log(master_log_file, f"Merging chromosome logs into {merged_log}")
 
+    # -------------------------------------------------------------------------
+    # 6. Merge Logs
+    # -------------------------------------------------------------------------
     with merged_log.open("w") as fout:
         if master_log_file.exists():
             with master_log_file.open() as f:
@@ -386,43 +492,35 @@ def run_pred_ld_parallel(
                 fout.write(f"\nLOG: {lf.name}\n")
                 fout.write(f.read())
 
-    # -------------------------------------------------------------------------
-    # 8. Summary (Screen Output Logic)
-    # -------------------------------------------------------------------------
-    elapsed_min = (time.time() - t0) / 60.0
-    write_log(master_log_file, f"\n🎯 PRED-LD completed in {elapsed_min:.2f} minutes.")
-
-    # --- CHANGED: Only print one summary line for failures ---
     if failed:
-        write_log(master_log_file, "⚠️ Failed / skipped chromosomes:")
-        # Sort keys numerically if possible, else string sort
-        try:
-            # Attempt to sort numerically (1, 2, 10 instead of 1, 10, 2)
-            failed_ids = sorted([str(c) for c, r in failed], key=lambda x: int(x) if x.isdigit() else 999)
-        except:
-            failed_ids = sorted([str(c) for c, r in failed])
-
-        # Log details to file
-        for chr_id, reason in failed:
-            write_log(master_log_file, f"   chr{chr_id}: {reason}")
-
-        # Print CONCISE summary to screen
         print(f"\n          ❌ PRED-LD Failed for chromosomes: {', '.join(failed_ids)}")
         print(f"            See detailed logs in: {merged_log}\n")
+        raise RuntimeError(
+            "PRED-LD did not complete every configured chromosome; failed or "
+            "missing chromosomes: %s. See %s"
+            % (", ".join(failed_ids), merged_log)
+        )
     else:
-        print("\n           ✅Summary stiatistics Imputation using PRED-LD software finished.")
-        print(" ")
-        print(" ")
+        print(
+            "\n          ✅ PRED-LD completed all %d configured chromosomes.\n"
+            % len(succeeded)
+        )
 
-    return bool(succeeded)
+    if not succeeded:
+        raise RuntimeError(
+            "PRED-LD produced no successful chromosome result. See %s"
+            % merged_log
+        )
+    return True
 
 
 def process_pred_ld_results_all_parallel(
     folder_path: str,
-    output_path: Optional[str] = None,
-    output_prefix: Optional[str] = None,
-    corr_method: str = "pearson",
-    threads: int = 6,
+    output_path: str,
+    output_prefix: str,
+    harmonised_dataset_id: str,
+    corr_method: str,
+    threads: int,
 ):
     """
     Production-ready PRED-LD postprocessing pipeline.
@@ -434,6 +532,11 @@ def process_pred_ld_results_all_parallel(
     - Harmonisation sample-sheet generation
     - Cleanup of intermediate files
     """
+    if corr_method not in {"pearson", "spearman"}:
+        raise ValueError(
+            "Unsupported PRED-LD correlation method: %r" % corr_method
+        )
+
     # =====================================================================
     # Safe helpers
     # =====================================================================
@@ -455,6 +558,28 @@ def process_pred_ld_results_all_parallel(
         if not existing:
             return df
         return df.drop(existing)
+
+    def paired_correlation(first, second) -> float:
+        """Apply the resolved QC correlation method to aligned observations."""
+        if corr_method == "pearson":
+            return float(np.corrcoef(first, second)[0, 1])
+        if corr_method == "spearman":
+            return float(spearmanr(first, second).statistic)
+        raise AssertionError("validated PRED-LD correlation method was lost")
+
+    def write_gzip(source: Path, destination: Path) -> None:
+        """Compress one file without invoking a shell or an external compressor."""
+        with source.open("rb") as input_handle, gzip.open(
+            destination, "wb", compresslevel=1,
+        ) as output_handle:
+            shutil.copyfileobj(input_handle, output_handle)
+
+    def archive_text_files(sources: Sequence[Path], destination: Path) -> None:
+        """Concatenate chromosome text files into one deterministic gzip stream."""
+        with gzip.open(destination, "wb", compresslevel=1) as output_handle:
+            for source in sources:
+                with source.open("rb") as input_handle:
+                    shutil.copyfileobj(input_handle, output_handle)
 
     # =====================================================================
     # Expected column types
@@ -505,15 +630,21 @@ def process_pred_ld_results_all_parallel(
     # Per-chromosome worker
     # =====================================================================
     results, summaries = [], []
+    postprocessing_failures: list[tuple[str, str]] = []
 
     def process_chr(chr_id):
         try:
             imp_file = folder_path / f"imputation_results_chr{chr_id}.txt"
             info_file = folder_path / f"LD_info_TOP_LD_chr{chr_id}.txt"
 
-            if not imp_file.exists() or not info_file.exists():
-                print(f"            ⚠️ chr{chr_id}: missing files, skipping.")
-                return None, None
+            if any(
+                not path.is_file() or path.stat().st_size <= 0
+                for path in (imp_file, info_file)
+            ):
+                return None, None, (
+                    "required chromosome result pair is incomplete: %s, %s"
+                    % (imp_file, info_file)
+                )
 
             # -------- Load files --------
             data_df = coerce_dtypes(
@@ -551,15 +682,15 @@ def process_pred_ld_results_all_parallel(
             )
 
             if dup_beta.height >= 2:
-                beta_corr = np.corrcoef(
+                beta_corr = paired_correlation(
                     dup_beta["beta_imp"].to_numpy(),
                     dup_beta["beta_nonimp"].to_numpy()
-                )[0, 1]
+                )
 
-                z_corr = np.corrcoef(
+                z_corr = paired_correlation(
                     dup_beta["z_imp"].to_numpy(),
                     dup_beta["z_nonimp"].to_numpy()
-                )[0, 1]
+                )
             else:
                 beta_corr = z_corr = np.nan
             # -------------------------------------------------------------
@@ -612,7 +743,9 @@ def process_pred_ld_results_all_parallel(
                 .rename({"rsID2": "snp"})
             )
 
-            imputed = imputed.join(imputed_stats, on="snp", how="left")
+            imputed = imputed.join(
+                imputed_stats, on="snp", how="left", coalesce=True,
+            )
 
             # Compute p-values for imputed SNPs
             if "z" in imputed.columns:
@@ -653,11 +786,10 @@ def process_pred_ld_results_all_parallel(
                 "z_corr": float(z_corr) if z_corr == z_corr else None,
             }
 
-            return final_df, summary
+            return final_df, summary, None
 
         except Exception as e:
-            print(f"            ❌ Error processing chr{chr_id}: {e}")
-            return None, None
+            return None, None, "%s: %s" % (type(e).__name__, e)
 
     # =====================================================================
     # Parallel execution
@@ -666,11 +798,33 @@ def process_pred_ld_results_all_parallel(
         futures = {exe.submit(process_chr, c): c for c in chromosomes}
 
         for fut in as_completed(futures):
-            df, summ = fut.result()
+            chromosome = futures[fut]
+            df, summ, failure = fut.result()
             if df is not None:
                 results.append(df)
             if summ is not None:
                 summaries.append(summ)
+            if failure is not None:
+                postprocessing_failures.append((chromosome, failure))
+
+    if postprocessing_failures:
+        postprocessing_failures.sort(
+            key=lambda item: _chr_sort_key(str(item[0])),
+        )
+        combined_log = folder_path / f"{output_prefix}_predld_combined.log"
+        with combined_log.open("a", encoding="utf-8") as handle:
+            handle.write("\nPRED-LD post-processing failed:\n")
+            for chromosome, reason in postprocessing_failures:
+                handle.write("  chr%s: %s\n" % (chromosome, reason))
+        raise RuntimeError(
+            "PRED-LD post-processing failed for chromosome(s) %s. See %s"
+            % (
+                ", ".join(
+                    chromosome for chromosome, _reason in postprocessing_failures
+                ),
+                combined_log,
+            )
+        )
 
     if not results:
         raise RuntimeError("❌ No chromosome processed successfully!")
@@ -681,17 +835,18 @@ def process_pred_ld_results_all_parallel(
     # =====================================================================
     # Output setup
     # =====================================================================
-    output_folder = output_path or folder_path
-    os.makedirs(output_folder, exist_ok=True)
-    output_prefix = output_prefix or "PRED_LD"
+    output_folder = Path(output_path).expanduser().resolve()
+    output_folder.mkdir(parents=True, exist_ok=True)
 
-    combined_path = f"{output_folder}/{output_prefix}_PREDLD_allchr.tsv"
-    corr_path = f"{output_folder}/{output_prefix}_PREDLD_correlations.tsv"
-    sample_sheet_path = f"{output_folder}/{output_prefix}_harmonisation_sample_sheet.csv"
+    combined_path = output_folder / f"{output_prefix}_PREDLD_allchr.tsv"
+    corr_path = output_folder / f"{output_prefix}_PREDLD_correlations.tsv"
+    sample_sheet_path = output_folder / f"{output_prefix}_harmonisation_sample_sheet.csv"
 
     combined_df.write_csv(combined_path, separator="\t")
     corr_df.write_csv(corr_path, separator="\t")
-    os.system(f"gzip {combined_path}")
+    combined_gzip = Path(str(combined_path) + ".gz")
+    write_gzip(combined_path, combined_gzip)
+    combined_path.unlink()
 
     # =====================================================================
     # Build the canonical harmonisation sample sheet
@@ -705,8 +860,8 @@ def process_pred_ld_results_all_parallel(
         )
     row = {
         "config_version": 2,
-        "dataset_id": f"{output_prefix}_imputed",
-        "input_file": f"{combined_path}.gz",
+        "dataset_id": harmonised_dataset_id,
+        "input_file": str(combined_gzip),
         "chromosome_column": "chr",
         "position_column": "pos",
         "variant_id_column": "snp" if "snp" in combined_df.columns else None,
@@ -725,22 +880,26 @@ def process_pred_ld_results_all_parallel(
     # =====================================================================
     # Cleanup original files
     # =====================================================================
-    subprocess.run(
-        f"(pigz -p {threads} -c {folder_path}/imputation_results_chr*.txt 2>/dev/null "
-        f"|| gzip -1 -c {folder_path}/imputation_results_chr*.txt) "
-        f"> {output_folder}/{output_prefix}_imputation_results.txt.gz",
-        shell=True,
-        check=False,
+    imputation_sources = sorted(folder_path.glob("imputation_results_chr*.txt"))
+    information_sources = sorted(folder_path.glob("LD_info_TOP_LD_chr*.txt"))
+    archive_text_files(
+        imputation_sources,
+        output_folder / f"{output_prefix}_imputation_results.txt.gz",
     )
+    archive_text_files(
+        information_sources,
+        output_folder / f"{output_prefix}_LD_info_TOP_LD.txt.gz",
+    )
+    for source in (*imputation_sources, *information_sources):
+        source.unlink()
+    for log_file in output_folder.glob(f"{output_prefix}_chr*_predld.log"):
+        log_file.unlink()
+    return combined_df, corr_df, str(sample_sheet_path)
 
-    subprocess.run(
-        f"(pigz -p {threads} -c {folder_path}/LD_info_TOP_LD_chr*.txt 2>/dev/null "
-        f"|| gzip -1 -c {folder_path}/LD_info_TOP_LD_chr*.txt) "
-        f"> {output_folder}/{output_prefix}_LD_info_TOP_LD.txt.gz",
-        shell=True,
-        check=False,
-    )
-    subprocess.run(f"rm -f {folder_path}/imputation_results_chr*.txt", shell=True, check=False)
-    subprocess.run(f"rm -f {folder_path}/LD_info_TOP_LD_chr*.txt", shell=True, check=False)
-    subprocess.run(f"rm -f {output_folder}/{output_prefix}_chr*_predld.log", shell=True, check=False)
-    return combined_df, corr_df, sample_sheet_path
+
+__all__ = [
+    "pred_ld_script_path",
+    "process_pred_ld_results_all_parallel",
+    "run_pred_ld_parallel",
+    "validate_pred_ld_reference",
+]

@@ -4,7 +4,6 @@ import argparse
 import sys
 
 from postgwas.cli.common import (
-    get_bcftools_binary_parser,
     get_common_out_parser,
     get_common_sumstat_filter_parser,
     get_inputvcf_parser,
@@ -35,6 +34,17 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             ),
             (
+                "Filter one VCF and also write a soft-filter audit VCF:",
+                "postgwas sumstat_filter",
+                (
+                    "--vcf study.vcf.gz",
+                    "--dataset-id STUDY",
+                    "--output-directory results",
+                    "--run-config filtering.yaml",
+                    "--write-soft-filter-vcf",
+                ),
+            ),
+            (
                 "Export a reusable filtering configuration:",
                 "postgwas config export",
                 ("--module filtering", "--style full", "--output filtering.yaml"),
@@ -47,7 +57,6 @@ def build_parser() -> argparse.ArgumentParser:
             get_inputvcf_parser(),
             get_common_out_parser(),
             get_common_sumstat_filter_parser(add_help=False),
-            get_bcftools_binary_parser(add_help=False),
         ],
     )
     parser.add_argument(

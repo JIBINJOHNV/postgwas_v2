@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 
 from rich_argparse import RichHelpFormatter
 
@@ -17,9 +18,10 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _positive_float(value: str) -> float:
+def positive_float(value: str) -> float:
+    """Parse a finite positive command-line number."""
     parsed = float(value)
-    if parsed <= 0:
+    if parsed <= 0 or not math.isfinite(parsed):
         raise argparse.ArgumentTypeError("must be greater than 0")
     return parsed
 
@@ -39,14 +41,14 @@ def get_compute_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         metavar="N",
         help=help_with_default(
-            "Maximum number of tasks PostGWAS may run at the same time. "
-            "If omitted, PostGWAS chooses automatically",
+            "Total CPU-thread budget across all concurrent tasks. PostGWAS "
+            "chooses automatically if omitted",
             defaults.threads,
         ),
     )
     group.add_argument(
         "--memory-gb",
-        type=_positive_float,
+        type=positive_float,
         default=argparse.SUPPRESS,
         metavar="GB",
         help=help_with_default(
@@ -68,45 +70,36 @@ def get_compute_parser() -> argparse.ArgumentParser:
         ),
     )
     screen = parser.add_argument_group("Screen output")
-    visibility = screen.add_mutually_exclusive_group()
-    visibility.add_argument(
-        "--show-screen",
-        dest="show_screen",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Display PostGWAS progress, summaries, warnings, and errors in the terminal",
-            configuration.logging.show_screen,
-        ),
-    )
-    visibility.add_argument(
+    screen.add_argument(
         "--hide-screen",
         dest="show_screen",
         action="store_false",
         default=argparse.SUPPRESS,
-        help=(
+        help=help_with_default(
             "Hide PostGWAS terminal output while continuing to save the same "
-            "screen stream to logging.screen_log_file."
+            "screen stream to logging.screen_log_file",
+            not configuration.logging.show_screen,
         ),
     )
     continuation = parser.add_argument_group("Run continuation")
-    continuation.add_argument(
+    run_mode = continuation.add_mutually_exclusive_group()
+    run_mode.add_argument(
         "--resume",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Reuse existing outputs only after the selected module validates "
-            "their completion state and provenance",
+            "Reuse validated completed steps and continue from the first "
+            "incomplete step",
             configuration.run.resume,
         ),
     )
-    continuation.add_argument(
+    run_mode.add_argument(
         "--overwrite",
         action="store_true",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Replace existing outputs owned by the selected run; this takes "
-            "precedence over resume",
+            "Start the analysis from the first step and replace files created "
+            "by the previous run",
             configuration.run.overwrite,
         ),
     )

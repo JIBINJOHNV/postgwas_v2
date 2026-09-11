@@ -12,8 +12,21 @@ model_directory: null
 vep_mode: api
 vep_command: null
 vep_cache: null
+vep_cache_genome_build: null
 cadd_mode: api
 cadd_file: null
+cadd_genome_build: null
+annotation_api:
+  vep_servers:
+    GRCh37: https://grch37.rest.ensembl.org
+    GRCh38: https://rest.ensembl.org
+  cadd_servers:
+    GRCh37: https://cadd.gs.washington.edu/api/v1.0/GRCh37-v1.6
+    GRCh38: https://cadd.gs.washington.edu/api/v1.0/GRCh38-v1.6
+  timeout_seconds: 25
+  retry_count: 10
+  retry_delay_seconds: 5
+  requests_per_second: 15
 input_schema:
   table_delimiter: "\t"
   whitespace_delimiter_pattern: '\s+'
@@ -84,3 +97,4 @@ output_layout:
   resolved_config_file: run_metadata/resolved_config.yaml
   completion_manifest: 'run_metadata/{dataset_id}_flames_completion.yaml'
   service_log_file: 'logs/{dataset_id}_flames.log'
+  annotation_api_log_file: 'logs/{dataset_id}_flames_api.jsonl'

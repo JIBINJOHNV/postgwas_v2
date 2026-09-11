@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import bz2
 from dataclasses import dataclass
-import gzip
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -16,6 +14,13 @@ from postgwas.core.completion import (
     write_completion_manifest,
 )
 from postgwas.core.io.reports import write_yaml_report
+from postgwas.core.ldsc_validation import (
+    LdscCelltypeManifestEntry,
+    read_ldcts_manifest,
+    resolve_ldscore_prefix,
+    validate_ldscore_reference_inventory,
+    validate_ldsc_sumstats_header,
+)
 from postgwas.core.paths import (
     remove_empty_directories,
     remove_owned_directory,
@@ -31,14 +36,6 @@ from postgwas.modules.single_cell.errors import SingleCellError
 from postgwas.modules.single_cell.methods.ldsc_celltype.analysis import (
     normalize_ldsc_celltype_results,
 )
-
-
-@dataclass(frozen=True)
-class LdscCelltypeManifestEntry:
-    """One tested annotation and its required control annotation prefixes."""
-
-    label: str
-    prefixes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -67,195 +64,13 @@ class LdscCelltypeExecution:
     resumed: bool
 
 
-def _resolve_prefix(value: str, *, relative_to: Path) -> str:
-    candidate = Path(value).expanduser()
-    if not candidate.is_absolute():
-        candidate = relative_to / candidate
-    return str(candidate.resolve())
-
-
-def _read_ldcts(path: Path, method) -> tuple[LdscCelltypeManifestEntry, ...]:
-    """Parse the exact two-field syntax consumed by LDSC ``--ref-ld-chr-cts``."""
-    configured = method.reference_format
-    entries: list[LdscCelltypeManifestEntry] = []
-    labels: set[str] = set()
-    tested_prefixes: set[str] = set()
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise SingleCellError(
-            "Cannot read LDSC .ldcts file %s: %s" % (path, exc)
-        ) from exc
-    for line_number, line in enumerate(lines, start=1):
-        fields = line.split()
-        if len(fields) != 2:
-            raise SingleCellError(
-                "LDSC .ldcts line %d must contain exactly a cell-type name and "
-                "a comma-delimited prefix list" % line_number
-            )
-        label, raw_prefixes = fields
-        if label in labels:
-            raise SingleCellError(
-                "Duplicate LDSC .ldcts cell-type name: %s" % label
-            )
-        labels.add(label)
-        values = raw_prefixes.split(configured.prefix_separator)
-        if any(not value.strip() for value in values):
-            raise SingleCellError(
-                "LDSC .ldcts line %d contains an empty LD-score prefix" % line_number
-            )
-        if len(values) < configured.minimum_prefixes_per_cell_type:
-            raise SingleCellError(
-                "LDSC .ldcts line %d requires at least %d prefixes: the tested "
-                "annotation followed by its all-genes control"
-                % (line_number, configured.minimum_prefixes_per_cell_type)
-            )
-        prefixes = tuple(
-            _resolve_prefix(value.strip(), relative_to=path.parent)
-            for value in values
-        )
-        if len(prefixes) != len(set(prefixes)):
-            raise SingleCellError(
-                "LDSC .ldcts line %d contains duplicate LD-score prefixes"
-                % line_number
-            )
-        if prefixes[0] in tested_prefixes:
-            raise SingleCellError(
-                "LDSC .ldcts tested annotation prefix is repeated: %s"
-                % prefixes[0]
-            )
-        tested_prefixes.add(prefixes[0])
-        entries.append(LdscCelltypeManifestEntry(label, prefixes))
-    if not entries:
-        raise SingleCellError("LDSC .ldcts file must contain at least one cell type")
-    return tuple(entries)
-
-
-def _chromosome_prefix(prefix: str, chromosome: int, placeholder: str) -> str:
-    occurrences = prefix.count(placeholder)
-    if occurrences > 1:
-        raise SingleCellError(
-            "LDSC reference prefix contains the chromosome placeholder more "
-            "than once: %s" % prefix
-        )
-    if occurrences:
-        return prefix.replace(placeholder, str(chromosome))
-    return "%s%d" % (prefix, chromosome)
-
-
-def _reference_file_record(path: Path, **metadata: Any) -> dict[str, Any]:
-    if not path.is_file() or path.stat().st_size <= 0:
-        raise SingleCellError(
-            "LDSC reference file does not exist or is empty: %s" % path
-        )
-    stat = path.stat()
-    return {
-        **metadata,
-        "path": str(path),
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-    }
-
-
-def _validate_prefix(
-    prefix: str,
-    *,
-    role: str,
-    method,
-    require_m_file: bool,
-) -> list[dict[str, Any]]:
-    configured = method.reference_format
-    records = []
-    for chromosome in range(1, configured.chromosomes + 1):
-        chromosome_prefix = _chromosome_prefix(
-            prefix, chromosome, configured.chromosome_placeholder,
-        )
-        ldscore = Path(chromosome_prefix + configured.ldscore_suffix)
-        records.append(_reference_file_record(
-            ldscore,
-            role=role,
-            prefix=prefix,
-            chromosome=chromosome,
-            resource="ld_score",
-        ))
-        if require_m_file:
-            m_file = Path(chromosome_prefix + configured.m_suffix)
-            records.append(_reference_file_record(
-                m_file,
-                role=role,
-                prefix=prefix,
-                chromosome=chromosome,
-                resource="regression_snp_count",
-            ))
-    return records
-
-
-def _validate_references(
-    baseline_ld_prefixes: tuple[str, ...],
-    weights_ld_prefix: str,
-    entries: tuple[LdscCelltypeManifestEntry, ...],
-    method,
-) -> tuple[Mapping[str, Any], ...]:
-    records: list[dict[str, Any]] = []
-    for prefix in baseline_ld_prefixes:
-        records.extend(_validate_prefix(
-            prefix, role="baseline", method=method, require_m_file=True,
-        ))
-    records.extend(_validate_prefix(
-        weights_ld_prefix,
-        role="regression_weights",
-        method=method,
-        require_m_file=False,
-    ))
-    validated_cts_prefixes: set[str] = set()
-    for entry in entries:
-        for index, prefix in enumerate(entry.prefixes):
-            if prefix in validated_cts_prefixes:
-                continue
-            validated_cts_prefixes.add(prefix)
-            records.extend(_validate_prefix(
-                prefix,
-                role=("cell_type_annotation" if index == 0 else "all_genes_control"),
-                method=method,
-                require_m_file=True,
-            ))
-    return tuple(records)
-
-
-def _open_text(path: Path):
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8", newline="")
-    if path.suffix == ".bz2":
-        return bz2.open(path, "rt", encoding="utf-8", newline="")
-    return path.open("r", encoding="utf-8", newline="")
-
-
 def validate_munged_sumstats(path: str | Path, method) -> dict[str, Any]:
-    """Validate columns required by the LDSC regression before execution."""
-    sumstats = require_nonempty_file(
-        path, "munged LDSC summary statistics", error_type=SingleCellError,
+    """Apply this consumer's configured header contract through the core reader."""
+    return validate_ldsc_sumstats_header(
+        path,
+        required_columns=method.result_format.sumstats_required_columns,
+        error_type=SingleCellError,
     )
-    try:
-        with _open_text(sumstats) as handle:
-            header_line = handle.readline()
-            first_data_line = next((line for line in handle if line.strip()), "")
-    except (OSError, UnicodeError) as exc:
-        raise SingleCellError(
-            "Cannot read munged LDSC summary statistics %s: %s" % (sumstats, exc)
-        ) from exc
-    columns = header_line.split()
-    required = method.result_format.sumstats_required_columns
-    missing = [column for column in required if column not in columns]
-    if missing:
-        raise SingleCellError(
-            "Munged LDSC summary statistics are missing required columns: %s"
-            % ", ".join(missing)
-        )
-    if len(columns) != len(set(columns)):
-        raise SingleCellError("Munged LDSC summary-statistic columns must be unique")
-    if not first_data_line:
-        raise SingleCellError("Munged LDSC summary statistics contain no variants")
-    return {"columns": columns, "required_columns": list(required)}
 
 
 def _probe_version(executable: str, method) -> str:
@@ -289,15 +104,25 @@ def preflight_ldsc_celltype(
         raise SingleCellError("A regression-weights LD-score prefix is required")
     cwd = Path.cwd()
     baseline_ld_prefixes = tuple(
-        _resolve_prefix(prefix, relative_to=cwd)
+        resolve_ldscore_prefix(prefix, relative_to=cwd)
         for prefix in method.input.baseline_ld_prefixes
     )
-    weights_ld_prefix = _resolve_prefix(
+    weights_ld_prefix = resolve_ldscore_prefix(
         method.input.weights_ld_prefix, relative_to=cwd,
     )
-    entries = _read_ldcts(ldcts_file, method)
-    reference_inventory = _validate_references(
-        baseline_ld_prefixes, weights_ld_prefix, entries, method,
+    entries = read_ldcts_manifest(
+        ldcts_file,
+        prefix_separator=method.reference_format.prefix_separator,
+        minimum_prefixes_per_cell_type=method.reference_format.minimum_prefixes_per_cell_type,
+        error_type=SingleCellError,
+    )
+    reference_inventory = validate_ldscore_reference_inventory(
+        baseline_ld_prefixes, weights_ld_prefix, entries,
+        chromosomes=method.reference_format.chromosomes,
+        chromosome_placeholder=method.reference_format.chromosome_placeholder,
+        ldscore_suffix=method.reference_format.ldscore_suffix,
+        m_suffix=method.reference_format.m_suffix,
+        error_type=SingleCellError,
     )
     executable = resolve_executable(
         ldsc_executable_value, "LDSC executable", error_type=SingleCellError,

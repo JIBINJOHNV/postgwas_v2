@@ -1,4 +1,0 @@
-sumstat_file,gwas_outputname,chr_col,pos_col,snp_id_col,ea_col,oa_col,eaf_col,beta_or_col,se_col,imp_z_col,pval_col,ncontrol_col,ncase_col,ncontrol,ncase,imp_info_col,infofile,infocolumn,eaffile,eafcolumn,liftover,chr_pos_col,resourse_folder,output_folder
-/data/ADHD2022_iPSYCH_deCODE_PGC.meta.gz,ADHD2022_iPSYCH_deCODE_PGC,CHR,BP,SNP,A1,A2,FRQ_U_186843,OR,SE,NA,P,Nco,Nca,NA,NA,INFO,NA,NA,NA,NA,Yes,NA,/resources/postgwas/,/out/ADHD2022/
-/data/HEIGHT_GIANT_2018.txt.gz,HEIGHT_GIANT_2018,NA,NA,SNP,Tested_Allele,Other_Allele,Freq_Tested_Allele,BETA,SE,NA,P,NA,NA,693529,NA,NA,/resources/info/1000G_info.tsv.gz,INFO,NA,NA,Yes,CHR_POS,/resources/postgwas/,/out/HEIGHT/
-/data/T2D_DIAMANTE_2022.tsv.gz,T2D_DIAMANTE_2022,chromosome,position,rsid,effect_allele,other_allele,NA,NA,NA,Zscore,pvalue,n_controls,n_cases,NA,NA,NA,/resources/info/1000G_info.tsv.gz,INFO,/resources/af/1000G_EUR.tsv.gz,EUR,No,NA,/resources/postgwas/,/out/T2D/

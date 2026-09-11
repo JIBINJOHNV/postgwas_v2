@@ -26,8 +26,6 @@ def _runtime_controls(configuration, arguments: Sequence[str]) -> tuple[bool, bo
     for argument in arguments:
         if argument == "--resume":
             resume = True
-        elif argument == "--no-resume":
-            resume = False
         elif argument == "--overwrite":
             overwrite = True
     return resume, overwrite

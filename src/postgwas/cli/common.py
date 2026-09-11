@@ -8,9 +8,180 @@ from postgwas.core.execution.runtime import validate_alphanumeric, validate_path
 # get_inputvcf_parser()
 # get_genome_build_parser()
 # get_common_out_parser()
-# get_magma_binary_parser(add_help=False)
 # get_flames_common_parser(add_help=False)
 # get_common_imputation_parser
+
+
+def add_variant_qc_policy_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    defaults,
+    reference_af_column,
+    maximum_af_difference,
+    group_title: str,
+):
+    """Add the policy options shared by QC assessment and VCF filtering."""
+    from postgwas.core.ui import help_with_default
+
+    group = parser.add_argument_group(group_title)
+    group.add_argument(
+        "--minimum-neglog10-p",
+        dest="minimum_neglog10_p",
+        type=float,
+        metavar="VALUE",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum -log10(P) accepted by the QC policy. For P <= 5e-8, "
+            "use 7.30103",
+            defaults.minimum_neglog10_p,
+        ),
+    )
+    group.add_argument(
+        "--minimum-maf",
+        dest="minimum_maf",
+        type=float,
+        metavar="VALUE",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum minor-allele frequency accepted by the QC policy",
+            defaults.maf_min,
+        ),
+    )
+    group.add_argument(
+        "--reference-af-column",
+        dest="reference_af_column",
+        metavar="TAG",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Reference-population allele-frequency INFO tag",
+            reference_af_column,
+        ),
+    )
+    group.add_argument(
+        "--maximum-af-difference",
+        dest="maximum_af_difference",
+        type=float,
+        metavar="VALUE",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Maximum accepted absolute difference between study and reference "
+            "allele frequencies",
+            maximum_af_difference,
+        ),
+    )
+    group.add_argument(
+        "--minimum-info",
+        dest="minimum_info",
+        type=float,
+        metavar="VALUE",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Minimum INFO or MaCH Rsq score accepted by the QC policy",
+            defaults.info_min,
+        ),
+    )
+    group.add_argument(
+        "--maximum-info",
+        dest="maximum_info",
+        type=float,
+        metavar="VALUE",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Maximum INFO or MaCH Rsq score accepted by the QC policy",
+            defaults.info_max,
+        ),
+    )
+    for option, destination, label, value in (
+        (
+            "--missing-pvalue-action",
+            "missing_pvalue_action",
+            "Action when the association P value is missing",
+            defaults.missing_pvalue_action,
+        ),
+        (
+            "--missing-af-action",
+            "missing_af_action",
+            "Action when a required allele frequency is missing",
+            defaults.missing_af_action,
+        ),
+        (
+            "--missing-info-action",
+            "missing_info_action",
+            "Action when imputation quality is missing",
+            defaults.missing_info_action,
+        ),
+    ):
+        group.add_argument(
+            option,
+            dest=destination,
+            choices=("keep", "remove"),
+            metavar="ACTION",
+            default=argparse.SUPPRESS,
+            help=help_with_default(label, value),
+        )
+
+    group.add_argument(
+        "--include-indels",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Allow indels and other non-SNP variants to pass this policy",
+            (
+                "indels are included"
+                if defaults.include_indels
+                else "indels are not included"
+            ),
+        ),
+    )
+    group.add_argument(
+        "--remove-palindromic",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Fail frequency-ambiguous A/T and C/G SNPs",
+            (
+                "palindromic variants are removed"
+                if defaults.remove_palindromic
+                else "palindromic variants are not removed"
+            ),
+        ),
+    )
+    group.add_argument(
+        "--palindromic-af-lower",
+        type=float,
+        default=argparse.SUPPRESS,
+        metavar="VALUE",
+        help=help_with_default(
+            "Lower allele-frequency ambiguity bound used with "
+            "--remove-palindromic",
+            defaults.palindromic_lower,
+        ),
+    )
+    group.add_argument(
+        "--palindromic-af-upper",
+        type=float,
+        default=argparse.SUPPRESS,
+        metavar="VALUE",
+        help=help_with_default(
+            "Upper allele-frequency ambiguity bound used with "
+            "--remove-palindromic",
+            defaults.palindromic_upper,
+        ),
+    )
+    group.add_argument(
+        "--remove-mhc",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Fail variants in the configured build-specific MHC region",
+            (
+                "MHC variants are removed"
+                if defaults.remove_mhc
+                else "MHC variants are not removed"
+            ),
+        ),
+    )
+    return group
 
 
 # ==================================================================
@@ -21,35 +192,37 @@ def sumstat_summary_arg_parser() -> argparse.ArgumentParser:
     from postgwas.core.ui import help_with_default
 
     defaults = load_configuration().modules.qc_summary
-    parser = argparse.ArgumentParser(add_help=False)
-    # 💥 DEFINE ARGUMENT GROUP for Step 2 💥
-    group = parser.add_argument_group("GWAS-VCF QC settings")
-
-    group.add_argument(
-        "--reference-af-column",
-        dest="reference_af_column",
-        metavar="TAG",
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Name of the INFO/<AF> tag used as external reference AF. "
-            "Examples: EUR, AFR, EAS",
-            defaults.reference_af_column,
-        ),
+    parser = argparse.ArgumentParser(
+        add_help=False,
+        conflict_handler="resolve",
     )
-
+    group = add_variant_qc_policy_arguments(
+        parser,
+        defaults=defaults.rules,
+        reference_af_column=defaults.reference_af_column,
+        maximum_af_difference=defaults.rules.maximum_af_difference,
+        group_title="GWAS-VCF QC policy",
+    )
     group.add_argument(
-        "--maximum-af-difference",
-        dest="maximum_af_difference",
+        "--sample-size-reference-quantile",
         type=float,
         metavar="VALUE",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Maximum allowed absolute difference between study INFO/AF and "
-            "INFO/<external_af_name>",
-            defaults.rules.maximum_af_difference,
+            "Raw usable-Neff quantile used as the low-Neff reference",
+            defaults.rules.sample_size_reference_quantile,
         ),
     )
-
+    group.add_argument(
+        "--sample-size-minimum-fraction",
+        type=float,
+        metavar="VALUE",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Fraction of the raw Neff reference used as the low-Neff threshold",
+            defaults.rules.sample_size_minimum_fraction_of_reference,
+        ),
+    )
     return parser
 
 
@@ -62,11 +235,27 @@ def get_annot_ldblock_parser(add_help=False):
     Returns the core ArgumentParser for annot_ldblock arguments, structured using a group.
     """
     from postgwas.config import load_configuration
-    from postgwas.core.ui import help_with_default
+    from postgwas.core.ui import help_with_default, style_cli_requirement
 
     configuration = load_configuration()
     defaults = configuration.modules.ld_annotation
     populations = [population.value for population in defaults.populations]
+    bed_filename_template = defaults.bed_filename_template
+    info_field_template = defaults.info_field_template
+    displayed_bed_pattern = bed_filename_template.replace(
+        "{genome_build}", "<BUILD>"
+    ).replace("{population}", "<POPULATION>")
+    displayed_info_field = info_field_template.replace(
+        "{population}", "<POP>"
+    )
+    example_bed_filename = bed_filename_template.format(
+        genome_build=next(iter(configuration.resources.genomes)),
+        population=populations[0],
+    )
+    example_bed_row = (
+        "1<TAB>16103<TAB>2047216<TAB>"
+        f"{populations[0]}-1_16103_2047216"
+    )
     # Create bare parser for inheritance
     parser = argparse.ArgumentParser(add_help=add_help)
 
@@ -79,22 +268,38 @@ def get_annot_ldblock_parser(add_help=False):
         nargs="+",
         choices=list(configuration.resources.populations),
         metavar="POPULATION",
-        default=populations,
+        default=argparse.SUPPRESS,
         help=help_with_default(
             "Populations to annotate (e.g., EUR AFR). "
-            "Files must follow the configured genome-build/population pattern",
+            "One exactly named BED file is required for each selected population",
             " ".join(populations),
         ),
     )
     group.add_argument(
         "--ld-region-dir",
-        type=validate_path(must_exist=True, must_be_dir=True,dir_must_have_files=True),
+        default=argparse.SUPPRESS,
         metavar="PATH",
-        help=(
-            "[bold bright_red]Required[/bold bright_red]: Directory containing LD-block BED files. "
-            "Each BED file must contain four columns: CHROM, START, END, and Annotation. "
-            "The fourth column is used as the LD-block annotation label."
-            "The Genome build of bed fle should be same as input sumstat Genome build"
+        help=style_cli_requirement(
+            "Directory containing LD-block BED files.\n\n"
+            "[bold cyan]File naming:[/bold cyan]\n"
+            "PostGWAS reads BUILD from the input VCF and expects each selected "
+            f"population file to be named exactly {displayed_bed_pattern}; for "
+            f"example, {example_bed_filename}. The spelling and .bed.gz suffix "
+            "must be exact.\n\n"
+            "[bold cyan]Required BED columns (tab-separated):[/bold cyan]\n"
+            "1. CHROM — exact input-VCF contig name, such as 1 or chr1.\n"
+            "2. START — zero-based block start; included.\n"
+            "3. END — zero-based block end; excluded.\n"
+            f"4. BLOCK_LABEL — nonempty value written to {displayed_info_field}. For "
+            "region clumping, it must end with _<START>_<END>, using the same "
+            "values as columns 2 and 3.\n"
+            "Additional trailing columns are allowed but ignored.\n"
+            f"Example row: {example_bed_row}\n\n"
+            "[bold bright_yellow]Warning:[/bold bright_yellow] "
+            "[bright_yellow]Every BED file must have been generated for the same "
+            "genome build declared inside the input GWAS-VCF; PostGWAS cannot "
+            "infer a BED file's build from its coordinates.[/bright_yellow]",
+            required=True,
         ),
     )
 
@@ -196,9 +401,17 @@ def get_ld_clump_parser(add_help=False):
     from postgwas.config import load_configuration
     from postgwas.config.models.modules.ld_clumping import LDClumpingMethod
     from postgwas.core.ui import help_with_default
+    from postgwas.modules.gcta_cojo.cli import get_gcta_cojo_selection_parser
 
     defaults = load_configuration().modules.ld_clumping
-    parser = argparse.ArgumentParser(add_help=add_help)
+    parser = argparse.ArgumentParser(
+        add_help=add_help,
+        parents=[get_gcta_cojo_selection_parser(
+            include_genome_build=False,
+            include_reference_population=False,
+            reference_requirement="when cojo-slct is selected",
+        )],
+    )
     general = parser.add_argument_group("LD-clumping analysis")
     general.add_argument(
         "--clumping-methods",
@@ -209,7 +422,8 @@ def get_ld_clump_parser(add_help=False):
         help=help_with_default(
             "Analyses to run: region selects one association per annotated LD "
             "block; standard performs two-stage r² clumping against the tabix "
-            "LD reference",
+            "LD reference; cojo-slct runs GCTA stepwise selection and groups "
+            "the selected signals into physical loci",
             " ".join(defaults.methods),
         ),
     )
@@ -231,7 +445,7 @@ def get_ld_clump_parser(add_help=False):
         action=argparse.BooleanOptionalAction,
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Exclude the build-specific MHC interval before either analysis",
+            "Exclude the build-specific MHC interval before each selected analysis",
             defaults.remove_mhc,
         ),
     )
@@ -241,14 +455,13 @@ def get_ld_clump_parser(add_help=False):
         "--ld-folder",
         metavar="PATH",
         default=argparse.SUPPRESS,
-        type=validate_path(
-            must_exist=True,
-            must_be_dir=True,
-            must_not_be_empty=True,
-        ),
+        # Deliberately unvalidated here. The directory is checked once, against
+        # the resolved configuration, so the same message is reported whether
+        # the value came from the command line or from YAML.
         help=(
             "Required when standard clumping is selected: directory containing "
-            "the configured LD manifest and symmetric tabix-indexed files."
+            "the configured LD manifest, variant inventories, and orientation-"
+            "specific tabix-indexed files."
         ),
     )
     standard.add_argument(
@@ -266,7 +479,7 @@ def get_ld_clump_parser(add_help=False):
         ),
     )
     standard.add_argument(
-        "--ld-window-kb", dest="window_kb", metavar="KB", type=int,
+        "--ld-window-kb", dest="ld_window_kb", metavar="KB", type=int,
         default=argparse.SUPPRESS,
         help=help_with_default(
             "Maximum distance from an index SNP for assigning LD partners",
@@ -283,14 +496,39 @@ def get_ld_clump_parser(add_help=False):
     )
     standard.add_argument(
         "--missing-index-action",
-        choices=("error", "self_only"),
+        choices=("error", "warning_skip"),
         metavar="ACTION",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Action when a significant index SNP cannot be found in the LD "
-            "reference. error prevents unsupported independence calls; self_only "
-            "is an explicit assumption that it has no LD partners",
+            "Action when a significant index SNP is absent from, allele-"
+            "incompatible with, or below the configured MAF threshold of the "
+            "LD-reference inventory. warning_skip excludes and audits the index; "
+            "error stops the analysis. A verified index without LD pairs is "
+            "always retained as self-only",
             defaults.missing_index_action,
+        ),
+    )
+    standard.add_argument(
+        "--missing-chromosome-action",
+        choices=("error", "warning"),
+        metavar="ACTION",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Action when a chromosome containing significant variants has no "
+            "required LD, reverse-index, inventory, or tabix resource. warning "
+            "skips that chromosome and records the excluded variant count; "
+            "error stops the analysis",
+            defaults.missing_chromosome_action,
+        ),
+    )
+    cojo = parser.add_argument_group("GCTA-COJO physical locus definition")
+    cojo.add_argument(
+        "--cojo-merge-dist", type=int, metavar="BP",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Maximum consecutive distance between GCTA-selected signals "
+            "grouped into one physical locus after model fitting",
+            defaults.cojo.merge_distance_bp,
         ),
     )
     return parser
@@ -402,29 +640,6 @@ def get_pipeline_genome_build_parser(add_help=False):
     )
 
 
-def get_ld_annotation_genome_build_parser(add_help=False):
-    """Return the LD-annotation build option from its canonical YAML."""
-    from postgwas.config import load_configuration
-
-    configuration = load_configuration()
-    return get_genome_build_parser(
-        available_builds=list(configuration.resources.genomes),
-        default_build=configuration.modules.ld_annotation.genome_build.value,
-    )
-
-
-def get_qc_genome_build_parser(add_help=False):
-    """Return the QC-summary build option from its canonical YAML."""
-    from postgwas.config import load_configuration
-
-    configuration = load_configuration()
-    return get_genome_build_parser(
-        available_builds=list(configuration.resources.genomes),
-        default_build=configuration.modules.qc_summary.target_build.value,
-        suppress_default=True,
-    )
-
-
 def _get_population_parser(
     module_name: str,
     add_help=False,
@@ -453,7 +668,9 @@ def _get_population_parser(
 
 
 def get_imputation_population_parser(add_help=False):
-    return _get_population_parser("imputation", add_help=add_help)
+    return _get_population_parser(
+        "imputation", add_help=add_help, suppress_default=True,
+    )
 
 
 def get_ld_clumping_population_parser(add_help=False):
@@ -519,13 +736,23 @@ def get_common_out_parser():
     return parser
 
 
-def get_common_magma_covar_parser(add_help=False):
-    from textwrap import wrap
+def get_common_magma_covar_parser(add_help=False, *, compact_help=False):
+    """Return MAGMAcovar options with optional concise pipeline guidance."""
     from typing import get_args
 
+    from rich.markup import escape
+
     from postgwas.config import load_configuration
-    from postgwas.config.models.modules.magmacovar import MagmaCovarDirection
-    from postgwas.core.ui import help_with_default
+    from postgwas.config.models.modules.magmacovar import (
+        MagmaCovarDirection,
+        MagmaCovarMissingGenes,
+        MagmaCovarMissingValues,
+    )
+    from postgwas.core.ui import (
+        format_cli_default,
+        format_cli_help_block,
+        help_with_default,
+    )
 
     defaults = load_configuration().modules.magmacovar
     accepted_modifiers = ", ".join(defaults.model_modifiers)
@@ -549,8 +776,7 @@ def get_common_magma_covar_parser(add_help=False):
         help=help_with_default(
             "Choose how MAGMA tests the properties in the covariate table. "
             "Accepted modifiers: %s. Omit this option to test every property "
-            "separately. See 'How to choose a MAGMA model' and 'Advanced MAGMA "
-            "model modifiers' below" % accepted_modifiers,
+            "separately" % accepted_modifiers,
             " ".join(defaults.model) if defaults.model else "none",
         ),
     )
@@ -558,6 +784,7 @@ def get_common_magma_covar_parser(add_help=False):
     group.add_argument(
         "--covariate-direction",
         choices=get_args(MagmaCovarDirection),
+        metavar="DIRECTION",
         default=argparse.SUPPRESS,
         help=help_with_default(
             "Testing direction passed through MAGMA's direction-covar model "
@@ -578,6 +805,89 @@ def get_common_magma_covar_parser(add_help=False):
             defaults.minimum_genes,
         ),
     )
+    group.add_argument(
+        "--covariate-missing-values",
+        choices=get_args(MagmaCovarMissingValues),
+        metavar="ACTION",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "How MAGMA handles NA values after a property passes max-miss. "
+            "Drop excludes genes having any NA in the loaded table; median "
+            "and mean replace each NA using that property's observed values",
+            defaults.input.missing_values,
+        ),
+    )
+    group.add_argument(
+        "--covariate-max-miss",
+        type=float,
+        metavar="FRACTION",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Largest permitted missing fraction for every property. Values "
+            "must be between 0 and MAGMA's maximum 0.2; equality is accepted",
+            defaults.input.maximum_missing_fraction,
+        ),
+    )
+    group.add_argument(
+        "--covariate-missing-genes",
+        choices=get_args(MagmaCovarMissingGenes),
+        metavar="ACTION",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "How MAGMA handles eligible .genes.raw genes absent from the "
+            "covariate table. Drop excludes them; fill counts them as missing "
+            "for every property before applying max-miss",
+            defaults.input.missing_genes,
+        ),
+    )
+
+    if compact_help:
+        return parser
+
+    accepted_directions = ", ".join(get_args(MagmaCovarDirection))
+    direction_lines = [
+        "[bold bright_yellow]Exact MAGMA direction modifier[/bold bright_yellow]",
+        "  PostGWAS emits [cyan]direction-covar=<DIRECTION>[/cyan] for gene "
+        "properties, not the blanket direction= or gene-set-only direction-sets=.",
+    ]
+    direction_lines.append(
+        "  Accepted values: [cyan]%s[/cyan]. MAGMA uses [cyan]smaller[/cyan], "
+        "not less." % escape(accepted_directions)
+    )
+    safety_lines = [
+        "[bold cyan]Property missingness guard[/bold cyan]",
+        "MAGMA removes a gene property when its missing fraction is greater "
+        "than max-miss. PostGWAS checks every property first and stops with "
+        "the property name, so a removed property cannot look like a test that "
+        "was never requested.",
+        "",
+        "[bold bright_yellow]Failure rule[/bold bright_yellow]",
+        "  A property fails only when missing fraction > max-miss; equality is "
+        "accepted.",
+        "",
+        "[bold bright_yellow]Missingness denominator[/bold bright_yellow]",
+        "[cyan]missing-genes=fill[/cyan]",
+        "  All eligible genes from the .genes.raw file. Genes absent from the "
+        "covariate table are filled and count as missing.",
+        "[cyan]missing-genes=drop[/cyan]",
+        "  Only gene IDs overlapping the .genes.raw file and covariate table. "
+        "Absent genes are excluded.",
+        "",
+        *direction_lines,
+        "",
+        format_cli_default(
+            "max-miss=%.12g, missing-genes=%s, missing-values=%s"
+            % (
+                defaults.input.maximum_missing_fraction,
+                defaults.input.missing_genes,
+                defaults.input.missing_values,
+            )
+        ),
+    ]
+    parser.add_argument_group(
+        "Pre-MAGMA safety checks",
+        format_cli_help_block("\n".join(safety_lines)),
+    )
 
     choice_lines = ["Choose the model that matches your research question:"]
     for use_case in defaults.model_use_cases.values():
@@ -587,59 +897,63 @@ def get_common_magma_covar_parser(add_help=False):
         )
         choice_lines.extend((
             "",
-            "  %s" % use_case.label,
-            "    Question: %s" % use_case.question,
-            "    Use: %s" % selected_model,
-            "    Direction: --covariate-direction %s" % use_case.direction,
+            "[bold cyan]%s[/bold cyan]" % escape(use_case.label),
+            "  [bold]Question:[/bold] %s" % escape(use_case.question),
+            "  [bold bright_yellow]Model:[/bold bright_yellow] "
+            "[cyan]%s[/cyan]" % escape(selected_model),
+            "  [bold bright_yellow]Direction:[/bold bright_yellow] "
+            "[cyan]--covariate-direction %s[/cyan]"
+            % escape(use_case.direction),
         ))
     parser.add_argument_group(
         "How to choose a MAGMA model",
-        "\n".join(choice_lines),
+        format_cli_help_block("\n".join(choice_lines)),
     )
-
-    def append_help_detail(lines, label, value):
-        prefix = "  %s: " % label
-        continuation = " " * len(prefix)
-        chunks = wrap(
-            value,
-            width=76 - len(prefix),
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
-        lines.append(prefix + chunks[0])
-        lines.extend(continuation + chunk for chunk in chunks[1:])
 
     modifier_lines = [
         "Use these only for a planned conditional or multivariable analysis:",
         "",
-        "Values used below:",
+        "[bold bright_yellow]Values used below[/bold bright_yellow]",
     ]
     for placeholder, description in defaults.model_placeholders.items():
-        append_help_detail(modifier_lines, "<%s>" % placeholder, description)
+        modifier_lines.extend((
+            "[cyan]<%s>[/cyan]" % escape(placeholder),
+            "  %s" % escape(description),
+        ))
     modifier_lines.extend((
         "",
         "Example property names are illustrative; use exact headers from your table.",
-    ))
-    for specification in defaults.model_modifiers.values():
-        modifier_lines.append("")
-        append_help_detail(modifier_lines, "Purpose", specification.description)
-        append_help_detail(
-            modifier_lines,
-            "Published GWAS example",
-            specification.published_example,
-        )
-        append_help_detail(modifier_lines, "Example command", specification.example)
-        modifier_lines.append("  Accepted forms:")
-        modifier_lines.extend("    %s" % syntax for syntax in specification.syntax)
-    modifier_lines.extend((
         "",
         "Interaction and gene-set-only modifiers are unavailable.",
         "This interface does not provide --set-annot.",
     ))
     parser.add_argument_group(
         "Advanced MAGMA model modifiers",
-        "\n".join(modifier_lines),
+        format_cli_help_block("\n".join(modifier_lines)),
     )
+
+    for modifier, specification in defaults.model_modifiers.items():
+        detail_lines = [
+            "[bold]Purpose:[/bold] %s" % escape(specification.description),
+            "",
+            "[bold bright_yellow]Accepted forms[/bold bright_yellow]",
+        ]
+        detail_lines.extend(
+            "  [cyan]%s[/cyan]" % escape(syntax)
+            for syntax in specification.syntax
+        )
+        detail_lines.extend((
+            "",
+            "[bold magenta]Example command[/bold magenta]",
+            "  [cyan]%s[/cyan]" % escape(specification.example),
+            "",
+            "[bold]Published GWAS example[/bold]",
+            "  %s" % escape(specification.published_example),
+        ))
+        parser.add_argument_group(
+            "MAGMA model modifier: %s" % modifier,
+            format_cli_help_block("\n".join(detail_lines)),
+        )
     return parser
 
 
@@ -745,33 +1059,6 @@ def get_common_magma_assoc_parser(add_help=False):
     return parser
 
 
-def get_magma_binary_parser(add_help=False):
-    """
-    Parser containing only MAGMA association-related arguments.
-    This is parent-safe and can be inserted into direct/pipeline mode.
-    """
-    from postgwas.config import load_configuration
-    from postgwas.core.ui import help_with_default
-
-    configured = load_configuration().resources.executables.magma
-    parser = argparse.ArgumentParser(add_help=add_help)
-    group = parser.add_argument_group("MAGMA binary")
-
-    # Required inputs (but NOT marked required here → handled by subparser)
-    group.add_argument(
-        "--magma",
-        default=argparse.SUPPRESS,
-        metavar="PATH",
-        help=help_with_default(
-            "Path to the MAGMA binary. "
-            "If not provided, assumes 'magma' is available in your system PATH",
-            configured,
-        ),
-    )
-    return parser
-
-
-
 def get_plink_binary_parser(add_help=False):
     """
     Parser containing only MAGMA association-related arguments.
@@ -796,30 +1083,6 @@ def get_plink_binary_parser(add_help=False):
     return parser
 
 
-
-
-def get_bcftools_binary_parser(add_help=False):
-    """Return the shared bcftools executable option."""
-    from postgwas.config import load_configuration
-    from postgwas.core.ui import help_with_default
-
-    configured = load_configuration().resources.executables.bcftools
-    parser = argparse.ArgumentParser(add_help=add_help)
-    group = parser.add_argument_group("External software")
-
-    # Required inputs (but NOT marked required here → handled by subparser)
-    group.add_argument(
-        "--bcftools",
-        default=argparse.SUPPRESS,
-        metavar="PATH",
-        help=help_with_default(
-            "Full path or command name for bcftools",
-            configured,
-        ),
-    )
-    return parser
-
-
 def get_tabix_binary_parser(add_help=False):
     """Return the shared tabix executable option."""
     from postgwas.config import load_configuration
@@ -838,9 +1101,6 @@ def get_tabix_binary_parser(add_help=False):
         ),
     )
     return parser
-
-
-
 
 
 def get_common_pops_parser(add_help=False):
@@ -895,7 +1155,7 @@ def get_common_pops_parser(add_help=False):
         metavar="POLICY",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "How MAGMA target genes absent from PoPS resources are handled: "
+            "How MAGMA genes with Z-scores absent from PoPS resources are handled: "
             "strict fails before fitting; intersect explicitly derives aligned "
             "compatible and excluded MAGMA files with a full audit report",
             module.gene_universe_policy,
@@ -941,22 +1201,23 @@ def get_common_pops_parser(add_help=False):
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=(
-            "Custom target-score table; mutually exclusive with "
-            "--magma-association-prefix."
+            "Custom gene-score table containing the configured gene-ID and "
+            "score columns; mutually exclusive with --magma-association-prefix. "
+            "The option name is retained for compatibility."
         ),
     )
     grp_cov.add_argument(
         "--target-covariates-file",
         metavar="PATH",
         default=argparse.SUPPRESS,
-        help="Optional covariate table aligned to the custom target scores.",
+        help="Optional covariate table aligned to the custom gene scores.",
     )
     grp_cov.add_argument(
         "--target-error-covariance-file",
         metavar="PATH",
         default=argparse.SUPPRESS,
         help=(
-            "Optional SciPy NPZ or NumPy NPY covariance for custom target scores."
+            "Optional SciPy NPZ or NumPy NPY covariance for custom gene scores."
         ),
     )
     grp_cov.add_argument(
@@ -1110,159 +1371,70 @@ def get_common_sumstat_filter_parser(add_help=False):
     from postgwas.core.ui import help_with_default
 
     module = load_configuration().modules.filtering
+    mhc_defaults = {
+        field: ", ".join(
+            "%s=%s" % (build.value, getattr(region, field))
+            for build, region in module.mhc_regions.items()
+        )
+        for field in ("chromosome", "start", "end")
+    }
     parser = argparse.ArgumentParser(
         formatter_class=RawTextRichHelpFormatter,
         add_help=add_help,
+        conflict_handler="resolve",
     )
 
-    group = parser.add_argument_group("Quality-control filters")
+    group = add_variant_qc_policy_arguments(
+        parser,
+        defaults=module,
+        reference_af_column=module.reference_population_tag,
+        maximum_af_difference=module.frequency_difference_max,
+        group_title="Quality-control filters",
+    )
 
-    # =====================================================
-    # NUMERIC FILTERS
-    # =====================================================
     group.add_argument(
-        "--minimum-neglog10-p",
-        dest="minimum_neglog10_p",
-        type=float,
-        metavar="VALUE",
+        "--mhc-chrom",
         default=argparse.SUPPRESS,
+        metavar="CHROM",
         help=help_with_default(
-            "Keep variants with -log10(P) at or above this value. "
-            "For genome-wide significance (P <= 5e-8), use 7.30103",
-            module.minimum_neglog10_p,
+            "Override the MHC chromosome for the genome build inferred from the "
+            "input VCF; otherwise use mhc_regions",
+            mhc_defaults["chromosome"],
         ),
     )
 
     group.add_argument(
-        "--minimum-maf",
-        dest="minimum_maf",
-        type=float,
-        metavar="VALUE",
+        "--mhc-start",
+        type=int,
         default=argparse.SUPPRESS,
+        metavar="POSITION",
         help=help_with_default(
-            "Remove variants below this minor-allele frequency",
-            module.maf_min,
+            "Override the one-based inclusive MHC start for the genome build "
+            "inferred from the input VCF; otherwise use mhc_regions",
+            mhc_defaults["start"],
         ),
     )
 
     group.add_argument(
-        "--reference-af-column",
-        dest="reference_af_column",
+        "--mhc-end",
+        type=int,
         default=argparse.SUPPRESS,
-        metavar="TAG",
+        metavar="POSITION",
         help=help_with_default(
-            "Reference-population frequency INFO tag",
-            module.reference_population_tag,
+            "Override the one-based inclusive MHC end for the genome build "
+            "inferred from the input VCF; otherwise use mhc_regions",
+            mhc_defaults["end"],
         ),
     )
 
     group.add_argument(
-        "--maximum-af-difference",
-        dest="maximum_af_difference",
-        type=float,
-        metavar="VALUE",
+        "--write-soft-filter-vcf",
+        action="store_true",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Remove variants whose study and reference allele frequencies differ "
-            "by more than this value",
-            module.frequency_difference_max,
-        ),
-    )
-
-    group.add_argument(
-        "--minimum-info",
-        dest="minimum_info",
-        type=float,
-        metavar="VALUE",
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Minimum INFO score",
-            module.info_min,
-        ),
-    )
-
-    group.add_argument(
-        "--maximum-info",
-        dest="maximum_info",
-        type=float,
-        metavar="VALUE",
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Remove variants above this INFO score",
-            module.info_max,
-        ),
-    )
-
-    group.add_argument(
-        "--missing-info-action",
-        dest="missing_info_action",
-        type=str,
-        metavar="ACTION",
-        default=argparse.SUPPRESS,
-        choices=["keep", "remove"],
-        help=help_with_default(
-            "What to do when INFO is missing: remove or keep",
-            module.missing_info_action,
-        ),
-    )
-    # =====================================================
-    # FLAGS
-    # =====================================================
-    group.add_argument(
-        "--include-indels",
-        action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Keep insertion/deletion and other non-SNP variants",
-            module.include_indels,
-        ),
-    )
-
-    group.add_argument(
-        "--remove-palindromic",
-        action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Remove ambiguous A/T and C/G SNPs when their allele frequency falls "
-            "between the two palindromic AF bounds",
-            module.remove_palindromic,
-        ),
-    )
-    # =====================================================
-    # PALINDROMIC AF BOUNDS
-    # =====================================================
-    group.add_argument(
-        "--palindromic-af-lower",
-        type=float,
-        default=argparse.SUPPRESS,
-        metavar="VALUE",
-        help=help_with_default(
-            "Lower ambiguity bound used with --remove-palindromic",
-            module.palindromic_lower,
-        ),
-    )
-
-    group.add_argument(
-        "--palindromic-af-upper",
-        type=float,
-        default=argparse.SUPPRESS,
-        metavar="VALUE",
-        help=help_with_default(
-            "Upper ambiguity bound used with --remove-palindromic",
-            module.palindromic_upper,
-        ),
-    )
-
-    # =====================================================
-    # MHC REGION
-    # =====================================================
-    group.add_argument(
-        "--remove-mhc",
-        action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Remove variants in the configured build-specific MHC region",
-            module.remove_mhc,
+            "Also retain every input variant in an indexed audit VCF and add "
+            "configured FILTER IDs for each active removal rule it fails",
+            module.write_soft_filter_vcf,
         ),
     )
 
@@ -1343,6 +1515,16 @@ def get_flames_common_parser(add_help=False):
         ),
     )
     group.add_argument(
+        "--vep-cache-genome-build",
+        metavar="BUILD",
+        choices=list(defaults.resources.genomes),
+        default=argparse.SUPPRESS,
+        help=help_with_conditional_requirement(
+            "Genome build explicitly declared for the local VEP cache",
+            "when --flames-vep-mode local is selected",
+        ),
+    )
+    group.add_argument(
         "--flames-cadd-mode",
         choices=("api", "local"),
         metavar="MODE",
@@ -1358,6 +1540,16 @@ def get_flames_common_parser(add_help=False):
         default=argparse.SUPPRESS,
         help=help_with_conditional_requirement(
             "Genome-build-matched tabix-indexed CADD file",
+            "when --flames-cadd-mode local is selected",
+        ),
+    )
+    group.add_argument(
+        "--cadd-genome-build",
+        metavar="BUILD",
+        choices=list(defaults.resources.genomes),
+        default=argparse.SUPPRESS,
+        help=help_with_conditional_requirement(
+            "Genome build explicitly declared for the local CADD file",
             "when --flames-cadd-mode local is selected",
         ),
     )
@@ -1380,7 +1572,7 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         metavar="ENGINE",
         type=str,
         choices=[module.engine],
-        default=module.engine,
+        default=argparse.SUPPRESS,
         help=help_with_default(
             "Choose the configured imputation tool",
             module.engine,
@@ -1392,6 +1584,7 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         dest="imputation_ld_reference",
         metavar="PATH",
         type=validate_path(must_exist=True, must_be_dir=True),
+        default=argparse.SUPPRESS,
         help=(
             "[bold bright_red]Required[/bold bright_red]: Directory containing the LD "
             "reference panel for PRED-LD. "
@@ -1406,7 +1599,7 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         dest="imputation_r2_threshold",
         metavar="R2",
         type=float,
-        default=pred_ld.minimum_r2,
+        default=argparse.SUPPRESS,
         help=help_with_default(
             "LD r² tagging threshold", pred_ld.minimum_r2,
         ),
@@ -1417,7 +1610,7 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         dest="imputation_minimum_maf",
         metavar="MAF",
         type=float,
-        default=pred_ld.minimum_maf,
+        default=argparse.SUPPRESS,
         help=help_with_default(
             "Minor allele frequency threshold", pred_ld.minimum_maf,
         ),
@@ -1427,7 +1620,8 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         "--ref",
         metavar="NAME",
         type=str,
-        default=pred_ld.mode,
+        default=argparse.SUPPRESS,
+        choices=[pred_ld.mode],
         help=help_with_default(
             "Reference panel name label", pred_ld.mode,
         ),
@@ -1438,7 +1632,7 @@ def get_common_imputation_parser(add_help: bool = False) -> argparse.ArgumentPar
         dest="corr_method",
         metavar="METHOD",
         type=str,
-        default=pred_ld.correlation_method,
+        default=argparse.SUPPRESS,
         choices=["pearson", "spearman"],
         help=help_with_default(
             "Correlation method used in QC/post-processing",
@@ -1465,6 +1659,25 @@ def get_ldsc_merge_alleles_parser(
     """Expose one shared HapMap3 option to formatter and LDSC commands."""
     parser = argparse.ArgumentParser(add_help=add_help)
     group = parser.add_argument_group("LDSC allele matching")
+    _add_ldsc_merge_alleles_argument(
+        group,
+        help_text=(
+            "HapMap3 SNP-and-allele table (for example w_hm3.snplist). "
+            "The direct formatter uses it optionally to select one rsID-and-allele "
+            "compatible LDSC record. Without it, the selected duplicate-ID "
+            "policy handles duplicated rsIDs. Heritability workflows require it "
+            "and reuse the same file during munge_sumstats."
+        ),
+    )
+    return parser
+
+
+def _add_ldsc_merge_alleles_argument(
+    group,
+    *,
+    help_text: str,
+) -> None:
+    """Add the shared LDSC allele-reference option to a context-specific group."""
     group.add_argument(
         "--merge-alleles",
         metavar="PATH",
@@ -1474,15 +1687,8 @@ def get_ldsc_merge_alleles_parser(
             must_be_file=True,
             must_not_be_empty=True,
         ),
-        help=(
-            "HapMap3 SNP-and-allele table (for example w_hm3.snplist). "
-            "The direct formatter uses it optionally to select one rsID-and-allele "
-            "compatible LDSC record. Without it, the selected duplicate-ID "
-            "policy handles duplicated rsIDs. Heritability workflows require it "
-            "and reuse the same file during munge_sumstats."
-        ),
+        help=help_text,
     )
-    return parser
 
 
 def get_ldsc_common_parser(
@@ -1535,14 +1741,37 @@ def get_ldsc_common_parser(
             "requires sample prevalence from --samp-prev or YAML; omit population "
             "prevalence to run observed-scale h² only"
         )
-    parser = argparse.ArgumentParser(
-        add_help=add_help,
-        parents=[get_ldsc_merge_alleles_parser()],
+    parser = argparse.ArgumentParser(add_help=add_help)
+
+    reference_files = parser.add_argument_group("LDSC reference files")
+    _add_ldsc_merge_alleles_argument(
+        reference_files,
+        help_text=(
+            "HapMap3 SNP-and-allele table (for example w_hm3.snplist) used to "
+            "retain allele-compatible variants and passed to munge_sumstats."
+        ),
+    )
+    reference_files.add_argument(
+        "--ref-ld-chr",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        type=validate_path(must_exist=True, must_be_dir=True),
+        help="Directory containing chromosome-split reference LD scores.",
+    )
+    reference_files.add_argument(
+        "--w-ld-chr",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        type=validate_path(must_exist=True, must_be_dir=True),
+        help=(
+            "Directory containing chromosome-split LDSC regression weights; "
+            "this is often the same directory as --ref-ld-chr."
+        ),
     )
 
-    ref = parser.add_argument_group("LDSC reference")
+    metadata = parser.add_argument_group("LDSC reference metadata")
 
-    ref.add_argument(
+    metadata.add_argument(
         "--ldsc-population",
         choices=[population.value for population in Population],
         default=argparse.SUPPRESS,
@@ -1552,7 +1781,7 @@ def get_ldsc_common_parser(
             module.population,
         ),
     )
-    ref.add_argument(
+    metadata.add_argument(
         "--ldsc-genome-build",
         choices=[build.value for build in GenomeBuild],
         default=argparse.SUPPRESS,
@@ -1563,23 +1792,8 @@ def get_ldsc_common_parser(
         ),
     )
 
-    ref.add_argument(
-        "--ref-ld-chr",
-        metavar="PATH",
-        default=argparse.SUPPRESS,
-        type=validate_path(must_exist=True, must_be_dir=True),
-        help="[bold bright_red]Required[/bold bright_red]: Directory containing reference LD scores (e.g., eur_w_ld_chr/).",
-    )
-
-    ref.add_argument(
-        "--w-ld-chr",
-        metavar="PATH",
-        default=argparse.SUPPRESS,
-        type=validate_path(must_exist=True, must_be_dir=True),
-        help="[bold bright_red]Required[/bold bright_red]: Directory containing LDSC regression weights (often same as --ref-ld-chr).",
-    )
-
-    ref.add_argument(
+    software = parser.add_argument_group("LDSC executables")
+    software.add_argument(
         "--ldsc-executable",
         metavar="PATH_OR_COMMAND",
         default=argparse.SUPPRESS,
@@ -1588,7 +1802,7 @@ def get_ldsc_common_parser(
             defaults.resources.executables.ldsc,
         ),
     )
-    ref.add_argument(
+    software.add_argument(
         "--munge-sumstats-executable",
         metavar="PATH_OR_COMMAND",
         default=argparse.SUPPRESS,
@@ -1598,7 +1812,7 @@ def get_ldsc_common_parser(
         ),
     )
 
-    prev = parser.add_argument_group("Liability-scale reporting")
+    prev = parser.add_argument_group("Liability-scale settings")
 
     prev.add_argument(
         "--samp-prev",
@@ -1621,8 +1835,22 @@ def get_ldsc_common_parser(
             module.population_prevalence,
         ),
     )
+    if pipeline_mode:
+        prev.add_argument(
+            "--samp-prev-warning-threshold",
+            dest="ldsc_sample_prevalence_warning_threshold",
+            metavar="VALUE",
+            type=float,
+            default=argparse.SUPPRESS,
+            help=help_with_default(
+                "Absolute difference above which an explicit sample prevalence "
+                "and the formatter-derived value produce a warning; values are "
+                "expressed as proportions",
+                module.sample_prevalence_comparison.warning_absolute_difference,
+            ),
+        )
 
-    regression = parser.add_argument_group("LDSC heritability regression")
+    regression = parser.add_argument_group("LDSC heritability settings")
     regression.add_argument(
         "--intercept-h2",
         dest="ldsc_intercept",
@@ -1668,23 +1896,18 @@ def get_ldsc_common_parser(
             module.n_blocks,
         ),
     )
-    m_group = regression.add_mutually_exclusive_group()
-    m_group.add_argument(
-        "--use-M-5-50",
-        dest="ldsc_use_m_5_50",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=help_with_default(
-            "Use the common-SNP .l2.M_5_50 files",
-            module.use_m_5_50,
-        ),
-    )
-    m_group.add_argument(
+    not_m_5_50_default = not module.use_m_5_50
+    regression.add_argument(
         "--not-M-5-50",
         dest="ldsc_use_m_5_50",
         action="store_false",
         default=argparse.SUPPRESS,
-        help="Use .l2.M files, matching the original LDSC flag.",
+        help=help_with_default(
+            "Use .l2.M files instead of .l2.M_5_50 files, matching the "
+            "original LDSC flag; this switch is %s by default"
+            % ("used" if not_m_5_50_default else "not used"),
+            not_m_5_50_default,
+        ),
     )
     regression.add_argument(
         "--print-cov",
@@ -1707,7 +1930,7 @@ def get_ldsc_common_parser(
         ),
     )
 
-    mung = parser.add_argument_group("LDSC formatting filters")
+    mung = parser.add_argument_group("Munge-sumstats settings")
 
     mung.add_argument(
         "--info-min", "--ldsc-minimum-info",
@@ -1780,8 +2003,8 @@ def get_ldsc_pipeline_parser(
 def get_assoc_plot_parser(add_help=False):
     """
     Parent-safe parser containing common assoc-plot arguments
-    shared between DIRECT and PIPELINE modes. Every displayed and effective
-    parser default is loaded from canonical ``modules.manhattan`` YAML.
+    shared between DIRECT and PIPELINE modes. Every displayed
+    default is loaded from canonical ``modules.manhattan`` YAML.
     """
     from postgwas.config import load_configuration
     from postgwas.core.ui import help_with_default
@@ -1791,17 +2014,19 @@ def get_assoc_plot_parser(add_help=False):
     # ------------------------------------------------------------
     # OUTPUTS
     # ------------------------------------------------------------
-    output_group = parser.add_argument_group("Plot output")
+    output_group = parser.add_argument_group("Plot output").add_mutually_exclusive_group()
 
     output_group.add_argument(
         "--pdf",
         metavar="PATH",
+        default=argparse.SUPPRESS,
         help="Output PDF file (e.g., result.pdf)."
     )
 
     output_group.add_argument(
         "--png",
         metavar="PATH",
+        default=argparse.SUPPRESS,
         help="Output PNG file (e.g., result.png)."
     )
     # ------------------------------------------------------------
@@ -1812,6 +2037,7 @@ def get_assoc_plot_parser(add_help=False):
     input_group.add_argument(
         "--pheno",
         metavar="NAME",
+        default=argparse.SUPPRESS,
         help="Phenotype name to extract from GWAS-VCF file."
     )
     # ------------------------------------------------------------
@@ -1822,7 +2048,7 @@ def get_assoc_plot_parser(add_help=False):
     flag_group.add_argument(
         "--allelic-shift",
         action="store_true",
-        default=defaults.allelic_shift,
+        default=argparse.SUPPRESS,
         help=help_with_default(
             "Input VCF contains allelic-shift annotation",
             defaults.allelic_shift,
@@ -1832,7 +2058,7 @@ def get_assoc_plot_parser(add_help=False):
     flag_group.add_argument(
         "--csq",
         action="store_true",
-        default=defaults.flag_coding,
+        default=argparse.SUPPRESS,
         help=help_with_default(
             "Flag coding variants from CSQ annotation in red",
             defaults.flag_coding,
@@ -1845,7 +2071,7 @@ def get_assoc_plot_parser(add_help=False):
     numeric_group.add_argument(
         "--nauto",
         type=int,
-        default=defaults.autosome_count,
+        default=argparse.SUPPRESS,
         metavar="N",
         help=help_with_default(
             "Number of autosomes", defaults.autosome_count,
@@ -1855,7 +2081,7 @@ def get_assoc_plot_parser(add_help=False):
     numeric_group.add_argument(
         "--min-af",
         type=float,
-        default=defaults.minimum_af,
+        default=argparse.SUPPRESS,
         metavar="AF",
         help=help_with_default(
             "Minimum allele frequency filter", defaults.minimum_af,
@@ -1865,7 +2091,7 @@ def get_assoc_plot_parser(add_help=False):
     numeric_group.add_argument(
         "--min-lp",
         type=float,
-        default=defaults.minimum_neglog10_p,
+        default=argparse.SUPPRESS,
         metavar="LP",
         help=help_with_default(
             "Minimum −log10(P) threshold", defaults.minimum_neglog10_p,
@@ -1875,7 +2101,7 @@ def get_assoc_plot_parser(add_help=False):
     numeric_group.add_argument(
         "--loglog-pval",
         type=float,
-        default=defaults.loglog_pvalue,
+        default=argparse.SUPPRESS,
         metavar="LP",
         help=help_with_default(
             "−log10(P) threshold for switching to log-log scale",
@@ -1886,7 +2112,7 @@ def get_assoc_plot_parser(add_help=False):
     numeric_group.add_argument(
         "--cyto-ratio",
         type=float,
-        default=defaults.cytoband_ratio,
+        default=argparse.SUPPRESS,
         metavar="RATIO",
         help=help_with_default(
             "Plot-height to cytoband-height ratio", defaults.cytoband_ratio,
@@ -1896,17 +2122,17 @@ def get_assoc_plot_parser(add_help=False):
     numeric_group.add_argument(
         "--max-height",
         type=float,
-        default=defaults.maximum_height,
+        default=argparse.SUPPRESS,
         metavar="VALUE",
         help=help_with_default(
-            "Maximum vertical height of the plot", defaults.maximum_height,
+            "Maximum raw -log10(P), before the log-log display transformation", defaults.maximum_height,
         ),
     )
 
     numeric_group.add_argument(
         "--spacing",
         type=int,
-        default=defaults.chromosome_spacing,
+        default=argparse.SUPPRESS,
         metavar="VALUE",
         help=help_with_default(
             "Spacing between chromosomes", defaults.chromosome_spacing,
@@ -1920,7 +2146,7 @@ def get_assoc_plot_parser(add_help=False):
     fig_group.add_argument(
         "--width",
         type=float,
-        default=defaults.width,
+        default=argparse.SUPPRESS,
         metavar="INCHES",
         help=help_with_default(
             "Plot width in inches", defaults.width,
@@ -1930,7 +2156,7 @@ def get_assoc_plot_parser(add_help=False):
     fig_group.add_argument(
         "--height",
         type=float,
-        default=defaults.height,
+        default=argparse.SUPPRESS,
         metavar="INCHES",
         help=help_with_default(
             "Plot height in inches", defaults.height,
@@ -1940,7 +2166,7 @@ def get_assoc_plot_parser(add_help=False):
     fig_group.add_argument(
         "--fontsize",
         type=int,
-        default=defaults.font_size,
+        default=argparse.SUPPRESS,
         metavar="POINTS",
         help=help_with_default(
             "Font size", defaults.font_size,

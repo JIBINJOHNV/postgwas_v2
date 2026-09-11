@@ -1,0 +1,10 @@
+variables:
+  PYTHONNOUSERSITE: "1"
+  PYTHONPATH: ""
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - zstd=1.4.8
+  - openblas=0.3.12
+  - llvm-openmp

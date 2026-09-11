@@ -102,12 +102,12 @@ def main():
         with open(args.json, encoding='utf8') as json_fh:
             json_data = schema.load(json.load(json_fh)).data
             logging.info(f"Parameters: {json_data}")
-    except json.decoder.JSONDecodeError as exception_name:
+    except (OSError, json.decoder.JSONDecodeError) as exception_name:
         logging.error(f"Could not read json parameter file: {exception_name}")
-        sys.exit()
+        sys.exit(1)
     except marshmallow.exceptions.ValidationError as exception_name:
         logging.error(f"Could not validate json parameter file: {exception_name}")
-        sys.exit()
+        sys.exit(1)
 
     logging.info("Checking input arguments")
     if args.data is None:
@@ -115,21 +115,21 @@ def main():
             vars(args)["data"] = json_data["data"]
         else:
             logging.error("'data' filename not provided in arguments or json file")
-            sys.exit()
+            sys.exit(1)
 
     if args.out is None:
         if "out" in json_data.keys():
             vars(args)["out"] = json_data["out"]
         else:
             logging.error("out filename not provided in arguments or json file")
-            sys.exit()
+            sys.exit(1)
 
     if args.id is None:
         if "id" in json_data.keys():
             vars(args)["id"] = json_data["id"]
         else:
             logging.error("id not provided in arguments or json file")
-            sys.exit()
+            sys.exit(1)
 
     if args.cohort_cases is None and "cohort_cases" in json_data.keys():
         vars(args)["cohort_cases"] = json_data["cohort_cases"]
@@ -139,23 +139,23 @@ def main():
 
     if (args.cohort_cases is not None) and (args.cohort_cases < 1):
         logging.error("Total study number of cases must be a positive number")
-        sys.exit()
+        sys.exit(1)
 
     if (args.cohort_controls is not None) and (args.cohort_controls < 1):
         logging.error("Total study number of controls must be a positive number")
-        sys.exit()
+        sys.exit(1)
 
     if not os.path.isfile(args.data):
         logging.error(f"{args.data} file does not exist")
-        sys.exit()
+        sys.exit(1)
 
     if not os.path.isfile(args.ref):
         logging.error(f"{args.ref} file does not exist")
-        sys.exit()
+        sys.exit(1)
 
     if not os.path.exists(os.path.dirname(args.out)):
         logging.error(f"{args.out} output directory does not exist")
-        sys.exit()
+        sys.exit(1)
 
     # Validate column indices against input file
     with open(args.data, 'r') if not args.data.endswith('.gz') else gzip.open(args.data, 'rt') as f:
@@ -177,9 +177,12 @@ def main():
             ("ncontrol_col", json_data.get("ncontrol_col")),
             ("ncase_col", json_data.get("ncase_col")),
         ]:
-            if col_idx is not None and col_idx >= num_columns:
-                logging.error(f"Column index for {col_name} ({col_idx}) exceeds number of columns in input file ({num_columns})")
-                sys.exit()
+            if col_idx is not None and (col_idx < 0 or col_idx >= num_columns):
+                logging.error(
+                    f"Column index for {col_name} ({col_idx}) is outside the valid "
+                    f"range 0 to {num_columns - 1} for the input file"
+                )
+                sys.exit(1)
 
     if args.alias is not None:
         alias = {}

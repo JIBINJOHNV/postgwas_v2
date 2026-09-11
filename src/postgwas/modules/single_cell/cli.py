@@ -3,21 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
-from rich.console import Console
-
-from postgwas.cli.common import (
-    get_common_out_parser,
-    get_magma_binary_parser,
-)
+from postgwas.cli.common import get_common_out_parser
 from postgwas.cli.compute import get_compute_parser
 from postgwas.config import load_configuration
 from postgwas.config.models.modules.single_cell import SINGLE_CELL_TOOLS
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.ui import (
+    print_screen_message,
     AlignedRichHelpFormatter,
     format_cli_examples,
     help_with_default,
+    mark_cli_required_help,
 )
 from postgwas.modules.magmacovar.cli import (
     get_magma_covar_gene_results_parser,
@@ -64,7 +62,8 @@ def get_single_cell_parser(add_help=False, *, direct_controls=False):
     return parser
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(argv=None) -> argparse.ArgumentParser:
+    method_parser = get_single_cell_parser(direct_controls=True)
     parser = argparse.ArgumentParser(
         prog="postgwas single_cell",
         usage=(
@@ -85,7 +84,6 @@ def build_parser() -> argparse.ArgumentParser:
                     "--tools magma_celltype",
                     "--magma-gene-results-file STUDY.genes.raw",
                     "--single-cell-covariates atlas_celltype_average.tsv",
-                    "--magma /path/to/magma",
                     "--dataset-id STUDY",
                     "--output-directory results",
                 ),
@@ -125,9 +123,8 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[
             get_compute_parser(),
             get_common_out_parser(),
-            get_magma_binary_parser(),
             get_magma_covar_gene_results_parser(add_help=False),
-            get_single_cell_parser(direct_controls=True),
+            method_parser,
         ],
     )
     for action in parser._actions:
@@ -144,7 +141,18 @@ def build_parser() -> argparse.ArgumentParser:
     for group in parser._action_groups:
         if group.title == "MAGMA gene-property input":
             group.title = "MAGMA gene-results input"
-    return parser
+    from postgwas.modules.single_cell.service import (
+        resolve_single_cell_configuration,
+        single_cell_required_arguments,
+    )
+
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    selectors, _ = method_parser.parse_known_args(arguments)
+    configuration = resolve_single_cell_configuration(selectors)
+    return mark_cli_required_help(parser, (
+        item.option[2:].replace("-", "_")
+        for item in single_cell_required_arguments(configuration)
+    ))
 
 
 def get_single_cell_pipeline_examples():
@@ -199,10 +207,10 @@ def get_single_cell_pipeline_examples():
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
     from postgwas.modules.single_cell.service import run_single_cell_direct
 
     try:
+        args = build_parser(argv).parse_args(argv)
         result = run_single_cell_direct(args)
     except (
         SingleCellError,
@@ -211,11 +219,14 @@ def main(argv=None) -> int:
         OSError,
         ValueError,
     ) as exc:
-        Console(stderr=True).print(
-            "\n[bold red]Single-cell analysis failed.[/bold red] %s\n" % exc
+        print_screen_message(
+            "error", "Single-cell analysis failed. %s" % exc, stderr=True,
         )
         return 1
-    print("\nSingle-cell analysis completed (%d output artifacts).\n" % len(result.artifacts))
+    print_screen_message(
+        "success", "Single-cell analysis completed (%d output artifacts)."
+        % len(result.artifacts),
+    )
     return 0
 
 

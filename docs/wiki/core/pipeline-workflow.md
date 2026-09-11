@@ -95,6 +95,30 @@ postgwas config export \
 Review the exported module order and complete all required resource paths before
 running the analysis.
 
+## Common input and resource validation
+
+Before scientific stages run, the pipeline checks the entry GWAS-VCF and runs
+the registered preflight for each selected module. It collects independent
+module failures and presents the observed file checks in a common style.
+The YAML audit is written at `pipeline.validation.report_file`; terminal detail
+uses one section per file, with indexes grouped. The shared
+reporter combines module-specific file facts into that section and shows only
+new findings at later stages. Cross-file comparisons refer to stable file
+numbers, while stage progress and scientific results remain separate. The
+version-2 audit stores each exact file path once with distinct check observations.
+The shared
+`logging.file_validation.max_screen_files` defaults to 20 successful file
+sections and never hides problems; additional successful files are summarized
+on screen and retained in full in the saved record set. The audit is updated before
+successful completion is announced
+or when execution fails, with checks observed at later stages and the failure.
+
+Existing checks have different coverage: some inspect complete file contents,
+while others establish availability or header/index validity only. Files produced
+by earlier pipeline stages are checked when their consumers can inspect them.
+Read [Pipeline Input Validation](pipeline-input-validation.md) before treating
+a startup pass as evidence of scientific compatibility.
+
 ## Execute the plan
 
 A typical configured downstream run has the following shape:
@@ -116,4 +140,5 @@ reaches it successfully.
 
 - [Configuration](configuration.md)
 - [Input and Output Contracts](input-output-contracts.md)
+- [Pipeline Input Validation](pipeline-input-validation.md)
 - [Logging and Reproducibility](logging-and-reproducibility.md)

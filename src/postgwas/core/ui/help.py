@@ -45,6 +45,7 @@ _REQUIRED_PARENTHETICAL = re.compile(r"\s*\(required\)", flags=re.IGNORECASE)
 _HELP_REQUIRED_ATTRIBUTE = "_postgwas_required_help"
 _NONBREAKING_DISPLAY_SPACE = "\ue000"
 _STYLED_DEFAULT_PLACEHOLDER = "\ue001%d\ue002"
+_WRAPPED_HELP_BLOCK_PREFIX = "\ue003"
 _STYLED_CHOICES_LABEL = (
     "[bold bright_yellow]Available options:[/bold bright_yellow]"
 )
@@ -113,6 +114,24 @@ class AlignedRichHelpFormatter(RawTextRichHelpFormatter):
         for line in lines:
             line.plain = line.plain.replace(_NONBREAKING_DISPLAY_SPACE, " ")
         return lines
+
+    def _rich_fill_text(self, text, width, indent):
+        """Wrap explicitly marked prose blocks while preserving their line breaks."""
+        if not text.plain.startswith(_WRAPPED_HELP_BLOCK_PREFIX):
+            return super()._rich_fill_text(text, width, indent)
+        protected = text[len(_WRAPPED_HELP_BLOCK_PREFIX):]
+        lines = []
+        for logical_line in protected.split():
+            leading_spaces = len(logical_line.plain) - len(
+                logical_line.plain.lstrip(" ")
+            )
+            content = logical_line[leading_spaces:]
+            wrapped = RichHelpFormatter._rich_split_lines(
+                self, content, max(1, width - leading_spaces),
+            )
+            prefix = Text(" " * leading_spaces)
+            lines.extend(prefix + line for line in (wrapped or [content]))
+        return Text("\n").join(indent + line for line in lines) + "\n\n"
 
 
 def format_cli_default(value) -> str:
@@ -232,35 +251,108 @@ def mark_cli_required_help(
     return parser
 
 
+def move_cli_help_actions(
+    parser: argparse.ArgumentParser,
+    group: argparse._ArgumentGroup,
+    destinations: Iterable[str],
+) -> None:
+    """Move existing actions between help groups without changing parsing."""
+    actions = [
+        action
+        for destination in destinations
+        for action in parser._actions
+        if action.dest == destination
+    ]
+    for source_group in parser._action_groups:
+        source_group._group_actions[:] = [
+            action
+            for action in source_group._group_actions
+            if action not in actions
+        ]
+    group._group_actions.extend(actions)
+
+
+def cli_option_values(
+    arguments: Sequence[str], option: str,
+) -> tuple[str, ...]:
+    """Return values explicitly supplied to one long CLI option.
+
+    This deliberately performs no default resolution.  It is used only to
+    route context-sensitive help before the complete parser validates the
+    command.  Values following an ``nargs`` option are collected until the
+    next option token; ``--option=value`` is supported as well.
+    """
+    for index, argument in enumerate(arguments):
+        if argument == option:
+            values = []
+            for value in arguments[index + 1:]:
+                if value.startswith("-"):
+                    break
+                values.append(value)
+            return tuple(values)
+        if argument.startswith(option + "="):
+            first = argument.partition("=")[2]
+            values = [first] if first else []
+            for value in arguments[index + 1:]:
+                if value.startswith("-"):
+                    break
+                values.append(value)
+            return tuple(values)
+    return ()
+
+
+def cli_option_value(arguments: Sequence[str], option: str) -> str | None:
+    """Return one explicitly supplied long-option value, without a default."""
+    values = cli_option_values(arguments, option)
+    return values[0] if values else None
+
+
 def format_cli_examples(
     *examples: tuple[str, str, Sequence[str]],
     notes: Sequence[str] = (),
     title: str = "Examples",
 ) -> str:
-    """Render consistently indented, copyable multi-line CLI examples."""
-    lines = [title]
+    """Render consistently indented, copyable, colour-coded CLI examples."""
+    lines = ["[bold cyan]%s[/bold cyan]" % escape(title)]
     for label, command, arguments in examples:
-        lines.extend(("", label))
+        lines.extend((
+            "",
+            "[bold bright_yellow]%s[/bold bright_yellow]" % escape(label),
+        ))
         arguments = tuple(arguments)
-        lines.append("  %s%s" % (command, " \\" if arguments else ""))
+        lines.append(
+            "  [bold magenta]%s[/bold magenta]%s"
+            % (escape(command), " \\" if arguments else "")
+        )
         for index, argument in enumerate(arguments):
             continuation = " \\" if index < len(arguments) - 1 else ""
-            lines.append("    %s%s" % (argument, continuation))
+            lines.append(
+                "    [cyan]%s[/cyan]%s" % (escape(argument), continuation)
+            )
     if notes:
-        lines.extend(("", "Notes"))
-        lines.extend("  %s" % note for note in notes)
+        lines.extend(("", "[bold cyan]Notes[/bold cyan]"))
+        lines.extend("  [dim]%s[/dim]" % escape(note) for note in notes)
     return "\n".join(lines)
+
+
+def format_cli_help_block(text: str) -> str:
+    """Mark deliberate multi-line help prose for width-aware shared wrapping."""
+    return _WRAPPED_HELP_BLOCK_PREFIX + text
 
 
 __all__ = [
     "AlignedRichHelpFormatter",
+    "cli_option_value",
+    "cli_option_values",
     "format_cli_choices",
     "format_cli_default",
     "format_cli_examples",
+    "format_cli_help_block",
     "help_with_choices",
     "help_with_conditional_requirement",
     "help_with_default",
     "mark_cli_required_help",
+    "move_cli_help_actions",
     "style_cli_defaults",
     "style_cli_requirement",
 ]

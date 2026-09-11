@@ -3,21 +3,30 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import traceback
-from typing import Any
+from typing import Any, Mapping
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.csv as pacsv
+import pyarrow.parquet as pq
 
-from postgwas.core.io.delimiters import resolve_delimiter
-from postgwas.core.paths import configured_output_path
+from postgwas.core.io.delimiters import open_binary, open_text, resolve_delimiter
+from postgwas.core.paths import configured_output_matches, configured_output_path
 from postgwas.core.pipeline_logging import PipelineLogger
 from postgwas.core.processes import run_checked_command
 from postgwas.core.ui.screen import screen_field, screen_line
-from postgwas.core.vcf import extract_vcf_table
+from postgwas.core.vcf import (
+    extract_vcf_table,
+    read_vcf_header,
+    validate_postgwas_vcf_provenance,
+)
 from postgwas.modules.harmonisation.resource_paths import (
     external_resource_template_fields,
     resolve_resource_file,
@@ -25,6 +34,7 @@ from postgwas.modules.harmonisation.resource_paths import (
 from postgwas.modules.harmonisation.study_properties import (
     finalise_eaf_decision_from_chromosomes,
 )
+from postgwas.modules.harmonisation.strand import STRAND_ACTION_COLUMN
 
 from .analysis import (
     INPUT_SOURCE_ROW_COLUMN,
@@ -213,28 +223,56 @@ def _stage_csv(
     comment_prefix: str | None,
     description: str,
     log: PipelineLogger,
+    batch_rows: int | None = None,
+    compression: str | None = None,
 ) -> int:
     """Stream selected columns to a partition-addressable Parquet table."""
     try:
-        lazy = _partitioned_csv_scan(
-            source,
-            separator=separator,
-            columns=columns,
-            partition_expression=partition_expression,
-            null_values=null_values,
-            schema_inference_rows=schema_inference_rows,
-            row_index_name=row_index_name,
-            comment_prefix=comment_prefix,
-        )
-        lazy.sink_parquet(destination, maintain_order=True)
-        rows = int(
-            pl.scan_parquet(destination)
-            .select(pl.len().alias("rows"))
-            .collect()
-            .item()
-            or 0
-        )
-    except (OSError, pl.exceptions.PolarsError) as exc:
+        if row_index_name or batch_rows is not None or compression is not None:
+            if batch_rows is None or compression is None:
+                raise ConcordanceValidationError(
+                    "Batched concordance staging requires the resolved "
+                    "staging_batch_rows and staging_compression settings."
+                )
+            rows = _stage_csv_batches(
+                source,
+                destination,
+                separator=separator,
+                columns=columns,
+                partition_expression=partition_expression,
+                null_values=null_values,
+                schema_inference_rows=schema_inference_rows,
+                batch_rows=batch_rows,
+                compression=compression,
+                row_index_name=row_index_name,
+                comment_prefix=comment_prefix,
+            )
+        else:
+            lazy = _partitioned_csv_scan(
+                source,
+                separator=separator,
+                columns=columns,
+                partition_expression=partition_expression,
+                null_values=null_values,
+                schema_inference_rows=schema_inference_rows,
+                row_index_name=None,
+                comment_prefix=comment_prefix,
+            )
+            sink_options: dict[str, Any] = {"maintain_order": True}
+            if compression is not None:
+                sink_options["compression"] = (
+                    "uncompressed" if compression == "none" else compression
+                )
+            lazy.sink_parquet(destination, **sink_options)
+            rows = int(
+                pl.scan_parquet(destination)
+                .select(pl.len().alias("rows"))
+                .collect()
+                .item()
+                or 0
+            )
+    except (OSError, pl.exceptions.PolarsError, pa.ArrowException) as exc:
+        destination.unlink(missing_ok=True)
         raise ConcordanceValidationError(
             "Cannot stage %s %s: %s" % (description, source, exc)
         ) from exc
@@ -243,6 +281,116 @@ def _stage_csv(
         "will be read one at a time."
         % (description.capitalize(), f"{rows:,}", len(columns))
     )
+    return rows
+
+
+def _stage_csv_batches(
+    source: str | Path,
+    destination: Path,
+    *,
+    separator: str,
+    columns: list[str],
+    partition_expression: pl.Expr,
+    null_values: list[str],
+    schema_inference_rows: int,
+    batch_rows: int,
+    compression: str,
+    row_index_name: str | None,
+    comment_prefix: str | None,
+) -> int:
+    """Stream plain or compressed source text with optional stable row IDs.
+
+    Polars 0.20's batched CSV reader opens compressed paths as raw bytes.  The
+    shared input stream performs the configured format-independent
+    decompression, while Arrow keeps every projected source token as text.
+    Downstream concordance then applies the same explicit numerical and
+    coordinate conversions as harmonisation, including exact extreme-P text.
+    """
+    del schema_inference_rows  # Projected source tokens intentionally remain text.
+
+    leading_rows = 0
+    if comment_prefix:
+        with open_text(source) as handle:
+            for line in handle:
+                if not line.strip() or line.startswith(comment_prefix):
+                    leading_rows += 1
+                    continue
+                break
+
+    def invalid_row_handler(invalid_row) -> str:
+        if comment_prefix and invalid_row.text.startswith(comment_prefix):
+            return "skip"
+        return "error"
+
+    writer = None
+    rows = 0
+    try:
+        with open_binary(source) as source_handle:
+            with pa.PythonFile(source_handle, mode="r") as stream:
+                reader = pacsv.open_csv(
+                    stream,
+                    read_options=pacsv.ReadOptions(skip_rows=leading_rows),
+                    parse_options=pacsv.ParseOptions(
+                        delimiter=separator,
+                        invalid_row_handler=invalid_row_handler,
+                    ),
+                    convert_options=pacsv.ConvertOptions(
+                        include_columns=columns,
+                        column_types={column: pa.string() for column in columns},
+                        null_values=null_values,
+                        strings_can_be_null=True,
+                    ),
+                )
+                for record_batch in reader:
+                    batch = pl.from_arrow(record_batch)
+                    for offset in range(0, batch.height, int(batch_rows)):
+                        piece = batch.slice(offset, int(batch_rows))
+                        indexed = (
+                            piece.with_row_index(row_index_name, offset=rows + 1)
+                            if row_index_name else piece
+                        )
+                        selected = (
+                            [row_index_name] if row_index_name else []
+                        ) + columns + [PARTITION_COLUMN]
+                        staged = (
+                            indexed.with_columns(
+                                partition_expression.alias(PARTITION_COLUMN)
+                            )
+                            .select(selected)
+                        )
+                        table = staged.to_arrow()
+                        if writer is None:
+                            writer = pq.ParquetWriter(
+                                destination,
+                                table.schema,
+                                compression=(
+                                    None if compression == "none" else compression
+                                ),
+                            )
+                        writer.write_table(table)
+                        rows += piece.height
+        if writer is None:
+            empty = pl.DataFrame(
+                schema={column: pl.String for column in columns}
+            )
+            indexed = (
+                empty.with_row_index(row_index_name, offset=1)
+                if row_index_name else empty
+            )
+            selected = (
+                [row_index_name] if row_index_name else []
+            ) + columns + [PARTITION_COLUMN]
+            empty = (
+                indexed.with_columns(partition_expression.alias(PARTITION_COLUMN))
+                .select(selected)
+            )
+            empty.write_parquet(
+                destination,
+                compression="uncompressed" if compression == "none" else compression,
+            )
+    finally:
+        if writer is not None:
+            writer.close()
     return rows
 
 
@@ -281,6 +429,9 @@ def _stage_input(
     destination: Path,
     policies,
     log: PipelineLogger,
+    *,
+    batch_rows: int,
+    compression: str,
 ) -> int:
     separator = _separator(row.input_file, row.delimiter, policies)
     columns = _input_columns(row)
@@ -296,11 +447,160 @@ def _stage_input(
         partition_expression=input_chromosome_expression(row, policies),
         null_values=list(policies.get("input.null_values")),
         schema_inference_rows=int(policies.get("input.schema_inference_rows")),
+        batch_rows=batch_rows,
+        compression=compression,
         row_index_name=INPUT_SOURCE_ROW_COLUMN,
         comment_prefix="##",
         description="input summary statistics",
         log=log,
     )
+
+
+def _stage_strand_actions(
+    base: Path,
+    destination: Path,
+    dataset_id: str,
+    output_layout,
+    vcf_config,
+    policies,
+    log: PipelineLogger,
+    *,
+    batch_rows: int,
+    compression: str,
+) -> Path | None:
+    """Stage archived reference-oriented rows for per-variant concordance."""
+    archive_directory = configured_output_path(
+        base,
+        output_layout["adapter_input_archive"],
+        dataset_id=dataset_id,
+        chromosome="*",
+    )
+    archive_pattern = Path(output_layout["adapter_input"]).name + "*"
+    sources = sorted(
+        path
+        for path in configured_output_matches(
+            archive_directory,
+            archive_pattern,
+            dataset_id=dataset_id,
+            chromosome="*",
+        )
+        if path.is_file() and path.stat().st_size > 0
+    )
+    mapping_path = configured_output_path(
+        base,
+        output_layout["adapter_merged_mapping"],
+        dataset_id=dataset_id,
+        chromosome="*",
+    )
+    if not sources or not mapping_path.is_file():
+        log.warning(
+            "Archived per-chromosome GWAS-to-VCF inputs or their merged mapping "
+            "are unavailable; palindromic concordance will fall back to the "
+            "study-wide strand decision."
+        )
+        return None
+    try:
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConcordanceValidationError(
+            "Cannot read archived GWAS-to-VCF column mapping %s: %s"
+            % (mapping_path, exc)
+        ) from exc
+    required_keys = ("chr_col", "pos_col", "ea_col", "oa_col")
+    missing_keys = [key for key in required_keys if key not in mapping]
+    if missing_keys:
+        raise ConcordanceValidationError(
+            "Archived GWAS-to-VCF column mapping is missing: %s"
+            % ", ".join(missing_keys)
+        )
+    separator = vcf_config["table_delimiter"]
+    lazy_tables = []
+    staged_sources: list[Path] = []
+    rows = 0
+    try:
+        for source in sources:
+            try:
+                with open_text(source) as handle:
+                    header = next(csv.reader(handle, delimiter=separator))
+            except (OSError, StopIteration, csv.Error) as exc:
+                raise ConcordanceValidationError(
+                    "Cannot read archived GWAS-to-VCF header %s: %s" % (source, exc)
+                ) from exc
+            try:
+                names = {
+                    key: header[int(mapping[key])]
+                    for key in required_keys
+                }
+            except (IndexError, TypeError, ValueError) as exc:
+                raise ConcordanceValidationError(
+                    "Archived GWAS-to-VCF mapping indexes do not match %s: %s"
+                    % (source, exc)
+                ) from exc
+            if STRAND_ACTION_COLUMN not in header:
+                raise ConcordanceValidationError(
+                    "Archived GWAS-to-VCF input lacks required audit column %s: %s"
+                    % (STRAND_ACTION_COLUMN, source)
+                )
+            source_columns = list(dict.fromkeys([
+                names["chr_col"],
+                names["pos_col"],
+                names["oa_col"],
+                names["ea_col"],
+                STRAND_ACTION_COLUMN,
+            ]))
+            staged_source = _temporary_path(destination.parent)
+            staged_sources.append(staged_source)
+            rows += _stage_csv(
+                source,
+                staged_source,
+                separator=separator,
+                columns=source_columns,
+                partition_expression=reference_chromosome_expression(
+                    names["chr_col"], policies,
+                ),
+                null_values=list(policies.get("input.null_values")),
+                schema_inference_rows=int(
+                    policies.get("input.schema_inference_rows")
+                ),
+                row_index_name=None,
+                comment_prefix=None,
+                description="archived GWAS-to-VCF strand-action table",
+                log=log,
+                batch_rows=batch_rows,
+                compression=compression,
+            )
+            lazy_tables.append(
+                pl.scan_parquet(staged_source).select(
+                    pl.col(names["chr_col"]).alias("CHROM"),
+                    pl.col(names["pos_col"]).alias("POS"),
+                    pl.col(names["oa_col"]).alias("REF"),
+                    pl.col(names["ea_col"]).alias("ALT"),
+                    pl.col(STRAND_ACTION_COLUMN),
+                    pl.col(PARTITION_COLUMN),
+                )
+            )
+        pl.concat(lazy_tables, how="vertical_relaxed").sink_parquet(
+            destination,
+            compression="uncompressed" if compression == "none" else compression,
+            maintain_order=True,
+        )
+        staged_rows = int(
+            pl.scan_parquet(destination).select(pl.len()).collect().item() or 0
+        )
+        if staged_rows != rows:
+            raise ConcordanceValidationError(
+                "Archived GWAS-to-VCF strand-action staging changed the row "
+                "count (%s input rows; %s staged rows)."
+                % (f"{rows:,}", f"{staged_rows:,}")
+            )
+    finally:
+        for staged_source in staged_sources:
+            staged_source.unlink(missing_ok=True)
+    log.info(
+        "Archived per-row strand actions staged: %s rows from %s chromosome "
+        "input file(s)." % (f"{rows:,}", f"{len(sources):,}")
+    )
+    return destination
 
 
 def _stage_duplicate_report(
@@ -311,6 +611,9 @@ def _stage_duplicate_report(
     delimiter: str,
     policies,
     log: PipelineLogger,
+    *,
+    batch_rows: int | None = None,
+    compression: str | None = None,
 ) -> Path | None:
     path = configured_output_path(
         base, output_layout["duplicates"], dataset_id=row.dataset_id,
@@ -326,6 +629,8 @@ def _stage_duplicate_report(
         partition_expression=input_chromosome_expression(row, policies),
         null_values=list(policies.get("input.null_values")),
         schema_inference_rows=int(policies.get("input.schema_inference_rows")),
+        batch_rows=batch_rows,
+        compression=compression,
         row_index_name=None,
         comment_prefix=None,
         description="harmonisation duplicate report",
@@ -342,6 +647,9 @@ def _stage_external_eaf(
     policies,
     log: PipelineLogger,
     reference_build: str,
+    *,
+    batch_rows: int | None = None,
+    compression: str | None = None,
 ) -> Path | None:
     if row.effect_allele_frequency_column:
         return None
@@ -384,9 +692,13 @@ def _stage_external_eaf(
         destination,
         separator=separator,
         columns=columns,
-        partition_expression=reference_chromosome_expression(mapping.chromosome),
+        partition_expression=reference_chromosome_expression(
+            mapping.chromosome, policies,
+        ),
         null_values=list(policies.get("input.null_values")),
         schema_inference_rows=int(policies.get("input.schema_inference_rows")),
+        batch_rows=batch_rows,
+        compression=compression,
         row_index_name=None,
         comment_prefix="##",
         description="external effect-allele-frequency table",
@@ -412,6 +724,10 @@ def _read_external_eaf_partition(
     reference_build: str,
     policies,
     log: PipelineLogger,
+    *,
+    workspace: Path,
+    batch_rows: int,
+    compression: str,
 ) -> pl.DataFrame:
     """Read one resolved external-EAF chromosome without staging the full panel."""
     try:
@@ -433,31 +749,37 @@ def _read_external_eaf_partition(
         "[%s] from %s with separator %r."
         % (partition, ", ".join(columns), source, separator)
     )
+    staged_path = _temporary_path(workspace)
     try:
-        frame = (
-            _partitioned_csv_scan(
-                source,
-                separator=separator,
-                columns=columns,
-                partition_expression=reference_chromosome_expression(
-                    mapping.chromosome
-                ),
-                null_values=list(policies.get("input.null_values")),
-                schema_inference_rows=int(
-                    policies.get("input.schema_inference_rows")
-                ),
-                row_index_name=None,
-                comment_prefix="##",
-            )
-            .filter(pl.col(PARTITION_COLUMN) == partition)
-            .drop(PARTITION_COLUMN)
-            .collect()
+        _stage_csv(
+            source,
+            staged_path,
+            separator=separator,
+            columns=columns,
+            partition_expression=reference_chromosome_expression(
+                mapping.chromosome, policies,
+            ),
+            null_values=list(policies.get("input.null_values")),
+            schema_inference_rows=int(
+                policies.get("input.schema_inference_rows")
+            ),
+            row_index_name=None,
+            comment_prefix="##",
+            description=(
+                "external effect-allele-frequency chromosome %s" % partition
+            ),
+            log=log,
+            batch_rows=batch_rows,
+            compression=compression,
         )
+        frame = _read_partition(staged_path, partition)
     except (OSError, pl.exceptions.PolarsError) as exc:
         raise ConcordanceValidationError(
             "Cannot read the external EAF file for concordance chromosome %s "
             "(%s): %s" % (partition, source, exc)
         ) from exc
+    finally:
+        staged_path.unlink(missing_ok=True)
     log.info(
         "Concordance chromosome %s: external EAF rows read=%s."
         % (partition, f"{frame.height:,}")
@@ -473,14 +795,20 @@ def _extract_vcf(
     bcftools: str,
     vcf_config,
     schema_inference_rows: int,
+    policies,
     log: PipelineLogger,
+    *,
+    batch_rows: int,
+    compression: str,
+    header: str | None = None,
 ) -> tuple[int, str]:
-    header = run_checked_command(
-        [bcftools, "view", "-h", str(vcf_path)],
-        "Reading VCF header",
-        logger=log,
-        error_type=ConcordanceValidationError,
-    )
+    if header is None:
+        header = run_checked_command(
+            [bcftools, "view", "-h", str(vcf_path)],
+            "Reading VCF header",
+            logger=log,
+            error_type=ConcordanceValidationError,
+        )
     handle = tempfile.NamedTemporaryFile(
         mode="w", suffix=vcf_config["temporary_table_suffix"],
         dir=temporary_directory, delete=False, encoding="utf-8",
@@ -509,9 +837,11 @@ def _extract_vcf(
             separator=vcf_config["table_delimiter"],
             destination=destination,
             columns=list(vcf_config["concordance_fields"]),
-            partition_expression=vcf_chromosome_expression(),
+            partition_expression=vcf_chromosome_expression(policies),
             null_values=vcf_config["table_null_values"],
             schema_inference_rows=int(schema_inference_rows),
+            batch_rows=batch_rows,
+            compression=compression,
             row_index_name=VCF_SOURCE_ROW_COLUMN,
             comment_prefix=None,
             description="extracted VCF concordance table",
@@ -580,6 +910,7 @@ def _compare_staged_partitions(
     vcf_path: Path,
     duplicate_path: Path | None,
     external_eaf_path: Path | None,
+    strand_action_path: Path | None = None,
     workspace: Path,
     row,
     effect_type: str,
@@ -618,6 +949,10 @@ def _compare_staged_partitions(
             _read_partition(duplicate_path, partition)
             if duplicate_path is not None else None
         )
+        strand_action_frame = (
+            _read_partition(strand_action_path, partition)
+            if strand_action_path is not None else None
+        )
         if external_eaf_path is not None:
             external_eaf_frame = _read_partition(external_eaf_path, partition)
         elif (
@@ -633,6 +968,9 @@ def _compare_staged_partitions(
                 external_eaf_build,
                 policies,
                 log,
+                workspace=workspace,
+                batch_rows=int(settings.staging_batch_rows),
+                compression=str(settings.staging_compression),
             )
         else:
             external_eaf_frame = None
@@ -650,6 +988,7 @@ def _compare_staged_partitions(
             external_eaf_frame=external_eaf_frame,
             external_eaf_mapping=external_eaf_mapping,
             duplicate_report_frame=duplicate_frame,
+            strand_action_frame=strand_action_frame,
         )
         partition_summaries.append(analysis.summary)
         for name in report_paths:
@@ -666,7 +1005,14 @@ def _compare_staged_partitions(
                 f"{analysis.summary['matched_variants']:,}",
             )
         )
-        del analysis, input_frame, vcf_frame, duplicate_frame, external_eaf_frame
+        del (
+            analysis,
+            input_frame,
+            vcf_frame,
+            duplicate_frame,
+            external_eaf_frame,
+            strand_action_frame,
+        )
 
     return combine_concordance_partitions(
         partition_summaries,
@@ -693,27 +1039,34 @@ def _write_frame(
     null_value: str,
 ) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
-    compression = "gzip" if path.suffix == ".gz" else "uncompressed"
+    compressed = path.suffix.lower() == ".gz"
     temporary = path.with_name(
         ".%s.tmp%s" % (path.stem, path.suffix)
-        if path.suffix == ".gz" else ".%s.tmp" % path.name
+        if compressed else ".%s.tmp" % path.name
     )
-    if isinstance(frame, pl.LazyFrame):
-        frame.sink_csv(
-            temporary,
-            separator=delimiter,
-            null_value=null_value,
-            compression=compression,
-            maintain_order=True,
-        )
-    else:
-        frame.write_csv(
-            temporary,
-            separator=delimiter,
-            null_value=null_value,
-            compression=compression,
-        )
-    temporary.replace(path)
+    uncompressed = path.with_name(".%s.uncompressed.tmp" % path.name)
+    table_path = uncompressed if compressed else temporary
+    try:
+        if isinstance(frame, pl.LazyFrame):
+            frame.sink_csv(
+                table_path,
+                separator=delimiter,
+                null_value=null_value,
+                maintain_order=True,
+            )
+        else:
+            frame.write_csv(
+                table_path,
+                separator=delimiter,
+                null_value=null_value,
+            )
+        if compressed:
+            with uncompressed.open("rb") as source, gzip.open(temporary, "wb") as target:
+                shutil.copyfileobj(source, target)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+        uncompressed.unlink(missing_ok=True)
     return str(path)
 
 
@@ -948,7 +1301,7 @@ def _screen_summary(dataset_id: str, analysis: ConcordanceAnalysis, reports: dic
         screen_line("genetic", "3. Allele-aware comparison", indent=6),
         screen_field(
             "info", "Match key",
-            "chromosome, position and unordered allele pair",
+            "chromosome, minimally represented position and unordered allele pair",
             indent=8, label_width=width,
         ),
         screen_line("genetic", "3.1 Common allele-aware variants", indent=8),
@@ -1256,8 +1609,15 @@ def run_concordance_validation(
     run_manifest: str | Path | None = None,
     external_eaf_mapping=None,
     show_screen: bool = True,
+    provenance_headers: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run one validation and always leave a complete log and status summary."""
+    """Run validation with a complete log and status summary.
+
+    Standalone callers supply the resolved PostGWAS provenance contract for
+    their primary study VCF. Internal harmonisation retains its existing
+    producer-owned input path; external reference tables are not subject to
+    this study-origin check.
+    """
     vcf = Path(vcf_path).expanduser().resolve()
     base = _dataset_harmonisation_directory(
         output_root, row.dataset_id, output_layout,
@@ -1295,6 +1655,16 @@ def run_concordance_validation(
         if not vcf.is_file() or vcf.stat().st_size <= 0:
             raise ConcordanceValidationError("VCF does not exist or is empty: %s" % vcf)
 
+        header = None
+        if provenance_headers is not None:
+            header = read_vcf_header(
+                vcf, bcftools, logger=log, error_type=ConcordanceValidationError,
+            )
+            validate_postgwas_vcf_provenance(
+                header, provenance_headers, vcf_path=vcf, logger=log,
+                error_type=ConcordanceValidationError,
+            )
+
         if run_manifest is None:
             candidate = configured_output_path(
                 base, output_layout["run_manifest"], dataset_id=row.dataset_id,
@@ -1313,7 +1683,7 @@ def run_concordance_validation(
                 "Effect type is unresolved. Keep the harmonisation run manifest beside the VCF "
                 "or set effect_type to beta/odds_ratio in the sample sheet."
             )
-        if p_value_type not in ("raw", "neglog10", "negln"):
+        if p_value_type not in ("raw", "neglog10"):
             raise ConcordanceValidationError(
                 "P-value type is unresolved. Keep the harmonisation run manifest beside the VCF "
                 "or set p_value_type in the sample sheet."
@@ -1354,11 +1724,21 @@ def run_concordance_validation(
             dir=temporary_prefix.parent,
         )
         workspace = Path(workspace_context.name)
+        staging_batch_rows = int(settings.staging_batch_rows)
+        staging_compression = str(settings.staging_compression)
         input_path = _temporary_path(workspace)
         duplicate_path = _temporary_path(workspace)
         external_eaf_path = _temporary_path(workspace)
+        strand_action_path = _temporary_path(workspace)
         vcf_path_staged = _temporary_path(workspace)
-        _stage_input(row, input_path, policies, log)
+        _stage_input(
+            row,
+            input_path,
+            policies,
+            log,
+            batch_rows=staging_batch_rows,
+            compression=staging_compression,
+        )
         duplicate_path = _stage_duplicate_report(
             base,
             duplicate_path,
@@ -1367,6 +1747,19 @@ def run_concordance_validation(
             vcf_config["table_delimiter"],
             policies,
             log,
+            batch_rows=staging_batch_rows,
+            compression=staging_compression,
+        )
+        strand_action_path = _stage_strand_actions(
+            base,
+            strand_action_path,
+            row.dataset_id,
+            output_layout,
+            vcf_config,
+            policies,
+            log,
+            batch_rows=staging_batch_rows,
+            compression=staging_compression,
         )
         _, header = _extract_vcf(
             vcf,
@@ -1376,7 +1769,11 @@ def run_concordance_validation(
             bcftools,
             vcf_config,
             policies.get("input.schema_inference_rows"),
+            policies,
             log,
+            batch_rows=staging_batch_rows,
+            compression=staging_compression,
+            header=header,
         )
         observed_build = _vcf_build(
             header, list(vcf_config["target_builds"]),
@@ -1404,6 +1801,8 @@ def run_concordance_validation(
             policies,
             log,
             observed_build,
+            batch_rows=staging_batch_rows,
+            compression=staging_compression,
         )
 
         log.info(
@@ -1423,6 +1822,7 @@ def run_concordance_validation(
             vcf_path=vcf_path_staged,
             duplicate_path=duplicate_path,
             external_eaf_path=external_eaf_path,
+            strand_action_path=strand_action_path,
             workspace=workspace,
             row=row,
             effect_type=effect_type, se_scale=se_scale,

@@ -46,6 +46,7 @@ from postgwas.modules.fine_mapping.engines.susie.main import (
     run_susie,
 )
 from postgwas.modules.fine_mapping.engines.susie.summary_preparation import (
+    normalize_chromosome,
     prepare_locus_summary_statistics,
 )
 
@@ -418,10 +419,12 @@ def split_locus_file(
     # --------------------------------------------------
     if finemap_skip_mhc:
         before = len(df)
+        chromosome = normalize_chromosome(df["CHR"])
+        normalized_mhc = normalize_chromosome(pd.Series([mhc_chr])).iloc[0]
 
         df = df[
             ~(
-                (df["CHR"].astype(str) == str(mhc_chr)) &
+                (chromosome == normalized_mhc) &
                 (df["START"].astype(int) < int(mhc_end)) &
                 (df["END"].astype(int) > int(mhc_start))
             )
@@ -516,7 +519,7 @@ def run_susie_worker(
         output_folder=str(worker_outdir),
         resolved_configuration_file=args.resolved_susie_configuration_file,
         rscript=args.rscript,
-        r_environment=args.susie_r_environment,
+        r_environment=args._susie_r_environment,
     )
 
 
@@ -545,7 +548,8 @@ def _run_parallel_susie(args, progress, screen=None):
         "pipeline", "initialization", 1, pipeline_total, "completed",
         f"output_dir={output_folder}",
     )
-    if screen:
+    preflight = getattr(args, "_fine_mapping_preflight", None)
+    if screen and preflight is None:
         screen.complete(1, [
             ("analysis", "Engine", "SuSiE-RSS"),
             ("info", "Dataset", args.dataset_id),
@@ -553,46 +557,49 @@ def _run_parallel_susie(args, progress, screen=None):
     final_plink_path = None
 
     logger.info("[STAGE] stage=dependency_validation status=started")
-    r_runtime = resolve_susie_r_runtime(
-        args.rscript,
-        runtime_defaults["tool_version_timeout_seconds"],
-    )
-    args.rscript = r_runtime["rscript"]
-    args.susie_r_environment = r_runtime["environment"]
-    if args.plink:
-        if Path(args.plink).exists():
-            final_plink_path = args.plink
-        else:
-            logger.warning(
-                "[STAGE] stage=dependency_validation status=warning "
-                "reason=provided_plink_path_missing path=%s",
-                args.plink,
+    if preflight is not None:
+        r_runtime = preflight.r_runtime
+        if r_runtime is None:
+            raise RuntimeError("SuSiE preflight did not retain its validated R runtime")
+        final_plink_path = args.plink
+        args.plink_version = next(
+            tool.version for tool in preflight.tools if tool.name == "PLINK"
+        )
+        logger.info(
+            "[STAGE] stage=dependency_validation status=reused_preflight"
+        )
+    else:
+        r_runtime = resolve_susie_r_runtime(
+            args.rscript,
+            runtime_defaults["tool_version_timeout_seconds"],
+        )
+        args.rscript = r_runtime["rscript"]
+        args._susie_r_environment = r_runtime["environment"]
+        if args.plink:
+            if Path(args.plink).exists():
+                final_plink_path = args.plink
+            else:
+                final_plink_path = shutil.which(str(args.plink))
+
+        if not final_plink_path:
+            raise EnvironmentError(
+                "The configured PLINK executable was not found. Provide --plink "
+                "PATH or set resources.executables.plink in the run configuration."
             )
-            final_plink_path = None
 
-    if not final_plink_path:
-        detected_plink = shutil.which("plink") or shutil.which("plink2")
-        if detected_plink:
-            final_plink_path = detected_plink
-
-    if not final_plink_path:
-        raise EnvironmentError(
-            "PLINK executable not found; add plink/plink2 to PATH or provide --plink"
-        )
-
-    args.plink = final_plink_path
-    try:
-        plink_version = subprocess.run(
-            [str(args.plink), "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=float(runtime_defaults["tool_version_timeout_seconds"]),
-        )
-        version_output = (plink_version.stdout or plink_version.stderr).strip()
-        args.plink_version = version_output.splitlines()[0]
-    except Exception:
-        args.plink_version = "unknown"
+        args.plink = final_plink_path
+        try:
+            plink_version = subprocess.run(
+                [str(args.plink), "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=float(runtime_defaults["tool_version_timeout_seconds"]),
+            )
+            version_output = (plink_version.stdout or plink_version.stderr).strip()
+            args.plink_version = version_output.splitlines()[0]
+        except Exception:
+            args.plink_version = "unknown"
     logger.info(
         "[STAGE] stage=dependency_validation status=completed "
         "plink=%s plink_version=%s rscript=%s r_version=%s r_libraries=%s",
@@ -606,7 +613,7 @@ def _run_parallel_susie(args, progress, screen=None):
         "pipeline", "dependency_validation", 2, pipeline_total, "completed",
         f"PLINK={args.plink_version}",
     )
-    if screen:
+    if screen and preflight is None:
         screen.complete(2, [
             ("success", "External tools", "validated"),
             ("info", "PLINK", args.plink_version),
@@ -616,6 +623,8 @@ def _run_parallel_susie(args, progress, screen=None):
     args.threads = safe_thread_count(
         requested_threads=args.threads,
         gb_per_thread=args.minimum_memory_per_worker_gb,
+        available_ram_gb=args.memory_gb,
+        enforce_memory_budget=True,
     )
 
     if args.finemap_include_mhc:
@@ -632,6 +641,10 @@ def _run_parallel_susie(args, progress, screen=None):
         raise ValueError(f"Could not read locus file: {e}") from e
 
     loci_df.columns = [x.strip().upper() for x in loci_df.columns]
+    loci_df["LP"] = pd.to_numeric(loci_df["LP"], errors="coerce")
+    loci_df = loci_df[loci_df["LP"] >= float(args.lp_threshold)].copy()
+    if loci_df.empty:
+        raise ValueError(f"No loci passed LP >= {args.lp_threshold}")
     flank_bp = int(args.window_kb * runtime_defaults["bases_per_kilobase"])
     if flank_bp < 0:
         raise ValueError("window_kb cannot be negative")
@@ -697,7 +710,7 @@ def _run_parallel_susie(args, progress, screen=None):
     )
     if screen:
         screen.complete(3, [
-            ("count", "Input loci", len(loci_df)),
+            ("count", "LP-eligible loci", len(loci_df)),
             ("analysis", "Boundary flank", f"{args.window_kb:,} kb"),
             (
                 "analysis",
@@ -761,6 +774,8 @@ def _run_parallel_susie(args, progress, screen=None):
     )
     memory_adjusted_threads = safe_thread_count(
         requested_threads=len(locus_chunks),
+        available_ram_gb=args.memory_gb,
+        enforce_memory_budget=True,
         gb_per_thread=max(
             args.minimum_memory_per_worker_gb,
             largest_locus_resource_qc["estimated_peak_ld_memory_gb"],
@@ -817,6 +832,7 @@ def _run_parallel_susie(args, progress, screen=None):
             },
             "resource_parameters": {
                 "selected_workers": len(locus_chunks),
+                "memory_budget_gb": args.memory_gb,
                 "minimum_memory_per_worker_gb": args.minimum_memory_per_worker_gb,
                 "ld_timeout_seconds": args.ld_timeout_seconds,
                 "susie_timeout_seconds": args.susie_timeout_seconds,
@@ -1189,6 +1205,7 @@ def run_parallel_susie(args, screen=None):
         "postgwas.modules.fine_mapping",
         output_paths["pipeline_log_file"],
         args.fine_mapping_logging["file_level"],
+        mode="a",
     ):
         progress = ProgressRecorder(
             output_paths["pipeline_progress_file"], logger=logger

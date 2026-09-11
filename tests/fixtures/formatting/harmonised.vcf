@@ -1,4 +1,8 @@
 ##fileformat=VCFv4.2
+##genome_build=GRCh37
+##postgwas_version="test"
+##postgwas_dataset_id="STUDY"
+##postgwas_vcf_status="created and structurally validated"
 ##contig=<ID=1,length=1000000>
 ##contig=<ID=2,length=1000000>
 ##FORMAT=<ID=ES,Number=A,Type=Float,Description="Effect size for ALT">

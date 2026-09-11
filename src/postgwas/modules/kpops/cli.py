@@ -13,12 +13,109 @@ from postgwas.config import load_configuration
 from postgwas.config.models.modules.kpops import KPopsGeneUniversePolicy
 from postgwas.core.errors import ConfigurationError, MissingRequiredArgumentsError
 from postgwas.core.ui import (
+    print_screen_message,
     AlignedRichHelpFormatter,
     format_cli_examples,
     help_with_default,
     mark_cli_required_help,
+    move_cli_help_actions,
 )
 from postgwas.modules.kpops.errors import KPopsError
+
+
+_KPOPS_OUTPUT_DESTINATIONS = (
+    "dataset_id",
+    "output_directory",
+    "save_attribution_files",
+)
+_KPOPS_INPUT_FILE_DESTINATIONS = ("vcf", "magma_association_prefix")
+_KPOPS_REFERENCE_FILE_DESTINATIONS = (
+    "magma_ld_reference",
+    "gene_location_file",
+    "gene_set_file",
+    "kpops_gene_annotation_file",
+    "kernel_matrix_prefix",
+)
+_KPOPS_REFERENCE_SETTING_DESTINATIONS = (
+    "kpops_genome_build",
+    "gene_universe_policy",
+    "kpops_gene_universe_policy",
+)
+_KPOPS_SOFTWARE_DESTINATIONS = ("kpops_script",)
+_KPOPS_HELP_GROUP_ORDER = (
+    "Output",
+    "Input files",
+    "Reference files",
+    "K-POPS reference settings",
+    "Variant identifiers",
+    "MAGMA analysis settings",
+    "MAGMA analysis scope",
+    "K-POPS training and explanation settings",
+    "K-POPS software",
+    "Performance",
+    "Screen output",
+    "Run continuation",
+    "Configuration",
+    "Choose analyses",
+)
+
+
+def organize_kpops_help(parser: argparse.ArgumentParser) -> None:
+    """Place outputs, analysis inputs, and reference resources before settings."""
+    original_groups = list(parser._action_groups)
+    output = next(group for group in original_groups if group.title == "Output")
+    inputs = parser.add_argument_group(
+        "Input files",
+        "Primary study data consumed directly by the selected execution mode.",
+    )
+    references = parser.add_argument_group(
+        "Reference files",
+        "MAGMA and K-POPS resources defining LD, genes, and the kernel.",
+    )
+    reference_settings = parser.add_argument_group(
+        "K-POPS reference settings",
+        "Declarations controlling compatibility across K-POPS resources.",
+    )
+    software = parser.add_argument_group("K-POPS software")
+
+    move_cli_help_actions(parser, output, _KPOPS_OUTPUT_DESTINATIONS)
+    move_cli_help_actions(parser, inputs, _KPOPS_INPUT_FILE_DESTINATIONS)
+    move_cli_help_actions(
+        parser,
+        references,
+        _KPOPS_REFERENCE_FILE_DESTINATIONS,
+    )
+    move_cli_help_actions(
+        parser,
+        reference_settings,
+        _KPOPS_REFERENCE_SETTING_DESTINATIONS,
+    )
+    move_cli_help_actions(parser, software, _KPOPS_SOFTWARE_DESTINATIONS)
+
+    leading_groups = [
+        group
+        for group in original_groups
+        if group.title in {"positional arguments", "options"}
+    ]
+    ordered_groups = [
+        group
+        for title in _KPOPS_HELP_GROUP_ORDER
+        for group in parser._action_groups
+        if group.title == title
+    ]
+    remaining_groups = [
+        group
+        for group in parser._action_groups
+        if group not in leading_groups and group not in ordered_groups
+        and not (
+            group.title in {"Input file", "MAGMA inputs", "K-POPS inputs"}
+            and not any(
+                action.help is not argparse.SUPPRESS
+                for action in group._group_actions
+            )
+        )
+    ]
+    parser._action_groups[:] = leading_groups + ordered_groups + remaining_groups
 
 
 def get_kpops_pipeline_examples():
@@ -35,9 +132,7 @@ def get_kpops_pipeline_examples():
                     "functional_mapping/base/ld_reference/g1000_eur/g1000_eur"
                 ),
                 (
-                    "--gene-location-file /path/to/postgwas-resources/kpops/"
-                    "software/8acd49ed8c96565b17c2997420f514f24b65e096/data/"
-                    "Ensembl.hg19.gene.loc"
+                    "--gene-location-file reference/PoPS_GRCh37_strand_aware.loc"
                 ),
                 (
                     "--kpops-gene-annotation-file /path/to/postgwas-resources/"
@@ -110,7 +205,12 @@ def get_kpops_direct_examples():
     )
 
 
-def get_kpops_parser(add_help=False, *, direct_controls=False):
+def get_kpops_pipeline_parser():
+    """Keep K-POPS model overrides independent of PoPS in joint pipelines."""
+    return get_kpops_parser(pipeline=True)
+
+
+def get_kpops_parser(add_help=False, *, direct_controls=False, pipeline=False):
     defaults = load_configuration()
     module = defaults.modules.kpops
     schema = module.input_schema
@@ -153,7 +253,7 @@ def get_kpops_parser(add_help=False, *, direct_controls=False):
         ),
     )
     inputs.add_argument(
-        "--gene-universe-policy",
+        "--kpops-gene-universe-policy" if pipeline else "--gene-universe-policy",
         choices=get_args(KPopsGeneUniversePolicy),
         metavar="POLICY",
         default=argparse.SUPPRESS,
@@ -186,7 +286,8 @@ def get_kpops_parser(add_help=False, *, direct_controls=False):
     )
     settings = parser.add_argument_group("K-POPS training and explanation settings")
     settings.add_argument(
-        "--training-chromosomes", nargs="+", metavar="CHROM",
+        "--kpops-training-chromosomes" if pipeline else "--training-chromosomes",
+        nargs="+", metavar="CHROM",
         default=argparse.SUPPRESS,
         help=help_with_default(
             "Training design: 'loco' fits one leave-one-chromosome-out model per "
@@ -236,12 +337,14 @@ def get_kpops_parser(add_help=False, *, direct_controls=False):
         ),
     )
     settings.add_argument(
-        "--use-magma-covariates", action=argparse.BooleanOptionalAction,
+        "--kpops-use-magma-covariates" if pipeline else "--use-magma-covariates",
+        action=argparse.BooleanOptionalAction,
         default=argparse.SUPPRESS,
         help=help_with_default(
             "Project MAGMA gene-size, gene-density, and inverse-MAC covariates "
             "derived from the .genes.raw file out of target Z statistics before "
-            "kernel fitting; use --no-use-magma-covariates to fit unadjusted targets",
+            "kernel fitting; use %s to fit unadjusted targets"
+            % ("--no-kpops-use-magma-covariates" if pipeline else "--no-use-magma-covariates"),
             module.use_magma_covariates,
         ),
     )
@@ -319,6 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
             "output_directory",
         ),
     )
+    organize_kpops_help(parser)
     return parser
 
 
@@ -331,11 +435,11 @@ def main(argv=None):
         run_kpops_direct(args)
     except MissingRequiredArgumentsError as exc:
         console = Console(stderr=True)
-        console.print("\n[bold red]K-POPS analysis failed.[/bold red] %s\n" % exc)
+        print_screen_message("error", "K-POPS analysis failed. %s" % exc, console=console)
         parser.print_help(file=console.file)
         return 1
     except (KPopsError, ConfigurationError, OSError, ValueError) as exc:
-        Console(stderr=True).print("\n[bold red]K-POPS analysis failed.[/bold red] %s\n" % exc)
+        print_screen_message("error", "K-POPS analysis failed. %s" % exc, stderr=True)
         return 1
     return 0
 
@@ -344,6 +448,8 @@ __all__ = [
     "build_parser",
     "get_kpops_direct_examples",
     "get_kpops_parser",
+    "get_kpops_pipeline_parser",
     "get_kpops_pipeline_examples",
     "main",
+    "organize_kpops_help",
 ]

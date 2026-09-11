@@ -35,10 +35,22 @@ class ModuleResult:
 
 
 class RunContext(MutableMapping[str, Any]):
-    """Run-scoped result store shared by pipeline modules."""
+    """Run-scoped result and transient validation store shared by modules.
 
-    def __init__(self, initial: Mapping[str, Any] | None = None):
+    Validation evidence is deliberately excluded from ``snapshot()`` because
+    pipeline preflight is rerun for every invocation, including resume. This
+    permits module-native evidence objects and prevents stale validation from
+    being restored from a checkpoint.
+    """
+
+    def __init__(
+        self,
+        initial: Mapping[str, Any] | None = None,
+        *,
+        validations: Mapping[str, Any] | None = None,
+    ):
         self._values = dict(initial or {})
+        self._validations = dict(validations or {})
 
     def __getitem__(self, key: str) -> Any:
         return self._values[key]
@@ -57,6 +69,23 @@ class RunContext(MutableMapping[str, Any]):
 
     def publish(self, result: ModuleResult) -> None:
         self._values[result.module] = result
+
+    def publish_validation(self, module: str, evidence: Any) -> None:
+        """Retain current-invocation preflight evidence for one module."""
+        name = str(module).strip()
+        if not name:
+            raise ValueError("Validation evidence requires a module name")
+        if evidence is None:
+            raise ValueError("Validation evidence must not be None")
+        self._validations[name] = evidence
+
+    def validation(self, module: str, default: Any = None) -> Any:
+        """Return transient preflight evidence without checkpointing it."""
+        return self._validations.get(str(module), default)
+
+    def validation_modules(self) -> tuple[str, ...]:
+        """Return modules with reusable evidence in stable insertion order."""
+        return tuple(self._validations)
 
     def snapshot(self) -> dict[str, Any]:
         return dict(self._values)

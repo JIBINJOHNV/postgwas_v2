@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 from argparse import Namespace
+from io import StringIO
 from pathlib import Path
 
 import numpy as np
@@ -12,18 +13,32 @@ import pandas as pd
 import pytest
 import yaml
 from rich.cells import cell_len
+from rich.console import Console
 
 from postgwas.config import load_configuration, load_module_configuration
+from postgwas.core.preflight import PipelinePreflightEvidence
+from postgwas.core.input_validation import InputValidationSession
+from postgwas.core.ui import PipelineStageController
+from postgwas.core.validation_reporting import FileValidationDisplay
+from postgwas.modules.magma.reporting import (
+    MAGMA_GENE_ONLY_STAGE_KEYS,
+    MAGMA_STAGE_TITLES,
+)
 from postgwas.modules.pops.cli import build_parser
 from postgwas.modules.pops.errors import PopsError
 from postgwas.modules.pops.service import (
     _resolved_configuration,
     _require_pops_runtime,
+    _validate_feature_resources,
     preflight_pops_pipeline,
     run_pops_direct,
     validate_pops_configuration,
 )
+from postgwas.modules.pops.stages import POPS_STAGES, pops_pipeline_progress_plan
+from postgwas.pipeline.planner import build_pipeline_plan
 from postgwas.pipeline.registry import REGISTRY
+from preflight_support import pipeline_input_vcf_evidence
+from postgwas.pipeline.runners import run_pops_runner
 
 
 def _pops_resources(tmp_path: Path, *, custom_target: bool = False) -> dict[str, Path]:
@@ -75,6 +90,27 @@ def _pops_resources(tmp_path: Path, *, custom_target: bool = False) -> dict[str,
     return resources
 
 
+def test_pops_feature_companions_have_one_validated_bundle_card(
+    tmp_path, capsys,
+):
+    resources = _pops_resources(tmp_path)
+    module = load_module_configuration("pops").model_copy(update={
+        "feature_matrix_prefix": str(resources["feature_prefix"]),
+        "feature_matrix_chunks": 1,
+    })
+    with InputValidationSession() as session:
+        display = FileValidationDisplay(session, load_configuration())
+        features = _validate_feature_resources(module)
+        display.flush()
+
+    screen = capsys.readouterr().out
+    assert "PoPS feature-matrix resources — CHECKS PASSED" in screen
+    assert "Matrix validation" in screen
+    assert "features.cols.0.txt" not in screen
+    assert "features.mat.0.npy" not in screen
+    assert features["feature_count"] == 2
+
+
 def _arguments(tmp_path: Path, resources: dict[str, Path], **overrides) -> Namespace:
     values = {
         "dataset_id": "STUDY",
@@ -95,17 +131,67 @@ def _arguments(tmp_path: Path, resources: dict[str, Path], **overrides) -> Names
 def _write_upstream_outputs(config: dict, progress_callback=None) -> None:
     _emit_upstream_progress(progress_callback)
     prefix = config["out_prefix"]
-    Path(prefix + ".preds").write_text(
-        "ENSGID\tPoPS_Score\ttraining_gene\n"
-        "ENSG001\t1\tTrue\nENSG002\t2\tTrue\n",
-        encoding="utf-8",
-    )
+    feature_ids = np.atleast_1d(np.loadtxt(
+        config["feature_mat_prefix"] + ".rows.txt", dtype=str,
+    )).reshape(-1).tolist()
+    if config["magma_prefix"] is not None:
+        target = pd.read_csv(config["magma_prefix"] + ".genes.out", sep=r"\s+")
+        target_scores = dict(zip(target["GENE"].astype(str), target["ZSTAT"]))
+        has_covariates = config["use_magma_covariates"]
+    else:
+        target = pd.read_csv(config["y_path"], sep="\t")
+        target_scores = dict(zip(target["ENSGID"].astype(str), target["Score"]))
+        has_covariates = config["y_covariates_path"] is not None
+    prediction = pd.DataFrame({
+        "ENSGID": feature_ids,
+        "PoPS_Score": [
+            2.0 if gene == "ENSG002" else 1.0 if gene == "ENSG001" else -index
+            for index, gene in enumerate(feature_ids, 1)
+        ],
+        "Y": [target_scores.get(gene) for gene in feature_ids],
+        "feature_selection_gene": [gene in target_scores for gene in feature_ids],
+        "training_gene": [gene in target_scores for gene in feature_ids],
+    })
+    if has_covariates:
+        prediction["Y_proj"] = prediction["Y"]
+        prediction["project_out_covariates_gene"] = prediction["Y"].notna()
+    prediction.to_csv(prefix + ".preds", sep="\t", index=False)
     Path(prefix + ".coefs").write_text("parameter\tbeta\nfeature_a\t1\n", encoding="utf-8")
     Path(prefix + ".marginals").write_text(
         "feature\tpval\tselected\nfeature_a\t0.01\tTrue\n",
         encoding="utf-8",
     )
     Path(prefix + ".log").write_text("completed\n", encoding="utf-8")
+
+
+def _write_annotated_magma_results(
+    path: Path,
+    genes: list[str],
+    scores: dict[str, float],
+    chromosomes: dict[str, str],
+) -> None:
+    rows = []
+    for index, gene in enumerate(genes, 1):
+        pvalue = min(1.0, 0.001 * index)
+        rows.append({
+            "GENE": gene,
+            "CHR": chromosomes[gene],
+            "START": 1000 + index,
+            "STOP": 1100 + index,
+            "NSNPS": 2,
+            "NPARAM": 1,
+            "N": 100,
+            "ZSTAT": scores[gene],
+            "P": pvalue,
+            "GENE_REFERENCE_CHR": chromosomes[gene],
+            "GENE_REFERENCE_START": 1000 + index,
+            "GENE_REFERENCE_END": 1100 + index,
+            "GENE_REFERENCE_STRAND": "+",
+            "GENE_SYMBOL": "SYMBOL_%03d" % index,
+            "P_bonferroni_corr": min(1.0, pvalue * len(genes)),
+            "P_fdr_bh_corr": min(1.0, pvalue * 2),
+        })
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
 
 
 def _mock_upstream(monkeypatch, function) -> None:
@@ -146,7 +232,7 @@ def _emit_upstream_progress(progress_callback) -> None:
         "selected_cv_alpha": 1.0,
     })
     progress_callback("gene_scoring", {
-        "genes_scored": 2,
+        "genes_scored": 10,
         "model_features": 1,
         "outputs_written": 3,
     })
@@ -155,7 +241,8 @@ def _emit_upstream_progress(progress_callback) -> None:
 def test_cli_has_no_independent_defaults():
     parser = build_parser()
     destinations = {
-        "magma_association_prefix", "feature_matrix_prefix",
+        "magma_association_prefix", "magma_annotated_results_file",
+        "feature_matrix_prefix",
         "feature_matrix_chunks", "pops_gene_location_file", "genome_build",
         "use_magma_covariates", "use_magma_error_covariance",
         "feature_selection_p_cutoff", "method", "save_matrix_files", "verbose",
@@ -220,7 +307,17 @@ def test_configuration_uses_upstream_method_names_and_validates_ranges(tmp_path)
     )
     with pytest.raises(Exception, match="top_gene_count"):
         load_module_configuration("pops", invalid_reporting)
-
+    assert (
+        load_configuration().modules.pops.output_layout.integrated_results_suffix
+        == ".integrated_gene_results.tsv"
+    )
+    annotated_without_magma = tmp_path / "annotated_without_magma.yaml"
+    annotated_without_magma.write_text(
+        "magma_annotated_results_file: magma_annotated.tsv\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(Exception, match="requires magma_association_prefix"):
+        load_module_configuration("pops", annotated_without_magma)
     conflicting_targets = tmp_path / "conflicting_targets.yaml"
     conflicting_targets.write_text(
         "magma_association_prefix: magma/study\n"
@@ -239,6 +336,42 @@ def test_configuration_uses_upstream_method_names_and_validates_ranges(tmp_path)
     with pytest.raises(Exception, match="supported only for MAGMA targets"):
         load_module_configuration("pops", unsupported_custom_intersection)
 
+
+def test_pipeline_plan_preserves_magma_validation_before_pops_stages():
+    plan = pops_pipeline_progress_plan(argparse.Namespace())
+    execution = build_pipeline_plan(["pops"])
+
+    assert plan is not None
+    assert plan["kind"] == "pops"
+    assert plan["label"] == "PoPS pipeline execution progress"
+    upstream_stages = tuple(
+        MAGMA_STAGE_TITLES[key] for key in MAGMA_GENE_ONLY_STAGE_KEYS
+    )
+    assert plan["stages"] == (*upstream_stages, *POPS_STAGES)
+    assert len(plan["stages"]) == 19
+    assert all("pathway" not in stage.lower() for stage in plan["stages"])
+    assert plan["modules"] == {
+        "formatter": (1, 4),
+        "magma": (4, 8),
+        "pops": (9, 19),
+    }
+    assert plan["stage_numbers"] == {
+        "target_inputs": 9,
+        "gene_annotation": 10,
+        "feature_matrix": 11,
+        "feature_controls": 12,
+        "gene_compatibility": 13,
+        "target_loading": 14,
+        "covariate_adjustment": 15,
+        "feature_selection": 16,
+        "model_fitting": 17,
+        "gene_scoring": 18,
+        "results": 19,
+    }
+    assert REGISTRY.get("pops").pipeline_progress_factory == (
+        "postgwas.modules.pops.stages:pops_pipeline_progress_plan"
+    )
+    assert execution.steps == ("formatter", "magma", "pops")
 
 def test_configuration_precedence_and_compute_seed_are_resolved_once(tmp_path):
     config = tmp_path / "pops.yaml"
@@ -259,20 +392,71 @@ def test_pipeline_registry_runs_pops_resource_preflight(tmp_path):
     resources = _pops_resources(tmp_path)
     args = _arguments(tmp_path, resources)
     del args.magma_association_prefix
-    preflight_pops_pipeline(args)
+    preflight_pops_pipeline(
+        args, preflight_evidence=pipeline_input_vcf_evidence(),
+    )
     Path(str(resources["feature_prefix"]) + ".mat.0.npy").unlink()
     with pytest.raises(PopsError, match="feature matrix chunk"):
-        preflight_pops_pipeline(args)
+        preflight_pops_pipeline(
+            args, preflight_evidence=pipeline_input_vcf_evidence(),
+        )
 
 
-def test_pipeline_preflight_rejects_magma_build_mismatch(tmp_path):
+def test_feature_matrix_validation_rejects_nonfinite_values(tmp_path, capsys):
+    resources = _pops_resources(tmp_path)
+    matrix_path = Path(str(resources["feature_prefix"]) + ".mat.0.npy")
+    matrix = np.load(matrix_path)
+    matrix[0, 0] = np.nan
+    np.save(matrix_path, matrix)
+
+    with pytest.raises(PopsError, match="contains non-finite values"):
+        run_pops_direct(_arguments(tmp_path, resources))
+    compact_screen = " ".join(capsys.readouterr().out.split())
+    assert "Failed 3/11 · Validate the PoPS feature-matrix files" in compact_screen
+    assert "All 11 stages completed" not in compact_screen
+    canonical_log = (
+        tmp_path / "output" / "logs" / "STUDY_pops_service.log"
+    ).read_text(encoding="utf-8")
+    assert "Feature matrix chunk 0 contains non-finite values" in canonical_log
+
+
+def test_feature_controls_cannot_be_silently_removed_by_feature_subset(tmp_path):
+    resources = _pops_resources(tmp_path)
+    subset = tmp_path / "subset.txt"
+    subset.write_text("feature_a\n", encoding="utf-8")
+    controls = tmp_path / "controls.txt"
+    controls.write_text("feature_b\n", encoding="utf-8")
+
+    with pytest.raises(PopsError, match="silently discarded"):
+        validate_pops_configuration(_arguments(
+            tmp_path,
+            resources,
+            feature_subset_file=str(subset),
+            control_features_file=str(controls),
+        ))
+
+
+def test_pipeline_preflight_defers_vcf_build_comparison_until_execution(tmp_path):
     resources = _pops_resources(tmp_path)
     args = _arguments(tmp_path, resources)
     del args.magma_association_prefix
     del args.genome_build
     args.pops_genome_build = "GRCh38"
-    with pytest.raises(PopsError, match="does not match pipeline MAGMA"):
-        preflight_pops_pipeline(args)
+
+    validated = preflight_pops_pipeline(
+        args, preflight_evidence=pipeline_input_vcf_evidence(),
+    )
+
+    assert isinstance(validated, PipelinePreflightEvidence)
+    assert validated.module == "pops"
+    configuration, features, annotation, controls = validated.resources
+    assert configuration.modules.pops.genome_build == "GRCh38"
+    assert features["row_count"] == annotation["gene_count"] == 10
+    assert controls is features["control_resources"]
+    assert validated.deferred_checks == (
+        "Validate the pipeline-generated MAGMA gene-association result.",
+    )
+    assert not hasattr(args, "_pops_resource_preflight")
 
 
 def test_preflight_rejects_magma_gene_universe_mismatch_with_diagnosis(tmp_path):
@@ -294,7 +478,7 @@ def test_preflight_rejects_magma_gene_universe_mismatch_with_diagnosis(tmp_path)
 
     message = str(captured.value)
     assert "PoPS input files are scientifically incompatible" in message
-    assert "MAGMA genes=11" in message
+    assert "MAGMA gene Z-scores=11" in message
     assert "PoPS annotation genes=10" in message
     assert "PoPS feature-row genes=10" in message
     assert "shared genes=10" in message
@@ -416,13 +600,16 @@ def test_intersection_policy_preserves_covariance_and_publishes_detailed_audit(
     assert result["summary"]["gene_compatibility"]["excluded_target_genes"] == 1
     screen = capsys.readouterr().out
     assert "MAGMA–PoPS gene compatibility" in screen
-    assert "Original target genes" in screen
-    assert screen.index("Original target genes") < screen.index("Started 2/7")
-    assert "Original MAGMA target genes" in screen
-    assert "Excluded target genes" in screen
+    assert "Original genes with input scores" in screen
+    assert screen.index("Original genes with input scores") < screen.index(
+        "Started 6/11"
+    )
+    assert "Original MAGMA genes with Z-scores" in screen
+    assert "Excluded MAGMA genes with Z-scores" in screen
     aligned_labels = (
-        "Dataset", "Genes assigned PoPS scores", "Original MAGMA target genes",
-        "1. ENSG002", "PoPS significance cutoff", "Complete PoPS results",
+        "Dataset", "Genes receiving finite PoPS scores",
+        "Original MAGMA genes with Z-scores", "1. ENSG002",
+        "PoPS significance cutoff", "Official PoPS predictions",
     )
     summary_screen = screen[screen.index("PoPS gene-prioritisation summary"):]
     colon_columns = {
@@ -439,6 +626,181 @@ def test_intersection_policy_preserves_covariance_and_publishes_detailed_audit(
     assert "excluded_target_genes=1" in log_text
 
 
+def test_integrated_results_merge_full_gene_union_and_annotated_magma(
+    tmp_path, monkeypatch,
+):
+    resources = _pops_resources(tmp_path)
+    genes = ["ENSG%03d" % index for index in range(1, 10)] + ["ENSG999"]
+    scores = {gene: index / 10 for index, gene in enumerate(genes)}
+    chromosomes = {
+        gene: "1" if gene in {
+            "ENSG001", "ENSG002", "ENSG003", "ENSG004", "ENSG005",
+        }
+        else "2"
+        for gene in genes
+    }
+    prefix = resources["magma_prefix"]
+    Path(str(prefix) + ".genes.out").write_text(
+        "GENE\tZSTAT\n" + "".join(
+            "%s\t%.6f\n" % (gene, scores[gene]) for gene in genes
+        ),
+        encoding="utf-8",
+    )
+    Path(str(prefix) + ".genes.raw").write_text(
+        "# VERSION = test\n# COVAR = NSAMP MAC\n" + "".join(
+            "%s %s 1 2 1 1 100 1 0\n" % (gene, chromosomes[gene])
+            for gene in genes
+        ),
+        encoding="utf-8",
+    )
+    annotated = tmp_path / "magma_genes_annotated.tsv"
+    _write_annotated_magma_results(annotated, genes, scores, chromosomes)
+    source_text = annotated.read_text(encoding="utf-8")
+
+    def fake_pops_main(config, progress_callback=None):
+        _write_upstream_outputs(config, progress_callback=progress_callback)
+        predictions = pd.read_csv(config["out_prefix"] + ".preds", sep="\t")
+        predictions.loc[
+            predictions["ENSGID"].eq("ENSG009"), "training_gene"
+        ] = False
+        predictions.to_csv(config["out_prefix"] + ".preds", sep="\t", index=False)
+
+    _mock_upstream(monkeypatch, fake_pops_main)
+    run_config = tmp_path / "pops_integrated.yaml"
+    run_config.write_text("minimum_gene_count: 2\n", encoding="utf-8")
+    result = run_pops_direct(_arguments(
+        tmp_path,
+        resources,
+        gene_universe_policy="intersect",
+        magma_annotated_results_file=str(annotated),
+        run_config=str(run_config),
+    ))
+
+    integrated_path = Path(result["integrated_results_file"])
+    html_path = Path(result["integrated_report_file"])
+    integrated_table = pd.read_csv(
+        integrated_path, sep="\t", dtype=str, keep_default_na=False,
+    )
+    assert integrated_table.columns[:17].tolist() == [
+        "gene_id",
+        "gene_symbol",
+        "pops_chromosome",
+        "pops_tss",
+        "pops_score",
+        "pops_rank",
+        "gene_analysis_status",
+        "magma_zstat",
+        "magma_pvalue",
+        "magma_bonferroni_pvalue",
+        "magma_fdr_pvalue",
+        "magma_chromosome",
+        "magma_start",
+        "magma_end",
+        "magma_snp_count",
+        "magma_parameter_count",
+        "magma_sample_size",
+    ]
+    integrated = integrated_table.set_index("gene_id")
+    assert len(integrated) == 11
+    assert integrated.index[-1] == "ENSG999"
+    assert integrated.loc["ENSG002", "pops_rank"] == "1"
+    assert integrated.loc["ENSG001", "gene_symbol"] == "SYMBOL_001"
+    assert integrated.loc["ENSG001", "magma_pvalue"] == "0.001"
+    assert integrated.loc["ENSG001", "gene_analysis_status"] == (
+        "scored_and_used_for_model_fitting"
+    )
+    assert integrated.loc["ENSG009", "gene_analysis_status"] == (
+        "scored_with_target_not_used_for_model_fitting"
+    )
+    assert integrated.loc["ENSG010", "gene_analysis_status"] == (
+        "scored_without_input_target_score"
+    )
+    assert integrated.loc["ENSG010", "input_target_score"] == "NA"
+    assert integrated.loc["ENSG999", "gene_analysis_status"] == (
+        "input_target_excluded_from_pops"
+    )
+    assert integrated.loc["ENSG999", "pops_score"] == "NA"
+    assert integrated.loc["ENSG999", "magma_zstat"] == "0.9"
+    assert result["summary"]["integrated_gene_count"] == 11
+    assert result["summary"]["genes_scored_without_target"] == 1
+    assert result["summary"]["genes_scored_with_target_not_fitted"] == 1
+    assert result["summary"]["input_target_genes_excluded"] == 1
+    html = html_path.read_text(encoding="utf-8")
+    assert "Integrated PoPS gene results" in html
+    assert "Download TSV" in html
+    assert "scored_without_input_target_score" in html
+    assert "SYMBOL_001" in html
+    assert annotated.read_text(encoding="utf-8") == source_text
+
+
+def test_annotated_magma_mismatch_fails_before_upstream_execution(
+    tmp_path, monkeypatch,
+):
+    resources = _pops_resources(tmp_path)
+    genes = ["ENSG%03d" % index for index in range(1, 11)]
+    scores = {gene: index / 10 for index, gene in enumerate(genes)}
+    chromosomes = {
+        gene: "1" if index < 5 else "2"
+        for index, gene in enumerate(genes)
+    }
+    annotated = tmp_path / "magma_genes_annotated.tsv"
+    _write_annotated_magma_results(annotated, genes, scores, chromosomes)
+    table = pd.read_csv(annotated, sep="\t")
+    table.loc[0, "ZSTAT"] = 99
+    table.to_csv(annotated, sep="\t", index=False)
+    called = False
+
+    def fake_pops_main(config, progress_callback=None):
+        nonlocal called
+        called = True
+
+    _mock_upstream(monkeypatch, fake_pops_main)
+    with pytest.raises(PopsError, match="do not match"):
+        run_pops_direct(_arguments(
+            tmp_path,
+            resources,
+            magma_annotated_results_file=str(annotated),
+        ))
+    assert not called
+    assert not (tmp_path / "output" / "STUDY_pops.integrated_gene_results.tsv").exists()
+
+
+def test_pipeline_passes_validated_annotated_magma_artifact_to_pops(
+    tmp_path, monkeypatch,
+):
+    annotated = tmp_path / "upstream_magma_annotated.tsv"
+    prefix = tmp_path / "upstream_magma"
+    observed = {}
+
+    def fake_run_pops_direct(args, ctx):
+        observed["prefix"] = args.magma_association_prefix
+        observed["annotated"] = args.magma_annotated_results_file
+        observed["output_directory"] = args.output_directory
+        return {"status": "success"}
+
+    monkeypatch.setattr(
+        "postgwas.modules.pops.service.run_pops_direct", fake_run_pops_direct,
+    )
+    args = Namespace(
+        output_directory=str(tmp_path / "pipeline"),
+        _step_num=3,
+    )
+    ctx = {"magma": {
+        "primary_mapping": "positional",
+        "mapping_analyses": {
+            "positional": {"result_statistic_type": "calibrated_gene_p_value"},
+        },
+        "magma_genes_prefix": str(prefix),
+        "magma_genes_annotated": str(annotated),
+    }}
+
+    assert run_pops_runner(args, ctx) == {"status": "success"}
+    assert observed["prefix"] == str(prefix)
+    assert observed["annotated"] == str(annotated)
+    assert observed["output_directory"].endswith("03_pops")
+    assert args.output_directory == str(tmp_path / "pipeline")
+
+
 def test_preflight_rejects_magma_raw_gene_order_mismatch(tmp_path):
     resources = _pops_resources(tmp_path)
     raw_path = Path(str(resources["magma_prefix"]) + ".genes.raw")
@@ -448,6 +810,22 @@ def test_preflight_rejects_magma_raw_gene_order_mismatch(tmp_path):
 
     with pytest.raises(PopsError, match=r"gene order differs at data row 1"):
         run_pops_direct(_arguments(tmp_path, resources))
+
+
+def test_preflight_rejects_invalid_magma_technical_covariate_metadata(tmp_path):
+    resources = _pops_resources(tmp_path)
+    raw_path = Path(str(resources["magma_prefix"]) + ".genes.raw")
+    raw_path.write_text(
+        raw_path.read_text(encoding="utf-8").replace(
+            "ENSG001 1 1 2 1 1 100 1 0",
+            "ENSG001 1 1 2 0 1 100 1 0",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PopsError, match="non-positive or non-finite NSNPS"):
+        validate_pops_configuration(_arguments(tmp_path, resources))
 
 
 def test_preflight_rejects_magma_annotation_chromosome_mismatch(tmp_path):
@@ -519,7 +897,7 @@ def test_standalone_uses_canonical_seed_and_does_not_require_context(tmp_path, m
     assert Path(result["pops_file"]).is_file()
     assert observed["random_seed"] == load_configuration().execution.random_seed
     assert Path(result["completion_manifest"]).is_file()
-    assert result["summary"]["genes_scored"] == 2
+    assert result["summary"]["genes_scored"] == 10
     assert result["summary"]["selected_features"] == 1
     assert result["summary"]["top_genes"][0]["gene_id"] == "ENSG002"
     assert yaml.safe_load(Path(result["completion_manifest"]).read_text())["status"] == "COMPLETED"
@@ -548,16 +926,24 @@ def test_terminal_summary_explains_ranking_and_incomplete_target_coverage(
     result = run_pops_direct(args)
 
     screen = capsys.readouterr().out
+    compact_screen = " ".join(screen.split())
     assert "PoPS analysis progress" in screen
-    assert "Completed 7/7 · Validate and publish PoPS results" in screen
-    assert "Target genes loaded" in screen
+    assert "Completed 11/11 · Validate and publish PoPS results" in screen
+    assert "MAGMA gene Z-score inputs" in screen
+    assert "Scores used to fit PoPS" in screen
+    assert "MAGMA gene-level association Z-scores (ZSTAT)" in compact_screen
+    assert "PoPS gene-location annotation" in screen
+    assert "PoPS feature matrices" in screen
+    assert "PoPS feature controls" in screen
+    assert "PoPS gene-identifier compatibility" in screen
+    assert "MAGMA gene Z-scores loaded" in screen
     assert "Features selected" in screen
-    assert "Training genes" in screen
+    assert "Genes used to fit the model" in screen
     assert "PoPS gene-prioritisation summary" in screen
-    assert "Genes assigned PoPS scores" in screen
+    assert "Genes receiving finite PoPS scores" in screen
     assert "None. PoPS scores are relative rankings, not p-values." in screen
     assert "COMPLETED WITH SCIENTIFIC WARNINGS" in screen
-    assert "Target scores cover 2 of 10 compatible genes" in screen
+    assert "MAGMA gene Z-scores cover 2 of 10 compatible genes" in screen
     assert result["summary"]["warnings"]
 
 
@@ -571,12 +957,13 @@ def test_real_upstream_reports_ordered_stages_without_internal_log_noise(
 
     screen = capsys.readouterr().out
     completed = [
-        screen.index("Completed %d/7" % step)
-        for step in range(1, 8)
+        screen.index("Completed %d/11" % step)
+        for step in range(1, 12)
     ]
     assert completed == sorted(completed)
-    assert "Target source" in screen
-    assert "target-score" in screen
+    assert "Scores used to fit PoPS" in screen
+    assert "Custom gene scores loaded" in screen
+    assert "MAGMA gene Z-scores loaded" not in screen
     assert "Selection strategy" in screen
     assert "Prediction model" in screen
     assert "Config dict =" not in screen
@@ -586,6 +973,103 @@ def test_real_upstream_reports_ordered_stages_without_internal_log_noise(
         Path(path) for path in result["published_files"] if path.endswith(".log")
     )
     assert "Config dict =" in upstream_log.read_text(encoding="utf-8")
+
+
+def test_detailed_pipeline_progress_continues_from_magma_through_pops_validation(
+    tmp_path, monkeypatch,
+):
+    resources = _pops_resources(tmp_path)
+    args = _arguments(tmp_path, resources)
+    plan = pops_pipeline_progress_plan(args)
+    assert plan is not None
+    stream = StringIO()
+    controller = PipelineStageController(
+        plan["label"],
+        plan["stages"],
+        console=Console(
+            file=stream,
+            force_terminal=True,
+            color_system=None,
+            width=120,
+        ),
+        outcome_label_width=38,
+    )
+    for number in range(1, len(MAGMA_GENE_ONLY_STAGE_KEYS) + 1):
+        controller.start(number)
+        controller.complete(number, outcome="validated upstream MAGMA stage")
+    args._pipeline_progress_plan = plan
+    args._pipeline_stage_progress = controller
+    _mock_upstream(monkeypatch, _write_upstream_outputs)
+
+    result = run_pops_direct(args)
+
+    assert Path(result["pops_file"]).is_file()
+    assert controller.completed == 18
+    assert controller.current == 19
+    completion = args._pipeline_stage_completion
+    controller.complete(
+        19,
+        outcome=completion.get("outcome"),
+        outcome_fields=completion.get("outcome_fields"),
+    )
+    controller.close()
+    compact_screen = " ".join(stream.getvalue().split())
+    assert "PoPS pipeline execution progress" in compact_screen
+    assert "Completed 19/19 · Validate and publish PoPS results" in compact_screen
+    assert "All 19 stages completed" in compact_screen
+    assert "pathway" not in compact_screen.lower()
+    assert "MAGMA gene-statistic file" in compact_screen
+    assert "Transcription-start-site column" in compact_screen
+    assert "Matrix chunks" in compact_screen
+    assert "Control-features file" in compact_screen
+    assert "Genes with scores shared by all inputs" in compact_screen
+    canonical_log = (
+        Path(args.output_directory) / "logs" / "STUDY_pops_service.log"
+    ).read_text(encoding="utf-8")
+    assert canonical_log.count("stage_outcome") == len(POPS_STAGES)
+    assert "target_score_file=" in canonical_log
+    assert "gene_annotation_file=" in canonical_log
+    assert "pops_feature_matrix_chunk" in canonical_log
+    assert "matrix_feature_compatibility=passed" in canonical_log
+
+
+def test_detailed_pipeline_rejects_pops_build_that_differs_from_validated_vcf(
+    tmp_path,
+):
+    resources = _pops_resources(tmp_path)
+    args = _arguments(tmp_path, resources, pops_genome_build="GRCh38")
+    del args.genome_build
+    plan = pops_pipeline_progress_plan(args)
+    assert plan is not None
+    stream = StringIO()
+    controller = PipelineStageController(
+        plan["label"],
+        plan["stages"],
+        console=Console(
+            file=stream,
+            force_terminal=True,
+            color_system=None,
+            width=120,
+        ),
+    )
+    for number in range(1, len(MAGMA_GENE_ONLY_STAGE_KEYS) + 1):
+        controller.start(number)
+        controller.complete(number)
+    args._pipeline_progress_plan = plan
+    args._pipeline_stage_progress = controller
+    args._pipeline_vcf_header_evidence = {"genome_build": "GRCh37"}
+
+    with pytest.raises(PopsError, match="does not match pipeline MAGMA genome build"):
+        run_pops_direct(args)
+    controller.fail_active()
+    controller.close()
+
+    compact_screen = " ".join(stream.getvalue().split())
+    assert (
+        "Failed 13/19 · Compare input-score, annotation, and feature gene identifiers"
+        in compact_screen
+    )
+    assert "All 19 stages completed" not in compact_screen
 
 
 def test_context_and_root_logging_are_restored_after_upstream_run(tmp_path, monkeypatch):

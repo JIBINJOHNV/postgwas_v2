@@ -6,15 +6,12 @@ from typing import Callable, Mapping, Sequence, Type
 
 import polars as pl
 
-from postgwas.core.dataframes import (
-    chromosome_expression,
-    count_non_null,
-    position_expression,
-    validate_cast_retention,
-)
+from .statistics import frequency_maf_screen
+from .variant_columns import canonicalize_variant_frame
 
 
-def _unused_name(prefix: str, *frames: pl.DataFrame) -> str:
+def unused_column_name(prefix: str, *frames: pl.DataFrame) -> str:
+    """Return ``prefix`` or a suffixed name that preserves every input column."""
     name = prefix
     occupied = {column for frame in frames for column in frame.columns}
     while name in occupied:
@@ -47,9 +44,9 @@ def deduplicate_reference_values(
             "%s must be 'discard_all' or 'fail'; received %r."
             % (non_identical_policy_key, non_identical_action)
         )
-    count_name = _unused_name("__postgwas_duplicate_count__", reference)
-    first_name = _unused_name("__postgwas_first_value__", reference)
-    distinct_name = _unused_name("__postgwas_distinct_values__", reference)
+    count_name = unused_column_name("__postgwas_duplicate_count__", reference)
+    first_name = unused_column_name("__postgwas_first_value__", reference)
+    distinct_name = unused_column_name("__postgwas_distinct_values__", reference)
     value = pl.col(value_column)
     grouped = reference.group_by(list(keys), maintain_order=True).agg([
         pl.len().cast(pl.UInt32).alias(count_name),
@@ -151,6 +148,7 @@ def allele_oriented_left_join(
     *,
     study_columns: Mapping[str, str],
     reference_columns: Mapping[str, str],
+    policies,
     value_column: str,
     output_column: str,
     duplicate_exact_action: str,
@@ -162,7 +160,7 @@ def allele_oriented_left_join(
     error_type: Type[Exception] = RuntimeError,
     warn: Callable[[str], None] | None = None,
     reference_label: str = "reference table",
-) -> tuple[pl.DataFrame, str, dict[str, int]]:
+) -> tuple[pl.DataFrame, str, dict[str, object]]:
     """Attach one numeric annotation using direct and/or swapped alleles.
 
     The function performs exactly one study/reference join and never changes
@@ -175,6 +173,8 @@ def allele_oriented_left_join(
     an empty direct record.
     ``swapped_value='one_minus'`` is appropriate only for an allele frequency;
     allele-independent annotations use ``'same'``.
+    Study and reference chromosome keys use the same resolved chromosome
+    policies before deduplication and matching.
     """
     requested = tuple(str(value).lower() for value in orientations)
     unsupported = [
@@ -217,55 +217,29 @@ def allele_oriented_left_join(
         )
 
     if not study_columns_canonical:
-        schema = dict(study.schema)
-        position_before = count_non_null(study, study_columns["pos"])
-        study = study.with_columns([
-            chromosome_expression(
-                study_columns["chr"], schema[study_columns["chr"]]
-            ),
-            position_expression(
-                study_columns["pos"], schema[study_columns["pos"]]
-            ),
-            pl.col(study_columns["ea"])
-            .cast(pl.String).str.to_uppercase().str.strip_chars(),
-            pl.col(study_columns["oa"])
-            .cast(pl.String).str.to_uppercase().str.strip_chars(),
-        ])
-        validate_cast_retention(
-            position_before,
-            count_non_null(study, study_columns["pos"]),
-            "study position",
+        study, _study_normalization = canonicalize_variant_frame(
+            study,
+            study_columns,
+            policies,
             error_type=error_type,
             warn=warn,
+            label="study",
         )
 
     reference = reference.select(required_reference_columns)
-    reference_schema = dict(reference.schema)
-    reference_position_before = count_non_null(
-        reference, reference_columns["pos"]
-    )
-    reference = reference.with_columns([
-        chromosome_expression(
-            reference_columns["chr"], reference_schema[reference_columns["chr"]]
-        ),
-        position_expression(
-            reference_columns["pos"], reference_schema[reference_columns["pos"]]
-        ),
-        pl.col(reference_columns["ea"])
-        .cast(pl.String).str.to_uppercase().str.strip_chars(),
-        pl.col(reference_columns["oa"])
-        .cast(pl.String).str.to_uppercase().str.strip_chars(),
-        pl.col(value_column).cast(pl.Float64, strict=False),
-    ]).rename({
-        reference_columns[key]: study_columns[key] for key in required_keys
-    })
-    validate_cast_retention(
-        reference_position_before,
-        count_non_null(reference, study_columns["pos"]),
-        "%s position" % reference_label,
+    reference, _reference_normalization = canonicalize_variant_frame(
+        reference,
+        reference_columns,
+        policies,
         error_type=error_type,
         warn=warn,
+        label=reference_label,
     )
+    reference = reference.with_columns(
+        pl.col(value_column).cast(pl.Float64, strict=False)
+    ).rename({
+        reference_columns[key]: study_columns[key] for key in required_keys
+    })
 
     rows_before_deduplication = reference.height
     reference, duplicate_stats = deduplicate_reference_values(
@@ -278,12 +252,22 @@ def allele_oriented_left_join(
         error_type=error_type,
     )
     rows_after_deduplication = reference.height
+    if swapped_value == "one_minus":
+        duplicate_stats["raw_frequency_screen"] = frequency_maf_screen(
+            reference,
+            value_column,
+            float(policies.get("eaf.maf_decision_cutoff")),
+        )
 
-    value_name = _unused_name("__postgwas_reference_value__", study, reference)
-    orientation_name = _unused_name(
+    value_name = unused_column_name(
+        "__postgwas_reference_value__", study, reference
+    )
+    orientation_name = unused_column_name(
         "__postgwas_allele_match_orientation__", study, reference
     )
-    priority_name = _unused_name("__postgwas_match_priority__", study, reference)
+    priority_name = unused_column_name(
+        "__postgwas_match_priority__", study, reference
+    )
     reference = reference.rename({value_column: value_name})
 
     frames = []
@@ -327,8 +311,18 @@ def allele_oriented_left_join(
         )
 
     rows_before_join = study.height
-    joined = study.join(
-        oriented, on=study_keys, how="left", maintain_order="left",
+    # Polars 0.20, which is the package-pinned runtime, has no join-level
+    # ``maintain_order`` argument. Preserve the scientific input order
+    # explicitly with a collision-safe row index and remove it immediately
+    # after the one-to-one left join.
+    row_order_name = unused_column_name(
+        "__postgwas_study_row_order__", study, oriented,
+    )
+    joined = (
+        study.with_row_index(row_order_name)
+        .join(oriented, on=study_keys, how="left", coalesce=True)
+        .sort(row_order_name)
+        .drop(row_order_name)
     )
     if joined.height != rows_before_join:
         raise error_type(
@@ -365,4 +359,8 @@ def allele_oriented_left_join(
     return joined, orientation_name, stats
 
 
-__all__ = ["allele_oriented_left_join", "deduplicate_reference_values"]
+__all__ = [
+    "allele_oriented_left_join",
+    "deduplicate_reference_values",
+    "unused_column_name",
+]

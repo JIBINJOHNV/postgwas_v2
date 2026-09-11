@@ -27,14 +27,11 @@ import polars as pl
 from postgwas.core.paths import configured_output_path
 from postgwas.core.vcf import extract_vcf_table
 
+from .shared.statistics import valid_frequency_mask
+
 
 class PopulationFrequencyQCError(RuntimeError):
     """The merged-VCF population-frequency check could not be completed."""
-
-
-def _valid_frequency(column: str) -> pl.Expr:
-    value = pl.col(column)
-    return value.is_not_null() & value.is_finite() & value.is_between(0.0, 1.0)
 
 
 def _finite_number(value: Any) -> float | None:
@@ -64,7 +61,7 @@ def assess_population_frequency_table(
             schema_overrides=schema,
         )
         complete = pl.all_horizontal(
-            [_valid_frequency(column) for column in columns]
+            [valid_frequency_mask(pl.col(column)) for column in columns]
         )
         study_complete = pl.when(complete).then(pl.col("STUDY_AF"))
         expressions: list[pl.Expr] = [
@@ -75,7 +72,7 @@ def assess_population_frequency_table(
             present = pl.col(column).is_not_null()
             expressions.extend([
                 pl.col(column).is_null().sum().alias("%s_missing" % column),
-                (present & ~_valid_frequency(column)).sum().alias(
+                (present & ~valid_frequency_mask(pl.col(column))).sum().alias(
                     "%s_invalid" % column
                 ),
             ])
@@ -89,6 +86,15 @@ def assess_population_frequency_table(
                 .then((pl.col("STUDY_AF") - pl.col(population)).abs())
                 .mean()
                 .alias("%s_mae" % population),
+                pl.when(complete)
+                .then(
+                    (
+                        (1.0 - pl.col("STUDY_AF"))
+                        - pl.col(population)
+                    ).abs()
+                )
+                .mean()
+                .alias("%s_inverted_mae" % population),
             ])
         values = table.select(expressions).collect().row(0, named=True)
     except Exception as exc:
@@ -121,23 +127,73 @@ def assess_population_frequency_table(
             "mean_absolute_difference": _finite_number(
                 values["%s_mae" % population]
             ),
+            "inverted_mean_absolute_difference": _finite_number(
+                values["%s_inverted_mae" % population]
+            ),
         }
 
     minimum_count = int(settings["minimum_comparable_variants"])
     minimum_correlation = float(settings["minimum_correlation"])
     minimum_gap = float(settings["minimum_correlation_gap"])
+    inversion_minimum_correlation = float(
+        settings["inversion_minimum_absolute_correlation"]
+    )
+    inversion_maximum_error = float(
+        settings["inversion_maximum_mean_absolute_difference"]
+    )
+    inversion_minimum_improvement = float(
+        settings[
+            "inversion_minimum_mean_absolute_difference_improvement"
+        ]
+    )
     candidates = [
         population
         for population, metric in metrics.items()
         if comparable >= minimum_count
         and metric["pearson_correlation"] is not None
         and metric["mean_absolute_difference"] is not None
+        and metric["inverted_mean_absolute_difference"] is not None
     ]
 
     closest = None
     reason = "insufficient comparable population-frequency evidence"
     correlation_gap = None
-    if len(candidates) >= 2:
+    inversion_population = None
+    negative_candidates = [
+        population
+        for population in candidates
+        if metrics[population]["pearson_correlation"]
+        <= -inversion_minimum_correlation
+    ]
+    if negative_candidates:
+        strongest_inversion = min(
+            negative_candidates,
+            key=lambda population: (
+                metrics[population]["inverted_mean_absolute_difference"],
+                metrics[population]["pearson_correlation"],
+            ),
+        )
+        inversion_metric = metrics[strongest_inversion]
+        if (
+            inversion_metric["inverted_mean_absolute_difference"]
+            <= inversion_maximum_error
+            and inversion_metric["inverted_mean_absolute_difference"]
+            + inversion_minimum_improvement
+            <= inversion_metric["mean_absolute_difference"]
+        ):
+            inversion_population = strongest_inversion
+            reason = (
+                "the study AF appears inverted relative to %s: Pearson correlation "
+                "is %.6g, mean absolute difference is %.6g as written and %.6g "
+                "after one-minus inversion"
+                % (
+                    strongest_inversion,
+                    inversion_metric["pearson_correlation"],
+                    inversion_metric["mean_absolute_difference"],
+                    inversion_metric["inverted_mean_absolute_difference"],
+                )
+            )
+    if inversion_population is None and len(candidates) >= 2:
         ranked = sorted(
             candidates,
             key=lambda population: metrics[population]["pearson_correlation"],
@@ -178,19 +234,45 @@ def assess_population_frequency_table(
                     "highest Pearson correlation with supporting absolute-frequency difference"
                 )
 
+    status = (
+        "frequency_inversion_suspected"
+        if inversion_population is not None
+        else "complete"
+        if closest is not None
+        else "inconclusive"
+    )
+    warnings = (
+        [
+            "The study frequency appears to belong to the non-effect allele "
+            "rather than the effect allele. %s" % reason
+        ]
+        if inversion_population is not None
+        else []
+    )
     return {
-        "status": "complete" if closest is not None else "inconclusive",
+        "status": status,
         "total_records": total,
         "comparable_variants": comparable,
         "fields": fields,
         "populations": metrics,
         "closest_population": closest,
+        "inversion_candidate_population": inversion_population,
         "correlation_gap": correlation_gap,
         "decision_reason": reason,
+        "warnings": warnings,
         "decision_thresholds": {
             "minimum_comparable_variants": minimum_count,
             "minimum_correlation": minimum_correlation,
             "minimum_correlation_gap": minimum_gap,
+            "inversion_minimum_absolute_correlation": (
+                inversion_minimum_correlation
+            ),
+            "inversion_maximum_mean_absolute_difference": (
+                inversion_maximum_error
+            ),
+            "inversion_minimum_mean_absolute_difference_improvement": (
+                inversion_minimum_improvement
+            ),
             "require_mae_agreement": bool(settings["require_mae_agreement"]),
         },
     }
@@ -379,7 +461,7 @@ def run_population_frequency_qc(
             "vcf_fields": columns,
             "selected_population_check": selected_check,
             "external_file_checks": checks,
-            "warnings": selected_warnings + (
+            "warnings": list(result.get("warnings") or []) + selected_warnings + (
                 filename_warnings
                 if bool(settings["warn_on_filename_mismatch"])
                 else []

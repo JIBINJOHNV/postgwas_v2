@@ -15,6 +15,18 @@ except ImportError:  # Executed as the upstream standalone script.
 valid_nucleotides = {"A", "T", "G", "C"}
 
 
+class ReferenceSequenceFetchError(RuntimeError):
+    """The reference sequence could not be retrieved from the configured FASTA."""
+
+
+class ReferenceAlleleMismatchError(ValueError):
+    """The supplied reference allele differs from a successfully fetched sequence."""
+
+
+class InvalidAlleleError(ValueError):
+    """An allele contains a character outside the supported DNA alphabet."""
+
+
 def normalize_alleles(reference, start, stop, alleles):
     """Return a minimal, left-aligned representation within ``reference``.
 
@@ -97,23 +109,56 @@ class Gwas:
             self.alt_freq = None
 
     def check_reference_allele(self, fasta):
+        start = self.pos - 1
+        end = start + len(self.ref)
         try:
+            contig_length = fasta.get_reference_length(self.chrom)
+            if start < 0 or end > contig_length:
+                raise ReferenceSequenceFetchError(
+                    "Reference interval is outside the FASTA contig: "
+                    f"{self.chrom}:{self.pos}-{self.pos + len(self.ref) - 1} "
+                    f"(contig length {contig_length})"
+                )
             fasta_ref_seq = fasta.fetch(
                 reference=self.chrom,
-                start=self.pos - 1,
-                end=self.pos + len(self.ref) - 1,
+                start=start,
+                end=end,
             ).upper()
-        except:
-            assert 1 == 2
-        assert self.ref == fasta_ref_seq
+        except ReferenceSequenceFetchError:
+            raise
+        except Exception as exception_name:
+            raise ReferenceSequenceFetchError(
+                "Could not retrieve the reference sequence for "
+                f"{self.chrom}:{self.pos}-{self.pos + len(self.ref) - 1}. "
+                "Check that the chromosome naming, coordinates, FASTA, and FASTA "
+                "index match the detected genome build."
+            ) from exception_name
+
+        if len(fasta_ref_seq) != len(self.ref):
+            raise ReferenceSequenceFetchError(
+                "The FASTA returned an incomplete reference sequence for "
+                f"{self.chrom}:{self.pos}-{self.pos + len(self.ref) - 1}."
+            )
+        if self.ref != fasta_ref_seq:
+            raise ReferenceAlleleMismatchError(
+                f"Supplied REF {self.ref} does not match FASTA REF "
+                f"{fasta_ref_seq} at {self.chrom}:{self.pos}"
+            )
 
     def normalise(self, fasta, padding=100):
         if len(self.ref) < 2 and len(self.alt) < 2:
             return
         pos0 = self.pos - 1
-        seq = fasta.fetch(
-            reference=self.chrom, start=pos0 - padding, end=pos0 + padding
-        ).upper()
+        try:
+            seq = fasta.fetch(
+                reference=self.chrom, start=pos0 - padding, end=pos0 + padding
+            ).upper()
+        except Exception as exception_name:
+            raise ReferenceSequenceFetchError(
+                "Could not retrieve the normalization window for "
+                f"{self.chrom}:{self.pos}. Check that the chromosome naming, "
+                "coordinates, FASTA, and FASTA index match the detected genome build."
+            ) from exception_name
         start, stop, alleles = normalize_alleles(
             seq, padding, padding + len(self.ref), (self.ref, self.alt)
         )
@@ -128,10 +173,18 @@ class Gwas:
             self.pos = self.pos - 1
 
     def check_alleles_are_valid(self):
+        if not self.alt or not self.ref:
+            raise InvalidAlleleError("REF and ALT alleles must both be non-empty")
         for nucleotide in self.alt:
-            assert nucleotide in valid_nucleotides
+            if nucleotide not in valid_nucleotides:
+                raise InvalidAlleleError(
+                    f"ALT allele {self.alt!r} contains unsupported base {nucleotide!r}"
+                )
         for nucleotide in self.ref:
-            assert nucleotide in valid_nucleotides
+            if nucleotide not in valid_nucleotides:
+                raise InvalidAlleleError(
+                    f"REF allele {self.ref!r} contains unsupported base {nucleotide!r}"
+                )
 
     def __str__(self):
         return str({
@@ -238,7 +291,8 @@ class Gwas:
 
             try:
                 pos = int(float(columns[pos_col_num]))
-                assert pos > 0
+                if pos <= 0:
+                    raise ValueError("Variant position must be a positive integer")
             except Exception as exception_name:
                 logging.debug(f"Skipping {columns}: {exception_name}")
                 metadata["VariantsNotRead"] += 1
@@ -366,19 +420,19 @@ class Gwas:
 
             try:
                 result.check_alleles_are_valid()
-            except AssertionError as exception_name:
+            except InvalidAlleleError as exception_name:
                 logging.debug(f"Skipping {columns}: {exception_name}")
                 metadata["VariantsNotRead"] += 1
                 continue
 
             try:
                 result.check_reference_allele(fasta)
-            except AssertionError:
+            except ReferenceAlleleMismatchError:
                 try:
                     result.reverse_sign()
                     result.check_reference_allele(fasta)
                     metadata["SwitchedAlleles"] += 1
-                except AssertionError as exception_name:
+                except ReferenceAlleleMismatchError as exception_name:
                     logging.debug(f"Could not harmonise {columns}: {exception_name}")
                     metadata["VariantsNotHarmonised"] += 1
                     continue
@@ -387,6 +441,8 @@ class Gwas:
             if len(ref) > 1 and len(alt) > 1:
                 try:
                     result.normalise(fasta)
+                except ReferenceSequenceFetchError:
+                    raise
                 except Exception as exception_name:
                     logging.debug(f"Could not normalise {columns}: {exception_name}")
                     metadata["VariantsNotHarmonised"] += 1

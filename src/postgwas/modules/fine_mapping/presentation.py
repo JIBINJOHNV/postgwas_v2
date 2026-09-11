@@ -6,18 +6,18 @@ from pathlib import Path
 
 from rich.console import Console
 
-from postgwas.core.ui import StageProgress, screen_field, screen_line
+from postgwas.core.ui import StageProgress, print_screen_block, screen_field, screen_line
 
 
 FINE_MAPPING_PROGRESS_STAGES = (
-    "Initialize the fine-mapping run",
-    "Validate tools and reference resources",
+    "Validate summary statistics and locus definitions",
+    "Validate tools and PLINK LD-reference resources",
     "Prepare locus boundaries",
     "Prepare locus model inputs",
     "Fit the primary loci",
     "Validate and publish primary results",
     "Summarize the primary analysis",
-    "Resolve overlapping loci and finalize results",
+    "Resolve overlaps, build the scientific report, and finalize results",
 )
 
 
@@ -108,7 +108,12 @@ class FineMappingScreen:
 
     def print_final_summary(self, result: dict, log_file: str | Path) -> None:
         """Print only decision-relevant counts and authoritative output paths."""
-        label_width = self.progress.outcome_label_width or 42
+        field_options = {
+            "width": self.console.width,
+            "indent": 6,
+            "label_width": self.progress.outcome_label_width,
+            "break_long_values": True,
+        }
         status = str(result.get("status", "unknown"))
         status_kind = (
             "success"
@@ -127,19 +132,19 @@ class FineMappingScreen:
             screen_line("analysis", "Fine-mapping completed", indent=2),
             screen_field(
                 "analysis", "Engine", self.engine,
-                indent=6, label_width=label_width,
+                **field_options,
             ),
             screen_field(
                 status_kind, "Overall status", status.replace("_", " "),
-                indent=6, label_width=label_width,
+                **field_options,
             ),
             screen_field(
                 "count", "Primary loci attempted", result.get("n_attempted", 0),
-                indent=6, label_width=label_width,
+                **field_options,
             ),
             screen_field(
                 "success", "Primary loci successful", result.get("n_successful", 0),
-                indent=6, label_width=label_width,
+                **field_options,
             ),
         ]
         failed = int(result.get("n_failed", 0) or 0)
@@ -147,7 +152,7 @@ class FineMappingScreen:
             lines.append(
                 screen_field(
                     "warning", "Failed or skipped loci", failed,
-                    indent=6, label_width=label_width,
+                    **field_options,
                 )
             )
         warnings = int(result.get("n_warnings", 0) or 0)
@@ -156,8 +161,7 @@ class FineMappingScreen:
                 "warning" if warnings else "info",
                 "Loci with scientific warnings",
                 warnings,
-                indent=6,
-                label_width=label_width,
+                **field_options,
             )
         )
         for reason, count in sorted(
@@ -168,8 +172,7 @@ class FineMappingScreen:
                     "warning",
                     "Warning reason",
                     _reason_count(reason, count),
-                    indent=6,
-                    label_width=label_width,
+                    **field_options,
                 )
             )
         for reason, count in sorted(
@@ -180,8 +183,7 @@ class FineMappingScreen:
                     "error",
                     "Failure reason",
                     _reason_count(reason, count),
-                    indent=6,
-                    label_width=label_width,
+                    **field_options,
                 )
             )
         lines.extend(
@@ -189,7 +191,7 @@ class FineMappingScreen:
                 screen_field(
                     "analysis", "Connected overlap groups",
                     result.get("n_overlap_groups", 0),
-                    indent=6, label_width=label_width,
+                    **field_options,
                 ),
                 screen_field(
                     "success", "Final credible sets",
@@ -197,7 +199,7 @@ class FineMappingScreen:
                         "n_final_credible_sets",
                         result.get("n_credible_sets", 0),
                     ),
-                    indent=6, label_width=label_width,
+                    **field_options,
                 ),
             ]
         )
@@ -207,13 +209,15 @@ class FineMappingScreen:
                     "info",
                     "Output directory",
                     output_root,
-                    indent=6,
-                    label_width=label_width,
+                    path_value=True,
+                    **field_options,
                 )
             )
         for kind, label, key in (
+            ("success", "Scientific HTML report", "html_report"),
             ("success", "Final combined result", "final_combined_credible_sets"),
             ("success", "FLAMES input", "flames_input"),
+            ("info", "Input and resource QC", "preflight_validation"),
             ("info", "Locus QC", "locus_status"),
             ("info", "QC summary", "overlap_resolution_summary"),
         ):
@@ -224,7 +228,8 @@ class FineMappingScreen:
                         kind,
                         label,
                         _output_path(value, output_root),
-                        indent=6, label_width=label_width,
+                        path_value=True,
+                        **field_options,
                     )
                 )
         lines.extend(
@@ -233,12 +238,13 @@ class FineMappingScreen:
                     "info",
                     "Full detailed log",
                     _output_path(log_file, output_root),
-                    indent=6, label_width=label_width,
+                    path_value=True,
+                    **field_options,
                 ),
                 "",
             ]
         )
-        self.console.print("\n".join(lines))
+        print_screen_block("\n".join(lines), console=self.console)
 
 
 __all__ = ["FINE_MAPPING_PROGRESS_STAGES", "FineMappingScreen"]

@@ -103,6 +103,16 @@ class LDSCOutputLayout(StrictModel):
         return self
 
 
+class LDSCSamplePrevalenceComparisonConfig(StrictModel):
+    """Pipeline warning policy for explicit versus formatter prevalence."""
+
+    warning_absolute_difference: float = Field(
+        ge=0,
+        lt=1,
+        allow_inf_nan=False,
+    )
+
+
 class LDSCConfig(ModuleConfig):
     """Supported upstream defaults for formatter-to-heritability execution.
 
@@ -132,6 +142,7 @@ class LDSCConfig(ModuleConfig):
     population_prevalence: float | None = Field(
         default=None, gt=0, lt=1, allow_inf_nan=False,
     )
+    sample_prevalence_comparison: LDSCSamplePrevalenceComparisonConfig
     reference_layout: LDSCReferenceLayout
     output_layout: LDSCOutputLayout
 

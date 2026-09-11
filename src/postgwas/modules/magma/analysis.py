@@ -9,7 +9,8 @@ configuration.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,8 +19,10 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from postgwas.core.io.delimiters import open_text
+from postgwas.core.gene_sets import GeneSetFormat, validate_gene_set_source
+from postgwas.core.io.delimiters import open_text, pandas_csv_engine
 from postgwas.core.io.reports import write_delimited_report
+from postgwas.core.genomic_scope import resolve_genomic_analysis_scope
 from postgwas.core.paths import (
     configured_output_path,
     require_nonempty_file,
@@ -27,15 +30,22 @@ from postgwas.core.paths import (
     validate_filename_component,
 )
 from postgwas.core.processes import run_checked_command
+from postgwas.core.plink import validate_plink_files
 from postgwas.core.statistics import adjust_p_values
 from postgwas.modules.magma.annotations import (
     map_regulatory_elements_to_genes,
     merge_gene_annotations,
+    prepare_scoped_gene_annotation,
     read_gene_locations,
     validate_gene_annotation,
+    write_pathway_compatible_gene_locations,
 )
 from postgwas.modules.magma.errors import MagmaError
 from postgwas.modules.magma.reference import read_reference_bim_matches
+from postgwas.modules.magma.reporting import (
+    MAGMA_PIPELINE_STAGE_KEYS,
+    magma_variant_input_outcome_fields,
+)
 
 
 # These suffixes are fixed by MAGMA's public file contract, not PostGWAS policy.
@@ -56,11 +66,28 @@ class MagmaPreflight:
     ld_reference_prefix: str
     executable: str
     version: str
-    mapping_gene_sets: dict[str, Path | None]
+    gene_set_plans: dict[str, dict]
+    analysis_scope: dict
+
+
+@dataclass(frozen=True)
+class MagmaReferencePreflight:
+    """Validated external resources independent of formatter-created tables."""
+
+    ld_reference_prefix: str
+    executable: str
+    version: str
+    gene_set_plans: dict[str, dict]
+    analysis_scope: dict
 
 
 def _tool_output(prefix: str | Path, suffix: str) -> Path:
     return Path("%s%s" % (prefix, suffix))
+
+
+def _annotation_window_argument(upstream_kb: int, downstream_kb: int) -> str:
+    """Return MAGMA's documented upstream-then-downstream window modifier."""
+    return "window=%s,%s" % (upstream_kb, downstream_kb)
 
 
 def resolve_magma_output_paths(
@@ -87,15 +114,40 @@ def resolve_magma_output_paths(
             error_type=MagmaError,
             dataset_id=dataset_id,
         ),
+        "excluded_variants": configured_output_path(
+            output,
+            layout.excluded_variants,
+            error_type=MagmaError,
+            dataset_id=dataset_id,
+        ),
         "mapping_comparison": configured_output_path(
             output,
             layout.mapping_comparison,
             error_type=MagmaError,
             dataset_id=dataset_id,
         ),
+        "pipeline_summary_csv": configured_output_path(
+            output,
+            layout.pipeline_summary_csv,
+            error_type=MagmaError,
+            dataset_id=dataset_id,
+        ),
+        "pipeline_summary_html": configured_output_path(
+            output,
+            layout.pipeline_summary_html,
+            error_type=MagmaError,
+            dataset_id=dataset_id,
+        ),
         "annotation_prefix": configured_output_path(
             output,
             layout.annotation_prefix,
+            error_type=MagmaError,
+            dataset_id=dataset_id,
+            analysis=selected,
+        ),
+        "scoped_annotation": configured_output_path(
+            output,
+            layout.scoped_annotation,
             error_type=MagmaError,
             dataset_id=dataset_id,
             analysis=selected,
@@ -153,9 +205,9 @@ def resolve_magma_output_paths(
             dataset_id=dataset_id,
             analysis=selected,
         ),
-        "prepared_gene_sets": configured_output_path(
+        "pathway_compatible_gene_locations": configured_output_path(
             output,
-            layout.prepared_gene_sets,
+            layout.pathway_compatible_gene_locations,
             error_type=MagmaError,
             dataset_id=dataset_id,
             analysis=selected,
@@ -163,6 +215,20 @@ def resolve_magma_output_paths(
         "chrom_magma_genes": configured_output_path(
             output,
             layout.chrom_magma_genes,
+            error_type=MagmaError,
+            dataset_id=dataset_id,
+            analysis=selected,
+        ),
+        "excluded_genes": configured_output_path(
+            output,
+            layout.excluded_genes,
+            error_type=MagmaError,
+            dataset_id=dataset_id,
+            analysis=selected,
+        ),
+        "exclusion_summary": configured_output_path(
+            output,
+            layout.exclusion_summary,
             error_type=MagmaError,
             dataset_id=dataset_id,
             analysis=selected,
@@ -194,6 +260,26 @@ def _normalize_chromosome(values: pd.Series, input_config) -> pd.Series:
     return normalized.replace(input_config.chromosome_aliases)
 
 
+def _analysis_scope(configuration) -> dict:
+    """Resolve build-specific MAGMA exclusions once from validated configuration."""
+    module = configuration.modules.magma
+    def normalize(value: object) -> str:
+        return str(
+            _normalize_chromosome(
+                pd.Series([str(value)]), module.input,
+            ).iloc[0]
+        )
+    return resolve_genomic_analysis_scope(
+        genome_build=module.genome_build,
+        genomes=configuration.resources.genomes,
+        mhc=module.mhc,
+        chromosomes=module.chromosomes,
+        normalize_chromosome=normalize,
+        analysis_name="MAGMA",
+        error_type=MagmaError,
+    )
+
+
 def _validate_p_values(
     values: pd.Series,
     source: str | Path,
@@ -217,21 +303,52 @@ def _read_table(
     path: str | Path,
     label: str,
     delimiter_pattern: str,
+    logger,
     *,
     comment_prefix: str | None = None,
     column_types: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     file_path = require_nonempty_file(path, label, error_type=MagmaError)
+    engine = pandas_csv_engine(delimiter_pattern)
+    logger.record(
+        "PARAM",
+        "table_parser",
+        label=label,
+        path=str(file_path),
+        delimiter_pattern=delimiter_pattern,
+        pandas_engine=engine,
+    )
     try:
         return pd.read_csv(
             file_path,
             sep=delimiter_pattern,
             comment=comment_prefix,
-            engine="c",
+            engine=engine,
             dtype=column_types,
         )
     except (OSError, ValueError, pd.errors.ParserError) as exc:
         raise MagmaError("Cannot parse %s %s: %s" % (label, file_path, exc)) from exc
+
+
+def _require_available_result_columns(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+    label: str,
+) -> None:
+    """Reject configured output-column collisions before changing a result."""
+    counts = Counter(columns)
+    duplicates = sorted(column for column, count in counts.items() if count > 1)
+    if duplicates:
+        raise MagmaError(
+            "Configured %s output columns are not unique: %s"
+            % (label, ", ".join(duplicates))
+        )
+    existing = sorted(set(columns) & set(frame.columns))
+    if existing:
+        raise MagmaError(
+            "Configured %s output columns already exist in MAGMA output: %s"
+            % (label, ", ".join(existing))
+        )
 
 
 def resolve_gene_set_identifiers(
@@ -239,9 +356,17 @@ def resolve_gene_set_identifiers(
     gene_sets: pl.DataFrame,
     minimum_overlap: float,
     module_config,
+    *,
+    enforce: bool = True,
+    allow_alternate_reference_ids: bool = False,
 ) -> tuple[pl.DataFrame, set[str], dict]:
-    """Validate six-column locations and use column-six IDs only when needed."""
+    """Select compatible gene-reference IDs without changing pathway members."""
     locations = read_gene_locations(location_file, module_config)
+    location_roles = module_config.input.gene_location_columns
+    alternate_column = (
+        location_roles.index("alternate_gene_id") + 1
+        if "alternate_gene_id" in location_roles else None
+    )
     primary_ids = set(locations)
     alternate_ids: dict[str, list[str]] = {}
     for primary, (*_, alternate) in locations.items():
@@ -252,59 +377,119 @@ def resolve_gene_set_identifiers(
         *(set(value.split(",")) for value in gene_sets[input_column].to_list())
     )
     primary_matches = genes & primary_ids
+    alternate_candidate_matches = genes & set(alternate_ids)
+    alternate_matches = (genes - primary_ids) & set(alternate_ids)
+    ambiguous_alternates = {
+        identifier for identifier, targets in alternate_ids.items()
+        if len(targets) > 1
+    }
+    unmatched_input_ids = genes - primary_ids - set(alternate_ids)
+    common_summary = {
+        "location_rows": len(locations),
+        "location_primary_unique_ids": len(primary_ids),
+        "location_alternate_unique_ids": len(alternate_ids),
+        "location_ambiguous_alternate_ids": len(ambiguous_alternates),
+        "alternate_identifier_column": alternate_column,
+        "alternate_identifiers_available": bool(alternate_ids),
+        "direct_primary_matches": len(primary_matches),
+        "alternate_candidate_matches": len(alternate_candidate_matches),
+        "alternate_ids_matched": len(alternate_matches),
+        "direct_primary_input_fraction": (
+            len(primary_matches) / len(genes) if genes else 0.0
+        ),
+        "alternate_input_fraction": (
+            len(alternate_candidate_matches) / len(genes) if genes else 0.0
+        ),
+        "alternate_reference_fraction": (
+            len(alternate_candidate_matches) / len(alternate_ids)
+            if alternate_ids else 0.0
+        ),
+        "ambiguous_input_alternate_ids": len(
+            alternate_matches & ambiguous_alternates
+        ),
+        "unmatched_input_ids": len(unmatched_input_ids),
+        "input_resolved_ids": len(primary_matches) + len(alternate_matches),
+        "input_resolution_fraction": (
+            (len(primary_matches) + len(alternate_matches)) / len(genes)
+            if genes else 0.0
+        ),
+    }
     primary_comparison = min(len(primary_ids), len(genes))
     primary_fraction = (
         len(primary_matches) / primary_comparison if primary_comparison else 0.0
     )
+    common_summary.update({
+        "primary_comparison_unique_ids": primary_comparison,
+        "primary_match_fraction": primary_fraction,
+    })
     if primary_fraction >= minimum_overlap:
         return gene_sets, primary_ids, {
+            **common_summary,
+            "alternate_ids_matched": 0,
+            "ambiguous_input_alternate_ids": 0,
+            "unmatched_input_ids": len(genes - primary_ids),
+            "input_resolved_ids": len(primary_matches),
+            "input_resolution_fraction": (
+                len(primary_matches) / len(genes) if genes else 0.0
+            ),
             "identifier_source": "primary_gene_id",
             "input_unique_ids": len(genes),
             "matched_unique_ids": len(primary_matches),
             "comparison_unique_ids": primary_comparison,
             "match_fraction": primary_fraction,
-            "translated_unique_ids": 0,
-            "one_to_many_identifiers": 0,
+            "pathway_identifiers_modified": False,
         }
 
-    translated = (genes - primary_ids) & set(alternate_ids)
-    records = []
-    for record in gene_sets.iter_rows(named=True):
-        resolved = []
-        for gene in record[input_column].split(","):
-            resolved.extend(
-                [gene] if gene in primary_ids else alternate_ids.get(gene, [gene])
+    if allow_alternate_reference_ids:
+        selected_reference_ids = set(alternate_ids)
+        matched = genes & selected_reference_ids
+        comparison_size = min(len(selected_reference_ids), len(genes))
+        match_fraction = len(matched) / comparison_size if comparison_size else 0.0
+        if enforce and match_fraction < minimum_overlap:
+            alternate_label = (
+                "alternate column %d" % alternate_column
+                if alternate_column is not None and alternate_ids else
+                "an available alternate identifier column"
             )
-        record[input_column] = ",".join(dict.fromkeys(resolved))
-        records.append(record)
-    resolved_gene_sets = pl.DataFrame(records, schema=gene_sets.schema)
-    effective_ids = set().union(
-        *(set(value.split(",")) for value in resolved_gene_sets[input_column].to_list())
-    )
-    matched = effective_ids & primary_ids
-    comparison_size = min(len(primary_ids), len(effective_ids))
-    match_fraction = len(matched) / comparison_size if comparison_size else 0.0
-    if match_fraction < minimum_overlap:
+            raise MagmaError(
+                "Gene-set identifiers match neither primary gene-location column 1 "
+                "(%d/%d; %.2f%%) nor %s (%d/%d; %.2f%%); the "
+                "configured minimum is %.2f%%."
+                % (
+                    len(primary_matches), primary_comparison,
+                    primary_fraction * 100, alternate_label,
+                    len(matched), comparison_size,
+                    match_fraction * 100, minimum_overlap * 100,
+                )
+            )
+        return gene_sets, selected_reference_ids, {
+            **common_summary,
+            "identifier_source": "alternate_gene_id",
+            "input_unique_ids": len(genes),
+            "matched_unique_ids": len(matched),
+            "comparison_unique_ids": comparison_size,
+            "match_fraction": match_fraction,
+            "pathway_identifiers_modified": False,
+        }
+
+    if enforce:
         raise MagmaError(
-            "Gene-set identifiers match neither primary gene-location column 1 "
-            "(%d/%d; %.2f%%) nor the effective column-1 IDs after translating "
-            "column 6 (%d/%d; %.2f%%); the configured minimum is %.2f%%."
+            "Gene-set identifiers match primary gene-location column 1 for only "
+            "%d/%d unique IDs (%.2f%%), below the configured %.2f%% minimum. "
+            "Pathway identifiers are never rewritten."
             % (
                 len(primary_matches), primary_comparison, primary_fraction * 100,
-                len(matched), comparison_size, match_fraction * 100,
                 minimum_overlap * 100,
             )
         )
-    return resolved_gene_sets, primary_ids, {
-        "identifier_source": "alternate_gene_id",
+    return gene_sets, primary_ids, {
+        **common_summary,
+        "identifier_source": "primary_gene_id",
         "input_unique_ids": len(genes),
-        "matched_unique_ids": len(matched),
-        "comparison_unique_ids": comparison_size,
-        "match_fraction": match_fraction,
-        "translated_unique_ids": len(translated),
-        "one_to_many_identifiers": sum(
-            len(alternate_ids[gene]) > 1 for gene in translated
-        ),
+        "matched_unique_ids": len(primary_matches),
+        "comparison_unique_ids": primary_comparison,
+        "match_fraction": primary_fraction,
+        "pathway_identifiers_modified": False,
     }
 
 
@@ -358,9 +543,10 @@ def validate_gene_set_identifier_overlap(
     overlap = reference_gene_ids & set_ids
     comparison_size = min(len(reference_gene_ids), len(set_ids))
     fraction = len(overlap) / comparison_size if comparison_size else 0.0
-    usable_sets = sum(
-        not reference_gene_ids.isdisjoint(values) for values in gene_set_values
-    )
+    represented_gene_counts = [
+        len(reference_gene_ids & values) for values in gene_set_values
+    ]
+    usable_sets = sum(count > 0 for count in represented_gene_counts)
     result = {
         "reference_unique_ids": len(reference_gene_ids),
         "geneset_unique_ids": len(set_ids),
@@ -370,6 +556,9 @@ def validate_gene_set_identifier_overlap(
         "minimum_required_overlap": minimum_overlap,
         "total_gene_sets": gene_sets.height,
         "gene_sets_with_at_least_one_reference_gene": usable_sets,
+        "gene_sets_with_exactly_one_reference_gene": sum(
+            count == 1 for count in represented_gene_counts
+        ),
     }
     if minimum_overlap is not None and fraction < minimum_overlap:
         raise MagmaError(
@@ -389,8 +578,11 @@ def prepare_magma_variant_inputs(
     location_output: str | Path,
     module_config,
     logger,
+    *,
+    analysis_scope: dict | None = None,
+    excluded_output: str | Path | None = None,
 ) -> dict:
-    """Prepare MAGMA tables and optionally retain their exact BIM intersection."""
+    """Validate MAGMA variant inputs and apply configured reference/scope policies."""
     columns = module_config.input
     policy = module_config.snp_harmonisation
     resolve_variants = policy.resolve_variants_to_reference
@@ -398,6 +590,7 @@ def prepare_magma_variant_inputs(
         pval_file,
         "MAGMA p-value file",
         columns.table_delimiter_pattern,
+        logger,
         column_types={
             columns.variant_id_column: "string",
             columns.p_value_column: "string",
@@ -408,6 +601,7 @@ def prepare_magma_variant_inputs(
         snp_loc_file,
         "MAGMA SNP-location file",
         columns.table_delimiter_pattern,
+        logger,
         column_types={
             columns.variant_id_column: "string",
             columns.chromosome_column: "string",
@@ -534,80 +728,134 @@ def prepare_magma_variant_inputs(
             )
         )
     input_unique = int(working[variant].nunique())
-    reference_variant_count = None
-    reference_id_match_rows = None
-    reference_unique_id_matches = None
-    reference_compatible_rows = None
-    reference_unique_compatible_variants = None
-    reference_coordinate_mismatch_rows = None
-    reference_allele_mismatch_rows = None
-    unmatched_rows = None
-    overlap_fraction = None
-    if resolve_variants:
-        reference_by_id, reference_variant_count = read_reference_bim_matches(
-            ld_ref, columns, set(working[variant]),
-        )
-        reference_ids = set(reference_by_id.index)
-        id_matched = working[variant].isin(reference_ids)
-        reference_id_match_rows = int(id_matched.sum())
-        unmatched_rows = int((~id_matched).sum())
-        reference_unique_id_matches = int(working.loc[id_matched, variant].nunique())
-
-        selected = reference_by_id.loc[working.loc[id_matched, variant]]
-        coordinate_matches = (
-            working.loc[id_matched, "CHR_NORM"].to_numpy()
-            == selected["CHR_NORM"].to_numpy()
-        ) & (
-            working.loc[id_matched, "BP_NORM"].to_numpy()
-            == selected["BP_NORM"].to_numpy()
-        )
-        allele_matches = (
-            working.loc[id_matched, "ALLELE_KEY"].to_numpy()
-            == selected["ALLELE_KEY"].to_numpy()
-        )
-        compatible_matches = coordinate_matches & allele_matches
-        compatible = pd.Series(False, index=working.index)
-        compatible.loc[id_matched] = compatible_matches
-        reference_coordinate_mismatch_rows = int((~coordinate_matches).sum())
-        reference_allele_mismatch_rows = int(
-            (coordinate_matches & ~allele_matches).sum()
-        )
-        reference_compatible_rows = int(compatible.sum())
-        resolved_unique = int(working.loc[compatible, variant].nunique())
-        reference_unique_compatible_variants = resolved_unique
-        overlap_fraction = resolved_unique / input_unique if input_unique else 0.0
-        if (
-            resolved_unique == 0
-            or overlap_fraction < policy.minimum_overlap_fraction
-        ):
-            raise MagmaError(
-                "Only %d/%d unique formatter variants (%.2f%%) have compatible "
-                "BIM identifiers, coordinates, and allele pairs; the configured "
-                "minimum is %.2f%%. Of %d ID-matched rows, %d have coordinate "
-                "mismatches and %d have allele-pair mismatches. Confirm that the "
-                "formatter and LD reference use the same genome build and alleles."
-                % (
-                    resolved_unique,
-                    input_unique,
-                    overlap_fraction * 100,
-                    policy.minimum_overlap_fraction * 100,
-                    reference_id_match_rows,
-                    reference_coordinate_mismatch_rows,
-                    reference_allele_mismatch_rows,
-                )
+    reference_by_id, reference_variant_count = read_reference_bim_matches(
+        ld_ref, columns, set(working[variant]),
+    )
+    reference_ids = set(reference_by_id.index)
+    id_matched = working[variant].isin(reference_ids)
+    reference_id_match_rows = int(id_matched.sum())
+    unmatched_rows = int((~id_matched).sum())
+    reference_unique_id_matches = int(
+        working.loc[id_matched, variant].nunique()
+    )
+    overlap_fraction = (
+        reference_unique_id_matches / input_unique if input_unique else 0.0
+    )
+    if (
+        reference_unique_id_matches == 0
+        or overlap_fraction < policy.minimum_overlap_fraction
+    ):
+        bim_identifier_column = columns.bim_columns.index("variant_id") + 1
+        raise MagmaError(
+            "Only %d/%d unique GWAS variant identifiers (%.2f%%) occur in BIM "
+            "column %d; the configured minimum is %.2f%%. Confirm that the "
+            "formatter identifier convention and LD reference are compatible."
+            % (
+                reference_unique_id_matches,
+                input_unique,
+                overlap_fraction * 100,
+                bim_identifier_column,
+                policy.minimum_overlap_fraction * 100,
             )
-        working = working.loc[compatible].copy()
-    else:
-        working = working.copy()
+        )
+    working = working.loc[id_matched].copy() if resolve_variants else working.copy()
+
+    excluded_chromosome_rows = 0
+    excluded_mhc_rows = 0
+    scope = analysis_scope or {
+        "mhc_policy": "include",
+        "exclude_mhc_snps": False,
+        "mhc_region": None,
+        "mhc_source": None,
+        "exclude_chromosomes": [],
+    }
+    chromosome_mask = working["CHR_NORM"].isin(scope["exclude_chromosomes"])
+    excluded_chromosome_counts = {
+        chromosome: int(working["CHR_NORM"].eq(chromosome).sum())
+        for chromosome in scope["exclude_chromosomes"]
+    }
+    excluded_chromosome_rows = int(chromosome_mask.sum())
+    mhc_mask = pd.Series(False, index=working.index)
+    region = scope["mhc_region"]
+    if scope.get("exclude_mhc_snps", False):
+        if region is None:
+            raise MagmaError("Resolved MAGMA MHC region is missing")
+        mhc_mask = (
+            working["CHR_NORM"].eq(region["chromosome"])
+            & working["BP_NORM"].between(
+                region["start"], region["end"], inclusive="both",
+            )
+        )
+    # Chromosome exclusions are attributed first; this keeps assigned reasons
+    # mutually exclusive even when a custom MHC region lies on an excluded contig.
+    assigned_mhc_mask = mhc_mask & ~chromosome_mask
+    excluded_mhc_rows = int(assigned_mhc_mask.sum())
+    excluded_mask = chromosome_mask | assigned_mhc_mask
+    excluded = working.loc[excluded_mask].copy()
+    if not excluded.empty:
+        reason_column = module_config.exclusion_reporting.reason_column
+        excluded[reason_column] = np.where(
+            chromosome_mask.loc[excluded.index],
+            module_config.exclusion_reporting.chromosome_reason,
+            module_config.exclusion_reporting.mhc_reason,
+        )
+    if excluded_output is not None:
+        destination = Path(excluded_output)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        report = pd.DataFrame({
+            variant: excluded.get(variant),
+            columns.chromosome_column: excluded.get("CHR_NORM"),
+            columns.position_column: excluded.get("BP_NORM"),
+            columns.reference_allele_column: excluded.get("REF_NORM"),
+            columns.alternate_allele_column: excluded.get("ALT_NORM"),
+            module_config.exclusion_reporting.reason_column: excluded.get(
+                module_config.exclusion_reporting.reason_column
+            ),
+        })
+        report.to_csv(
+            destination,
+            sep=columns.output_table_delimiter,
+            index=False,
+        )
+    working = working.loc[~excluded_mask].copy()
+    if working.empty:
+        raise MagmaError(
+            "MAGMA chromosome and MHC policies excluded every eligible variant"
+        )
 
     resolved = working
-    resolved = resolved.sort_values(
-        [variant, "_P_NUMERIC", "_ROW_ORDER"], kind="mergesort",
-    )
-    before_deduplication = len(resolved)
-    resolved = resolved.drop_duplicates(variant, keep="first")
-    duplicate_rows = before_deduplication - len(resolved)
+    duplicate_mask = resolved[variant].duplicated(keep=False)
+    duplicate_rows_detected = int(duplicate_mask.sum())
+    duplicate_ids = resolved.loc[duplicate_mask, variant].drop_duplicates()
+    duplicate_groups = int(len(duplicate_ids))
+    duplicate_policy = policy.duplicate_policy
+    if duplicate_groups and duplicate_policy == "err":
+        raise MagmaError(
+            "MAGMA input contains %d duplicated SNP IDs across %d rows after "
+            "optional LD-reference filtering; examples: %s. Use unique inputs, "
+            "or explicitly select --duplicate-policy lowest_p or remove."
+            % (
+                duplicate_groups,
+                duplicate_rows_detected,
+                duplicate_ids.head(5).tolist(),
+            )
+        )
+    if duplicate_policy == "lowest_p":
+        resolved = resolved.sort_values(
+            [variant, "_P_NUMERIC", "_ROW_ORDER"], kind="mergesort",
+        ).drop_duplicates(variant, keep="first")
+    elif duplicate_policy == "remove":
+        resolved = resolved.loc[~duplicate_mask].copy()
+    # Schema validation makes any other policy unreachable.
+    elif duplicate_policy != "err":
+        raise MagmaError("Unsupported MAGMA duplicate policy: %s" % duplicate_policy)
+    duplicate_rows_removed = int(len(working) - len(resolved))
     resolved = resolved.sort_values("_ROW_ORDER", kind="mergesort")
+    if resolved.empty:
+        raise MagmaError(
+            "MAGMA duplicate policy %s removed every eligible variant; no analysis "
+            "input remains." % duplicate_policy
+        )
 
     harmonised_pval = resolved[original_columns].copy()
     harmonised_pval[columns.p_value_column] = resolved["_P_NUMERIC"].to_numpy()
@@ -641,21 +889,33 @@ def prepare_magma_variant_inputs(
         "reference_variant_count": reference_variant_count,
         "reference_id_match_rows": reference_id_match_rows,
         "reference_unique_id_matches": reference_unique_id_matches,
-        "reference_compatible_rows": reference_compatible_rows,
-        "reference_unique_compatible_variants": (
-            reference_unique_compatible_variants
-        ),
-        "reference_coordinate_mismatch_rows": reference_coordinate_mismatch_rows,
-        "reference_allele_mismatch_rows": reference_allele_mismatch_rows,
         "not_in_reference_rows": unmatched_rows,
         "overlap_fraction": overlap_fraction,
-        "duplicates_resolved_by_lowest_p": int(duplicate_rows),
+        "duplicate_policy": duplicate_policy,
+        "duplicate_groups_detected": duplicate_groups,
+        "duplicate_rows_detected": duplicate_rows_detected,
+        "duplicate_rows_removed": duplicate_rows_removed,
+        "duplicate_groups_resolved_by_lowest_p": (
+            duplicate_groups if duplicate_policy == "lowest_p" else 0
+        ),
+        "duplicate_groups_removed": (
+            duplicate_groups if duplicate_policy == "remove" else 0
+        ),
+        "mhc_policy": scope["mhc_policy"],
+        "mhc_region": scope["mhc_region"],
+        "mhc_region_source": scope["mhc_source"],
+        "excluded_chromosomes": scope["exclude_chromosomes"],
+        "excluded_chromosome_rows": excluded_chromosome_rows,
+        "excluded_chromosome_counts": excluded_chromosome_counts,
+        "excluded_mhc_rows": excluded_mhc_rows,
+        "excluded_scope_rows": excluded_chromosome_rows + excluded_mhc_rows,
         "retained_rows": len(harmonised_pval),
     }
     logger.record("RESULT", "magma_variant_preparation", **qc)
     return {
         "pval_file": str(pval_destination),
         "snp_loc_file": str(location_destination),
+        "excluded_variants": str(excluded_output) if excluded_output is not None else None,
         "qc": qc,
     }
 
@@ -691,17 +951,6 @@ def require_supported_magma(executable: str, module_config, logger) -> str:
         )
     logger.record("OBSERVED", "magma_version", version=version, executable=executable)
     return version
-
-
-def _validate_ld_reference(ld_ref: str | Path, input_config) -> None:
-    missing = [
-        "%s%s" % (ld_ref, suffix)
-        for suffix in input_config.required_reference_extensions
-        if not Path("%s%s" % (ld_ref, suffix)).is_file()
-        or Path("%s%s" % (ld_ref, suffix)).stat().st_size <= 0
-    ]
-    if missing:
-        raise MagmaError("LD reference is incomplete or empty: %s" % ", ".join(missing))
 
 
 def _count_annotation_genes(annotation_file: Path) -> int:
@@ -742,6 +991,7 @@ def correct_gene_set_p_values(
         source,
         "MAGMA gene-set output",
         schema.table_delimiter_pattern,
+        logger,
         comment_prefix=_RESULT_COMMENT_PREFIX,
     )
     name_column = schema.gene_set_name_column
@@ -765,9 +1015,30 @@ def correct_gene_set_p_values(
             "MAGMA gene-set output contains duplicate %s values" % full_name_column
         )
 
+    global_columns = {
+        method: schema.global_correction_column_pattern.format(method=method)
+        for method in module_config.multiple_testing.global_methods
+    }
+    family_columns = {
+        (name, method): schema.family_correction_column_pattern.format(
+            family=name, method=method,
+        )
+        for name, family in module_config.multiple_testing.families.items()
+        for method in family.methods
+    }
+    primary_columns = [
+        schema.primary_correction_method_column,
+        schema.primary_adjusted_p_value_column,
+        schema.primary_significant_column,
+    ]
+    _require_available_result_columns(
+        frame,
+        [*global_columns.values(), *family_columns.values(), *primary_columns],
+        "gene-set correction",
+    )
+
     values = frame[p_column].to_numpy(dtype=float)
-    for method in module_config.multiple_testing.global_methods:
-        column = schema.global_correction_column_pattern.format(method=method)
+    for method, column in global_columns.items():
         frame[column] = adjust_p_values(values, method)
         logger.record(
             "PARAM", "multiple_testing_family",
@@ -779,9 +1050,7 @@ def correct_gene_set_p_values(
         )
         family_values = frame.loc[selected, p_column].to_numpy(dtype=float)
         for method in family.methods:
-            column = schema.family_correction_column_pattern.format(
-                family=name, method=method,
-            )
+            column = family_columns[(name, method)]
             frame[column] = np.nan
             if len(family_values):
                 frame.loc[selected, column] = adjust_p_values(family_values, method)
@@ -790,6 +1059,30 @@ def correct_gene_set_p_values(
                 family=name, pattern=family.pattern, method=method,
                 tests=len(family_values),
             )
+    primary_method = module_config.multiple_testing.primary_method
+    primary_source_column = global_columns[primary_method]
+    threshold = module_config.multiple_testing.reporting_significance_threshold
+    frame[schema.primary_correction_method_column] = primary_method
+    frame[schema.primary_adjusted_p_value_column] = frame[primary_source_column]
+    frame[schema.primary_significant_column] = (
+        frame[schema.primary_adjusted_p_value_column] <= threshold
+    )
+    primary_significant = int(frame[schema.primary_significant_column].sum())
+    logger.record(
+        "RESULT",
+        "primary_gene_set_correction",
+        family="all_gene_sets",
+        method=primary_method,
+        method_label=module_config.multiple_testing.reporting_method_labels[
+            primary_method
+        ],
+        threshold=threshold,
+        tests=len(values),
+        significant=primary_significant,
+        source_column=primary_source_column,
+        adjusted_p_value_column=schema.primary_adjusted_p_value_column,
+        significance_column=schema.primary_significant_column,
+    )
     frame = frame.sort_values(p_column, kind="mergesort")
     destination = write_delimited_report(
         frame.to_dict(orient="records"),
@@ -798,7 +1091,14 @@ def correct_gene_set_p_values(
         delimiter=schema.report_delimiter,
         null_value=schema.report_null_value,
     )
-    logger.record("OUTPUT", "corrected_gene_sets", path=str(destination), rows=len(frame))
+    logger.record(
+        "OUTPUT",
+        "corrected_gene_sets",
+        path=str(destination),
+        rows=len(frame),
+        primary_method=primary_method,
+        primary_significant=primary_significant,
+    )
     return pl.DataFrame(frame.to_dict(orient="list"))
 
 
@@ -816,14 +1116,18 @@ def correct_gene_p_values(
     output_file: str | Path,
     module_config,
     logger,
+    *,
+    gene_location_file: str | Path | None = None,
+    gene_location_has_header: bool | None = None,
 ) -> pl.DataFrame:
-    """Add configured adjusted p-values to the complete MAGMA gene result."""
+    """Join configured gene metadata and add adjusted p-values to MAGMA results."""
     schema = module_config.result_schema
     source = Path(genes_out_file).expanduser().resolve()
     frame = _read_table(
         source,
         "MAGMA gene output",
         schema.table_delimiter_pattern,
+        logger,
         comment_prefix=_RESULT_COMMENT_PREFIX,
     )
     gene_column = schema.gene_id_column
@@ -845,15 +1149,76 @@ def correct_gene_p_values(
         )
     if normalized_genes.duplicated().any():
         raise MagmaError("MAGMA gene output contains duplicate normalized gene IDs")
+    frame[gene_column] = normalized_genes
 
-    values = frame[p_column].to_numpy(dtype=float)
-    for method in module_config.multiple_testing.gene_methods:
-        column = schema.global_correction_column_pattern.format(method=method)
-        if column in frame.columns:
+    if gene_location_file is not None:
+        locations = read_gene_locations(
+            gene_location_file,
+            module_config,
+            has_header=gene_location_has_header,
+        )
+        annotation_columns = {
+            "chromosome": schema.gene_reference_chromosome_column,
+            "start": schema.gene_reference_start_column,
+            "end": schema.gene_reference_end_column,
+            "strand": schema.gene_reference_strand_column,
+            "alternate_gene_id": schema.gene_reference_alternate_id_column,
+        }
+        _require_available_result_columns(
+            frame, list(annotation_columns.values()), "gene-location annotation",
+        )
+        location_frame = pd.DataFrame.from_records(
+            [
+                {
+                    gene_column: gene,
+                    annotation_columns["chromosome"]: chromosome,
+                    annotation_columns["start"]: start,
+                    annotation_columns["end"]: end,
+                    annotation_columns["strand"]: strand,
+                    annotation_columns["alternate_gene_id"]: alternate,
+                }
+                for gene, (
+                    chromosome, start, end, strand, alternate,
+                ) in locations.items()
+            ]
+        )
+        frame = frame.merge(
+            location_frame, on=gene_column, how="left", validate="one_to_one",
+        )
+        missing_annotations = int(
+            frame[annotation_columns["chromosome"]].isna().sum()
+        )
+        if missing_annotations:
             raise MagmaError(
-                "Configured gene correction column already exists in MAGMA output: %s"
-                % column
+                "%d MAGMA gene results are absent from the configured gene-location "
+                "reference; examples: %s"
+                % (
+                    missing_annotations,
+                    frame.loc[
+                        frame[annotation_columns["chromosome"]].isna(), gene_column
+                    ].head(5).tolist(),
+                )
             )
+        logger.record(
+            "RESULT",
+            "gene_result_location_annotation",
+            gene_location_file=str(
+                Path(gene_location_file).expanduser().resolve()
+            ),
+            annotated_genes=len(frame),
+            missing_annotations=missing_annotations,
+            columns=annotation_columns,
+        )
+
+    correction_columns = {
+        method: schema.global_correction_column_pattern.format(method=method)
+        for method in module_config.multiple_testing.gene_methods
+    }
+    _require_available_result_columns(
+        frame, list(correction_columns.values()), "gene correction",
+    )
+    values = frame[p_column].to_numpy(dtype=float)
+    for method, column in correction_columns.items():
         frame[column] = adjust_p_values(values, method)
         logger.record(
             "PARAM",
@@ -887,6 +1252,8 @@ def _significance_outcome(
     module_config,
     singular: str,
     plural: str,
+    *,
+    primary_method: str | None = None,
 ) -> tuple[str, dict, list[tuple[str, str, object]]]:
     """Summarise configured nominal and adjusted result thresholds once."""
     threshold = module_config.multiple_testing.reporting_significance_threshold
@@ -917,6 +1284,54 @@ def _significance_outcome(
     }
     labels = module_config.multiple_testing.reporting_method_labels
     subject = singular if tested == 1 else plural
+    if primary_method is not None:
+        if primary_method not in adjusted:
+            raise MagmaError(
+                "Configured primary correction %s was not calculated" % primary_method
+            )
+        primary_count = adjusted[primary_method]
+        secondary_methods = [
+            method for method in methods if method != primary_method
+        ]
+        message = (
+            f"{tested:,} {subject} tested at the configured p ≤ {threshold:g} "
+            f"threshold: {primary_count:,} significant by the primary global "
+            f"{labels[primary_method]} correction; {nominal:,} nominally "
+            "significant (descriptive only)."
+        )
+        metrics = {
+            "tested": tested,
+            "significance_threshold": threshold,
+            "nominal_significant": nominal,
+            "adjusted_significant": adjusted,
+            "primary_correction": primary_method,
+            "primary_significant": primary_count,
+        }
+        fields = [
+            ("count", f"{plural.capitalize()} tested", tested),
+            ("analysis", "Reporting threshold", f"p ≤ {threshold:g}"),
+            (
+                "analysis",
+                "Primary correction",
+                f"Global {labels[primary_method]}",
+            ),
+            (
+                "analysis",
+                "Significant by primary correction",
+                primary_count,
+            ),
+            ("info", "Nominally significant (descriptive)", nominal),
+        ]
+        if secondary_methods:
+            fields.append(
+                (
+                    "info",
+                    "Other global corrections in results",
+                    ", ".join(labels[method] for method in secondary_methods),
+                )
+            )
+        return message, metrics, fields
+
     findings = [f"{nominal:,} nominally significant"]
     findings.extend(
         f"{adjusted[method]:,} significant after global {labels[method]} correction"
@@ -954,115 +1369,46 @@ def parse_gene_set_file(
     logger,
     *,
     input_format: str | None = None,
-) -> pl.DataFrame:
-    """Parse configured GMT, native MAGMA, or two-column memberships once."""
+    return_metadata: bool = False,
+) -> pl.DataFrame | tuple[pl.DataFrame, dict]:
+    """Build configured gene-set columns from the shared validated reader."""
     source = require_nonempty_file(
         gene_set_path, "gene-set file", error_type=MagmaError,
     )
     configured_format = input_format or module_config.gene_sets.input_format
     schema = module_config.result_schema
     records = []
-    seen: set[str] = set()
-    detected_format: str | None = None
-    table_delimiter = re.compile(module_config.input.table_delimiter_pattern)
-    if configured_format == "membership":
-        membership = module_config.gene_sets
-        delimiter = re.compile(membership.membership_delimiter_pattern)
-        grouped: dict[str, list[str]] = {}
-        with open_text(source) as handle:
-            for line_number, raw in enumerate(handle, 1):
-                if membership.membership_has_header and line_number == 1:
-                    continue
-                text = raw.strip()
-                if not text or text.startswith(_RESULT_COMMENT_PREFIX):
-                    continue
-                fields = delimiter.split(text)
-                maximum = max(
-                    membership.membership_set_column,
-                    membership.membership_gene_column,
-                )
-                if len(fields) <= maximum:
-                    raise MagmaError(
-                        "Malformed two-column gene-set membership at line %d"
-                        % line_number
-                    )
-                name = fields[membership.membership_set_column].strip()
-                gene = _normalize_gene_id(fields[membership.membership_gene_column])
-                if not name or gene is None:
-                    raise MagmaError(
-                        "Empty set or gene identifier in membership line %d"
-                        % line_number
-                    )
-                grouped.setdefault(name, []).append(gene)
-        for name, values in grouped.items():
-            genes = list(dict.fromkeys(values))
-            joined_genes = ",".join(genes)
-            records.append(
-                {
-                    schema.gene_set_full_name_column: name,
-                    schema.report_gene_set_description_column: None,
-                    schema.report_source_input_genes_column: joined_genes,
-                    schema.report_input_genes_column: joined_genes,
-                }
-            )
-        detected_format = "membership"
-    else:
-        with open_text(source) as handle:
-            for line_number, raw in enumerate(handle, 1):
-                if not raw.strip() or raw.lstrip().startswith(
-                    _RESULT_COMMENT_PREFIX
-                ):
-                    continue
-                text = raw.rstrip("\r\n")
-                tab_parts = text.split("\t")
-                line_format = "gmt" if len(tab_parts) >= 3 else "magma"
-                if detected_format is None:
-                    detected_format = (
-                        line_format if configured_format == "auto" else configured_format
-                    )
-                if configured_format == "auto" and line_format != detected_format:
-                    raise MagmaError(
-                        "Gene-set file mixes GMT and native MAGMA records at line %d"
-                        % line_number
-                    )
-                if detected_format == "gmt":
-                    if len(tab_parts) < 3 or not tab_parts[0].strip():
-                        raise MagmaError("Malformed GMT gene-set line %d" % line_number)
-                    name = tab_parts[0].strip()
-                    description = tab_parts[1].strip() or None
-                    gene_values = tab_parts[2:]
-                else:
-                    parts = table_delimiter.split(text)
-                    if len(parts) < 2 or not parts[0].strip():
-                        raise MagmaError(
-                            "Malformed native MAGMA gene-set line %d" % line_number
-                        )
-                    name = parts[0].strip()
-                    description = None
-                    gene_values = parts[1:]
-                if name in seen:
-                    raise MagmaError("Duplicate gene-set name: %s" % name)
-                seen.add(name)
-                genes = list(
-                    dict.fromkeys(
-                        gene
-                        for gene in (_normalize_gene_id(value) for value in gene_values)
-                        if gene is not None
-                    )
-                )
-                if not genes:
-                    raise MagmaError("Gene set %s contains no valid gene IDs" % name)
-                joined_genes = ",".join(genes)
-                records.append(
-                    {
-                        schema.gene_set_full_name_column: name,
-                        schema.report_gene_set_description_column: description,
-                        schema.report_source_input_genes_column: joined_genes,
-                        schema.report_input_genes_column: joined_genes,
-                    }
-                )
-    if not records:
-        raise MagmaError("Gene-set file contains no gene sets: %s" % source)
+    membership = module_config.gene_sets
+    is_membership = configured_format == "membership"
+
+    def append_record(row):
+        joined_genes = ",".join(row.genes)
+        records.append({
+            schema.gene_set_full_name_column: row.name,
+            schema.report_gene_set_description_column: row.description or None,
+            schema.report_source_input_genes_column: joined_genes,
+            schema.report_input_genes_column: joined_genes,
+        })
+
+    validated = validate_gene_set_source(
+        source,
+        GeneSetFormat(
+            input_format=configured_format,
+            delimiter_pattern=(membership.membership_delimiter_pattern if is_membership
+                               else module_config.input.table_delimiter_pattern),
+            comment_prefix=_RESULT_COMMENT_PREFIX,
+            compressed=True,
+            empty_gene_policy="reject" if is_membership else "drop",
+            duplicate_gene_policy="deduplicate",
+            reject_name_whitespace=False,
+            membership_has_header=membership.membership_has_header if is_membership else False,
+            membership_set_column=membership.membership_set_column if is_membership else None,
+            membership_gene_column=membership.membership_gene_column if is_membership else None,
+        ),
+        error_type=MagmaError,
+        on_row=append_record,
+    )
+    detected_format = validated.detected_format
     logger.record(
         "DECIDE",
         "gene_set_input_format",
@@ -1070,36 +1416,22 @@ def parse_gene_set_file(
         detected=detected_format,
         gene_sets=len(records),
     )
-    return pl.DataFrame(records)
-
-
-def write_native_gene_set_file(
-    gene_sets: pl.DataFrame,
-    output_file: str | Path,
-    module_config,
-) -> Path:
-    """Write parsed memberships in MAGMA's native set-annotation format."""
-    schema = module_config.result_schema
-    destination = Path(output_file)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with destination.open("w", encoding="utf-8", newline="\n") as handle:
-            for record in gene_sets.iter_rows(named=True):
-                handle.write(
-                    "%s %s\n"
-                    % (
-                        record[schema.gene_set_full_name_column],
-                        record[schema.report_input_genes_column].replace(",", " "),
-                    )
-                )
-    except OSError as exc:
-        raise MagmaError(
-            "Cannot write native MAGMA gene-set file %s: %s"
-            % (destination, exc)
-        ) from exc
-    return require_nonempty_file(
-        destination, "Prepared MAGMA gene-set file", error_type=MagmaError,
+    frame = pl.DataFrame(
+        records,
+        schema={
+            schema.gene_set_full_name_column: pl.String,
+            schema.report_gene_set_description_column: pl.String,
+            schema.report_source_input_genes_column: pl.String,
+            schema.report_input_genes_column: pl.String,
+        },
     )
+    if return_metadata:
+        return frame, {
+            "configured_format": configured_format,
+            "detected_format": detected_format,
+            "gene_sets": len(records),
+        }
+    return frame
 
 
 def annotate_gene_set_results(
@@ -1118,6 +1450,7 @@ def annotate_gene_set_results(
         source,
         "MAGMA gene output",
         schema.table_delimiter_pattern,
+        logger,
         comment_prefix=_RESULT_COMMENT_PREFIX,
     )
     gene_column = schema.gene_id_column
@@ -1153,11 +1486,17 @@ def annotate_gene_set_results(
                 ),
                 schema.report_total_genes_column: len(values),
                 schema.report_common_gene_count_column: len(common),
+                schema.report_untested_genes_column: (
+                    ",".join(gene for gene in values if gene not in gene_p) or None
+                ),
+                schema.report_untested_gene_count_column: sum(
+                    gene not in gene_p for gene in values
+                ),
             }
         )
     annotated = (
         corrected.join(
-            pl.concat([gene_sets, pl.DataFrame(details)], how="horizontal_extend"),
+            pl.concat([gene_sets, pl.DataFrame(details)], how="horizontal"),
             on=schema.gene_set_full_name_column,
             how="left",
             coalesce=True,
@@ -1289,6 +1628,156 @@ def _mapping_gene_set(definition, inputs) -> Path | None:
     )
 
 
+def _prepare_gene_set_plans(mapping_gene_sets, module, logger) -> dict[str, dict]:
+    """Validate optional pathway inputs before any MAGMA scientific command."""
+    plans: dict[str, dict] = {}
+    for name in module.mapping.selected:
+        source = mapping_gene_sets[name]
+        if source is None:
+            plans[name] = {"status": "not_requested", "reason": None}
+            continue
+        definition = module.mapping.definitions[name]
+        gene_set_format = (
+            module.gene_sets.input_format
+            if definition.gene_set_format == "auto"
+            else definition.gene_set_format
+        )
+        parsed, input_metadata = parse_gene_set_file(
+            source,
+            module,
+            logger,
+            input_format=gene_set_format,
+            return_metadata=True,
+        )
+        if (
+            input_metadata["detected_format"] == "membership"
+            and module.gene_sets.membership_has_header
+        ):
+            raise MagmaError(
+                "MAGMA column-based --set-annot input cannot contain a header. "
+                "Provide the original headerless membership file; PostGWAS does "
+                "not rewrite pathway inputs."
+            )
+        minimum = (
+            definition.minimum_gene_id_overlap_fraction
+            or module.gene_sets.minimum_gene_id_overlap_fraction
+        )
+        if definition.method in {"positional", "n_magma"}:
+            location = (
+                definition.gene_location_file or module.input.gene_location_file
+            )
+            if location is None:
+                raise MagmaError(
+                    "Mapping %s requires a gene-location file" % name
+                )
+            reference = require_nonempty_file(
+                location,
+                "%s gene-location file" % name,
+                error_type=MagmaError,
+            )
+            parsed, reference_ids, resolution = resolve_gene_set_identifiers(
+                reference,
+                parsed,
+                minimum,
+                module,
+                enforce=False,
+                allow_alternate_reference_ids=(definition.method == "positional"),
+            )
+        else:
+            reference = require_nonempty_file(
+                definition.gene_annotation_file,
+                "%s source gene annotation" % definition.display_name,
+                error_type=MagmaError,
+            )
+            reference_ids = _gene_ids_from_table(
+                reference,
+                "%s source gene annotation" % definition.display_name,
+                module.input.table_delimiter_pattern,
+                0,
+                has_header=False,
+                comment_prefix=module.annotation_validation.comment_prefix,
+            )
+            resolution = {
+                "identifier_source": "annotation_gene_id",
+                "pathway_identifiers_modified": False,
+            }
+        validation = validate_gene_set_identifier_overlap(
+            reference_ids,
+            parsed,
+            None,
+            module.result_schema.report_input_genes_column,
+        )
+        validation["identifier_resolution"] = resolution
+        observed = validation["overlap_fraction_of_smaller_universe"]
+        if observed < minimum:
+            alternate_column = resolution.get("alternate_identifier_column")
+            alternate_reason = (
+                "The optional alternate gene-identifier column is absent or "
+                "contains no usable identifiers. "
+                if not resolution.get("alternate_identifiers_available", True)
+                else ""
+            )
+            incompatibility = (
+                "Gene-set identifiers for %s overlap the mapping reference for only "
+                "%d/%d unique IDs (%.2f%%), below the configured %.2f%% minimum. "
+                "%sUse a gene-set file "
+                "whose identifiers match gene-location column 1 or its optional "
+                "%s."
+                % (
+                    definition.display_name,
+                    validation["overlapping_unique_ids"],
+                    validation["comparison_unique_ids"],
+                    observed * 100,
+                    minimum * 100,
+                    alternate_reason,
+                    (
+                        "column %d aliases" % alternate_column
+                        if alternate_column is not None else
+                        "alternate identifier column"
+                    ),
+                )
+            )
+            if module.gene_sets.identifier_mismatch_action == "error":
+                raise MagmaError(
+                    "%s The configured action is error, so the complete MAGMA "
+                    "run was stopped." % incompatibility
+                )
+            reason = (
+                "Competitive gene-set analysis was not performed. %s "
+                "Gene-association analysis will continue." % incompatibility
+            )
+            logger.warn(reason)
+            logger.record(
+                "SKIP",
+                "magma_gene_set_analysis",
+                mapping=name,
+                reason="incompatible_gene_identifiers",
+                message=reason,
+                **validation,
+            )
+            plans[name] = {
+                "status": "skipped",
+                "reason": reason,
+                "pathway_file": str(source),
+                "gene_reference_file": str(reference),
+                "minimum_overlap": minimum,
+                "input_metadata": input_metadata,
+                "validation": validation,
+            }
+            continue
+        plans[name] = {
+            "status": "ready",
+            "reason": None,
+            "pathway_file": str(source),
+            "gene_reference_file": str(reference),
+            "minimum_overlap": minimum,
+            "input_metadata": input_metadata,
+            "parsed_gene_sets": parsed,
+            "validation": validation,
+        }
+    return plans
+
+
 def _write_mapping_comparison(
     analyses: dict[str, dict],
     output_file: Path,
@@ -1312,6 +1801,24 @@ def _write_mapping_comparison(
             schema.report_statistic_interpretation_column: (
                 definition.result_statistic_interpretation
             ),
+            schema.report_mhc_policy_column: analyses[name]["analysis_scope"][
+                "mhc_policy"
+            ],
+            schema.report_mhc_region_column: analyses[name]["analysis_scope"][
+                "mhc_region_label"
+            ],
+            schema.report_excluded_chromosomes_column: ",".join(
+                analyses[name]["analysis_scope"]["exclude_chromosomes"]
+            ),
+            schema.report_excluded_units_column: analyses[name]["gene_scope"][
+                "excluded_units"
+            ],
+            schema.report_gene_set_status_column: analyses[name][
+                "gene_set_analysis"
+            ]["status"],
+            schema.report_gene_set_reason_column: analyses[name][
+                "gene_set_analysis"
+            ]["reason"],
         }
         for column, value in reversed(list(metadata.items())):
             frame.insert(0, column, value)
@@ -1339,6 +1846,9 @@ def preflight_magma_analysis(
     dataset_id: str,
     configuration,
     logger,
+    *,
+    references: MagmaReferencePreflight | None = None,
+    include_gene_sets: bool = True,
 ) -> MagmaPreflight:
     """Validate run-level MAGMA resources without creating analysis outputs."""
     validate_filename_component(dataset_id, "dataset_id", error_type=MagmaError)
@@ -1363,28 +1873,80 @@ def preflight_magma_analysis(
     p_value_file = require_nonempty_file(
         inputs.p_value_file, "p-value file", error_type=MagmaError,
     )
-    ld_reference_prefix = str(
-        Path(inputs.ld_reference_prefix).expanduser().resolve()
+    reference = references or preflight_magma_references(
+        dataset_id, configuration, logger, include_gene_sets=include_gene_sets,
     )
-    _validate_ld_reference(ld_reference_prefix, inputs)
+    return MagmaPreflight(
+        snp_location_file=snp_location_file,
+        p_value_file=p_value_file,
+        ld_reference_prefix=reference.ld_reference_prefix,
+        executable=reference.executable,
+        version=reference.version,
+        gene_set_plans=reference.gene_set_plans,
+        analysis_scope=reference.analysis_scope,
+    )
+
+
+def preflight_magma_references(
+    dataset_id: str,
+    configuration,
+    logger,
+    *,
+    include_gene_sets: bool = True,
+) -> MagmaReferencePreflight:
+    """Validate all MAGMA resources that precede GWAS-VCF extraction."""
+    validate_filename_component(dataset_id, "dataset_id", error_type=MagmaError)
+    ld_reference_prefix, executable, version, analysis_scope = (
+        validate_magma_ld_reference_and_runtime(configuration, logger)
+    )
+    gene_set_plans = validate_magma_gene_set_references(
+        configuration, logger, include_gene_sets=include_gene_sets,
+    )
+    return MagmaReferencePreflight(
+        ld_reference_prefix=ld_reference_prefix,
+        executable=executable,
+        version=version,
+        gene_set_plans=gene_set_plans,
+        analysis_scope=analysis_scope,
+    )
+
+
+def validate_magma_ld_reference_and_runtime(configuration, logger):
+    """Validate the PLINK LD reference and configured MAGMA executable."""
+    module = configuration.modules.magma
+    inputs = module.input
+    if configuration.execution.random_seed < 1:
+        raise MagmaError("MAGMA requires a positive execution.random_seed")
+    if inputs.ld_reference_prefix is None:
+        raise MagmaError("Required MAGMA input is missing: LD-reference prefix")
+    ld_reference_prefix = str(Path(inputs.ld_reference_prefix).expanduser().resolve())
+    validate_plink_files(
+        ld_reference_prefix, inputs.required_reference_extensions, error_type=MagmaError,
+        missing_message="LD reference is incomplete or empty",
+    )
     executable = resolve_executable(
         configuration.resources.executables.magma,
         "MAGMA executable",
         error_type=MagmaError,
     )
     version = require_supported_magma(executable, module, logger)
+    return ld_reference_prefix, executable, version, _analysis_scope(configuration)
+
+
+def validate_magma_gene_set_references(
+    configuration, logger, *, include_gene_sets: bool = True,
+):
+    """Validate pathway files against each selected mapping's gene reference."""
+    module = configuration.modules.magma
+    inputs = module.input
     mapping_gene_sets = {
-        name: _mapping_gene_set(module.mapping.definitions[name], inputs)
+        name: (
+            _mapping_gene_set(module.mapping.definitions[name], inputs)
+            if include_gene_sets else None
+        )
         for name in module.mapping.selected
     }
-    return MagmaPreflight(
-        snp_location_file=snp_location_file,
-        p_value_file=p_value_file,
-        ld_reference_prefix=ld_reference_prefix,
-        executable=executable,
-        version=version,
-        mapping_gene_sets=mapping_gene_sets,
-    )
+    return _prepare_gene_set_plans(mapping_gene_sets, module, logger)
 
 
 def run_magma_analysis(
@@ -1394,10 +1956,21 @@ def run_magma_analysis(
     logger,
     *,
     preflight: MagmaPreflight | None = None,
+    pipeline_progress=None,
+    pipeline_stage_numbers: Mapping[str, int] | None = None,
+    formatter_result=None,
+    variant_id_observation=None,
 ) -> dict:
     """Run positional and configured functional MAGMA mappings independently."""
+    include_gene_sets = (
+        pipeline_stage_numbers is None
+        or "pathway_analysis" in pipeline_stage_numbers
+    )
     prepared = preflight or preflight_magma_analysis(
-        dataset_id, configuration, logger,
+        dataset_id,
+        configuration,
+        logger,
+        include_gene_sets=include_gene_sets,
     )
     module = configuration.modules.magma
     inputs = module.input
@@ -1406,9 +1979,25 @@ def run_magma_analysis(
     ld_ref = prepared.ld_reference_prefix
     executable = prepared.executable
     version = prepared.version
-    mapping_gene_sets = prepared.mapping_gene_sets
+    gene_set_plans = prepared.gene_set_plans
+    analysis_scope = prepared.analysis_scope
+    active_pipeline_stages = dict(pipeline_stage_numbers or {})
+    if pipeline_progress is not None and not active_pipeline_stages:
+        active_pipeline_stages = {
+            key: number
+            for number, key in enumerate(MAGMA_PIPELINE_STAGE_KEYS, 1)
+        }
+
+    def start_pipeline_stage(key: str) -> None:
+        if pipeline_progress is not None and key in active_pipeline_stages:
+            pipeline_progress.start(active_pipeline_stages[key])
+
+    def complete_pipeline_stage(key: str, **values) -> None:
+        if pipeline_progress is not None and key in active_pipeline_stages:
+            pipeline_progress.complete(active_pipeline_stages[key], **values)
+
     total_steps = 1 + sum(
-        3 + (4 if mapping_gene_sets[name] is not None else 0)
+        3 + (2 if gene_set_plans[name]["status"] == "ready" else 0)
         for name in module.mapping.selected
     )
     shared_paths = resolve_magma_output_paths(
@@ -1417,66 +2006,133 @@ def run_magma_analysis(
     for path in shared_paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
     step_number = 1
+    if pipeline_progress is not None and pipeline_progress.current == 0:
+        start_pipeline_stage("variant_inputs")
     variant_stage_title = (
-        "Retain variants present in LD reference"
-        if module.snp_harmonisation.resolve_variants_to_reference
-        else "Prepare MAGMA input tables"
+        "Assess GWAS-BIM identifier overlap and apply configured variant policies"
     )
     with logger.step(
         step_number, total_steps, variant_stage_title, "prepare_magma_variant_inputs",
     ) as step:
-        variant_preparation = prepare_magma_variant_inputs(
-            pval,
-            snp_loc,
-            ld_ref,
-            shared_paths["harmonised_p_values"],
-            shared_paths["harmonised_snp_locations"],
-            module,
-            logger,
+        variant_preparation = (
+            formatter_result.get("variant_preparation")
+            if isinstance(formatter_result, Mapping) else None
         )
+        if variant_preparation is None:
+            variant_preparation = prepare_magma_variant_inputs(
+                pval,
+                snp_loc,
+                ld_ref,
+                shared_paths["harmonised_p_values"],
+                shared_paths["harmonised_snp_locations"],
+                module,
+                logger,
+                analysis_scope=analysis_scope,
+                excluded_output=shared_paths["excluded_variants"],
+            )
+        else:
+            shared_paths["harmonised_p_values"] = Path(
+                variant_preparation["pval_file"]
+            )
+            shared_paths["harmonised_snp_locations"] = Path(
+                variant_preparation["snp_loc_file"]
+            )
+            logger.record(
+                "SKIP",
+                "prepare_magma_variant_inputs",
+                reason="completed_by_formatter_in_memory",
+                p_value_file=variant_preparation["pval_file"],
+                snp_location_file=variant_preparation["snp_loc_file"],
+            )
         qc = variant_preparation["qc"]
         removed = qc["input_rows"] - qc["retained_rows"]
         step.set_rows(qc["retained_rows"], removed=removed)
         variant_fields = [
             ("count", "Formatter rows", qc["input_rows"]),
             ("success", "Prepared variants", qc["retained_rows"]),
+            ("count", "BIM reference variants", qc["reference_variant_count"]),
+            ("success", "GWAS identifiers found in BIM", (
+                "%s/%s (%.2f%%)"
+                % (
+                    f"{qc['reference_unique_id_matches']:,}",
+                    f"{qc['input_unique_variants']:,}",
+                    qc["overlap_fraction"] * 100,
+                )
+            )),
+            (
+                "analysis", "Minimum identifier overlap",
+                "%.2f%%" % (
+                    module.snp_harmonisation.minimum_overlap_fraction * 100
+                ),
+            ),
             (
                 "info", "BIM intersection",
                 "applied" if qc["reference_intersection_enabled"] else "not requested",
             ),
-        ]
-        if qc["reference_intersection_enabled"]:
-            variant_fields.extend(
-                [
-                    (
-                        "count", "Unique BIM ID matches",
-                        qc["reference_unique_id_matches"],
-                    ),
-                    (
-                        "success", "Compatible unique variants",
-                        qc["reference_unique_compatible_variants"],
-                    ),
-                    ("warning", "Rows absent from BIM", qc["not_in_reference_rows"]),
-                    (
-                        "warning", "Rows with coordinate mismatch",
-                        qc["reference_coordinate_mismatch_rows"],
-                    ),
-                    (
-                        "warning", "Rows with allele-pair mismatch",
-                        qc["reference_allele_mismatch_rows"],
-                    ),
-                ]
-            )
-        variant_fields.append(
             (
-                "info", "Duplicate rows consolidated",
-                "%s (lowest-p-value rule)"
-                % f"{qc['duplicates_resolved_by_lowest_p']:,}",
-            )
+                "warning" if qc["not_in_reference_rows"] else "success",
+                "Rows absent from BIM", qc["not_in_reference_rows"],
+            ),
+        ]
+        variant_fields.extend(
+            [
+                ("analysis", "MHC policy", qc["mhc_policy"]),
+                (
+                    "genetic", "MHC region",
+                    (
+                        "%s:%s-%s"
+                        % (
+                            qc["mhc_region"]["chromosome"],
+                            qc["mhc_region"]["start"],
+                            qc["mhc_region"]["end"],
+                        )
+                        if qc["mhc_region"] is not None else "not used"
+                    ),
+                ),
+                (
+                    "genetic", "Excluded chromosomes",
+                    ", ".join(qc["excluded_chromosomes"]) or "none",
+                ),
+                (
+                    (
+                        "loss" if qc["excluded_chromosome_counts"]
+                        else "success"
+                    ),
+                    "Variants excluded by chromosome",
+                    ", ".join(
+                        "%s=%s" % (chromosome, count)
+                        for chromosome, count
+                        in qc["excluded_chromosome_counts"].items()
+                    ) or "none",
+                ),
+                (
+                    "loss" if qc["excluded_mhc_rows"] else "success",
+                    "Variants excluded from MHC",
+                    qc["excluded_mhc_rows"],
+                ),
+            ]
+        )
+        variant_fields.extend(
+            [
+                ("info", "Duplicate policy", qc["duplicate_policy"]),
+                (
+                    "count", "Duplicate ID groups detected",
+                    qc["duplicate_groups_detected"],
+                ),
+                (
+                    "info",
+                    (
+                        "Rows removed after keeping lowest P"
+                        if qc["duplicate_policy"] == "lowest_p"
+                        else "Rows removed with duplicated IDs"
+                    ),
+                    qc["duplicate_rows_removed"],
+                ),
+            ]
         )
         variant_outcome = (
-            "%s formatter rows; %s ID-, coordinate-, and allele-compatible "
-            "variants retained; %s rows were not retained."
+            "%s formatter rows; %s BIM-matched identifiers retained; %s rows "
+            "were not retained."
             % (
                 f"{qc['input_rows']:,}",
                 f"{qc['retained_rows']:,}",
@@ -1496,16 +2152,33 @@ def run_magma_analysis(
             fields=variant_fields,
             **qc,
         )
+    if pipeline_progress is not None:
+        complete_pipeline_stage(
+            "variant_inputs",
+            outcome_fields=magma_variant_input_outcome_fields(
+                configuration,
+                formatter_result or {"rows_in": qc["input_rows"]},
+                variant_id_observation or {},
+                qc,
+                {
+                    "snp_loc_file": variant_preparation["snp_loc_file"],
+                    "pval_file": variant_preparation["pval_file"],
+                },
+            ),
+        )
     step_number += 1
 
     analyses: dict[str, dict] = {}
     for name in module.mapping.selected:
         definition = module.mapping.definitions[name]
-        gene_set_file = mapping_gene_sets[name]
-        parsed_gene_sets = None
-        prepared_gene_sets = None
-        gene_id_validation = None
+        gene_set_plan = gene_set_plans[name]
+        parsed_gene_sets = gene_set_plan.get("parsed_gene_sets")
+        gene_id_validation = gene_set_plan.get("validation")
         tested_gene_coverage = None
+        location_reference = None
+        pathway_location_preparation = None
+        gene_significance = None
+        pathway_significance = None
         paths = resolve_magma_output_paths(
             output_directory, dataset_id, module, name,
         )
@@ -1514,10 +2187,12 @@ def run_magma_analysis(
         paths["harmonised_p_values"] = shared_paths["harmonised_p_values"]
         paths["harmonised_snp_locations"] = shared_paths["harmonised_snp_locations"]
 
+        start_pipeline_stage("gene_annotation")
         with logger.step(
             step_number,
             total_steps,
-            "%s · prepare SNP-to-unit annotation" % definition.display_name,
+            "%s · create the MAGMA SNP-to-gene annotation"
+            % definition.display_name,
             "magma_mapping_annotation",
         ) as step:
             if definition.method == "positional":
@@ -1532,6 +2207,23 @@ def run_magma_analysis(
                     configured_location, "%s gene-location file" % name,
                     error_type=MagmaError,
                 )
+                resolution = (
+                    (gene_set_plan.get("validation") or {}).get(
+                        "identifier_resolution"
+                    ) or {}
+                )
+                if (
+                    gene_set_plan["status"] == "ready"
+                    and resolution.get("identifier_source") == "alternate_gene_id"
+                ):
+                    location_reference, pathway_location_preparation = (
+                        write_pathway_compatible_gene_locations(
+                            location_reference,
+                            paths["pathway_compatible_gene_locations"],
+                            module,
+                            logger,
+                        )
+                    )
                 upstream = (
                     definition.annotation_window_upstream_kb
                     if definition.annotation_window_upstream_kb is not None
@@ -1546,7 +2238,8 @@ def run_magma_analysis(
                 _run_command(
                     [
                         executable,
-                        "--annotate", "window=%s,%s" % (upstream, downstream),
+                        "--annotate",
+                        _annotation_window_argument(upstream, downstream),
                         "--snp-loc", str(paths["harmonised_snp_locations"]),
                         "--gene-loc", str(location_reference),
                         "--out", str(paths["annotation_prefix"]),
@@ -1560,6 +2253,9 @@ def run_magma_analysis(
                     "source": "generated_by_magma",
                     "upstream_kb": upstream,
                     "downstream_kb": downstream,
+                    "pathway_compatible_gene_location": (
+                        pathway_location_preparation
+                    ),
                 }
             elif definition.method == "n_magma":
                 location_reference = require_nonempty_file(
@@ -1571,8 +2267,7 @@ def run_magma_analysis(
                     [
                         executable,
                         "--annotate",
-                        "window=%s,%s"
-                        % (
+                        _annotation_window_argument(
                             definition.annotation_window_upstream_kb,
                             definition.annotation_window_downstream_kb,
                         ),
@@ -1622,8 +2317,7 @@ def run_magma_analysis(
                     [
                         executable,
                         "--annotate",
-                        "window=%s,%s"
-                        % (
+                        _annotation_window_argument(
                             definition.annotation_window_upstream_kb,
                             definition.annotation_window_downstream_kb,
                         ),
@@ -1647,12 +2341,79 @@ def run_magma_analysis(
                 annotation_validation = validate_gene_annotation(
                     annotation_file, ld_ref, module, logger,
                 )
-            annotated_units = _count_annotation_genes(annotation_file)
+            scope_result = prepare_scoped_gene_annotation(
+                annotation_file,
+                paths["scoped_annotation"],
+                paths["excluded_genes"],
+                paths["exclusion_summary"],
+                module,
+                analysis_scope,
+                logger,
+            )
+            source_annotation_file = annotation_file
+            annotation_file = paths["scoped_annotation"]
+            annotated_units = scope_result["retained_units"]
             annotation_fields = [
                 ("analysis", "Mapping method", definition.method),
                 ("genetic", "Annotated units", annotated_units),
+                (
+                    (
+                        "loss"
+                        if scope_result["excluded_by_reason"][
+                            module.exclusion_reporting.chromosome_reason
+                        ] else "success"
+                    ),
+                    "Units excluded by chromosome",
+                    scope_result["excluded_by_reason"][
+                        module.exclusion_reporting.chromosome_reason
+                    ],
+                ),
+                (
+                    (
+                        "loss"
+                        if scope_result["excluded_by_reason"][
+                            module.exclusion_reporting.mhc_reason
+                        ] else "success"
+                    ),
+                    "Units excluded from MHC",
+                    scope_result["excluded_by_reason"][
+                        module.exclusion_reporting.mhc_reason
+                    ],
+                ),
                 ("info", "Biological context", definition.context),
             ]
+            if pathway_location_preparation is not None:
+                annotation_fields.extend([
+                    (
+                        "success", "Pathway gene identifiers",
+                        "unchanged",
+                    ),
+                    (
+                        "genetic", "Gene-location identifier",
+                        "alternate ID from configured column %d"
+                        % (
+                            inputs.gene_location_columns.index(
+                                "alternate_gene_id"
+                            ) + 1
+                        ),
+                    ),
+                    (
+                        "count", "Derived gene-location rows",
+                        pathway_location_preparation["retained_rows"],
+                    ),
+                    (
+                        (
+                            "warning"
+                            if pathway_location_preparation[
+                                "ambiguous_alternate_ids"
+                            ] else "success"
+                        ),
+                        "Alternate IDs with multiple intervals",
+                        pathway_location_preparation[
+                            "ambiguous_alternate_ids"
+                        ],
+                    ),
+                ])
             if definition.method == "n_magma":
                 annotation_fields.extend(
                     [
@@ -1687,123 +2448,35 @@ def run_magma_analysis(
                 method=definition.method,
                 annotated_units=annotated_units,
                 validation=annotation_validation,
+                scope=scope_result,
             )
             step.output("gene_annotation", path=str(annotation_file))
+        if pipeline_progress is not None:
+            complete_pipeline_stage(
+                "gene_annotation",
+                outcome_fields=[
+                    ("genetic", "Annotated units", annotated_units),
+                    ("count", "Excluded units", scope_result["excluded_units"]),
+                ],
+            )
         step_number += 1
 
-        if gene_set_file is not None:
-            with logger.step(
-                step_number,
-                total_steps,
-                "%s · validate competitive gene sets" % definition.display_name,
-                "parse_gene_set_file",
-            ) as step:
-                parsed_gene_sets = parse_gene_set_file(
-                    gene_set_file,
-                    module,
-                    logger,
-                    input_format=definition.gene_set_format,
-                )
-                if definition.method in {"positional", "n_magma"}:
-                    parsed_gene_sets, reference_gene_ids, identifier_resolution = (
-                        resolve_gene_set_identifiers(
-                            location_reference,
-                            parsed_gene_sets,
-                            (
-                                definition.minimum_gene_id_overlap_fraction
-                                or module.gene_sets.minimum_gene_id_overlap_fraction
-                            ),
-                            module,
-                        )
-                    )
-                else:
-                    reference_gene_ids = _gene_ids_from_table(
-                        annotation_file,
-                        "%s gene annotation" % definition.display_name,
-                        module.input.table_delimiter_pattern,
-                        0,
-                        has_header=False,
-                        comment_prefix=module.annotation_validation.comment_prefix,
-                    )
-                    identifier_resolution = {
-                        "identifier_source": "annotation_gene_id",
-                        "translated_unique_ids": 0,
-                        "one_to_many_identifiers": 0,
-                    }
-                gene_id_validation = validate_gene_set_identifier_overlap(
-                    reference_gene_ids,
-                    parsed_gene_sets,
-                    (
-                        definition.minimum_gene_id_overlap_fraction
-                        or module.gene_sets.minimum_gene_id_overlap_fraction
-                    ),
-                    module.result_schema.report_input_genes_column,
-                )
-                gene_id_validation["identifier_resolution"] = identifier_resolution
-                prepared_gene_sets = write_native_gene_set_file(
-                    parsed_gene_sets, paths["prepared_gene_sets"], module,
-                )
-                logger.record(
-                    "RESULT",
-                    "gene_id_compatibility",
-                    mapping=name,
-                    reference_universe="complete_mapping_reference",
-                    **gene_id_validation,
-                )
-                step.set_rows(parsed_gene_sets.height)
-                step.outcome(
-                    "%s validated %s competitive gene sets against the complete "
-                    "mapping reference."
-                    % (definition.display_name, f"{parsed_gene_sets.height:,}"),
-                    fields=[
-                        (
-                            "genetic", "Reference genes",
-                            gene_id_validation["reference_unique_ids"],
-                        ),
-                        (
-                            "count", "Unique gene-set genes",
-                            gene_id_validation["geneset_unique_ids"],
-                        ),
-                        (
-                            "success", "Overlapping identifiers",
-                            "%s/%s (%.2f%%)"
-                            % (
-                                f"{gene_id_validation['overlapping_unique_ids']:,}",
-                                f"{gene_id_validation['comparison_unique_ids']:,}",
-                                gene_id_validation[
-                                    "overlap_fraction_of_smaller_universe"
-                                ] * 100,
-                            ),
-                        ),
-                        (
-                            "success", "Gene sets represented in reference",
-                            gene_id_validation[
-                                "gene_sets_with_at_least_one_reference_gene"
-                            ],
-                        ),
-                        (
-                            "info", "Gene-set identifier source",
-                            identifier_resolution["identifier_source"],
-                        ),
-                        (
-                            "count", "Alternate IDs translated",
-                            identifier_resolution["translated_unique_ids"],
-                        ),
-                        (
-                            "info", "One-to-many IDs expanded",
-                            identifier_resolution["one_to_many_identifiers"],
-                        ),
-                    ],
-                    mapping=name,
-                    reference_universe="complete_mapping_reference",
-                    **gene_id_validation,
-                )
-            step_number += 1
+        if gene_set_plan["status"] == "ready":
+            logger.record(
+                "RESULT",
+                "gene_id_compatibility",
+                mapping=name,
+                reference_universe="complete_mapping_reference",
+                pathway_file=str(gene_set_plan["pathway_file"]),
+                pathway_file_modified=False,
+                **gene_id_validation,
+            )
 
+        start_pipeline_stage("gene_analysis")
         with logger.step(
             step_number,
             total_steps,
-            "%s · calculate associations" % definition.display_name,
+            "%s · calculate gene-association statistics" % definition.display_name,
             "magma_gene_analysis",
         ) as step:
             genes, batches, workers = _run_gene_associations(
@@ -1829,15 +2502,24 @@ def run_magma_analysis(
                 batches=batches,
                 workers=workers,
             )
+        if pipeline_progress is not None:
+            complete_pipeline_stage(
+                "gene_analysis",
+                outcome_fields=[
+                    ("genetic", "Genes submitted", genes),
+                    ("analysis", "Parallel workers", workers),
+                ],
+            )
         step_number += 1
 
+        start_pipeline_stage("gene_results")
         with logger.step(
             step_number,
             total_steps,
             (
                 "%s · map regulatory-element results to genes"
                 if definition.method == "chrom_magma"
-                else "%s · correct p-values"
+                else "%s · annotate gene results and adjust p-values for multiple testing"
             )
             % definition.display_name,
             "correct_gene_p_values",
@@ -1848,6 +2530,7 @@ def run_magma_analysis(
                     paths["genes_out"],
                     "chromMAGMA regulatory-element output",
                     module.result_schema.table_delimiter_pattern,
+                    logger,
                     comment_prefix=_RESULT_COMMENT_PREFIX,
                 )
                 mapped = map_regulatory_elements_to_genes(
@@ -1867,6 +2550,7 @@ def run_magma_analysis(
                     "significance_not_reported": True,
                     "reason": definition.result_statistic_interpretation,
                 }
+                gene_significance = significance
                 step.set_rows(mapped.height)
                 step.outcome(
                     "%s mapped %s genes. The minimum linked element p-value is "
@@ -1886,7 +2570,14 @@ def run_magma_analysis(
                 step.output("mapped_gene_ranking", path=str(gene_result_path))
             else:
                 corrected_genes = correct_gene_p_values(
-                    paths["genes_out"], paths["corrected_genes"], module, logger,
+                    paths["genes_out"],
+                    paths["corrected_genes"],
+                    module,
+                    logger,
+                    gene_location_file=location_reference,
+                    gene_location_has_header=(
+                        False if pathway_location_preparation is not None else None
+                    ),
                 )
                 result_frame = corrected_genes
                 gene_result_path = paths["corrected_genes"]
@@ -1899,11 +2590,38 @@ def run_magma_analysis(
                     "gene",
                     "genes",
                 )
+                gene_significance = significance
+                if corrected_genes.height > genes:
+                    raise MagmaError(
+                        "MAGMA returned more gene results (%d) than annotated "
+                        "genes submitted (%d) for %s"
+                        % (corrected_genes.height, genes, definition.display_name)
+                    )
+                fields = [
+                    ("genetic", "Genes submitted to MAGMA", genes),
+                    *fields,
+                    (
+                        "warning", "Genes without a valid MAGMA result",
+                        genes - corrected_genes.height,
+                    ),
+                ]
                 step.set_rows(corrected_genes.height)
                 step.outcome(outcome, fields=fields, mapping=name, **significance)
                 step.output(
-                    "corrected_gene_associations", path=str(paths["corrected_genes"]),
+                    "annotated_gene_associations",
+                    path=str(paths["corrected_genes"]),
                 )
+        if pipeline_progress is not None:
+            complete_pipeline_stage(
+                "gene_results",
+                outcome_fields=[
+                    ("genetic", "Genes tested", gene_significance["tested"]),
+                    (
+                        "info", "Nominally significant",
+                        gene_significance.get("nominal_significant", "not applicable"),
+                    ),
+                ],
+            )
         step_number += 1
 
         if parsed_gene_sets is not None:
@@ -1944,7 +2662,16 @@ def run_magma_analysis(
             "mapping_method": definition.method,
             "display_name": definition.display_name,
             "biological_context": definition.context,
-            "gene_id_type": definition.gene_id_type,
+            "gene_id_type": (
+                inputs.alternate_gene_id_type
+                if pathway_location_preparation is not None
+                else definition.gene_id_type
+            ),
+            "effective_gene_id_source": (
+                ((gene_set_plan.get("validation") or {}).get(
+                    "identifier_resolution"
+                ) or {}).get("identifier_source", "mapping_definition")
+            ),
             "annotation_source": definition.source_name,
             "annotation_version": definition.source_version,
             "result_statistic_type": definition.result_statistic_type,
@@ -1952,10 +2679,31 @@ def run_magma_analysis(
                 definition.result_statistic_interpretation
             ),
             "gene_annotation": str(annotation_file),
+            "source_gene_annotation": str(source_annotation_file),
+            "gene_location_reference": (
+                str(location_reference) if location_reference is not None else None
+            ),
+            "pathway_compatible_gene_location": (
+                str(paths["pathway_compatible_gene_locations"])
+                if pathway_location_preparation is not None else None
+            ),
+            "gene_scope": scope_result,
+            "analysis_scope": {
+                **analysis_scope,
+                "mhc_region_label": (
+                    "%s:%s-%s"
+                    % (
+                        analysis_scope["mhc_region"]["chromosome"],
+                        analysis_scope["mhc_region"]["start"],
+                        analysis_scope["mhc_region"]["end"],
+                    )
+                    if analysis_scope["mhc_region"] is not None else None
+                ),
+            },
             "magma_genes_prefix": str(paths["gene_prefix"]),
             "magma_genes_raw": str(paths["genes_raw"]),
             "magma_genes_out": str(paths["genes_out"]),
-            "magma_genes_corrected": corrected_gene_path,
+            "magma_genes_annotated": corrected_gene_path,
             "magma_gene_results": str(gene_result_path),
             "chrom_magma_gene_report": chrom_gene_report,
             "corrected_gene_results": result_frame,
@@ -1965,22 +2713,40 @@ def run_magma_analysis(
                 "batches": batches,
                 "workers": workers,
             },
+            "gene_significance": gene_significance,
             "gene_id_validation": gene_id_validation,
             "tested_gene_coverage": tested_gene_coverage,
+            "gene_set_analysis": {
+                "status": gene_set_plan["status"],
+                "reason": gene_set_plan["reason"],
+            },
         }
 
-        if gene_set_file is not None:
+        if gene_set_plan["status"] == "ready":
+            start_pipeline_stage("pathway_analysis")
             with logger.step(
                 step_number,
                 total_steps,
-                "%s · test competitive gene sets" % definition.display_name,
+                "%s · run competitive pathway analysis with the original pathway file"
+                % definition.display_name,
                 "magma_gene_set_analysis",
             ) as step:
+                set_annotation_arguments = [
+                    "--set-annot", str(gene_set_plan["pathway_file"]),
+                ]
+                if gene_set_plan["input_metadata"]["detected_format"] == "membership":
+                    set_annotation_arguments.append(
+                        "col=%d,%d"
+                        % (
+                            module.gene_sets.membership_gene_column + 1,
+                            module.gene_sets.membership_set_column + 1,
+                        )
+                    )
                 _run_command(
                     [
                         executable,
                         "--gene-results", str(paths["genes_raw"]),
-                        "--set-annot", str(prepared_gene_sets),
+                        *set_annotation_arguments,
                         "--out", str(paths["gene_set_prefix"]),
                         "--seed", str(configuration.execution.random_seed),
                     ],
@@ -1992,7 +2758,8 @@ def run_magma_analysis(
                 )
                 step.set_rows(parsed_gene_sets.height)
                 step.outcome(
-                    "%s submitted %s validated gene sets using %s tested genes."
+                    "%s submitted the original pathway file containing %s gene "
+                    "sets using %s tested genes."
                     % (
                         definition.display_name,
                         f"{parsed_gene_sets.height:,}",
@@ -2000,7 +2767,15 @@ def run_magma_analysis(
                     ),
                     fields=[
                         (
-                            "count", "Validated gene sets submitted",
+                            "info", "Pathway file",
+                            Path(gene_set_plan["pathway_file"]).name,
+                        ),
+                        (
+                            "success", "Pathway file handling",
+                            "passed directly to MAGMA without modification",
+                        ),
+                        (
+                            "count", "Pathway records submitted",
                             parsed_gene_sets.height,
                         ),
                         (
@@ -2023,15 +2798,30 @@ def run_magma_analysis(
                         ),
                     ],
                     mapping=name,
+                    pathway_file=str(gene_set_plan["pathway_file"]),
+                    pathway_file_modified=False,
                     tested_gene_coverage=tested_gene_coverage,
+                )
+            if pipeline_progress is not None:
+                complete_pipeline_stage(
+                    "pathway_analysis",
+                    outcome_fields=[
+                        ("count", "Pathways submitted", parsed_gene_sets.height),
+                        (
+                            "genetic", "Study-tested genes",
+                            tested_gene_coverage["reference_unique_ids"],
+                        ),
+                    ],
                 )
             step_number += 1
 
+            start_pipeline_stage("pathway_results")
             with logger.step(
                 step_number,
                 total_steps,
-                "%s · correct gene-set p-values" % definition.display_name,
-                "correct_gene_set_p_values",
+                "%s · annotate pathway results and adjust pathway p-values"
+                % definition.display_name,
+                "annotate_and_correct_gene_set_results",
             ) as step:
                 corrected_sets = correct_gene_set_p_values(
                     paths["gene_sets_raw"], paths["corrected_gene_sets"], module, logger,
@@ -2043,17 +2833,30 @@ def run_magma_analysis(
                     module,
                     "gene set",
                     "gene sets",
+                    primary_method=module.multiple_testing.primary_method,
                 )
-                step.set_rows(corrected_sets.height)
-                step.outcome(outcome, fields=fields, mapping=name, **significance)
-            step_number += 1
-
-            with logger.step(
-                step_number,
-                total_steps,
-                "%s · annotate gene-set results" % definition.display_name,
-                "annotate_gene_set_results",
-            ) as step:
+                pathway_significance = significance
+                if corrected_sets.height > parsed_gene_sets.height:
+                    raise MagmaError(
+                        "MAGMA returned more pathway results (%d) than pathways "
+                        "submitted (%d) for %s"
+                        % (
+                            corrected_sets.height,
+                            parsed_gene_sets.height,
+                            definition.display_name,
+                        )
+                    )
+                fields = [
+                    (
+                        "count", "Pathways submitted to MAGMA",
+                        parsed_gene_sets.height,
+                    ),
+                    *fields,
+                    (
+                        "warning", "Pathways without a valid MAGMA result",
+                        parsed_gene_sets.height - corrected_sets.height,
+                    ),
+                ]
                 pathway = annotate_gene_set_results(
                     paths["genes_out"],
                     parsed_gene_sets,
@@ -2065,21 +2868,60 @@ def run_magma_analysis(
                 )
                 step.set_rows(corrected_sets.height)
                 step.outcome(
-                    "%s wrote %s annotated competitive gene-set results."
-                    % (definition.display_name, f"{corrected_sets.height:,}"),
+                    outcome,
                     fields=[
-                        ("success", "Tested gene-set results", corrected_sets.height),
+                        *fields,
+                        (
+                            "success", "Annotated pathway results",
+                            corrected_sets.height,
+                        ),
                     ],
                     mapping=name,
+                    **significance,
+                )
+            if pipeline_progress is not None:
+                complete_pipeline_stage(
+                    "pathway_results",
+                    outcome_fields=[
+                        ("count", "Pathways tested", pathway_significance["tested"]),
+                        (
+                            "success", "Primary-adjusted significant",
+                            pathway_significance["primary_significant"],
+                        ),
+                    ],
                 )
             step_number += 1
             analysis_result.update(
                 {
-                    "prepared_gene_sets": str(prepared_gene_sets),
+                    "pathway_file": str(gene_set_plan["pathway_file"]),
                     "magma_gene_sets_raw": str(paths["gene_sets_raw"]),
                     "magma_gene_sets_corrected": str(paths["corrected_gene_sets"]),
                     "magma_pathway": pathway,
+                    "pathway_significance": pathway_significance,
+                    "gene_set_analysis": {
+                        "status": "completed",
+                        "reason": None,
+                    },
                 }
+            )
+        elif (
+            pipeline_progress is not None
+            and "pathway_analysis" in active_pipeline_stages
+        ):
+            start_pipeline_stage("pathway_analysis")
+            complete_pipeline_stage(
+                "pathway_analysis",
+                outcome=(
+                    "Pathway analysis was not requested or gene identifiers "
+                    "were incompatible"
+                ),
+            )
+            start_pipeline_stage("pathway_results")
+            complete_pipeline_stage(
+                "pathway_results",
+                outcome=(
+                    "No pathway result required annotation or p-value adjustment"
+                ),
             )
         analyses[name] = analysis_result
 
@@ -2091,6 +2933,7 @@ def run_magma_analysis(
         "magma_version": version,
         "magma_executable": executable,
         "variant_preparation": variant_preparation,
+        "analysis_scope": analysis_scope,
         "mapping_analyses": {
             name: {
                 key: value
@@ -2108,10 +2951,11 @@ def run_magma_analysis(
         "magma_gene_annotation": primary["gene_annotation"],
         "gene_id_validation": primary["gene_id_validation"],
         "tested_gene_coverage": primary["tested_gene_coverage"],
+        "gene_set_analysis": primary["gene_set_analysis"],
         "batching": primary["batching"],
     }
-    if primary["magma_genes_corrected"] is not None:
-        result["magma_genes_corrected"] = primary["magma_genes_corrected"]
+    if primary["magma_genes_annotated"] is not None:
+        result["magma_genes_annotated"] = primary["magma_genes_annotated"]
     if primary["chrom_magma_gene_report"] is not None:
         result["chrom_magma_gene_report"] = primary["chrom_magma_gene_report"]
     for key in (
@@ -2124,14 +2968,18 @@ def run_magma_analysis(
 
 __all__ = [
     "MagmaPreflight",
+    "MagmaReferencePreflight",
     "annotate_gene_set_results",
     "correct_gene_p_values",
     "correct_gene_set_p_values",
     "prepare_magma_variant_inputs",
     "parse_gene_set_file",
     "preflight_magma_analysis",
+    "preflight_magma_references",
     "require_supported_magma",
     "resolve_gene_set_identifiers",
     "resolve_magma_output_paths",
     "run_magma_analysis",
+    "validate_magma_gene_set_references",
+    "validate_magma_ld_reference_and_runtime",
 ]

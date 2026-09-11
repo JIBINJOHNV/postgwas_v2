@@ -9,12 +9,14 @@ executables:
   scdrs: scdrs
   ldsc: ldsc.py
   munge_sumstats: munge_sumstats.py
+  bgenix: bgenix
+  ldstore: ldstore
   finemap: finemap
   gcta: gcta64
   rscript: Rscript
   python: python
-  mixer: /tools/mixer/precimed/mixer.py
-  mixer_figures: /tools/mixer/precimed/mixer_figures.py
+  mixer: mixer.py
+  mixer_figures: mixer_figures.py
   pigz: pigz
 containers:
   mixer:
@@ -26,8 +28,12 @@ containers:
     mixer_figures: /tools/mixer/precimed/mixer_figures.py
     use_host_user: true
 genomes:
-  GRCh37: {}
-  GRCh38: {}
+  GRCh37:
+    regions:
+      mhc: {chromosome: '6', start: 28477797, end: 33448354}
+  GRCh38:
+    regions:
+      mhc: {chromosome: '6', start: 28510120, end: 33480577}
 populations:
   EUR: {}
   AFR: {}

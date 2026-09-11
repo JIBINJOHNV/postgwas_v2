@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from postgwas.core.gene_property_validation import validate_magma_covariate_table
 from postgwas.core.io.reports import write_delimited_report
 from postgwas.core.statistics import adjust_p_values
 from postgwas.modules.magmacovar.main import (
     read_magma_covariate_results,
-    validate_magma_covariate_table,
 )
+from postgwas.modules.magmacovar.errors import MagmaCovarError
 from postgwas.modules.single_cell.errors import SingleCellError
 
 
@@ -48,6 +49,7 @@ def validate_magma_celltype_covariates(
             magmacovar_config.input.maximum_missing_fraction
         ),
         missing_genes=magmacovar_config.input.missing_genes,
+        error_type=MagmaCovarError,
     )
     properties = list(summary["property_names"])
     if average_property not in properties:

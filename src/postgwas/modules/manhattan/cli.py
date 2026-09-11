@@ -26,6 +26,11 @@ from postgwas.modules.manhattan.service import run_assoc_plot_direct
 # MAIN CLI - DIRECT MODE ONLY
 # =========================================================
 def build_parser() -> argparse.ArgumentParser:
+    genome_parser = get_genome_build_parser(suppress_default=True, display_default=False)
+    genome_parser._option_string_actions["--genome-build"].help = (
+        "Optional assertion of the build declared by the VCF header. "
+        "If omitted, the validated VCF declaration supplies the build."
+    )
     return argparse.ArgumentParser(
         prog="postgwas manhattan",
         usage="postgwas manhattan --vcf PATH [--png PATH | --pdf PATH] [options]",
@@ -47,14 +52,30 @@ def build_parser() -> argparse.ArgumentParser:
             (
                 "Highlight consequence annotations:",
                 "postgwas manhattan",
-                ("--vcf study_annotated.vcf.gz", "--png STUDY_csq.png", "--csq"),
+                (
+                    "--vcf study_annotated.vcf.gz", "--png STUDY_csq.png", "--csq",
+                    "--dataset-id STUDY", "--output-directory results",
+                ),
+            ),
+            (
+                "Plot two-count INFO/AS allelic-shift associations:",
+                "postgwas manhattan",
+                (
+                    "--vcf study_allelic_counts.vcf.gz", "--pdf STUDY_as.pdf",
+                    "--allelic-shift", "--dataset-id STUDY", "--output-directory results",
+                ),
+            ),
+            (
+                "Export reusable Manhattan settings:",
+                "postgwas config export",
+                ("--module manhattan", "--style full", "--output manhattan.yaml"),
             ),
         ),
         formatter_class=AlignedRichHelpFormatter,
         parents=[
             get_compute_parser(),
             get_inputvcf_parser(),
-            get_genome_build_parser(),
+            genome_parser,
             get_common_out_parser(),
             get_assoc_plot_parser(),
         ],
@@ -76,5 +97,3 @@ if __name__ == "__main__":
 
 
 __all__ = ["build_parser", "main"]
-
-

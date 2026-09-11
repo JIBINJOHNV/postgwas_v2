@@ -179,6 +179,8 @@ class SampleSheetGeneratorConfig(StrictModel):
     trait_type: Literal["auto"]
     effect_type: Literal["auto"]
     p_value_type: Literal["auto"]
+    failure_policy: Literal["write_valid", "fail_all"]
+    rejection_report_suffix: str
     on_missing_sample_size: Literal["write_draft", "fail"]
     effect_frequency_prefixes: list[str]
     alternative_frequency: SampleSheetAlternativeFrequencyAliases
@@ -193,6 +195,23 @@ class SampleSheetGeneratorConfig(StrictModel):
         if len(cleaned) != len(set(cleaned)):
             raise ValueError("supported_suffixes must be unique")
         return cleaned
+
+    @field_validator("rejection_report_suffix")
+    @classmethod
+    def safe_rejection_report_suffix(cls, value: str) -> str:
+        value = value.strip()
+        if (
+            not value.startswith(".")
+            or not value.lower().endswith(".tsv")
+            or "/" in value
+            or "\\" in value
+            or value in {".", ".."}
+        ):
+            raise ValueError(
+                "rejection_report_suffix must be a dot-prefixed .tsv filename "
+                "suffix without path separators"
+            )
+        return value
 
     @field_validator("effect_frequency_prefixes")
     @classmethod
@@ -279,22 +298,25 @@ class HarmonisationOutputLayout(RootModel[dict[str, str]]):
             "adapter_log_directory", "chromosome_table", "chromosome_source_snapshot",
             "chromosome_log",
             "chromosome_reject", "input_reject", "duplicates", "adapter_input",
+            "post_orientation_duplicates",
             "adapter_mapping", "adapter_summary", "adapter_transcript",
             "adapter_output_vcf",
-            "bcftools_transcript", "chromosome_raw_vcf", "chromosome_original_vcf",
+            "bcftools_transcript", "chromosome_raw_vcf",
             "chromosome_normalized_vcf", "chromosome_id_vcf",
             "chromosome_frequency_vcf", "chromosome_annotated_vcf",
             "chromosome_lifted_vcf", "chromosome_not_lifted_vcf",
             "sort_temp_directory", "merged_build_vcf", "merged_raw_vcf",
             "merged_not_lifted_vcf", "dataset_reject", "reject_summary",
-            "run_manifest", "qc_summary", "gwas2vcf_summary", "dataset_log",
+            "run_manifest", "field_completeness", "qc_summary",
+            "gwas2vcf_summary", "dataset_log",
             "population_frequency_qc", "population_frequency_temporary",
-            "screen_report",
+            "screen_report", "html_report",
             "combined_log", "concordance_log", "concordance_summary",
             "concordance_mismatches", "concordance_input_only",
             "concordance_vcf_only", "concordance_vcf_duplicates",
             "concordance_position_matches", "concordance_all_matches",
             "missing_eaf", "out_of_range_eaf",
+            "external_eaf_partition", "external_info_partition",
             "concordance_temporary",
             "adapter_merged_mapping", "adapter_input_archive",
         }
@@ -305,6 +327,30 @@ class HarmonisationOutputLayout(RootModel[dict[str, str]]):
             )
         if any(not key.strip() or not value.strip() for key, value in self.root.items()):
             raise ValueError("output_layout keys and patterns must not be empty")
+        for key in (
+            "chromosome_table", "chromosome_source_snapshot",
+            "external_eaf_partition", "external_info_partition",
+        ):
+            pattern = self.root[key]
+            if (
+                "{dataset_id}" not in pattern
+                or "{chromosome}" not in pattern
+                or not pattern.lower().endswith(".parquet")
+            ):
+                raise ValueError(
+                    "%s must contain {dataset_id} and {chromosome} and end "
+                    "with .parquet" % key
+                )
+        duplicate_pattern = self.root["post_orientation_duplicates"]
+        if (
+            "{dataset_id}" not in duplicate_pattern
+            or "{chromosome}" not in duplicate_pattern
+            or not duplicate_pattern.lower().endswith(".tsv")
+        ):
+            raise ValueError(
+                "post_orientation_duplicates must contain {dataset_id} and "
+                "{chromosome} and end with .tsv"
+            )
         return self
 
 
@@ -330,6 +376,13 @@ class Gwas2VcfInputConfig(StrictModel):
             raise ValueError("must contain unique non-empty values")
         return cleaned
 
+    @field_validator("delimiter")
+    @classmethod
+    def single_character_delimiter(cls, value: str) -> str:
+        if len(value) != 1:
+            raise ValueError("delimiter must be exactly one character")
+        return value
+
     @model_validator(mode="after")
     def consistent_mapping(self):
         overlap = set(self.required_column_keys) & set(self.optional_column_keys)
@@ -344,9 +397,125 @@ class Gwas2VcfInputConfig(StrictModel):
             raise ValueError(
                 "renamed_keys contains unknown column keys: %s" % ", ".join(unknown)
             )
-        if not self.delimiter:
-            raise ValueError("delimiter must not be empty")
         return self
+
+
+class HarmonisationLiftoverTagRoles(StrictModel):
+    """Allele-dependent VCF fields that the liftover plugin must harmonise."""
+
+    allele_frequency: list[str]
+    signed_effect: list[str]
+
+    @field_validator("allele_frequency", "signed_effect")
+    @classmethod
+    def qualified_unique_fields(cls, values: list[str]) -> list[str]:
+        cleaned = [str(value).strip() for value in values]
+        pattern = r"^(?:INFO|FORMAT)/[A-Za-z][A-Za-z0-9_.-]*$"
+        if (
+            not cleaned
+            or len(cleaned) != len(set(cleaned))
+            or any(not re.fullmatch(pattern, value) for value in cleaned)
+        ):
+            raise ValueError(
+                "must contain unique INFO/TAG or FORMAT/TAG fields"
+            )
+        return cleaned
+
+    @model_validator(mode="after")
+    def roles_are_distinct(self):
+        overlap = set(self.allele_frequency) & set(self.signed_effect)
+        if overlap:
+            raise ValueError(
+                "allele-frequency and signed-effect roles overlap: %s"
+                % ", ".join(sorted(overlap))
+            )
+        if any(not field.startswith("FORMAT/") for field in self.signed_effect):
+            raise ValueError("signed-effect fields must use FORMAT/TAG")
+        return self
+
+
+class HarmonisationVcfProvenanceConfig(StrictModel):
+    """Names and formatting for PostGWAS scientific VCF metadata."""
+
+    missing_value: str
+    path_separator: str
+    headers: dict[str, str]
+    output_fields: dict[str, str]
+
+    @field_validator("missing_value", "path_separator")
+    @classmethod
+    def nonempty_text(cls, value: str) -> str:
+        if not value or "\n" in value or "\r" in value:
+            raise ValueError("must be non-empty single-line text")
+        return value
+
+    @field_validator("headers")
+    @classmethod
+    def complete_header_names(cls, values: dict[str, str]) -> dict[str, str]:
+        required = {
+            "postgwas_version", "dataset_id", "input_file",
+            "resource_directory", "output_directory",
+            "dataset_output_directory", "run_manifest",
+            "vcf_created_at", "vcf_status", "input_genome_build",
+            "output_genome_build", "liftover", "resolved_resource_files",
+            "source_fasta_files", "target_fasta_files",
+            "liftover_chain_files", "annotation_files",
+            "dbsnp_reference_files", "strand_consensus",
+            "strand_reference_column", "strand_reference_files", "af_source",
+            "af_input_column", "af_input_type", "af_type_decision",
+            "af_reference_template", "af_reference_files",
+            "af_harmonisation", "af_swapped_formula", "af_output_field",
+            "info_source", "info_input_column", "info_reference_template",
+            "info_reference_files", "info_fixed_value", "info_matching",
+            "info_swapped_action", "info_interpretation", "info_output_field",
+            "effect_input_column", "effect_input_type",
+            "effect_type_decision", "effect_source", "effect_harmonisation",
+            "effect_formula", "effect_orientation", "effect_output_field",
+            "effect_output_scale", "se_input_column", "se_source",
+            "se_input_scale", "se_scale_decision", "se_harmonisation",
+            "se_formula", "se_output_field", "z_input_column", "z_source",
+            "z_harmonisation", "z_formula", "z_output_field",
+            "pvalue_input_column", "pvalue_input_scale",
+            "pvalue_scale_decision", "pvalue_harmonisation",
+            "pvalue_harmonisation_formula", "pvalue_vcf_export",
+            "pvalue_vcf_formula", "pvalue_output_field", "trait_type",
+            "case_count_column", "case_count_value", "control_count_column",
+            "control_count_value", "sample_size_source", "sample_size_formula",
+            "sample_size_output_field", "population_af_reference_files",
+            "population_af_fields",
+        }
+        if set(values) != required:
+            missing = sorted(required - set(values))
+            extra = sorted(set(values) - required)
+            raise ValueError(
+                "headers must define the complete PostGWAS provenance contract; "
+                "missing=%s; unexpected=%s"
+                % (missing or "none", extra or "none")
+            )
+        names = [str(value).strip() for value in values.values()]
+        if (
+            any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", name) for name in names)
+            or len(names) != len(set(names))
+        ):
+            raise ValueError(
+                "header names must be unique VCF metadata identifiers"
+            )
+        return dict(zip(values, names))
+
+    @field_validator("output_fields")
+    @classmethod
+    def complete_output_fields(cls, values: dict[str, str]) -> dict[str, str]:
+        required = {"af", "info", "effect", "se", "z", "pvalue", "sample_size"}
+        if set(values) != required:
+            raise ValueError(
+                "output_fields must define exactly: %s"
+                % ", ".join(sorted(required))
+            )
+        pattern = r"^(?:INFO|FORMAT)/[A-Za-z][A-Za-z0-9_.-]*$"
+        cleaned = {key: str(value).strip() for key, value in values.items()}
+        if any(not re.fullmatch(pattern, value) for value in cleaned.values()):
+            raise ValueError("output_fields must use INFO/TAG or FORMAT/TAG")
+        return cleaned
 
 
 class HarmonisationVcfConfig(StrictModel):
@@ -358,6 +527,8 @@ class HarmonisationVcfConfig(StrictModel):
     target_builds: dict[str, str]
     required_merge_groups: list[str]
     liftover_plugin: str
+    liftover_tag_roles: HarmonisationLiftoverTagRoles
+    provenance: HarmonisationVcfProvenanceConfig
     concordance_fields: dict[str, str]
     table_delimiter: str
     table_null_values: list[str]
@@ -484,6 +655,11 @@ class PopulationFrequencyQCConfig(StrictModel):
     minimum_comparable_variants: int = Field(ge=2)
     minimum_correlation: float = Field(ge=-1, le=1)
     minimum_correlation_gap: float = Field(ge=0, le=2)
+    inversion_minimum_absolute_correlation: float = Field(ge=0, le=1)
+    inversion_maximum_mean_absolute_difference: float = Field(ge=0, le=1)
+    inversion_minimum_mean_absolute_difference_improvement: float = Field(
+        ge=0, le=1
+    )
     require_mae_agreement: bool
     warn_on_filename_mismatch: bool
     on_error: Literal["warn", "fail"]
@@ -526,13 +702,14 @@ class HarmonisationRuntimeConfig(StrictModel):
     top_metadata_directory: str
     resolved_config_file: str
     run_summary_file: str
+    run_html_report: str
     sample_sheet_row_file: str
     command_file: str
     supplied_config_file: str
 
     @field_validator(
         "metadata_directory", "top_metadata_directory", "resolved_config_file",
-        "run_summary_file",
+        "run_summary_file", "run_html_report",
         "sample_sheet_row_file", "command_file", "supplied_config_file",
     )
     @classmethod
@@ -540,6 +717,47 @@ class HarmonisationRuntimeConfig(StrictModel):
         value = value.strip()
         if not value or value.startswith(("/", "~")) or ".." in value.split("/"):
             raise ValueError("must be a non-empty relative path")
+        return value
+
+
+class ExternalReferenceStagingConfig(StrictModel):
+    """Bounded I/O used for user tables shared by chromosome workers."""
+
+    batch_rows: int = Field(ge=1)
+    compression: Literal[
+        "none", "snappy", "gzip", "brotli", "lz4", "zstd",
+    ]
+    compressed_suffixes: list[str]
+    atomic_output_suffix: str
+
+    @field_validator("compressed_suffixes")
+    @classmethod
+    def valid_compressed_suffixes(cls, values: list[str]) -> list[str]:
+        cleaned = [str(value).strip().lower() for value in values]
+        if (
+            not cleaned
+            or any(not value.startswith(".") for value in cleaned)
+            or len(cleaned) != len(set(cleaned))
+        ):
+            raise ValueError(
+                "must contain unique, non-empty dot-prefixed suffixes"
+            )
+        return cleaned
+
+    @field_validator("atomic_output_suffix")
+    @classmethod
+    def safe_atomic_output_suffix(cls, value: str) -> str:
+        value = value.strip()
+        if (
+            not value
+            or not value.startswith(".")
+            or "/" in value
+            or "\\" in value
+            or value in {".", ".."}
+        ):
+            raise ValueError(
+                "must be a dot-prefixed filename suffix without path separators"
+            )
         return value
 
 
@@ -556,6 +774,10 @@ class ConcordanceFailureConfig(StrictModel):
 
 class ConcordanceValidationConfig(StrictModel):
     enabled: bool
+    staging_batch_rows: int = Field(ge=1)
+    staging_compression: Literal[
+        "none", "snappy", "gzip", "brotli", "lz4", "zstd",
+    ]
     allow_strand_complement: bool
     palindromic_action: Literal[
         "exclude", "compare_resolved", "compare_as_listed",
@@ -585,5 +807,6 @@ class HarmonisationConfig(ModuleConfig):
     vcf_processing: HarmonisationVcfConfig
     population_frequency_qc: PopulationFrequencyQCConfig
     runtime: HarmonisationRuntimeConfig
+    external_reference_staging: ExternalReferenceStagingConfig
     concordance_validation: ConcordanceValidationConfig
     policies: dict[str, Any]

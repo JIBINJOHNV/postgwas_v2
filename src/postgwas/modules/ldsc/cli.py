@@ -9,12 +9,13 @@ import argparse
 import sys
 
 from pydantic import ValidationError
-from rich.console import Console
-from rich.markup import escape
 
 from postgwas.cli.compute import get_compute_parser
+from postgwas.config import load_configuration
 from postgwas.core.errors import ConfigurationError
-from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples
+from postgwas.core.ui import (
+    AlignedRichHelpFormatter, format_cli_examples, print_screen_message,
+)
 
 # =========================================================
 # BACKEND RUNNERS
@@ -40,7 +41,7 @@ def get_ldsc_parser(add_help: bool = False) -> argparse.ArgumentParser:
     Defines input arguments for LDSC direct execution.
     """
     parser = argparse.ArgumentParser(add_help=add_help)
-    grp = parser.add_argument_group("Formatted summary statistics")
+    grp = parser.add_argument_group("LDSC input")
 
     grp.add_argument(
         "--ldsc-input",
@@ -51,7 +52,10 @@ def get_ldsc_parser(add_help: bool = False) -> argparse.ArgumentParser:
             must_be_file=True,
             must_not_be_empty=True,
         ),
-        help="REQUIRED. LDSC input TSV created by the PostGWAS formatter.",
+        help=(
+            "Formatter-created summary-statistics table consumed by direct "
+            "LDSC analysis."
+        ),
     )
 
     controls = parser.add_argument_group("Configuration")
@@ -72,15 +76,42 @@ def get_ldsc_parser(add_help: bool = False) -> argparse.ArgumentParser:
 # MAIN CLI
 # =========================================================
 def build_parser() -> argparse.ArgumentParser:
+    defaults = load_configuration()
+    ldsc_export = defaults.modules.formatting.exports["ldsc"]
+    if ldsc_export.output_file is None:
+        raise ConfigurationError(
+            "modules.formatting.exports.ldsc.output_file must be configured"
+        )
+    ldsc_input_name = ldsc_export.output_file.format(dataset_id="STUDY")
     parser = argparse.ArgumentParser(
         prog="postgwas heritability",
-        description="Estimate single-trait SNP heritability from formatter-created LDSC input.",
+        usage=(
+            "postgwas heritability --ldsc-input PATH --merge-alleles PATH "
+            "--ref-ld-chr PATH --w-ld-chr PATH --dataset-id NAME "
+            "--output-directory PATH [options]"
+        ),
+        description=(
+            "Run single-trait LDSC to estimate observed-scale SNP heritability "
+            "and, when prevalence values are available, liability-scale "
+            "heritability."
+        ),
         epilog=format_cli_examples(
             (
-                "Estimate observed-scale SNP heritability:",
+                "Create the LDSC input first:",
+                "postgwas formatter",
+                (
+                    "--vcf study.vcf.gz",
+                    "--format ldsc",
+                    "--merge-alleles reference/w_hm3.snplist",
+                    "--dataset-id STUDY",
+                    "--output-directory formatted",
+                ),
+            ),
+            (
+                "Run observed-scale LDSC heritability:",
                 "postgwas heritability",
                 (
-                    "--ldsc-input formatted/STUDY_ldsc.tsv.gz",
+                    "--ldsc-input formatted/%s" % ldsc_input_name,
                     "--merge-alleles reference/w_hm3.snplist",
                     "--ref-ld-chr reference/eur_w_ld_chr",
                     "--w-ld-chr reference/eur_w_ld_chr",
@@ -89,15 +120,33 @@ def build_parser() -> argparse.ArgumentParser:
                 ),
             ),
             (
-                "Add prevalence values for liability-scale reporting:",
+                "Run observed- and liability-scale LDSC heritability:",
                 "postgwas heritability",
                 (
-                    "--ldsc-input formatted/STUDY_ldsc.tsv.gz",
+                    "--ldsc-input formatted/%s" % ldsc_input_name,
                     "--merge-alleles reference/w_hm3.snplist",
                     "--ref-ld-chr reference/eur_w_ld_chr",
                     "--w-ld-chr reference/eur_w_ld_chr",
                     "--samp-prev 0.2",
                     "--pop-prev 0.01",
+                    "--dataset-id STUDY",
+                    "--output-directory results",
+                ),
+            ),
+            (
+                "Export reusable LDSC settings:",
+                "postgwas config export",
+                ("--module ldsc", "--style full", "--output ldsc.yaml"),
+            ),
+            (
+                "Run with exported LDSC settings and explicit input resources:",
+                "postgwas heritability",
+                (
+                    "--run-config ldsc.yaml",
+                    "--ldsc-input formatted/%s" % ldsc_input_name,
+                    "--merge-alleles reference/w_hm3.snplist",
+                    "--ref-ld-chr reference/eur_w_ld_chr",
+                    "--w-ld-chr reference/eur_w_ld_chr",
                     "--dataset-id STUDY",
                     "--output-directory results",
                 ),
@@ -126,6 +175,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def get_ldsc_pipeline_examples():
+    """Return complete LDSC examples for context-sensitive pipeline help."""
+    required = (
+        "--modules heritability",
+        "--vcf study.vcf.gz",
+        "--merge-alleles reference/w_hm3.snplist",
+        "--ref-ld-chr reference/eur_w_ld_chr",
+        "--w-ld-chr reference/eur_w_ld_chr",
+        "--dataset-id STUDY",
+        "--output-directory results",
+    )
+    return (
+        (
+            "Run observed-scale LDSC heritability from a GWAS-VCF:",
+            "postgwas pipeline",
+            required,
+        ),
+        (
+            "Add liability-scale heritability using the GWAS-VCF case fraction:",
+            "postgwas pipeline",
+            required + ("--pop-prev 0.01",),
+        ),
+        (
+            "Override the GWAS-VCF case fraction for liability-scale heritability:",
+            "postgwas pipeline",
+            required + ("--samp-prev 0.2", "--pop-prev 0.01"),
+        ),
+    )
+
+
 def main(argv=None) -> int:
     parser = build_parser()
 
@@ -145,11 +224,10 @@ def main(argv=None) -> int:
     try:
         run_ldsc_direct(args)
     except (LDSCError, ConfigurationError, OSError, ValidationError) as exc:
-        Console(stderr=True).print(
-            "\n[bold red]LDSC heritability stopped.[/bold red]\n"
-            "[bold]Reason:[/bold] %s\n"
-            "[bold]No new LDSC results were published.[/bold]\n"
-            % escape(str(exc))
+        print_screen_message(
+            "error", "LDSC heritability stopped.\n"
+            "Reason: %s\nNo new LDSC results were published." % exc,
+            stderr=True,
         )
         return 1
     return 0
@@ -159,4 +237,6 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["build_parser", "get_ldsc_parser", "main"]
+__all__ = [
+    "build_parser", "get_ldsc_parser", "get_ldsc_pipeline_examples", "main",
+]

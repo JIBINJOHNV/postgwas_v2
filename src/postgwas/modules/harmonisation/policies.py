@@ -38,6 +38,8 @@ Python 3.8 compatible.
 import copy
 import dataclasses
 import difflib
+import json
+import math
 import os
 import re
 import types
@@ -728,6 +730,53 @@ def load_registry(path=None):
     lifecycle = document.get("field_lifecycle") or {}
     if not isinstance(lifecycle, dict):
         raise RegistryError("%s: 'field_lifecycle' must be a mapping." % location)
+    if not lifecycle:
+        raise RegistryError("%s: 'field_lifecycle' must not be empty." % location)
+    for field, specification in lifecycle.items():
+        if not isinstance(specification, dict):
+            raise RegistryError(
+                "%s: field_lifecycle.%s must be a mapping."
+                % (location, field)
+            )
+        unknown_lifecycle_keys = sorted(
+            set(specification)
+            - {"at_read", "at_export", "recovered", "note"}
+        )
+        if unknown_lifecycle_keys:
+            raise RegistryError(
+                "%s: field_lifecycle.%s has unknown keys: %s."
+                % (location, field, ", ".join(unknown_lifecycle_keys))
+            )
+        missing_lifecycle_keys = sorted(
+            {"at_read", "at_export", "recovered", "note"}
+            - set(specification)
+        )
+        if missing_lifecycle_keys:
+            raise RegistryError(
+                "%s: field_lifecycle.%s is missing %s."
+                % (location, field, ", ".join(missing_lifecycle_keys))
+            )
+        if specification["at_read"] not in (True, False, "alternative"):
+            raise RegistryError(
+                "%s: field_lifecycle.%s.at_read must be true, false, or "
+                "'alternative'." % (location, field)
+            )
+        if not isinstance(specification["at_export"], bool):
+            raise RegistryError(
+                "%s: field_lifecycle.%s.at_export must be true or false."
+                % (location, field)
+            )
+        recovered = specification["recovered"]
+        if recovered is not None and not str(recovered).strip():
+            raise RegistryError(
+                "%s: field_lifecycle.%s.recovered must be text or null."
+                % (location, field)
+            )
+        if not str(specification["note"]).strip():
+            raise RegistryError(
+                "%s: field_lifecycle.%s.note must not be empty."
+                % (location, field)
+            )
     FIELD_LIFECYCLE = lifecycle
 
     groups = document.get("required_inputs") or {}
@@ -1201,6 +1250,19 @@ def _cross_check(values):
     """Relationships between settings that a single validator cannot see."""
     problems = []
 
+    for key, value in values.items():
+        if key.startswith("execution.") and isinstance(value, (int, float)):
+            if not math.isfinite(value):
+                problems.append(PolicyProblem(key, value, "must be finite"))
+    if values.get("execution.scheduling_mode") == "adaptive":
+        low = values.get("execution.min_threads_per_chromosome")
+        high = values.get("execution.threads_per_chromosome")
+        if low is not None and high is not None and low > high:
+            problems.append(PolicyProblem(
+                "execution.min_threads_per_chromosome", low,
+                "must not exceed execution.threads_per_chromosome (%s)" % high,
+            ))
+
     def pair(low_key, high_key, what):
         low, high = values.get(low_key), values.get(high_key)
         if low is None or high is None:
@@ -1216,22 +1278,94 @@ def _cross_check(values):
 
     pair("pvalue.clip_low", "pvalue.clip_high", "p-value")
     pair("info.clip_min", "info.clip_max", "imputation quality")
+    pair(
+        "info.clip_tolerance", "info.mach_rsq_max",
+        "standard INFO versus MaCH Rsq",
+    )
     pair("input.delimiter_min_columns", "input.delimiter_max_columns", "column count")
+    pair(
+        "strand.palindromic_af_ambiguity_lower",
+        "strand.palindromic_af_ambiguity_upper",
+        "palindromic allele-frequency ambiguity",
+    )
 
-    mlogp_max = values.get("pvalue.mlogp_max")
-    if mlogp_max is not None and mlogp_max <= values.get("pvalue.mlogp_min", 0.0):
+    info_ceiling = values.get("info.clip_max")
+    info_tolerance = values.get("info.clip_tolerance")
+    if (
+        info_ceiling is not None
+        and info_tolerance is not None
+        and info_tolerance < info_ceiling
+    ):
         problems.append(
             PolicyProblem(
-                "pvalue.mlogp_max", mlogp_max,
-                "must be larger than pvalue.mlogp_min (%s), or null to turn the cap off"
-                % format_value(values.get("pvalue.mlogp_min")),
+                "info.clip_tolerance",
+                info_tolerance,
+                "must be at least info.clip_max (%s), otherwise the configured "
+                "standard-INFO rounding band is inverted"
+                % format_value(info_ceiling),
             )
         )
 
-    tolerance = values.get("eaf.clip_tolerance")
-    if tolerance is not None and values.get("eaf.out_of_range") == "fail" and tolerance > 1.0:
-        # Not an error, just impossible to reach; leave it alone.
-        pass
+    ambiguity_lower = values.get("strand.palindromic_af_ambiguity_lower")
+    ambiguity_upper = values.get("strand.palindromic_af_ambiguity_upper")
+    if ambiguity_lower is not None and ambiguity_lower >= 0.5:
+        problems.append(
+            PolicyProblem(
+                "strand.palindromic_af_ambiguity_lower",
+                ambiguity_lower,
+                "must be below the allele-frequency midpoint 0.5",
+            )
+        )
+    if ambiguity_upper is not None and ambiguity_upper <= 0.5:
+        problems.append(
+            PolicyProblem(
+                "strand.palindromic_af_ambiguity_upper",
+                ambiguity_upper,
+                "must be above the allele-frequency midpoint 0.5",
+            )
+        )
+    if ambiguity_upper is not None and ambiguity_upper >= 1.0:
+        problems.append(
+            PolicyProblem(
+                "strand.palindromic_af_ambiguity_upper",
+                ambiguity_upper,
+                "must be below the probability upper bound 1.0",
+            )
+        )
+
+    expected_median = values.get("pvalue.mlogp_expected_median")
+    median_tolerance = values.get("pvalue.mlogp_median_tolerance")
+    if (
+        expected_median is not None
+        and median_tolerance is not None
+        and median_tolerance >= expected_median
+    ):
+        problems.append(
+            PolicyProblem(
+                "pvalue.mlogp_median_tolerance",
+                median_tolerance,
+                "must be smaller than pvalue.mlogp_expected_median (%s), so the "
+                "automatic -log10 median acceptance interval remains positive"
+                % format_value(expected_median),
+            )
+        )
+
+    detection_threshold = values.get("pvalue.mlogp_detect_threshold")
+    raw_tolerance = values.get("pvalue.tolerance_above_one")
+    if (
+        detection_threshold is not None
+        and raw_tolerance is not None
+        and detection_threshold < raw_tolerance
+    ):
+        problems.append(
+            PolicyProblem(
+                "pvalue.mlogp_detect_threshold",
+                detection_threshold,
+                "must not be below pvalue.tolerance_above_one (%s), otherwise values "
+                "accepted as raw-p rounding error also count as -log10 evidence"
+                % format_value(raw_tolerance),
+            )
+        )
 
     warn = values.get("validation.warn_reject_fraction")
     hard = values.get("validation.max_reject_fraction")
@@ -1357,7 +1491,9 @@ def _short_gloss(pol, key, width=58):
         choices = " | ".join(str(m) for m in members)
         if len(choices) <= width:
             return choices
-    text = str(pol.help(key) or "").strip()
+    text = " ".join(str(pol.help(key) or "").split())
+    if text.startswith("What it does:"):
+        text = text[len("What it does:"):].lstrip()
     sentence = text.split(". ")[0].rstrip(".")
     if len(sentence) > width:
         sentence = sentence[: width - 1].rsplit(" ", 1)[0] + "\u2026"
@@ -1366,14 +1502,17 @@ def _short_gloss(pol, key, width=58):
 
 def as_yaml_template(group=None, changed_only=False, policies=None,
                      style="minimal", common_only=False,
-                     include_header=True, include_required_inputs=True):
+                     include_header=True, include_required_inputs=True,
+                     include_changed=False, group_notes=None):
     # type: (Optional[str], bool, Any, str, bool) -> str
-    """A ``policies:`` block ready to save and pass with --parameter-config.
+    """A ``policies:`` block ready to save and pass with --run-config.
 
     ``style='minimal'`` one line per setting with a short trailing comment.
     ``style='full'``    the whole help text as comment lines above each setting.
     ``style='values'``  key-value pairs only, with no comments.
     ``common_only``     just the settings the registry marks as commonly changed.
+    ``include_changed`` retain non-default policies in a common-settings export.
+    ``group_notes``     optional canonical summaries of each group's consequences.
     """
     if style == "simple":
         style = "minimal"
@@ -1382,7 +1521,7 @@ def as_yaml_template(group=None, changed_only=False, policies=None,
     pol = policies if policies is not None else default_policies()
     keys = [k for k in pol.keys() if group is None or k.split(".")[0] == group]
     if common_only:
-        keys = [k for k in keys if k in COMMON_KEYS]
+        keys = [k for k in keys if k in COMMON_KEYS or (include_changed and not pol.is_default(k))]
     if changed_only:
         keys = [k for k in keys if not pol.is_default(k)]
     if not keys:
@@ -1407,11 +1546,13 @@ def as_yaml_template(group=None, changed_only=False, policies=None,
     out = head + ["policies:"]
 
     width = max(len(k.split(".", 1)[1]) for k in keys) + 1
-    for position, head_group in enumerate(_ordered_groups(keys), 1):
+    for head_group in _ordered_groups(keys):
         stage = _stage_of(head_group)
         if style != "values":
             out.append("")
-            out.append("  # %02d  %s" % (position, stage) if stage else "  # %02d" % position)
+            out.append("  # %s: %s" % (head_group, stage))
+            if group_notes and head_group in group_notes:
+                out.extend("  # " + line for line in _wrap(group_notes[head_group], 76))
         out.append("  %s:" % head_group)
         for key in _ordered_keys(head_group, [k for k in keys if k.split(".")[0] == head_group]):
             leaf = key.split(".", 1)[1]
@@ -1514,26 +1655,22 @@ def _yaml_scalar(value):
         return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, float):
+        # YAML 1.1 needs a decimal mantissa to recognize an exponent as numeric.
+        mantissa, separator, exponent = repr(value).partition("e")
+        if separator and "." not in mantissa:
+            mantissa += ".0"
+        return mantissa + separator + exponent
     if isinstance(value, (list, tuple)):
         return "[%s]" % ", ".join(_yaml_scalar(v) for v in value)
     if isinstance(value, dict):
         return "{%s}" % ", ".join(
-            "%s: %s" % (k, _yaml_scalar(v)) for k, v in value.items()
+            "%s: %s" % (_yaml_scalar(k), _yaml_scalar(v)) for k, v in value.items()
         )
     if isinstance(value, str):
-        if value == "":
-            return '""'
-        if value.lower() in _YAML_RESERVED:
-            return '"%s"' % value
-        # Anything that would come back as a number must be quoted too.
-        try:
-            float(value)
-            return '"%s"' % value
-        except ValueError:
-            pass
-        if value.strip() != value or any(
-            c in value for c in ":#{}[],&*?|<>=!%@`\"'"
-        ):
-            return '"%s"' % value
-        return value
+        # Keep ordinary enum names readable. JSON quoting is also valid YAML
+        # and preserves escapes, newlines, numeric strings and date-like text.
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_./+-]*", value) and value.lower() not in _YAML_RESERVED:
+            return value
+        return json.dumps(value, ensure_ascii=False)
     return repr(value)

@@ -12,7 +12,19 @@ clump_r2: 0.6
 lead_r2: 0.1
 window_kb: 250
 merge_distance_bp: 250000
-missing_index_action: error
+# FUMA-compatible index handling: reference-absent or allele-mismatched index
+# variants are excluded explicitly, while a verified index with no qualifying
+# LD partners is retained as a self row with r2=1.
+missing_index_action: warning_skip
+# FUMA-compatible MAF floor applied to both index variants and every LD partner.
+# The permissive packaged value removes only monomorphic or nearly absent panel
+# variants; raise it explicitly when the analysis requires a stronger MAF floor.
+# The reference manifest may declare an equal or more permissive build-time MAF.
+minimum_reference_maf: 0.00001
+# When a chromosome has variants at lead_pvalue but its LD file or tabix index
+# is absent, warning skips only that chromosome and records the affected counts.
+# Set to error to require genome-wide reference coverage.
+missing_chromosome_action: warning
 remove_mhc: true
 mhc_regions:
   GRCh37:
@@ -31,9 +43,11 @@ reference:
   directory: null
   manifest_filename: ld_reference.yaml
   file_pattern: "{population}_chr{chromosome}.ld.gz"
+  reverse_file_pattern: "{population}_chr{chromosome}.reverse.ld.gz"
+  variant_inventory_pattern: "{population}_chr{chromosome}.variants.tsv.gz"
   index_suffix: .tbi
-  format_version: 1
-  orientation: symmetric_first_endpoint
+  format_version: 2
+  orientation: upper_triangle_dual_index
   columns:
     - chromosome_a
     - position_a
@@ -42,6 +56,14 @@ reference:
     - position_b
     - variant_b
     - r2
+  variant_inventory_columns:
+    - chromosome
+    - position
+    - reference_id
+    - canonical_id
+    - allele_1
+    - allele_2
+    - minor_allele_frequency
 vcf_fields:
   chromosome: "%CHROM"
   position: "%POS"
@@ -59,21 +81,136 @@ table:
   infer_schema_length: 20000
   io_buffer_bytes: 1048576
   biallelic_include_expression: "N_ALT=1"
+  # Parallel gzip-compatible compressor for the raw region table. Python's
+  # single-threaded gzip is used when this is null or the tool is not installed.
+  compressor: pigz
 compute:
   minimum_worker_memory_gb: 1.0
   input_memory_multiplier: 1.1
+cojo:
+  # Physical grouping is applied only after GCTA --cojo-slct. It does not
+  # change GCTA's model window or the number of selected signals.
+  merge_distance_bp: 250000
+  # PostGWAS interprets the cited workflow's "most significant index SNP" as
+  # the strongest marginal GWAS association. Both p and pJ remain in outputs.
+  index_pvalue: marginal
+  # LD clumping consumes the chromosome-combined .jma selection results, whose
+  # bJ, bJ_se, and pJ values are already estimated by GCTA --cojo-slct. The
+  # separate genome-wide --cojo-cond pass creates a .cma but does not alter the
+  # selected signals or physical loci, so omit it from this consumer's contract.
+  # Set complete only when that additional conditional-statistics table is
+  # explicitly required. Standalone gcta_cojo slct remains complete by default.
+  parallel_output_contract: selection_only
+  # Formatter and GCTA outputs share visible method directories, so every
+  # subordinate filename carries both the study ID and reference population.
+  subordinate_dataset_id: "{dataset_id}_{population}"
+  formatter_resolved_config_file: "run_metadata/{dataset_id}_formatter_resolved_config.yaml"
+  formatter_completion_manifest_file: "run_metadata/{dataset_id}_formatter_completion.yaml"
+  gcta_resolved_config_file: "run_metadata/{dataset_id}_{mode}_gcta_cojo_resolved_config.yaml"
+reporting:
+  # Compact, interpretable columns embedded in the self-contained HTML report.
+  # Complete rows, including LD membership lists, remain in the linked TSVs.
+  result_table_columns:
+    genomic_risk_loci:
+      - Genomic_locus
+      - Lead_uniqID
+      - Lead_rsID
+      - CHR
+      - POS
+      - START
+      - END
+      - P_value
+      - Beta
+      - SE
+      - nIndSigSNPs
+      - nLeadSNPs
+      - n_members
+      - n_refsnps
+      - Merged_by_Distance
+    lead_snps:
+      - Genomic_locus
+      - lead_SNP_id
+      - l_rsid
+      - chr
+      - l_pos
+      - p
+      - l_beta
+      - l_se
+      - l_ea
+      - l_nea
+      - l_eaf
+      - start
+      - end
+      - sum_members
+      - sum_refsnps
+    independent_significant_snps:
+      - Genomic_locus
+      - ind_sig_SNP_id
+      - rsID
+      - chr
+      - pos
+      - p
+      - beta
+      - se
+      - ea
+      - nea
+      - eaf
+      - lead_SNP_id
+      - r2_with_Lead
+      - start
+      - end
+      - n_members
+      - n_refsnps
+    cojo_loci:
+      - COJO_locus
+      - Chr
+      - start
+      - end
+      - span_bp
+      - index_SNP
+      - index_bp
+      - index_p
+      - index_pJ
+      - selected_signals
+      - selected_signal_ids
+    cojo_selected_signals:
+      - COJO_locus
+      - is_locus_index
+      - Chr
+      - SNP
+      - bp
+      - p
+      - b
+      - se
+      - pJ
+      - bJ
+      - bJ_se
+      - freq
+      - freq_geno
+      - locus_start
+      - locus_end
+      - distance_to_previous_signal_bp
 output_layout:
-  region_working_table: ".working/{dataset_id}_region_query.tsv"
-  region_raw_table: "{dataset_id}_vcf.tsv.gz"
+  region_working_table: ".working/{dataset_id}_{population}_region_query.tsv"
+  region_raw_table: "{dataset_id}_{population}_vcf.tsv.gz"
   region_pruned_table: "{dataset_id}_LDpruned_{population}.tsv"
   region_significant_table: "{dataset_id}_LDpruned_{population}_sig.tsv"
-  region_log: "logs/{dataset_id}_ld_clump_region.log"
-  standard_working_table: ".working/{dataset_id}_standard_query.tsv"
-  standard_formatted_table: "{dataset_id}_formatted.tsv"
-  standard_log: "logs/{dataset_id}_ld_clump_standard.log"
-  standard_summary: "{dataset_id}_GenomicRiskLoci_Summary.txt"
-  standard_hierarchy: "{dataset_id}_GenomicRiskLoci_Hierarchy.txt"
-  standard_independent_clusters: "{dataset_id}_IndSig_Clusters_Boundaries.txt"
-  standard_lead_clusters: "{dataset_id}_Lead_Clusters_LD_Only.txt"
-  canonical_log: "logs/{dataset_id}_ld_clumping.log"
-  resolved_configuration: "run_metadata/{dataset_id}_ld_clumping_resolved.yaml"
+  region_significant_outside_ld_regions: "{dataset_id}_{population}_GenomeWideSignificant_Outside_LD_Regions.tsv"
+  region_log: "logs/{dataset_id}_{population}_ld_clump_region.log"
+  standard_working_table: ".working/{dataset_id}_{population}_standard_query.tsv"
+  standard_formatted_table: "{dataset_id}_{population}_formatted.tsv"
+  standard_log: "logs/{dataset_id}_{population}_ld_clump_standard.log"
+  standard_summary: "{dataset_id}_{population}_GenomicRiskLoci_Summary.txt"
+  standard_hierarchy: "{dataset_id}_{population}_GenomicRiskLoci_Hierarchy.txt"
+  standard_independent_clusters: "{dataset_id}_{population}_IndSig_Clusters_Boundaries.txt"
+  standard_lead_clusters: "{dataset_id}_{population}_Lead_Clusters_LD_Only.txt"
+  standard_reference_exclusions: "{dataset_id}_{population}_LD_Reference_Exclusions.tsv"
+  cojo_formatter_directory: "cojo/formatter"
+  cojo_root_directory: "cojo"
+  cojo_selected_signals: "{dataset_id}_{population}_COJO_Selected_Signals.tsv"
+  cojo_loci: "{dataset_id}_{population}_COJO_Loci.tsv"
+  cojo_excluded_variants: "{dataset_id}_{population}_COJO_Excluded_Variants.txt"
+  summary_csv: "reports/{dataset_id}_{population}_LD_Clumping_Summary.csv"
+  html_report: "reports/{dataset_id}_{population}_LD_Clumping_Report.html"
+  canonical_log: "logs/{dataset_id}_{population}_ld_clumping.log"
+  resolved_configuration: "run_metadata/{dataset_id}_{population}_ld_clumping_resolved.yaml"

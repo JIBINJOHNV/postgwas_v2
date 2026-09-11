@@ -28,6 +28,7 @@ from postgwas.modules.fine_mapping.arguments import (
 )
 from postgwas.modules.fine_mapping.engines.finemap.adapter import (
     _effective_max_causal_snps,
+    _prepare_loci,
     _reconcile_model_selection_failures,
     generate_tasks,
     process_single_locus,
@@ -83,6 +84,7 @@ def _resource_config():
 def test_packaged_finemap_defaults_match_the_documented_baseline():
     module = load_configuration().modules.fine_mapping
 
+    assert module.locus_window_kb == 500
     assert module.credible_set_coverage == 0.95
     assert module.memory_per_worker_gb == 14.0
     assert module.sample_size.model_dump() == {
@@ -118,6 +120,29 @@ def test_packaged_finemap_defaults_match_the_documented_baseline():
         "std_effects": False,
         "flames_manifest_filename": "finemap_FLAMES_manifest.tsv",
     }
+
+
+def test_predefined_range_boundaries_can_be_preserved_or_flanked(tmp_path):
+    locus_file = tmp_path / "loci.tsv"
+    locus_file.write_text(
+        "CHR\tSTART\tEND\tLP\n1\t1000000\t2000000\t8.0\n",
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        locus_file=locus_file,
+        locus_type="range",
+        window_kb=0,
+        lp_threshold=7.3,
+        finemap_skip_mhc=False,
+        finemap_include_mhc=True,
+    )
+
+    exact = _prepare_loci(args).row(0, named=True)
+    assert (exact["START"], exact["END"]) == (1000000, 2000000)
+
+    args.window_kb = 500
+    flanked = _prepare_loci(args).row(0, named=True)
+    assert (flanked["START"], flanked["END"]) == (500000, 2500000)
 
 
 def test_causal_snp_limit_is_a_per_locus_upper_bound():
@@ -295,6 +320,9 @@ def test_finemap_records_per_locus_nef_warning_without_failing(tmp_path):
     args = argparse.Namespace(
         **_finemap_config(),
         plink="plink2",
+        bgenix="bgenix",
+        ldstore="ldstore",
+        finemap_executable="finemap",
         sample_size_policy="warn",
         sample_size_summary_statistic="median",
         sample_size_relative_range_warning_threshold=0.05,
@@ -1073,9 +1101,18 @@ def test_susie_reused_fit_payload_is_numerically_equivalent(tmp_path):
         Path(__file__).parents[1]
         / "src/postgwas/modules/fine_mapping/engines/susie"
     )
+    module = load_configuration().modules.fine_mapping
+    susie = module.engines.susie
     script = f"""
     source({str(susie_dir / 'defaults.r')!r})
     source({str(susie_dir / 'utlities.r')!r})
+    SUSIE_DEFAULTS <- utils::modifyList(SUSIE_DEFAULTS, list(
+      credible_set_coverage = {module.credible_set_coverage!r},
+      min_abs_corr = {susie.minimum_purity!r},
+      process_poll_seconds = {susie.execution.process_poll_seconds!r},
+      process_terminate_grace_seconds = {susie.execution.termination_grace_seconds!r},
+      stderr_tail_lines = {susie.execution.stderr_tail_lines!r}
+    ))
     quiet <- function(...) invisible(NULL)
     z <- c(4.0, 2.5, -1.5)
     ld <- matrix(c(
@@ -1205,6 +1242,7 @@ def test_finemap_timeout_is_typed_and_logged(tmp_path):
             run_finemap_binary(
                 master,
                 _finemap_config(),
+                finemap_binary="finemap",
                 timeout_seconds=2,
                 termination_grace_seconds=1,
             )
@@ -1235,6 +1273,7 @@ def test_finemap_no_causal_configuration_remains_a_locus_outcome(tmp_path):
         success, reason = run_finemap_binary(
             master,
             _finemap_config(),
+            finemap_binary="finemap",
             timeout_seconds=2,
             termination_grace_seconds=1,
         )
@@ -1255,6 +1294,7 @@ def test_ldstore_timeout_is_typed_and_logged(tmp_path):
         with pytest.raises(FinemapExternalToolTimeout) as caught:
             run_ldstore(
                 master,
+                ldstore_binary="ldstore",
                 timeout_seconds=2,
                 termination_grace_seconds=1,
             )
@@ -1307,6 +1347,9 @@ def test_ldstore_timeout_marks_only_the_locus_and_removes_partial_outputs(
         "finemap_timeout_seconds": 3,
         "termination_grace_seconds": 1,
         "plink": "plink2",
+        "bgenix": "bgenix",
+        "ldstore": "ldstore",
+        "finemap_executable": "finemap",
         "genomic_locus": "chr1:1-2",
         "chromosome": "1",
         "start": 1,
@@ -1407,6 +1450,7 @@ def test_sss_command_receives_every_applicable_configured_control(tmp_path):
             master,
             _finemap_config(),
             threads=3,
+            finemap_binary="finemap",
             timeout_seconds=43200,
             termination_grace_seconds=30,
         )
@@ -1419,7 +1463,8 @@ def test_sss_command_receives_every_applicable_configured_control(tmp_path):
     assert command[command.index("--n-conv-sss") + 1] == "100"
     assert command[command.index("--n-configs-top") + 1] == "50000"
     assert command[command.index("--corr-config") + 1] == "0.95"
-    assert command[command.index("--pvalue-snps") + 1] == "1.0"
+    assert "--pvalue-snps" not in command
+    assert "native unfiltered endpoint" in master.with_suffix(".finemap.log").read_text()
     assert command[command.index("--prior-std") + 1] == "0.05"
     assert "--cond-pvalue" not in command
 
@@ -1443,6 +1488,7 @@ def test_conditional_command_excludes_sss_controls(tmp_path):
             master,
             config,
             threads=2,
+            finemap_binary="finemap",
             timeout_seconds=43200,
             termination_grace_seconds=30,
         )

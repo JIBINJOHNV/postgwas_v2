@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
@@ -158,6 +159,29 @@ class FlamesUpstreamResources(StrictModel):
         return value
 
 
+class FlamesAnnotationAPI(StrictModel):
+    vep_servers: dict[GenomeBuild, str]
+    cadd_servers: dict[GenomeBuild, str]
+    timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    retry_count: int = Field(ge=0)
+    retry_delay_seconds: float = Field(ge=0, allow_inf_nan=False)
+    requests_per_second: float = Field(gt=0, allow_inf_nan=False)
+
+    @field_validator("vep_servers", "cadd_servers")
+    @classmethod
+    def public_https_servers(cls, values):
+        if set(values) != set(GenomeBuild):
+            raise ValueError("must configure an endpoint for every supported genome build")
+        for value in values.values():
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme != "https" or not parsed.netloc
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+            ):
+                raise ValueError("must be public HTTPS URLs without credentials, queries or fragments")
+        return values
+
+
 class FlamesResultSchema(StrictModel):
     filename_column: str
     locus_column: str
@@ -196,6 +220,7 @@ class FlamesOutputLayout(StrictModel):
     resolved_config_file: str
     completion_manifest: str
     service_log_file: str
+    annotation_api_log_file: str
 
     @field_validator("*")
     @classmethod
@@ -210,6 +235,7 @@ class FlamesOutputLayout(StrictModel):
         dataset_fields = (
             "score_basename", "annotation_file", "index_file",
             "staging_directory", "completion_manifest", "service_log_file",
+            "annotation_api_log_file",
         )
         for field in dataset_fields:
             if "{dataset_id}" not in getattr(self, field):
@@ -238,8 +264,11 @@ class FlamesConfig(ModuleConfig):
     vep_mode: Literal["api", "local"]
     vep_command: str | None = None
     vep_cache: str | None = None
+    vep_cache_genome_build: GenomeBuild | None = None
     cadd_mode: Literal["api", "local"]
     cadd_file: str | None = None
+    cadd_genome_build: GenomeBuild | None = None
+    annotation_api: FlamesAnnotationAPI
     input_schema: FlamesInputSchema
     upstream: FlamesUpstreamResources
     result_schema: FlamesResultSchema
@@ -257,15 +286,4 @@ class FlamesConfig(ModuleConfig):
             raise ValueError("must be null or non-empty")
         return value
 
-    @model_validator(mode="after")
-    def local_annotation_requirements(self):
-        if self.vep_mode == "local" and (
-            self.vep_command is None or self.vep_cache is None
-        ):
-            raise ValueError("local VEP mode requires vep_command and vep_cache")
-        if self.cadd_mode == "local" and self.cadd_file is None:
-            raise ValueError("local CADD mode requires cadd_file")
-        return self
-
-
-__all__ = ["FlamesConfig", "FlamesMagmaCovarContract"]
+__all__ = ["FlamesConfig"]

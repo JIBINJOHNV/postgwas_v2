@@ -1,4 +1,4 @@
-"""Step 13 - the SNP identifier column.
+"""Step 12 - the SNP identifier column.
 
 Makes sure every variant has an identifier: creates one from chromosome,
 position and the two alleles when the study has none, replaces ':' with '_' so
@@ -10,14 +10,14 @@ symmetry with the other steps and does not use it.
 
 Policies read here
 ------------------
-input.null_values   the strings that count as a missing identifier
+input.null_values   configured reader tokens added to shared identifier sentinels
 """
 
 from typing import Any, Dict, List, Optional, Tuple
 
 import polars as pl
 
-from postgwas.core.values import optional_text
+from postgwas.core.values import missing_tokens, optional_text
 
 from .policies import default_policies
 from .shared.runtime import step_context
@@ -42,18 +42,12 @@ def _missing_sentinels(policies):
     # type: (Any) -> List[str]
     """The upper-case strings that mean "this identifier is missing".
 
-    Files derived from a VCF write '.', and plenty of others write 'NA' or '-',
-    so all configured missing tokens are treated as absent. The list comes from
-    input.null_values, whose
-    default is NA, NAN and the empty string; adding '.' and '-' there is the
-    registry's own recommendation.  The empty string is always included so the
-    original behaviour cannot be lost.
+    Identifier matching combines the configured input.null_values with the
+    shared optional-text placeholders. This deliberately recognizes '-' as a
+    missing identifier without asking the table reader to erase '-' from allele
+    columns, where older indel representations may use it for a deletion.
     """
-    values = list(policies.input.null_values or [])
-    sentinels = [str(v).strip().upper() for v in values]
-    if "" not in sentinels:
-        sentinels.append("")
-    return sorted(set(sentinels))
+    return list(missing_tokens(policies.input.null_values))
 
 
 def _missing_expr(snp_col, sentinels):
@@ -112,8 +106,8 @@ def harmonise_variant_identifiers(
     - creates one from chromosome, position and the two alleles when the study
       has none, or names one that is not in the file;
     - replaces ':' with '_';
-    - fills in identifiers that are missing, empty, or one of the strings listed
-      in input.null_values.
+    - fills in identifiers that are missing, empty, or one of the configured or
+      shared optional-text placeholders.
 
     Returns ``(df, sample_column_dict)``.
 

@@ -12,6 +12,7 @@ input:
   gene_set_file: null
   sample_size_column: N_COL
   table_delimiter_pattern: '\s+'
+  bim_delimiter: "\t"
   output_table_delimiter: "\t"
   chromosome_prefix_pattern: '(?i)^chr'
   chromosome_aliases: {'23': X, '24': Y, '25': XY, '26': MT, M: MT}
@@ -28,13 +29,32 @@ input:
   bim_columns: [chromosome, variant_id, genetic_distance, position, allele1, allele2]
   gene_location_has_header: false
   gene_location_columns: [gene_id, chromosome, start, end, strand, alternate_gene_id]
+  alternate_gene_id_type: symbol
 snp_harmonisation:
   resolve_variants_to_reference: false
   minimum_overlap_fraction: 0.50
   duplicate_policy: lowest_p
+mhc:
+  policy: exclude_both
+  region_override: null
+chromosomes:
+  exclude: [Y, MT]
+exclusion_reporting:
+  chromosome_reason: excluded_chromosome
+  mhc_reason: mhc_region
+  annotated_units_scope: annotated_units
+  reason_column: exclusion_reason
+  scope_column: scope
+  excluded_count_column: excluded
+  input_count_column: input
+  retained_count_column: retained
+  start_column: START
+  end_column: END
 gene_sets:
   input_format: auto
   minimum_gene_id_overlap_fraction: 0.50
+  identifier_mismatch_action: skip
+  alternate_id_duplicate_policy: longest_interval
   membership_delimiter_pattern: '\s+'
   membership_has_header: false
   membership_set_column: 0
@@ -97,6 +117,7 @@ batching:
   memory_per_process_gb: 16
 multiple_testing:
   reporting_significance_threshold: 0.05
+  primary_method: fdr_bh
   reporting_method_labels:
     bonferroni: Bonferroni
     sidak: Šidák
@@ -124,8 +145,16 @@ result_schema:
   gene_set_full_name_column: FULL_NAME
   gene_id_column: GENE
   gene_p_value_column: P
+  gene_reference_chromosome_column: GENE_REFERENCE_CHR
+  gene_reference_start_column: GENE_REFERENCE_START
+  gene_reference_end_column: GENE_REFERENCE_END
+  gene_reference_strand_column: GENE_REFERENCE_STRAND
+  gene_reference_alternate_id_column: GENE_SYMBOL
   global_correction_column_pattern: 'P_{method}_corr'
   family_correction_column_pattern: '{family}_P_{method}_corr'
+  primary_correction_method_column: primary_correction_method
+  primary_adjusted_p_value_column: primary_adjusted_p
+  primary_significant_column: primary_significant
   report_dataset_column: dataset_id
   report_gene_set_description_column: gene_set_description
   report_source_input_genes_column: source_input_genes
@@ -134,6 +163,8 @@ result_schema:
   report_common_gene_p_values_column: CommonGenes_Pvalues
   report_total_genes_column: TotalGenes
   report_common_gene_count_column: CommonGeneCount
+  report_untested_genes_column: untested_genes
+  report_untested_gene_count_column: untested_gene_count
   report_mapping_name_column: mapping_analysis
   report_mapping_method_column: mapping_method
   report_mapping_context_column: biological_context
@@ -142,8 +173,32 @@ result_schema:
   report_source_version_column: annotation_version
   report_statistic_type_column: result_statistic_type
   report_statistic_interpretation_column: result_statistic_interpretation
+  report_mhc_policy_column: mhc_policy
+  report_mhc_region_column: mhc_region
+  report_excluded_chromosomes_column: excluded_chromosomes
+  report_excluded_units_column: excluded_annotated_units
+  report_gene_set_status_column: gene_set_analysis_status
+  report_gene_set_reason_column: gene_set_analysis_reason
   report_delimiter: "\t"
   report_null_value: NA
+pipeline_summary_schema:
+  version: 5
+  step_column: step
+  stage_column: stage
+  status_column: status
+  summary_column: summary
+  details_column: details
+  output_column: output
+  csv_delimiter: ','
+  null_value: NA
+html_report:
+  page_size: 50
+  gene_columns: [GENE, GENE_SYMBOL, CHR, START, STOP, NSNPS, N, ZSTAT, P, P_bonferroni_corr, P_fdr_bh_corr]
+  pathway_columns: [VARIABLE, FULL_NAME, NGENES, BETA, BETA_STD, SE, P, P_bonferroni_corr, P_fdr_bh_corr, primary_adjusted_p, primary_significant]
+screen_summary:
+  top_gene_rows: 10
+  top_pathway_rows: 10
+  p_value_significant_digits: 3
 minimum_magma_version: '1.10'
 version_arguments: [--version]
 version_pattern: '(?i)MAGMA\s+(?:version:\s+)?v([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
@@ -154,14 +209,20 @@ output_layout:
   staging_directory: '.partial/{dataset_id}_magma'
   harmonised_p_values: '01_inputs/{dataset_id}_magma_p_values_harmonised.tsv'
   harmonised_snp_locations: '01_inputs/{dataset_id}_magma_snp_locations_harmonised.tsv'
+  excluded_variants: '02_intermediates/exclusions/{dataset_id}_magma_excluded_variants.tsv'
   annotation_prefix: '02_intermediates/{analysis}/annotations/{dataset_id}_magma_annotation'
+  scoped_annotation: '02_intermediates/{analysis}/annotations/{dataset_id}_magma_analysis_scope.genes.annot'
   component_annotation_prefix: '02_intermediates/{analysis}/annotations/{dataset_id}_magma_positional_component'
   gene_result_prefix: '02_intermediates/{analysis}/native_outputs/{dataset_id}_magma_{upstream}up_{downstream}down'
   gene_batch_prefix: '02_intermediates/{analysis}/batches/{dataset_id}_magma_{upstream}up_{downstream}down'
   gene_set_prefix: '02_intermediates/{analysis}/native_outputs/{dataset_id}_magma_gene_sets'
-  corrected_genes: '03_results/{analysis}/{dataset_id}_magma_genes_corrected.tsv'
+  corrected_genes: '03_results/{analysis}/{dataset_id}_magma_genes_annotated.tsv'
   corrected_gene_sets: '03_results/{analysis}/{dataset_id}_magma_gene_sets_corrected.tsv'
   annotated_gene_sets: '03_results/{analysis}/{dataset_id}_magma_gene_sets_annotated.tsv'
-  prepared_gene_sets: '02_intermediates/{analysis}/prepared_gene_sets/{dataset_id}_magma_gene_sets.txt'
+  pathway_compatible_gene_locations: '02_intermediates/{analysis}/gene_reference/{dataset_id}_magma_pathway_compatible_genes.loc'
   chrom_magma_genes: '03_results/{analysis}/{dataset_id}_chrom_magma_genes.tsv'
+  excluded_genes: '02_intermediates/{analysis}/exclusions/{dataset_id}_magma_excluded_genes.tsv'
+  exclusion_summary: '03_results/{analysis}/{dataset_id}_magma_exclusion_summary.tsv'
   mapping_comparison: '04_comparisons/{dataset_id}_magma_mapping_comparison.tsv'
+  pipeline_summary_csv: '04_reports/{dataset_id}_magma_pipeline_summary.csv'
+  pipeline_summary_html: '04_reports/{dataset_id}_magma_report.html'

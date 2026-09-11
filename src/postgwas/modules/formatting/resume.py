@@ -36,6 +36,34 @@ _MANIFEST_SCHEMA_VERSION = 1
 _NON_PATH_RESULT_KEYS = frozenset({"columns", "field_roles"})
 
 
+def magma_formatter_content_paths() -> tuple[str, ...]:
+    """Return MAGMA values consumed while formatter creates pipeline inputs."""
+    return (
+        "input.ld_reference_prefix",
+        "input.sample_size_column",
+        "input.variant_id_column",
+        "input.chromosome_column",
+        "input.position_column",
+        "input.bim_extension",
+        "input.bim_columns",
+        "input.bim_delimiter",
+        "snp_harmonisation",
+        "mhc",
+        "chromosomes",
+        "exclusion_reporting",
+        "output_layout.excluded_variants",
+    )
+
+
+def _magma_pipeline_export_enabled(configuration, selected: list[str]) -> bool:
+    magma = configuration.modules.magma
+    return (
+        "magma" in selected
+        and magma.enabled
+        and magma.input.ld_reference_prefix is not None
+    )
+
+
 def _formatter_scoped_paths(
     configuration,
     selected: list[str],
@@ -79,9 +107,18 @@ def formatter_output_paths(
     dataset_id: str,
     selected: list[str],
     module,
+    *,
+    configuration=None,
 ) -> dict[str, Path]:
     """Resolve the canonical configured path for every selected artifact."""
-    destinations: dict[str, Path] = {}
+    destinations: dict[str, Path] = {
+        "formatter.html_report": configured_output_path(
+            output_directory,
+            module.runtime.html_report_file,
+            error_type=FormattingError,
+            dataset_id=dataset_id,
+        ),
+    }
     for target in selected:
         schema = module.exports[target]
         if schema.output_file is not None:
@@ -95,6 +132,17 @@ def formatter_output_paths(
             destinations["%s.%s" % (target, name)] = configured_output_path(
                 output_directory,
                 output_schema.output_file,
+                error_type=FormattingError,
+                dataset_id=dataset_id,
+            )
+        if (
+            target == "magma"
+            and configuration is not None
+            and _magma_pipeline_export_enabled(configuration, selected)
+        ):
+            destinations["magma.excluded_variants"] = configured_output_path(
+                output_directory,
+                configuration.modules.magma.output_layout.excluded_variants,
                 error_type=FormattingError,
                 dataset_id=dataset_id,
             )
@@ -144,12 +192,21 @@ def _file_fingerprint(path: Path) -> dict[str, Any]:
 def _input_resource_paths(configuration, selected: list[str]) -> dict[str, Path]:
     """Return external resources whose content determines formatter outputs."""
     formatting = configuration.modules.formatting
+    resources = {}
     merge_alleles = formatting.ldsc_reference.merge_alleles_file
-    if "ldsc" not in selected or merge_alleles is None:
-        return {}
-    return {
-        "ldsc_merge_alleles": Path(merge_alleles).expanduser().resolve(),
-    }
+    if "ldsc" in selected and merge_alleles is not None:
+        resources["ldsc_merge_alleles"] = Path(
+            merge_alleles
+        ).expanduser().resolve()
+    magma = configuration.modules.magma
+    if _magma_pipeline_export_enabled(configuration, selected):
+        resources["magma_bim"] = Path(
+            "%s%s" % (
+                magma.input.ld_reference_prefix,
+                magma.input.bim_extension,
+            )
+        ).expanduser().resolve()
+    return resources
 
 
 def _input_resource_fingerprints(
@@ -183,8 +240,15 @@ def _configuration_digest(configuration, selected: list[str]) -> str:
             "formatting": formatter_content_paths(configuration, selected),
         },
     )["modules"]["formatting"]
+    payload = dict(formatting)
+    if _magma_pipeline_export_enabled(configuration, selected):
+        payload["magma_input_preparation"] = resolved_configuration_values(
+            configuration,
+            modules=("magma",),
+            module_paths={"magma": magma_formatter_content_paths()},
+        )["modules"]["magma"]
     return _configuration_values_digest(
-        formatting, configuration.resources.executables.bcftools, selected,
+        payload, configuration.resources.executables.bcftools, selected,
     )
 
 
@@ -288,6 +352,7 @@ def _recorded_artifact_paths(
         )
     artifacts: dict[str, Path] = {}
     auxiliary: dict[str, Path] = {}
+    report_paths: set[Path] = set()
     for target in targets:
         result = results.get(target)
         if not isinstance(result, Mapping):
@@ -295,6 +360,9 @@ def _recorded_artifact_paths(
                 "Formatter completion manifest has no reusable results for %s."
                 % target
             )
+        report_paths.add(_required_result_path(
+            result, "html_report", "%s.html_report" % target,
+        ))
         if target == CUSTOM_OUTPUT_TARGET:
             result_key = SINGLE_OUTPUT_RESULT_KEYS[CUSTOM_OUTPUT_TARGET]
             artifacts[target] = _required_result_path(result, result_key, target)
@@ -342,6 +410,20 @@ def _recorded_artifact_paths(
                             "conflicting recorded paths: %s and %s."
                             % (label, artifacts[label], detailed_path)
                         )
+        if (
+            target == "magma"
+            and result.get("variant_preparation") is not None
+        ):
+            preparation = result.get("variant_preparation")
+            if not isinstance(preparation, Mapping):
+                raise FormattingError(
+                    "Formatter completion manifest has no MAGMA variant preparation."
+                )
+            artifacts["magma.excluded_variants"] = _required_result_path(
+                preparation,
+                "excluded_variants",
+                "magma.excluded_variants",
+            )
         if schema.partition_file is not None:
             try:
                 result_keys = PARTITIONED_OUTPUT_RESULT_KEYS[target]
@@ -369,6 +451,12 @@ def _recorded_artifact_paths(
         auxiliary["%s.log_file" % target] = _required_result_path(
             result, "log_file", "%s.log_file" % target,
         )
+    if len(report_paths) != 1:
+        raise FormattingError(
+            "Formatter completion manifest results do not identify one shared "
+            "HTML report."
+        )
+    artifacts["formatter.html_report"] = next(iter(report_paths))
     return artifacts, auxiliary
 
 
@@ -450,7 +538,11 @@ def _rebase_manifest_results(
 ):
     module = configuration.modules.formatting
     expected = formatter_output_paths(
-        output_directory, dataset_id, selected, module,
+        output_directory,
+        dataset_id,
+        selected,
+        module,
+        configuration=configuration,
     )
     recorded, auxiliary = _recorded_artifact_paths(results, selected, module)
     if set(recorded) != set(expected):
@@ -848,7 +940,11 @@ def resume_formatter_outputs(
     existing = [
         path
         for path in formatter_output_paths(
-            output_directory, dataset_id, selected, module,
+            output_directory,
+            dataset_id,
+            selected,
+            module,
+            configuration=configuration,
         ).values()
         if path.exists() or path.is_symlink()
     ]

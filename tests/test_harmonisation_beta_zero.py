@@ -6,6 +6,9 @@ import polars as pl
 import pytest
 
 from postgwas.config import load_configuration
+from postgwas.modules.harmonisation.effect_validation import (
+    validate_effect_statistics,
+)
 from postgwas.modules.harmonisation.z_score import (
     derive_z_score_from_effect_and_standard_error,
 )
@@ -26,13 +29,17 @@ def test_zero_beta_is_kept_and_produces_zero_z_by_default(tmp_path):
         "output_folder": str(tmp_path),
     }
 
-    result, qc, resolved = derive_z_score_from_effect_and_standard_error(
+    with_z, z_qc, resolved = derive_z_score_from_effect_and_standard_error(
         "1", frame, columns, policies=default_policies()
+    )
+    result, qc, resolved = validate_effect_statistics(
+        "1", with_z, resolved, policies=default_policies()
     )
 
     assert default_policies().get("validation.beta_zero") == "keep"
     assert result.height == 2
     assert result[resolved["imp_z_col"]].to_list() == [0.0, 0.5]
+    assert "variants_removed_invalid_beta_se" not in z_qc
     assert qc["variants_with_zero_beta"] == 1
     assert qc["beta_zero_action"] == "keep"
     assert qc["beta_zero_removed_flag"] is False
@@ -50,8 +57,13 @@ def test_configured_se_division_floor_rejects_only_numerically_unsafe_rows(tmp_p
         "output_folder": str(tmp_path),
     }
 
-    result, qc, resolved = derive_z_score_from_effect_and_standard_error(
+    with_z, _z_qc, resolved = derive_z_score_from_effect_and_standard_error(
         "1", frame, columns, policies=default_policies()
+    )
+    assert with_z.height == 3
+    assert with_z[resolved["imp_z_col"]].to_list() == [2.0, None, None]
+    result, qc, resolved = validate_effect_statistics(
+        "1", with_z, resolved, policies=default_policies()
     )
 
     assert result.height == 1
@@ -62,7 +74,7 @@ def test_configured_se_division_floor_rejects_only_numerically_unsafe_rows(tmp_p
     assert qc["se_division_floor"] == pytest.approx(1.0e-12)
 
 
-def test_primary_output_contract_returns_exact_existing_files(tmp_path):
+def test_required_merged_output_contract_returns_exact_existing_files(tmp_path):
     sample = "study"
     harmonisation = load_configuration().modules.harmonisation
     expected = {
@@ -83,9 +95,9 @@ def test_primary_output_contract_returns_exact_existing_files(tmp_path):
     assert outputs == {name: str(path) for name, path in expected.items()}
 
 
-def test_primary_output_contract_rejects_missing_promised_file(tmp_path):
+def test_required_merged_output_contract_rejects_missing_file(tmp_path):
     harmonisation = load_configuration().modules.harmonisation
-    with pytest.raises(PipelineError, match="cannot return all promised VCF outputs"):
+    with pytest.raises(PipelineError, match="cannot validate all required merged VCF"):
         _resolved_harmonisation_outputs(
             tmp_path,
             "study",

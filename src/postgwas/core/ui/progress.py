@@ -8,18 +8,28 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TypeVar
 
+from rich.cells import cell_len
 from rich.console import Console
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
+    ProgressColumn,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
 )
 from rich.text import Text
+from rich.table import Column
 
-from postgwas.core.ui.screen import screen_field
+from postgwas.core.ui.screen import (
+    SYMBOLS,
+    normalize_stage_outcome_fields,
+    screen_field,
+    screen_line,
+    style_screen_block,
+    terminal_style,
+)
 
 
 _Result = TypeVar("_Result")
@@ -28,8 +38,70 @@ _ACTIVE_PROGRESS: ContextVar[tuple["StageProgress", ...]] = ContextVar(
 )
 
 
+class _NeutralProgressColumn(ProgressColumn):
+    """Retain Rich's count/time algorithms without its independent palette."""
+
+    def __init__(self, column: ProgressColumn):
+        super().__init__(table_column=Column(no_wrap=True))
+        self.column = column
+        # Rich refreshes in its own thread, outside the run ContextVar scope.
+        self.style = terminal_style("text")
+
+    def render(self, task):
+        return Text(self.column.render(task).plain, style=self.style)
+
+
+class _OperationColumn(TextColumn):
+    """Show the active stage number separately from completed-stage progress."""
+
+    def __init__(self):
+        super().__init__(
+            "{task.description}", style=terminal_style("analysis"), markup=False,
+            table_column=Column(ratio=2, no_wrap=True, overflow="ellipsis"),
+        )
+        self.prefix = screen_line("analysis", "", indent=6)
+
+    def render(self, task):
+        # The numeric progress columns count only validated completed work.
+        # Retain the active stage number in a compact form so it is not
+        # mistaken for the completed-stage count shown beside the bar, while
+        # preserving enough width for the operation name on narrow terminals.
+        _counter, separator, operation = task.description.partition(" · ")
+        description = operation if separator else task.description
+        active_stage = task.fields.get("active_stage")
+        active_stage_total = task.fields.get("active_stage_total")
+        if active_stage is not None and active_stage_total is not None:
+            description = "%s/%s · %s" % (
+                active_stage,
+                active_stage_total,
+                description,
+            )
+        return Text(self.prefix + description, style=self.style)
+
+
+class StageOutcome:
+    """Mutable completion details yielded by :meth:`StageProgress.step`."""
+
+    __slots__ = ("message", "fields")
+
+    def __init__(self) -> None:
+        self.message: str | None = None
+        self.fields: tuple[tuple, ...] | None = None
+
+    def outcome(self, message: str, fields=None, **_values) -> None:
+        """Attach a concise message and semantic fields to a completed stage."""
+        text = str(message).strip()
+        if not text:
+            raise ValueError("A completed-stage outcome must not be empty")
+        self.message = text
+        self.fields = normalize_stage_outcome_fields(fields)
+
+
 class StageProgress:
     """Retain completed stages and aligned, meaning-specific outcome fields."""
+
+    _OUTCOME_FIELD_INDENT = 14
+    _OUTCOME_SECTION_FIELD_INDENT = 18
 
     def __init__(
         self,
@@ -71,13 +143,28 @@ class StageProgress:
         self._closed = False
         self._parent: StageProgress | None = None
 
-    def _emit(self, renderable=None) -> None:
+    @property
+    def outcome_separator_column(self) -> int | None:
+        """Return the configured terminal-cell column before `` : ``."""
+        if self.outcome_label_width is None:
+            return None
+        return (
+            self._OUTCOME_FIELD_INDENT
+            + cell_len(SYMBOLS["count"])
+            + 2
+            + self.outcome_label_width
+        )
+
+    def _emit(self, renderable=None, *, soft_wrap: bool = False) -> None:
         """Serialize a milestone with live display and plain transcript copies."""
+        if isinstance(renderable, (str, Text)):
+            renderable = style_screen_block(renderable)
+
         def emit(console: Console) -> None:
             if renderable is None:
                 console.print()
             else:
-                console.print(renderable)
+                console.print(renderable, soft_wrap=soft_wrap)
 
         if self._display_console is None:
             emit(self.console)
@@ -89,16 +176,68 @@ class StageProgress:
     def _emit_started(self, renderable) -> None:
         """Record a durable start without leaving a static live-stage copy."""
         if self._summary_console is not None:
-            self._summary_console.print(renderable)
+            self._summary_console.print(renderable, soft_wrap=True)
         elif not self._interactive:
-            self.console.print(renderable)
+            self.console.print(renderable, soft_wrap=True)
+
+    def _emit_forced_capture_current(self, description: str) -> None:
+        """Preserve one live state when a forced terminal is not a real TTY."""
+        if (
+            self._display_console is None
+            and self._interactive
+            and not self.console.file.isatty()
+        ):
+            self.console.print(
+                style_screen_block(screen_line("analysis", description, indent=6)),
+                end="\r",
+            )
+
+    def print_block(self, block: str | Text, *, console: Console | None = None) -> None:
+        """Print one multiline result block without a live progress redraw."""
+        active = _ACTIVE_PROGRESS.get()
+        current = active[-1] if active else None
+        if current is not None:
+            current._pause()
+        try:
+            if console is not None and self._display_console is None:
+                console.print(style_screen_block(block), soft_wrap=True)
+            else:
+                self._emit(block, soft_wrap=True)
+        finally:
+            if current is not None and not current._closed:
+                current._resume()
 
     def _pause(self) -> None:
         if self._progress is not None:
             self._progress.stop()
 
+    @staticmethod
+    def _columns():
+        """The same theme for stage-count and native measured progress bars."""
+        return (
+            _OperationColumn(),
+            BarColumn(
+                bar_width=None,
+                table_column=Column(ratio=1, min_width=1),
+                style=terminal_style("text"),
+                complete_style=terminal_style("analysis"),
+                finished_style=terminal_style("success"),
+                pulse_style=terminal_style("analysis"),
+            ),
+            _NeutralProgressColumn(MofNCompleteColumn()),
+            _NeutralProgressColumn(TaskProgressColumn()),
+            _NeutralProgressColumn(TimeElapsedColumn()),
+        )
+
     def _resume(self) -> None:
-        if self._progress is not None and not self._closed:
+        active = _ACTIVE_PROGRESS.get()
+        # Rich's live stack must retain the same parent-to-child order as this
+        # logical stack. Restarting an ancestor before its active child closes
+        # reverses that order and makes Rich recursively refresh its root Live.
+        has_active_child = any(item is self for item in active) and (
+            active[-1] is not self
+        )
+        if self._progress is not None and not self._closed and not has_active_child:
             self._progress.start()
 
     def _start(self, number: int, total: int, title: str) -> None:
@@ -108,21 +247,31 @@ class StageProgress:
             self._parent._pause()
         self._started = True
         self._emit()
-        self._emit(Text("  🔬  %s" % self.label, style="bold cyan"))
+        self._emit(screen_line("analysis", self.label, indent=2))
         self._emit_started(
-            Text(
-                "      🔬  %s"
+            style_screen_block(
+                screen_line("analysis", "%s", indent=6)
                 % self._description("Started", number, total, title),
-                style="cyan",
             ),
+        )
+        if (
+            self._display_console is not None
+            and not self._display_console.file.isatty()
+        ):
+            # A terminal-preserving recorder can target a captured descriptor
+            # in tests or redirected launchers. Rich cannot retain its first
+            # transient redraw there, so emit the truthful active state once.
+            self._display_console.print(style_screen_block(
+                screen_line("analysis", "%s", indent=6)
+                % self._description("Current", number, total, title),
+            ))
+        self._emit_forced_capture_current(
+            self._description("Current", number, total, title),
         )
         if self._interactive:
             self._progress = Progress(
-                TextColumn("      🔬  {task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TaskProgressColumn(),
-                TimeElapsedColumn(),
+                *self._columns(),
+                expand=True,
                 console=self._live_console,
                 transient=True,
                 redirect_stdout=False,
@@ -132,6 +281,8 @@ class StageProgress:
                 self._description("Current", number, total, title),
                 total=total,
                 completed=number - 1,
+                active_stage=number,
+                active_stage_total=total,
             )
             self._progress.start()
             self._progress.refresh()
@@ -166,11 +317,13 @@ class StageProgress:
         else:
             self._pause()
             self._emit_started(
-                Text(
-                    "      🔬  %s"
+                style_screen_block(
+                    screen_line("analysis", "%s", indent=6)
                     % self._description("Started", number, total, title),
-                    style="cyan",
                 ),
+            )
+            self._emit_forced_capture_current(
+                self._description("Current", number, total, title),
             )
             if self._progress is not None:
                 self._progress.update(
@@ -178,21 +331,30 @@ class StageProgress:
                     description=self._description("Current", number, total, title),
                     total=total,
                     completed=number - 1,
+                    active_stage=number,
+                    active_stage_total=total,
                 )
             self._resume()
         self._step_started = time.monotonic()
 
     @contextmanager
     def step(self, number: int, total: int, title: str):
-        """Run one measurable stage and preserve truthful failure progress."""
+        """Run one measurable stage and preserve truthful completion details."""
+        outcome = StageOutcome()
         self.start_step(number, total, title)
         try:
-            yield
+            yield outcome
         except BaseException:
             self.fail_step(number, total, title)
             raise
         else:
-            self.complete_step(number, total, title)
+            self.complete_step(
+                number,
+                total,
+                title,
+                outcome=outcome.message,
+                outcome_fields=outcome.fields,
+            )
 
     def complete_step(
         self,
@@ -202,6 +364,12 @@ class StageProgress:
         outcome: str | None = None,
         outcome_fields=None,
     ) -> None:
+        from postgwas.core.validation_reporting import (
+            consolidate_validation_fields, flush_file_validation_display,
+        )
+
+        outcome_fields = consolidate_validation_fields(outcome_fields)
+        flush_file_validation_display()
         if not self.enabled:
             return
         number, total = self._values(number, total)
@@ -217,45 +385,63 @@ class StageProgress:
             )
             self._progress.refresh()
         self._pause()
-        self._emit(Text(
-            "      ✅  Completed %d/%d · %s · %s"
-            % (number, total, title, self._duration(elapsed)),
-            style="green",
-        ))
+        self._emit(screen_line("success", "Completed %d/%d · %s · %s", indent=6)
+            % (number, total, title, self._duration(elapsed)), soft_wrap=True)
         if outcome_fields:
-            self._emit(Text("          🧮  Outcome", style="bold cyan"))
+            self._emit(screen_line("count", "Outcome", indent=10))
+            value_fields = [field for field in outcome_fields if len(field) == 3]
             label_width = self.outcome_label_width or max(
-                len(label) for _, label, _ in outcome_fields
+                (len(field[1]) for field in value_fields), default=1,
             )
-            for kind, label, value in outcome_fields:
+            separator_column = self.outcome_separator_column or (
+                self._OUTCOME_FIELD_INDENT
+                + cell_len(SYMBOLS["count"])
+                + 2
+                + label_width
+            )
+            section_started = False
+            for field in outcome_fields:
+                kind, label = field[:2]
+                if len(field) == 2:
+                    if section_started:
+                        self._emit("")
+                    self._emit(screen_line(
+                            kind,
+                            label,
+                            indent=self._OUTCOME_FIELD_INDENT,
+                        ))
+                    section_started = True
+                    continue
+                value = field[2]
                 if isinstance(value, int) and not isinstance(value, bool):
                     value = f"{value:,}"
-                self._emit(Text(
-                    screen_field(
+                self._emit(screen_field(
                         kind,
                         label,
                         value,
                         width=self.console.width,
-                        indent=14,
+                        indent=(
+                            self._OUTCOME_SECTION_FIELD_INDENT
+                            if section_started
+                            else self._OUTCOME_FIELD_INDENT
+                        ),
                         label_width=label_width,
-                    ),
-                    style="cyan",
-                ))
+                        separator_column=separator_column,
+                        break_long_values=True,
+                    ), soft_wrap=True)
         elif outcome:
-            self._emit(Text(
-                "          🧮  Outcome : %s" % str(outcome).strip(),
-                style="cyan",
-            ))
+            self._emit(screen_field("count", "Outcome", str(outcome).strip(),
+                             indent=10, width=self._live_console.width), soft_wrap=True)
         if number == total:
-            self._emit(Text(
-                "      ✅  All %d stages completed" % total,
-                style="green",
-            ))
+            self._emit(screen_line("success", "All %d stages completed" % total, indent=6))
             self.close()
         else:
             self._resume()
 
     def fail_step(self, number: int, total: int, title: str) -> None:
+        from postgwas.core.validation_reporting import flush_file_validation_display
+
+        flush_file_validation_display()
         if not self.enabled:
             return
         number, total = self._values(number, total)
@@ -271,11 +457,8 @@ class StageProgress:
             )
             self._progress.refresh()
         self._pause()
-        self._emit(Text(
-            "      ❌  Failed %d/%d · %s · %s"
-            % (number, total, title, self._duration(elapsed)),
-            style="bold red",
-        ))
+        self._emit(screen_line("error", "Failed %d/%d · %s · %s", indent=6)
+            % (number, total, title, self._duration(elapsed)), soft_wrap=True)
         # A failed child stage propagates to its enclosing operation. Keep the
         # parent live region paused so the actionable error can be printed
         # without an obsolete outer bar redrawing over it.
@@ -292,6 +475,70 @@ class StageProgress:
             _ACTIVE_PROGRESS.set(tuple(item for item in active if item is not self))
         if resume_parent and self._parent is not None:
             self._parent._resume()
+
+
+class PipelineStageController:
+    """Advance one validated scientific stage plan across pipeline modules."""
+
+    def __init__(
+        self,
+        label: str,
+        stages,
+        *,
+        console: Console | None = None,
+        outcome_label_width: int | None = None,
+    ):
+        titles = tuple(str(title) for title in stages)
+        if not titles:
+            raise ValueError("Pipeline progress requires at least one stage")
+        self.stages = titles
+        self.progress = StageProgress(
+            label,
+            enabled=True,
+            console=console,
+            outcome_label_width=outcome_label_width,
+        )
+        self.current = 0
+        self.completed = 0
+
+    def start(self, number: int) -> None:
+        number = int(number)
+        if number != self.completed + 1:
+            raise ValueError(
+                "Pipeline stage %d cannot start after completed stage %d"
+                % (number, self.completed)
+            )
+        self.current = number
+        self.progress.start_step(number, len(self.stages), self.stages[number - 1])
+
+    def complete(self, number: int, *, outcome=None, outcome_fields=None) -> None:
+        number = int(number)
+        if self.current != number:
+            raise ValueError(
+                "Pipeline stage %d cannot complete while stage %d is active"
+                % (number, self.current)
+            )
+        self.progress.complete_step(
+            number,
+            len(self.stages),
+            self.stages[number - 1],
+            outcome=outcome,
+            outcome_fields=outcome_fields,
+        )
+        self.completed = number
+        self.current = 0
+
+    def fail_active(self) -> None:
+        if self.current:
+            self.progress.fail_step(
+                self.current,
+                len(self.stages),
+                self.stages[self.current - 1],
+            )
+            self.current = 0
+
+    def close(self) -> None:
+        self.progress.close()
 
 
 class MeasuredProgress(StageProgress):
@@ -357,20 +604,19 @@ class MeasuredProgress(StageProgress):
         self._title = str(title)
         self._total = total
         self._emit()
-        self._emit(Text("  🔬  %s" % self.label, style="bold cyan"))
-        started = Text(
-            "      🔬  %s"
+        self._emit(screen_line("analysis", self.label, indent=2))
+        started = style_screen_block(
+            screen_line("analysis", "%s", indent=6)
             % self._count_description("Started", 0, total, self._title),
-            style="cyan",
         )
         self._emit_started(started)
+        self._emit_forced_capture_current(
+            self._count_description("Current", 0, total, self._title),
+        )
         if self._interactive:
             self._progress = Progress(
-                TextColumn("      🔬  {task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TaskProgressColumn(),
-                TimeElapsedColumn(),
+                *self._columns(),
+                expand=True,
                 console=self._live_console,
                 transient=True,
                 redirect_stdout=False,
@@ -438,17 +684,14 @@ class MeasuredProgress(StageProgress):
             return
         self._last_summary_percentage = percentage
         elapsed = time.monotonic() - (self._step_started or time.monotonic())
-        self._emit(Text(
-            "      🔬  Progress %s/%s · %s · %d%% · %s"
+        self._emit(screen_line("analysis", "Progress %s/%s · %s · %d%% · %s", indent=6)
             % (
                 f"{displayed:,}",
                 f"{total:,}",
                 self._title,
                 percentage,
                 self._duration(elapsed),
-            ),
-            style="cyan",
-        ))
+            ))
 
     def set_phase(self, title: str) -> None:
         """Change an observed phase without pretending that work was measured."""
@@ -464,12 +707,11 @@ class MeasuredProgress(StageProgress):
         displayed = self._completed
         if self._total is not None and displayed == self._total:
             displayed = max(0, self._total - 1)
-        current = Text(
-            "      🔬  %s"
+        current = style_screen_block(
+            screen_line("analysis", "%s", indent=6)
             % self._count_description(
                 "Current", displayed, self._total, self._title,
             ),
-            style="cyan",
         )
         self._emit_started(current)
         if self._progress is not None:
@@ -508,11 +750,8 @@ class MeasuredProgress(StageProgress):
             )
             self._progress.refresh()
         self._pause()
-        self._emit(Text(
-            "      ✅  Completed %s/%s · %s · %s"
-            % (f"{completed:,}", f"{total:,}", self._title, self._duration(elapsed)),
-            style="green",
-        ))
+        self._emit(screen_line("success", "Completed %s/%s · %s · %s", indent=6)
+            % (f"{completed:,}", f"{total:,}", self._title, self._duration(elapsed)))
         self.close()
 
     def fail(self, *, title: str | None = None) -> None:
@@ -538,15 +777,54 @@ class MeasuredProgress(StageProgress):
             )
             self._progress.refresh()
         self._pause()
-        self._emit(Text(
-            "      ❌  Failed %s · %s"
+        self._emit(screen_line("error", "Failed %s · %s", indent=6)
             % (
                 self._count_description("", displayed, total, self._title).strip(),
                 self._duration(elapsed),
-            ),
-            style="bold red",
-        ))
+            ))
         self.close(resume_parent=False)
+
+
+def print_screen_block(block: str | Text, *, console: Console | None = None) -> None:
+    """Print a styled semantic block without corrupting active progress output."""
+    active = _ACTIVE_PROGRESS.get()
+    if active:
+        active[-1].print_block(block, console=console)
+        return
+    from postgwas.core.screen_logging import progress_display_console, progress_summary_console
+
+    rendered = style_screen_block(block)
+    display = progress_display_console()
+    if display is not None:
+        display.print(rendered, soft_wrap=True)
+        summary = progress_summary_console()
+        if summary is not None:
+            summary.print(rendered, soft_wrap=True)
+    else:
+        (console or Console()).print(rendered, soft_wrap=True)
+
+
+def print_screen_message(
+    kind: str, message: str, *, stderr: bool = False, console: Console | None = None,
+) -> None:
+    """Render explicitly classified literal text with shared wrapping and colour."""
+    destination = console or Console(stderr=stderr)
+    prefix = screen_line(kind, "", indent=6)
+    continuation = " " * cell_len(prefix)
+    # Rich Text handles terminal-cell widths and never interprets user paths
+    # or external diagnostics as markup. Keep each explicit source line.
+    lines = []
+    for number, line in enumerate(str(message).strip("\n").split("\n")):
+        first = prefix if number == 0 else continuation
+        available = max(1, destination.width - cell_len(first))
+        fragments = Text(line).wrap(
+            destination, available, overflow="fold", no_wrap=False,
+        )
+        lines.extend(
+            (first if index == 0 else continuation) + fragment.plain
+            for index, fragment in enumerate(fragments)
+        )
+    print_screen_block("\n".join(lines), console=destination)
 
 
 def run_with_progress(
@@ -581,4 +859,10 @@ def run_with_progress(
         progress.close()
 
 
-__all__ = ["MeasuredProgress", "StageProgress", "run_with_progress"]
+__all__ = [
+    "MeasuredProgress",
+    "StageProgress",
+    "print_screen_block",
+    "print_screen_message",
+    "run_with_progress",
+]

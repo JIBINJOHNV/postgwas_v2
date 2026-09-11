@@ -2,14 +2,49 @@
 
 from __future__ import annotations
 
-from postgwas.config import load_run_configuration_for_module
+import logging
+
+from postgwas.config import load_module_configuration, load_run_configuration_for_module
 from postgwas.config.cli_overrides import explicit_overrides
+from postgwas.core.execution.runtime import safe_thread_count
+from postgwas.core.io.reports import write_delimited_report
+from postgwas.core.preflight import (
+    PipelinePreflightEvidence,
+    pipeline_preflight_evidence,
+    require_pipeline_input_vcf,
+)
+from postgwas.core.plink import (
+    PLINK_BIM_COLUMN_ROLES,
+    PLINK_TABLE_DELIMITER_PATTERN,
+    validate_plink_bundle_dimensions,
+)
+from postgwas.core.required_arguments import (
+    RequiredArgument,
+    require_resolved_arguments,
+)
 from postgwas.modules.fine_mapping.logging_utils import detailed_file_logging
 from postgwas.modules.fine_mapping.output_layout import resolve_output_paths
 from postgwas.modules.fine_mapping.overlap_resolution import resolve_overlapping_results
 from postgwas.modules.fine_mapping.presentation import FineMappingScreen
+from postgwas.modules.fine_mapping.preflight import (
+    FineMappingResourcePreflight,
+    run_fine_mapping_preflight,
+    run_fine_mapping_resource_preflight,
+)
+from postgwas.modules.fine_mapping.reporting import write_fine_mapping_html_report
+from postgwas.modules.formatting.reference_identifiers import (
+    BimIdentifierRequirement,
+    configure_reference_variant_identifiers,
+)
+
+
+logger = logging.getLogger("postgwas.modules.fine_mapping")
 
 _COMMON_OVERRIDES = {
+    "locus_file": "input.locus_file",
+    "susie_input_file": "input.susie_summary_statistics_file",
+    "finemap_in_files": "input.finemap_summary_statistics_file",
+    "finemap_ld_reference": "input.ld_reference_prefix",
     "locus_type": "locus_type",
     "window_kb": "locus_window_kb",
     "lp_threshold": "locus_lp_threshold",
@@ -96,11 +131,15 @@ def _resolve_fine_mapping_arguments(args):
         for path, value in overrides.items()
         if path in set(_COMMON_OVERRIDES.values()) | {"engine"}
     }
+    plink_was_explicit = hasattr(args, "plink")
     global_overrides = explicit_overrides(
         args,
         {
             "plink": "resources.executables.plink",
             "rscript": "resources.executables.rscript",
+            "threads": "execution.threads",
+            "memory_gb": "execution.memory_gb",
+            "seed": "execution.random_seed",
         },
     )
     selected_configuration = load_run_configuration_for_module(
@@ -134,9 +173,23 @@ def _resolve_fine_mapping_arguments(args):
         global_overrides=global_overrides,
     )
     module = configuration.modules.fine_mapping
-    args.plink = configuration.resources.executables.plink
+    args.threads = configuration.execution.threads
+    args.memory_gb = configuration.execution.memory_gb
+    args.seed = configuration.execution.random_seed
+    args.plink = (
+        configuration.resources.executables.plink
+        if module.engine == "susie" or plink_was_explicit
+        else configuration.resources.executables.plink2
+    )
     args.rscript = configuration.resources.executables.rscript
+    args.bgenix = configuration.resources.executables.bgenix
+    args.ldstore = configuration.resources.executables.ldstore
+    args.finemap_executable = configuration.resources.executables.finemap
     args.finemap_method = module.engine
+    args.locus_file = module.input.locus_file
+    args.susie_input_file = module.input.susie_summary_statistics_file
+    args.finemap_in_files = module.input.finemap_summary_statistics_file
+    args.finemap_ld_reference = module.input.ld_reference_prefix
     args.locus_type = module.locus_type
     args.window_kb = module.locus_window_kb
     args.lp_threshold = module.locus_lp_threshold
@@ -156,6 +209,7 @@ def _resolve_fine_mapping_arguments(args):
     )
     args.fine_mapping_validation = module.validation.model_dump()
     args.fine_mapping_runtime = module.runtime.model_dump()
+    args.fine_mapping_html_report = module.html_report.model_dump()
     args.finemap_ld_peak_matrix_multiplier = (
         module.ld_resource_guard.finemap_peak_matrix_multiplier
     )
@@ -202,9 +256,106 @@ def _resolve_fine_mapping_arguments(args):
     return args
 
 
-def run_fine_mapping(args):
+def _require_fine_mapping_inputs(args) -> None:
+    """Validate all engine-specific required values after YAML/CLI resolution."""
+    summary_requirement = (
+        RequiredArgument(
+            "--susie-input-file",
+            "modules.fine_mapping.input.susie_summary_statistics_file",
+            args.susie_input_file,
+        )
+        if args.finemap_method == "susie"
+        else RequiredArgument(
+            "--finemap-in-files",
+            "modules.fine_mapping.input.finemap_summary_statistics_file",
+            args.finemap_in_files,
+        )
+    )
+    require_resolved_arguments(
+        (
+            RequiredArgument(
+                "--locus-file",
+                "modules.fine_mapping.input.locus_file",
+                args.locus_file,
+            ),
+            summary_requirement,
+            RequiredArgument(
+                "--finemap-ld-reference",
+                "modules.fine_mapping.input.ld_reference_prefix",
+                args.finemap_ld_reference,
+            ),
+        )
+    )
+
+
+def preflight_fine_mapping_pipeline(
+    args,
+    *,
+    preflight_evidence=None,
+) -> PipelinePreflightEvidence:
+    """Validate fine-mapping references and tools before generated inputs exist."""
+    require_pipeline_input_vcf(preflight_evidence)
+    args = _resolve_fine_mapping_arguments(args)
+    require_resolved_arguments((
+        RequiredArgument(
+            "--finemap-ld-reference",
+            "modules.fine_mapping.input.ld_reference_prefix",
+            args.finemap_ld_reference,
+        ),
+    ))
+    safe_thread_count(
+        args.threads,
+        args.minimum_memory_per_worker_gb,
+        available_ram_gb=args.memory_gb,
+        enforce_memory_budget=True,
+        reporter=None,
+    )
+    resources = run_fine_mapping_resource_preflight(args)
+    # Both engines extract reference variants by the exact SNP identifier;
+    # the column named rsid in FINEMAP is not an rsID-only scientific contract.
+    reference_files = dict(resources.reference_files)
+    configure_reference_variant_identifiers(
+        args,
+        load_module_configuration("formatting", getattr(args, "run_config", None)),
+        [BimIdentifierRequirement(
+            consumer="Fine-mapping (%s)" % args.finemap_method,
+            formatter_target=args.finemap_method,
+            bim_file=reference_files[".bim"],
+            column_roles=PLINK_BIM_COLUMN_ROLES,
+            delimiter_pattern=PLINK_TABLE_DELIMITER_PATTERN,
+        )],
+    )
+    validate_plink_bundle_dimensions(
+        reference_files,
+        variants=args.variant_id_observations[args.finemap_method]["variants"],
+    )
+    return pipeline_preflight_evidence(
+        "finemap",
+        preflight_evidence,
+        resources=resources,
+        deferred_checks=(
+            "Validate formatter summary statistics and LD-clumping loci.",
+            "Validate locus-level variant and coordinate overlap with the PLINK panel.",
+        ),
+    )
+
+
+def run_fine_mapping(
+    args,
+    *,
+    resource_preflight: FineMappingResourcePreflight | None = None,
+    upstream_results=None,
+):
     """Dispatch a resolved fine-mapping request to its selected engine."""
     args = _resolve_fine_mapping_arguments(args)
+    _require_fine_mapping_inputs(args)
+    safe_thread_count(
+        args.threads,
+        args.minimum_memory_per_worker_gb,
+        available_ram_gb=args.memory_gb,
+        enforce_memory_budget=True,
+        reporter=None,
+    )
     method = args.finemap_method
     if method == "susie":
         from postgwas.modules.fine_mapping.engines.susie.adapter import (
@@ -233,6 +384,98 @@ def run_fine_mapping(args):
     )
     screen.start()
     try:
+        initial_output_paths = resolve_output_paths(
+            args.output_directory,
+            args.fine_mapping_output_layout,
+            args.dataset_id,
+        )
+        with detailed_file_logging(
+            "postgwas.modules.fine_mapping",
+            initial_output_paths["pipeline_log_file"],
+            args.fine_mapping_logging["file_level"],
+        ):
+            logger.info(
+                "Fine-mapping preflight started: engine=%s dataset=%s",
+                method,
+                args.dataset_id,
+            )
+            try:
+                preflight = run_fine_mapping_preflight(
+                    args,
+                    resource_preflight=resource_preflight,
+                )
+            except BaseException as exc:
+                write_delimited_report(
+                    (
+                        {
+                            "category": "preflight",
+                            "check": "input_and_resource_validation",
+                            "status": "failed",
+                            "value": "",
+                            "path": "",
+                            "detail": str(exc) or type(exc).__name__,
+                        },
+                    ),
+                    initial_output_paths["preflight_validation_file"],
+                    fieldnames=(
+                        "category",
+                        "check",
+                        "status",
+                        "value",
+                        "path",
+                        "detail",
+                    ),
+                    delimiter="\t",
+                    null_value="",
+                )
+                logger.exception("Fine-mapping preflight failed: %s", exc)
+                raise
+            preflight_report = write_delimited_report(
+                preflight.audit_rows(),
+                initial_output_paths["preflight_validation_file"],
+                fieldnames=(
+                    "category",
+                    "check",
+                    "status",
+                    "value",
+                    "path",
+                    "detail",
+                ),
+                delimiter="\t",
+                null_value="",
+            )
+            logger.info(
+                "Fine-mapping preflight completed: summary_variants=%d "
+                "eligible_loci=%d reference_variants=%d reference_samples=%d "
+                "report=%s",
+                preflight.inputs.summary_statistics_rows,
+                preflight.inputs.eligible_loci,
+                preflight.reference.variants,
+                preflight.reference.samples,
+                preflight_report,
+            )
+            if (
+                preflight.reference.loci_with_reference_variants
+                < preflight.reference.loci_requested
+            ):
+                logger.warning(
+                    "Fine-mapping preflight found eligible loci without a "
+                    "coordinate-concordant PLINK reference variant: covered=%d "
+                    "eligible=%d; locus processing will retain locus-scoped "
+                    "failure handling",
+                    preflight.reference.loci_with_reference_variants,
+                    preflight.reference.loci_requested,
+                )
+            for tool in preflight.tools:
+                logger.info(
+                    "Fine-mapping runtime validated: tool=%s path=%s version=%s",
+                    tool.name,
+                    tool.path,
+                    tool.version,
+                )
+        args._fine_mapping_preflight = preflight
+        screen.complete(1, preflight.input_screen_fields())
+        screen.complete(2, preflight.resource_screen_fields())
         primary_result = run_engine(args, screen=screen)
         output_paths = resolve_output_paths(
             primary_result["output_dir"],
@@ -249,6 +492,19 @@ def run_fine_mapping(args):
                 args,
                 primary_result,
                 run_engine,
+            )
+            result["preflight_validation"] = str(preflight_report)
+            html_report = write_fine_mapping_html_report(
+                args,
+                preflight,
+                result,
+                output_paths,
+                upstream_results=upstream_results,
+            )
+            result["html_report"] = str(html_report)
+            logger.info(
+                "Fine-mapping scientific HTML report completed: %s",
+                html_report,
             )
         screen.complete(
             8,
@@ -276,6 +532,7 @@ def run_fine_mapping(args):
                     "Overall status",
                     result["status"].replace("_", " "),
                 ),
+                ("success", "Scientific HTML report", html_report.name),
             ],
         )
         screen.print_final_summary(result, output_paths["pipeline_log_file"])

@@ -74,6 +74,17 @@ class PostGWASConfig(StrictModel):
             raise ValueError("Unknown pipeline modules: " + ", ".join(unknown))
         if self.pipeline.stop_after and self.pipeline.stop_after not in self.pipeline.modules:
             raise ValueError("pipeline.stop_after must name an enabled pipeline module")
+        if {"ld_annotation", "ld_clumping"}.issubset(self.pipeline.modules):
+            annotation_field = (
+                "%INFO/" + self.modules.ld_annotation.info_field_template
+            )
+            clumping_field = self.modules.ld_clumping.vcf_fields.ld_block
+            if annotation_field != clumping_field:
+                raise ValueError(
+                    "modules.ld_annotation.info_field_template and "
+                    "modules.ld_clumping.vcf_fields.ld_block must describe the "
+                    "same population INFO field when both modules are in the pipeline"
+                )
         configured_builds = set(self.resources.genomes)
         filtering_mhc_builds = {
             build.value for build in self.modules.filtering.mhc_regions
@@ -109,11 +120,6 @@ class PostGWASConfig(StrictModel):
                 % ", ".join(sorted(missing_ld_clumping_mhc_builds))
             )
         qc_summary = self.modules.qc_summary
-        if qc_summary.target_build.value not in configured_builds:
-            raise ValueError(
-                "modules.qc_summary.target_build must be defined in "
-                "resources.genomes"
-            )
         qc_mhc_builds = {
             build.value for build in qc_summary.rules.mhc_regions
         }

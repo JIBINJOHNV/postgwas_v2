@@ -37,6 +37,7 @@ from postgwas.modules.single_cell.service import (
     resolve_single_cell_configuration,
     run_single_cell_direct,
 )
+from preflight_support import pipeline_input_vcf_evidence
 from postgwas.modules.single_cell.methods.registry import METHOD_REGISTRY
 from postgwas.modules.single_cell.methods.scdrs.runner import (
     validate_scdrs_covariates,
@@ -1148,7 +1149,9 @@ def test_scdrs_pipeline_preflight_defers_only_the_magma_result(tmp_path):
         output_directory=str(tmp_path / "results"),
     )
 
-    preflight_single_cell_pipeline(args)
+    preflight_single_cell_pipeline(
+        args, preflight_evidence=pipeline_input_vcf_evidence(),
+    )
 
     assert args.scdrs_gene_set_source == "magma"
     assert not hasattr(args, "scdrs_magma_gene_results_file")
@@ -1172,7 +1175,9 @@ def test_ldsc_celltype_pipeline_preflight_defers_only_formatter_sumstats(
         output_directory=str(tmp_path / "results"),
     )
 
-    preflight_single_cell_pipeline(args)
+    preflight_single_cell_pipeline(
+        args, preflight_evidence=pipeline_input_vcf_evidence(),
+    )
 
     assert args.ldsc_celltype_sumstats_source == "formatter"
     assert not hasattr(args, "ldsc_celltype_sumstats_file")

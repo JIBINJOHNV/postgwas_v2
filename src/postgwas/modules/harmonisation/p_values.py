@@ -1,43 +1,51 @@
-"""P-value scale: raw p, -log10 p or -ln p (per-chromosome step 08).
+"""P-value scale: raw p or -log10 p (per-chromosome step 07).
 
 Two entry points matter:
 
 ``detect_p_value_type(df, pval_col, policies)``
     Pure detection.  Reads the frame, changes nothing, returns
-    ``(decision, evidence)`` where ``decision`` is ``'raw'``, ``'neglog10'`` or
-    ``'negln'``.  The dataset-level "resolve study properties" step calls this
-    ONCE on the full input so every chromosome applies the same answer.
+    ``(decision, evidence)`` where ``decision`` is ``'raw'`` or ``'neglog10'``.
+    The dataset-level "resolve study properties" step calls this ONCE on the
+    full input so every chromosome applies the same answer.
 
 ``harmonise_p_values(chromosome, df, sample_column_dict, ...)``
     Applies a decision - the study-level one when handed in through
     ``decision=``, otherwise one detected from this chromosome alone - and
-    leaves a plain p-value column behind, exactly as before.
+    leaves one plain p-value column named by ``pvalue.output_column``. The
+    GWAS-to-VCF boundary consumes that raw value and creates FORMAT/LP later.
 
-The natural-log case is new.  The old classifier had two outcomes, and both of
-its last two branches returned the same one, so a ``-ln p`` column was labelled
-``-log10 p`` and had ``10 ** (-x)`` applied to it: every p-value wrong by about
-four orders of magnitude, silently.  The medians are the discriminator - about
-0.5 for raw p, 0.30 for -log10 p, 0.69 for -ln p - and a median that sits
-between the two log scales is reported as ambiguous and raises rather than
-being guessed at.
+Automatic detection recognises only the two standard GWAS representations.
+Negative values are incompatible with both. A small configured fraction is
+warned about and rejected row by row; a larger fraction stops the study before
+chromosome processing because it is evidence of a wrong scale or mapping. A
+-log10 decision requires agreement between the configured count, fraction,
+and study-wide median policies; therefore one sentinel cannot select a scale
+for the file. Signed logarithms and natural-log representations must be
+converted before PostGWAS reads them.
 
-Two internal boolean columns, ``__pval_clipped_high`` and ``__pval_clipped_low``,
-mark values forced back into the valid range. ``__pval_reported_zero`` separately
-preserves the fact that a raw input value was exactly zero after the value itself
-is raised to the configured floating-point floor. A reported p-value of exactly 1
-is valid, remains unchanged, and is never flagged. The working columns survive
-until effect validation and are dropped before export.
+The canonical public value remains a plain raw p-value. Private source-text,
+natural-log-p and exact-raw-text columns preserve values that cannot be
+represented as a positive Float64. These are numerical provenance, not a
+second public p-value field. A positive source token such as ``1e-400`` is
+therefore never confused with a study-reported zero.
 """
 
+from decimal import Decimal, InvalidOperation, localcontext
 import math
-from typing import Any, Dict, Optional, Tuple, Union
+import sys
+from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
 
 from postgwas.core.values import format_count as _count, format_number as _fmt
 from postgwas.core.statistics import negative_log10_to_raw_p
 
-from .shared.runtime import NullStepContext, resolve_policies, step_context
+from .shared.runtime import (
+    NullStepContext,
+    reject_rows,
+    resolve_policies,
+    step_context,
+)
 
 
 __all__ = [
@@ -45,15 +53,24 @@ __all__ = [
     "CLIPPED_COLUMNS",
     "CLIPPED_HIGH_COLUMN",
     "CLIPPED_LOW_COLUMN",
+    "EXACT_RAW_P_COLUMN",
+    "ExcessiveNegativePValueError",
+    "FLOAT_UNDERFLOW_COLUMN",
     "INTERNAL_PVALUE_COLUMNS",
+    "LOG_P_COLUMN",
+    "P_VALUE_EXACT_RAW_KEY",
+    "P_VALUE_LOG_KEY",
+    "P_VALUE_SOURCE_TEXT_KEY",
     "REPORTED_ZERO_COLUMN",
+    "SOURCE_TEXT_COLUMN",
     "POLICY_KEYS",
     "PValueTypeError",
     "STEP_LABEL",
+    "assess_negative_pvalues",
     "convert_negative_log10_to_p_value",
-    "convert_p_value_to_negative_log10",
     "harmonise_p_values",
     "detect_p_value_type",
+    "preserve_pvalue_source_text",
 ]
 
 
@@ -66,49 +83,68 @@ STEP_TITLE = "P-value scale"
 
 POLICY_KEYS = [
     "pvalue.type",
+    "pvalue.output_column",
     "pvalue.mlogp_detect_threshold",
     "pvalue.mlogp_detect_proportion",
+    "pvalue.mlogp_detect_min_count",
+    "pvalue.mlogp_expected_median",
+    "pvalue.mlogp_median_tolerance",
+    "pvalue.max_negative_fraction",
     "pvalue.tolerance_above_one",
     "pvalue.out_of_range",
     "pvalue.clip_low",
     "pvalue.clip_high",
     "pvalue.mlogp_min",
-    "pvalue.mlogp_max",
     "pvalue.verify_per_chromosome",
 ]
 
-# Internal flags consumed by the effect-statistics validation step and dropped
-# before export.
+# Private calculation and provenance columns. Boolean correction flags are
+# consumed by effect validation; mapped source/log/exact columns remain until
+# the adapter boundary and are excluded from its explicit scientific mapping.
 CLIPPED_HIGH_COLUMN = "__pval_clipped_high"
 CLIPPED_LOW_COLUMN = "__pval_clipped_low"
 CLIPPED_COLUMNS = (CLIPPED_HIGH_COLUMN, CLIPPED_LOW_COLUMN)
 REPORTED_ZERO_COLUMN = "__pval_reported_zero"
-INTERNAL_PVALUE_COLUMNS = CLIPPED_COLUMNS + (REPORTED_ZERO_COLUMN,)
+SOURCE_TEXT_COLUMN = "__pval_source_text"
+LOG_P_COLUMN = "__pval_ln"
+EXACT_RAW_P_COLUMN = "__pval_exact_raw"
+FLOAT_UNDERFLOW_COLUMN = "__pval_float_underflow"
 
-# Constants of the arithmetic, not settings.  Under the null hypothesis half the
-# p-values are below 0.5, so the median of -log10 p is log10(2) and the median of
-# -ln p is ln(2).  Real data is enriched and sits a little above these, which is
-# why the decision is made on the ratio and why the middle ground is refused.
-LN10 = math.log(10.0)
-MEDIAN_NEGLOG10 = math.log10(2.0)        # 0.30103
-MEDIAN_NEGLN = math.log(2.0)             # 0.69315
-MEDIAN_MIDPOINT = math.sqrt(MEDIAN_NEGLOG10 * MEDIAN_NEGLN)   # 0.45673
-MEDIAN_AMBIGUITY_FACTOR = 1.15           # a median within x1.15 of the midpoint
-                                         # is too close to call
-# How far, as a ratio, the observed median may sit from an expected one and
-# still count as that scale.  Half the separation between the two expectations,
-# so the two acceptance windows meet at the midpoint and cover 0.198 to 1.051.
-# A median outside both - a file of top hits only, say - fits neither scale and
-# is reported as undecidable rather than guessed at.
-MEDIAN_ACCEPT_LOG_DISTANCE = 0.5 * abs(math.log(MEDIAN_NEGLN / MEDIAN_NEGLOG10))
-# A p-value can never exceed 1, so anything past this is evidence of a log
-# scale on its own.  This is the `max_val > 2` rule the old detector used.
-MAX_RAW_PVALUE_EVIDENCE = 2.0
+# Temporary source-status columns. They are materialised before either scale
+# branch changes the selected input column, then consumed and removed by the
+# shared canonical range/missingness gate. Keeping the categories separate is
+# what prevents a valid Float64-underflow probability from being mistaken for
+# a missing or non-finite source value after -log10 conversion.
+SOURCE_MISSING_STATUS_COLUMN = "__pval_source_missing"
+SOURCE_NONFINITE_STATUS_COLUMN = "__pval_source_nonfinite"
+SOURCE_NEGATIVE_STATUS_COLUMN = "__pval_source_negative"
+SOURCE_STATUS_COLUMNS = (
+    SOURCE_MISSING_STATUS_COLUMN,
+    SOURCE_NONFINITE_STATUS_COLUMN,
+    SOURCE_NEGATIVE_STATUS_COLUMN,
+)
+
+P_VALUE_SOURCE_TEXT_KEY = "pvalue_source_text_col"
+P_VALUE_LOG_KEY = "pvalue_log_col"
+P_VALUE_EXACT_RAW_KEY = "pvalue_exact_raw_col"
+
+INTERNAL_PVALUE_COLUMNS = CLIPPED_COLUMNS + (
+    REPORTED_ZERO_COLUMN,
+    SOURCE_TEXT_COLUMN,
+    LOG_P_COLUMN,
+    EXACT_RAW_P_COLUMN,
+    FLOAT_UNDERFLOW_COLUMN,
+) + SOURCE_STATUS_COLUMNS
+
+# Decimal128 precision is far beyond the Float32 precision of GWAS-VCF LP and
+# is used only for exceptional source tokens that Float64 cannot represent.
+_DECIMAL_PRECISION = 34
+_DECIMAL_EMIN = -999999999
+_DECIMAL_EMAX = 999999999
 
 _SCALE_TEXT = {
     "raw": "plain p-values",
     "neglog10": "-log10 p",
-    "negln": "-ln p (natural log)",
 }
 
 
@@ -117,20 +153,269 @@ class PValueTypeError(ValueError):
 
 
 class AmbiguousPValueTypeError(PValueTypeError):
-    """The column is on a log scale but which log cannot be determined."""
+    """Automatic evidence does not safely identify raw p or -log10 p."""
 
 
-class _Unset(object):
-    def __repr__(self):
-        return "<from policies>"
+class ExcessiveNegativePValueError(PValueTypeError):
+    """Too much of the study p-value column is negative to continue safely."""
 
 
-_UNSET = _Unset()
+def assess_negative_pvalues(
+    statistics: Dict[str, Any],
+    pval_col: str,
+    policies: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Validate the study-wide fraction of negative usable p-value cells.
+
+    The denominator is the finite numeric subset. Missing, unparseable, NaN and
+    infinite cells cannot dilute evidence of a signed-log or wrongly mapped
+    p-value column.
+    """
+    policies = resolve_policies(policies)
+    n_usable = int(statistics.get("n_usable") or 0)
+    n_negative = int(statistics.get("n_negative") or 0)
+    negative_fraction = n_negative / n_usable if n_usable else 0.0
+    maximum_fraction = float(policies.pvalue.max_negative_fraction)
+    result = {
+        "n_negative": n_negative,
+        "negative_fraction": negative_fraction,
+        "max_negative_fraction": maximum_fraction,
+    }
+    if n_negative and negative_fraction > maximum_fraction:
+        value_word = "value" if n_negative == 1 else "values"
+        raise ExcessiveNegativePValueError(
+            "P-value column %r contains %s negative usable %s out of %s "
+            "(%s), exceeding pvalue.max_negative_fraction=%s (%s). PostGWAS "
+            "supports raw p-values in [0,1] or non-negative -log10(p). This "
+            "negative fraction usually indicates signed log10(p), ln(p), an "
+            "incorrect p-value-column mapping, or mixed/corrupt data. Convert "
+            "the complete column to raw p or non-negative -log10(p), correct "
+            "p_value_column/p_value_type if necessary, and rerun. No chromosome "
+            "processing was started."
+            % (
+                pval_col,
+                _count(n_negative),
+                value_word,
+                _count(n_usable),
+                "%.4f%%" % (negative_fraction * 100.0),
+                _fmt(maximum_fraction),
+                "%.2f%%" % (maximum_fraction * 100.0),
+            )
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+def preserve_pvalue_source_text(df: pl.DataFrame, sample_column_dict):
+    """Keep the configured source token before any numeric normalization.
+
+    The stable private mapping is carried through chromosome partition I/O and
+    final validation. Direct library callers receive the same protection when
+    they call :func:`harmonise_p_values` without the dataset reader.
+    """
+    pval_col = sample_column_dict.get("pval_col")
+    if not pval_col or pval_col not in df.columns:
+        return df, sample_column_dict
+
+    configured = sample_column_dict.get(P_VALUE_SOURCE_TEXT_KEY)
+    if configured and configured in df.columns:
+        return df, sample_column_dict
+    if SOURCE_TEXT_COLUMN in df.columns and SOURCE_TEXT_COLUMN != pval_col:
+        raise PValueTypeError(
+            "Input uses reserved internal p-value provenance column %r. Rename "
+            "that input column before harmonisation." % SOURCE_TEXT_COLUMN
+        )
+
+    df = df.with_columns(
+        pl.col(pval_col)
+        .cast(pl.String, strict=False)
+        .str.strip_chars()
+        .replace("", None)
+        .alias(SOURCE_TEXT_COLUMN)
+    )
+    sample_column_dict[P_VALUE_SOURCE_TEXT_KEY] = SOURCE_TEXT_COLUMN
+    return df, sample_column_dict
+
+
+def _attach_pvalue_source_status(df, pval_col, source_col):
+    """Materialise source missing/non-finite/negative status before conversion.
+
+    The ordinary path is fully vectorised. Decimal inspection is restricted to
+    negative-signed numeric zeros so an extreme token such as ``-1e-400`` is
+    not rounded to ``-0.0`` and then silently accepted as ``-log10(p) = 0``.
+    A literal ``-0`` remains mathematically zero and is not marked negative.
+    """
+    collisions = [name for name in SOURCE_STATUS_COLUMNS if name in df.columns]
+    if collisions:
+        raise PValueTypeError(
+            "Input uses reserved internal p-value source-status column(s): %s. "
+            "Rename those input columns before harmonisation."
+            % ", ".join(collisions)
+        )
+
+    row_column = "__pval_source_status_row"
+    if row_column in df.columns:
+        raise PValueTypeError(
+            "Input uses reserved internal p-value provenance column %r. Rename "
+            "that input column before harmonisation." % row_column
+        )
+
+    indexed = df.with_row_index(row_column)
+    numeric = pl.col(pval_col).cast(pl.Float64, strict=False)
+    signed_zero_candidates = indexed.filter(
+        numeric.is_finite()
+        & (numeric == 0.0)
+        & pl.col(source_col).cast(pl.String, strict=False)
+        .str.starts_with("-")
+        .fill_null(False)
+    ).select(row_column, source_col)
+    negative_underflow_indices = []
+    for index, token in signed_zero_candidates.iter_rows():
+        value = _decimal_value(token)
+        if value is not None and value < 0:
+            negative_underflow_indices.append(index)
+
+    source_negative = (
+        (numeric.is_finite() & (numeric < 0.0))
+        | pl.col(row_column).is_in(negative_underflow_indices)
+    ).fill_null(False)
+    return indexed.with_columns(
+        numeric.is_null().alias(SOURCE_MISSING_STATUS_COLUMN),
+        (
+            numeric.is_not_null() & ~numeric.is_finite()
+        ).fill_null(False).alias(SOURCE_NONFINITE_STATUS_COLUMN),
+        source_negative.alias(SOURCE_NEGATIVE_STATUS_COLUMN),
+    ).drop(row_column)
+
+
+def _decimal_value(token):
+    if token is None:
+        return None
+    try:
+        value = Decimal(str(token).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return value if value.is_finite() else None
+
+
+def _decimal_ln(value: Decimal) -> float:
+    with localcontext() as ctx:
+        ctx.prec = _DECIMAL_PRECISION
+        ctx.Emin = _DECIMAL_EMIN
+        ctx.Emax = _DECIMAL_EMAX
+        return float(value.ln())
+
+
+def _raw_text_from_neglog10(value: Decimal) -> str:
+    with localcontext() as ctx:
+        ctx.prec = _DECIMAL_PRECISION
+        ctx.Emin = _DECIMAL_EMIN
+        ctx.Emax = _DECIMAL_EMAX
+        return format(ctx.power(Decimal(10), -value), "E")
+
+
+def _attach_raw_source_provenance(df, pval_col, source_col):
+    """Attach exact log-p and underflow provenance for a raw-p source."""
+    row_column = "__pval_provenance_row"
+    if row_column in df.columns:
+        raise PValueTypeError(
+            "Input uses reserved internal p-value provenance column %r. Rename "
+            "that input column before harmonisation." % row_column
+        )
+    indexed = df.with_row_index(row_column)
+    numeric = pl.col(pval_col).cast(pl.Float64, strict=False)
+    # Only literal zero, Float64 underflow, and subnormal values need Decimal.
+    # Ordinary GWAS rows stay entirely vectorised and do not acquire Python
+    # objects, which keeps this step practical for tens of millions of rows.
+    candidates = indexed.filter(
+        numeric.is_not_null()
+        & numeric.is_finite()
+        & (numeric.abs() < sys.float_info.min)
+    ).select(row_column, source_col, pval_col)
+
+    reported_zero_indices = []
+    underflow_indices = []
+    negative_underflow_indices = []
+    log_override_indices = []
+    log_override_values = []
+    for index, token, numeric_value in candidates.iter_rows():
+        value = _decimal_value(token)
+        if value is None:
+            continue
+        if value.is_zero():
+            reported_zero_indices.append(index)
+        elif value < 0:
+            negative_underflow_indices.append(index)
+        elif value <= 1:
+            log_override_indices.append(index)
+            log_override_values.append(_decimal_ln(value))
+            if float(numeric_value) == 0.0:
+                underflow_indices.append(index)
+
+    if log_override_indices:
+        overrides = pl.DataFrame({
+            row_column: pl.Series(
+                row_column,
+                log_override_indices,
+                dtype=indexed.schema[row_column],
+            ),
+            "__pval_log_override": log_override_values,
+        })
+        indexed = indexed.join(
+            overrides, on=row_column, how="left", coalesce=True,
+        )
+        exact_log = pl.col("__pval_log_override")
+    else:
+        exact_log = pl.lit(None, dtype=pl.Float64)
+
+    underflow = pl.col(row_column).is_in(underflow_indices)
+    reported_zero = pl.col(row_column).is_in(reported_zero_indices)
+    negative_underflow = pl.col(row_column).is_in(negative_underflow_indices)
+    numeric_log = (
+        pl.when(
+            numeric.is_finite() & (numeric > 0.0) & (numeric <= 1.0)
+        )
+        .then(numeric.log())
+        .otherwise(None)
+    )
+    result = indexed.with_columns(
+        pl.when(underflow)
+        .then(None)
+        .when(negative_underflow)
+        .then(pl.lit(-sys.float_info.min))
+        .otherwise(numeric)
+        .alias(pval_col),
+        pl.coalesce(exact_log, numeric_log).alias(LOG_P_COLUMN),
+        reported_zero.alias(REPORTED_ZERO_COLUMN),
+        underflow.alias(FLOAT_UNDERFLOW_COLUMN),
+        pl.when(underflow)
+        .then(pl.col(source_col))
+        .otherwise(None)
+        .cast(pl.String)
+        .alias(EXACT_RAW_P_COLUMN),
+    )
+    drop_columns = [row_column]
+    if "__pval_log_override" in result.columns:
+        drop_columns.append("__pval_log_override")
+    return result.drop(drop_columns)
+
+
+def _synchronise_log_from_raw_p(df, pval_col):
+    """Make log provenance follow every representable validated raw value."""
+    numeric = pl.col(pval_col).cast(pl.Float64, strict=False)
+    existing = pl.col(LOG_P_COLUMN).cast(pl.Float64, strict=False)
+    return df.with_columns(
+        pl.when(existing.is_finite() & (existing <= 0.0))
+        .then(existing)
+        .when(numeric.is_finite() & (numeric > 0.0) & (numeric <= 1.0))
+        .then(numeric.log())
+        .otherwise(None)
+        .alias(LOG_P_COLUMN)
+    )
+
+
 def _normalise_decision(value):
     """Return a canonical p-value scale decision."""
     if value is None:
@@ -149,27 +434,9 @@ def _normalise_decision(value):
         return "raw"
     if text == "neglog10":
         return "neglog10"
-    if text == "negln":
-        return "negln"
     raise PValueTypeError(
-        "unknown p-value scale %r - expected 'raw', 'neglog10' or 'negln'" % (value,)
+        "unknown p-value scale %r - expected 'raw' or 'neglog10'" % (value,)
     )
-
-
-def _drop_or_reject(df, mask, reason, detail, plain, check, ctx, rejects, warn=True):
-    """Remove the rows the mask selects, recorded either way.
-
-    ``mask`` must already be null-free (nulls are handled before this is
-    called).  With a reject collector the rows go into the reject file and the
-    collector does its own before/after logging; without one they are filtered
-    out and the QC action is logged here so the count is never silent.
-    """
-    before = df.height
-    if rejects is not None:
-        return rejects.reject(df, mask, STEP_LABEL, reason, detail=detail)
-    df = df.filter(~mask)
-    ctx.qc(check, plain, before, df.height, reason=reason, warn=warn, step=STEP_LABEL)
-    return df
 
 
 # ---------------------------------------------------------------------------
@@ -184,11 +451,10 @@ def detect_p_value_type(
     """Decide the scale of ``pval_col``.
 
     Returns ``(decision, evidence)`` with ``decision`` in
-    ``{'raw', 'neglog10', 'negln'}``.  Raises ``AmbiguousPValueTypeError`` when
-    the column is clearly on a log scale but the median lies between the two
-    log scales, rather than picking one and being wrong by a factor of
-    ``ln(10)`` in the exponent. The optional ``statistics`` input lets the
-    dataset-level resolver reuse the canonical aggregates from its combined scan.
+    ``{'raw', 'neglog10'}``. Raises ``AmbiguousPValueTypeError`` when the
+    configured count, fraction, and median evidence do not agree. The optional
+    ``statistics`` input lets the dataset-level resolver reuse the canonical
+    aggregates from its combined scan.
     """
     policies = resolve_policies(policies)
 
@@ -200,6 +466,9 @@ def detect_p_value_type(
 
     threshold = policies.pvalue.mlogp_detect_threshold
     proportion = policies.pvalue.mlogp_detect_proportion
+    minimum_count = policies.pvalue.mlogp_detect_min_count
+    expected_median = policies.pvalue.mlogp_expected_median
+    median_tolerance = policies.pvalue.mlogp_median_tolerance
 
     row = statistics
     if row is None:
@@ -215,28 +484,35 @@ def detect_p_value_type(
             % (pval_col, n_rows)
         )
 
-    above_fraction = int(row["n_above_threshold"] or 0) / n_usable
-    within_fraction = int(row["n_within"] or 0) / n_usable
+    n_above_threshold = int(row["n_above_threshold"] or 0)
+    n_negative = int(row["n_negative"] or 0)
+    above_fraction = n_above_threshold / n_usable
     median = row["median"]
     maximum = row["max"]
+    minimum = row["min"]
+    median_low = expected_median - median_tolerance
+    median_high = expected_median + median_tolerance
 
     evidence = {
         "pval_col": pval_col,
         "n_rows": n_rows,
         "n_non_null": int(row["n_non_null"] or 0),
         "n_usable": n_usable,
-        "n_negative": int(row["n_negative"] or 0),
+        "n_negative": n_negative,
+        "n_above_threshold": n_above_threshold,
         "above_threshold_fraction": above_fraction,
-        "within_range_fraction": within_fraction,
         "detect_threshold": threshold,
         "detect_proportion": proportion,
-        "min": row["min"],
+        "detect_min_count": minimum_count,
+        "min": minimum,
         "max": maximum,
         "mean": row["mean"],
         "median": median,
-        "expected_median_neglog10": MEDIAN_NEGLOG10,
-        "expected_median_negln": MEDIAN_NEGLN,
+        "expected_median_neglog10": expected_median,
+        "median_tolerance": median_tolerance,
+        "median_acceptance_range": [median_low, median_high],
     }
+    evidence.update(assess_negative_pvalues(row, pval_col, policies))
 
     configured = policies.pvalue.type
     if configured != "auto":
@@ -245,87 +521,56 @@ def detect_p_value_type(
 
     evidence["decision_source"] = "automatic detection"
 
-    # Raw against log is decided by the SHARE of values above 1, not by the
-    # largest one.  A p-value cannot exceed 1, while a -log10 p column has
-    # roughly 10% of its values above 1 and a -ln p column roughly 37%, so the
-    # share separates the hypotheses cleanly.  The old detector also declared a
-    # log scale whenever the maximum exceeded 2, which turned a raw column with
-    # a single corrupt cell into a log column and applied 10**(-p) to all of
-    # it; the maximum is kept as evidence and the offending values are dealt
-    # with by the range gate instead.
-    on_log_scale = above_fraction >= proportion
-    evidence["on_log_scale"] = on_log_scale
-    evidence["max_above_raw_range"] = bool(
-        maximum is not None and maximum > MAX_RAW_PVALUE_EVIDENCE
-    )
+    fraction_supports_log = above_fraction >= proportion
+    count_supports_log = n_above_threshold >= minimum_count
+    evidence["fraction_supports_neglog10"] = fraction_supports_log
+    evidence["count_supports_neglog10"] = count_supports_log
+    evidence["on_log_scale"] = fraction_supports_log and count_supports_log
+    evidence["has_values_above_detection_threshold"] = n_above_threshold > 0
 
-    if not on_log_scale:
+    if fraction_supports_log and not count_supports_log:
+        raise AmbiguousPValueTypeError(
+            "Column %r has %s usable values above the configured -log10 evidence "
+            "threshold %s (%s), but pvalue.mlogp_detect_min_count requires at least "
+            "%s. A single sentinel or corrupt value cannot select the scale for the "
+            "study. Validate the outlying cells or set pvalue.type only after confirming "
+            "the source representation. No chromosome processing was started."
+            % (
+                pval_col,
+                _count(n_above_threshold),
+                _fmt(threshold),
+                "%.4f%%" % (above_fraction * 100.0),
+                _count(minimum_count),
+            )
+        )
+
+    if not evidence["on_log_scale"]:
         return "raw", evidence
 
-    # A log scale: which log?
-    if median is None or median <= 0.0:
+    # Range evidence alone is insufficient: require the configured study-wide
+    # median so -ln p and selected/top-hit-only files are never guessed.
+    if median is None or median < median_low or median > median_high:
         raise AmbiguousPValueTypeError(
-            "Column %r is on a log scale (%.4f%% of values exceed %s, maximum %s) "
-            "but its median is %s, so -log10 p and -ln p cannot be told apart. "
-            "Set pvalue.type in the config."
+            "Column %r has -log10-like range evidence (%s values; %.4f%% exceed %s), "
+            "but its study-wide median %s does not agree with the configured -log10 "
+            "median %s within tolerance %s (accepted range %s to %s). This can indicate "
+            "-ln(p), a selected/top-hit-only file, or mixed/invalid data. Convert the "
+            "column to raw p or -log10 p, or explicitly set pvalue.type='neglog10' only "
+            "when the source metadata proves that representation. No chromosome processing "
+            "was started."
             % (
                 pval_col,
+                _count(n_above_threshold),
                 above_fraction * 100.0,
                 _fmt(threshold),
-                _fmt(maximum),
                 _fmt(median),
+                _fmt(expected_median),
+                _fmt(median_tolerance),
+                _fmt(median_low),
+                _fmt(median_high),
             )
         )
-
-    band_low = MEDIAN_MIDPOINT / MEDIAN_AMBIGUITY_FACTOR
-    band_high = MEDIAN_MIDPOINT * MEDIAN_AMBIGUITY_FACTOR
-    accept_low = MEDIAN_NEGLOG10 / math.exp(MEDIAN_ACCEPT_LOG_DISTANCE)
-    accept_high = MEDIAN_NEGLN * math.exp(MEDIAN_ACCEPT_LOG_DISTANCE)
-    evidence["ambiguous_median_band"] = [band_low, band_high]
-    evidence["plausible_median_range"] = [accept_low, accept_high]
-
-    if median < accept_low or median > accept_high:
-        # Neither scale predicts this median.  The usual cause is a file that
-        # holds only the top hits, where the median says nothing about the
-        # scale.  Refuse rather than pick.
-        raise AmbiguousPValueTypeError(
-            "Column %r is on a log scale, but its median of %s fits neither "
-            "-log10 p (expected about %s) nor -ln p (expected about %s); "
-            "anything outside %s to %s is not decidable from the median, which "
-            "usually means the file holds only the strongest associations. "
-            "Guessing would make every p-value wrong by a factor of ln(10) in "
-            "the exponent, so nothing was guessed. Set pvalue.type to "
-            "'neglog10' or 'negln' in the config."
-            % (
-                pval_col,
-                _fmt(median, "%.4f"),
-                _fmt(MEDIAN_NEGLOG10, "%.4f"),
-                _fmt(MEDIAN_NEGLN, "%.4f"),
-                _fmt(accept_low, "%.4f"),
-                _fmt(accept_high, "%.4f"),
-            )
-        )
-
-    if band_low <= median <= band_high:
-        raise AmbiguousPValueTypeError(
-            "Column %r is on a log scale, but its median of %s sits between the "
-            "%s expected of -log10 p and the %s expected of -ln p (the "
-            "undecidable band is %s to %s). Guessing would make every p-value "
-            "wrong by a factor of ln(10) in the exponent, so nothing was "
-            "guessed. Set pvalue.type to 'neglog10' or 'negln' in the config."
-            % (
-                pval_col,
-                _fmt(median, "%.4f"),
-                _fmt(MEDIAN_NEGLOG10, "%.4f"),
-                _fmt(MEDIAN_NEGLN, "%.4f"),
-                _fmt(band_low, "%.4f"),
-                _fmt(band_high, "%.4f"),
-            )
-        )
-
-    if median < MEDIAN_MIDPOINT:
-        return "neglog10", evidence
-    return "negln", evidence
+    return "neglog10", evidence
 
 
 def _pvalue_type_statistic_expressions(
@@ -341,7 +586,6 @@ def _pvalue_type_statistic_expressions(
         values.is_not_null().sum().alias(prefix + "n_non_null"),
         values.is_finite().sum().alias(prefix + "n_usable"),
         (usable > threshold).sum().alias(prefix + "n_above_threshold"),
-        ((usable >= 0.0) & (usable <= threshold)).sum().alias(prefix + "n_within"),
         (usable < 0.0).sum().alias(prefix + "n_negative"),
         usable.min().alias(prefix + "min"),
         usable.max().alias(prefix + "max"),
@@ -352,10 +596,11 @@ def _pvalue_type_statistic_expressions(
 
 def _detection_sentence(evidence):
     return (
-        "%s of %s usable values exceed %s (median %s, maximum %s)"
+        "%s of %s usable values (%s) exceed %s (median %s, maximum %s)"
         % (
-            "%.3f%%" % (evidence.get("above_threshold_fraction", 0.0) * 100.0),
+            _count(evidence.get("n_above_threshold")),
             _count(evidence.get("n_usable")),
+            "%.3f%%" % (evidence.get("above_threshold_fraction", 0.0) * 100.0),
             _fmt(evidence.get("detect_threshold")),
             _fmt(evidence.get("median"), "%.4f"),
             _fmt(evidence.get("max")),
@@ -364,168 +609,74 @@ def _detection_sentence(evidence):
 
 
 # ---------------------------------------------------------------------------
-# 3.  Raw p  ->  -log10 p
-# ---------------------------------------------------------------------------
-def convert_p_value_to_negative_log10(
-    df: pl.DataFrame,
-    sample_column_dict,
-    output_col: str = "LP",
-    min_p: Optional[float] = None,
-    max_p: Optional[float] = None,
-    logger: Optional[Any] = None,
-    policies: Optional[Any] = None,
-    ctx: Optional[Any] = None,
-    rejects: Optional[Any] = None,
-):
-    """Turn plain p-values into ``-log10 p`` in ``output_col``.
-
-    ``min_p`` / ``max_p`` default to ``pvalue.clip_low`` and
-    ``pvalue.clip_high``. The canonical upper bound is 1 because p=1 is valid.
-    """
-    policies = resolve_policies(policies)
-    ctx = ctx if ctx is not None else NullStepContext(df.height)
-    if min_p is None:
-        min_p = policies.pvalue.clip_low
-    if max_p is None:
-        max_p = policies.pvalue.clip_high
-
-    pval_col = sample_column_dict["pval_col"]
-    if pval_col not in df.columns:
-        raise PValueTypeError("Column '%s' not found in DataFrame." % (pval_col,))
-
-    values = pl.col(pval_col).cast(pl.Float64, strict=False)
-    counts = df.select(
-        [
-            values.is_null().sum().alias("n_null"),
-            ((values <= 0.0) | (values > 1.0)).sum().alias("n_out"),
-        ]
-    ).to_dicts()[0]
-    n_null = int(counts["n_null"] or 0)
-    n_out = int(counts["n_out"] or 0)
-
-    if n_null:
-        df = _drop_or_reject(
-            df,
-            pl.col(pval_col).is_null(),
-            "pval_null",
-            None,
-            "%s variants have no p-value, so -log10 p cannot be computed for "
-            "them." % (_count(n_null),),
-            "p-value present",
-            ctx,
-            rejects,
-        )
-    if n_out:
-        df = _drop_or_reject(
-            df,
-            ((pl.col(pval_col) <= 0.0) | (pl.col(pval_col) > 1.0)).fill_null(False),
-            "pval_out_of_range",
-            "p is above 0 and at most 1",
-            "%s variants have a p-value of 0 or below, or above 1, which has "
-            "no usable logarithm." % (_count(n_out),),
-            "p-value range",
-            ctx,
-            rejects,
-        )
-
-    df = df.with_columns(pl.col(pval_col).clip(min_p, max_p).alias("__p_clipped"))
-    df = df.with_columns(
-        (-pl.col("__p_clipped").log10()).clip(0.0, None).alias(output_col)
-    ).drop("__p_clipped")
-
-    stats = df.select(
-        pl.col(output_col).min().alias("min_LP"),
-        pl.col(output_col).max().alias("max_LP"),
-        pl.col(output_col).mean().alias("mean_LP"),
-        pl.col(output_col).median().alias("median_LP"),
-    ).to_dicts()[0]
-
-    ctx.info(
-        "Converted plain p-values to -log10 p in '%s': minimum %s, maximum %s, "
-        "median %s."
-        % (
-            output_col,
-            _fmt(stats["min_LP"]),
-            _fmt(stats["max_LP"]),
-            _fmt(stats["median_LP"]),
-        )
-    )
-
-    sample_column_dict["pval_col"] = output_col
-    return df, stats, sample_column_dict
-
-
-# ---------------------------------------------------------------------------
-# 4.  -log10 p  ->  raw p
+# 3.  -log10 p  ->  raw p
 # ---------------------------------------------------------------------------
 def convert_negative_log10_to_p_value(
     df: pl.DataFrame,
     sample_column_dict,
-    output_col: str = "PVAL",
+    output_col: str,
     min_lp: Optional[float] = None,
-    max_lp: Union[float, None, "_Unset"] = _UNSET,
     logger: Optional[Any] = None,
     policies: Optional[Any] = None,
     ctx: Optional[Any] = None,
 ):
     """Turn ``-log10 p`` back into plain p-values in ``output_col``.
 
-    ``min_lp`` defaults to ``pvalue.mlogp_min`` (0.0) and ``max_lp`` to
-    ``pvalue.mlogp_max`` (300.0, or ``null`` to turn the cap off).  Both caps
-    are now reported: capping used to be silent, which made -log10 p of 320,
-    500 and 1200 indistinguishable in the output and left no trace of it.
-
-    Adds ``__pval_clipped_high`` / ``__pval_clipped_low`` so the
-    effect-statistics validation step can see which p-values were forced.
+    Negative LP values are refused because they imply p > 1; the orchestration
+    path masks source-invalid rows for conversion, retains their source-status
+    provenance, and applies the shared range policy afterward. Non-negative
+    values below ``pvalue.mlogp_min`` follow that explicit floor policy.
+    Positive LP values are never capped. When their raw probability is smaller
+    than Float64 can represent, the public raw column is null and the exact raw
+    token plus natural-log probability are retained in private provenance
+    columns for calculations and export.
     """
     policies = resolve_policies(policies)
     ctx = ctx if ctx is not None else NullStepContext(df.height)
     if min_lp is None:
         min_lp = policies.pvalue.mlogp_min
-    if isinstance(max_lp, _Unset):
-        max_lp = policies.pvalue.mlogp_max
 
     pval_col = sample_column_dict["pval_col"]
     if pval_col not in df.columns:
         raise PValueTypeError("Column '%s' not found in DataFrame." % (pval_col,))
+    source_col = sample_column_dict.get(P_VALUE_SOURCE_TEXT_KEY)
+    if not source_col or source_col not in df.columns:
+        df, sample_column_dict = preserve_pvalue_source_text(
+            df, sample_column_dict
+        )
+        source_col = sample_column_dict[P_VALUE_SOURCE_TEXT_KEY]
 
     values = pl.col(pval_col).cast(pl.Float64, strict=False)
-    low_mask = (values < min_lp) if min_lp is not None else pl.lit(False)
-    high_mask = (values > max_lp) if max_lp is not None else pl.lit(False)
-
+    negative_mask = (values.is_finite() & (values < 0.0)).fill_null(False)
+    low_mask = (
+        values.is_finite() & (values >= 0.0) & (values < min_lp)
+        if min_lp is not None
+        else pl.lit(False)
+    )
     counts = df.select(
         [
+            negative_mask.sum().alias("n_negative"),
             low_mask.sum().alias("n_below"),
-            high_mask.sum().alias("n_above"),
             values.max().alias("max_lp_seen"),
         ]
     ).to_dicts()[0]
-    n_below = int(counts["n_below"] or 0)
-    n_above = int(counts["n_above"] or 0)
-    n_clipped = n_below + n_above
-
-    df = df.with_columns(pl.col(pval_col).clip(min_lp, max_lp).alias("__lp_clipped"))
-
-    if n_above:
-        # A -log10 p above the cap is a genuine top hit being flattened.
-        ctx.qc(
-            "-log10 p cap",
-            "%s variants have a -log10 p above the cap of %s (the largest seen "
-            "was %s). Their p-values were all set to %s, so they can no longer "
-            "be told apart. Policy 'pvalue.mlogp_max' controls this; null turns "
-            "the cap off."
-            % (
-                _count(n_above),
-                _fmt(max_lp),
-                _fmt(counts["max_lp_seen"]),
-                _fmt(10.0 ** (-max_lp) if max_lp is not None else None, "%.3e"),
-            ),
-            df.height,
-            df.height,
-            changed=n_above,
-            warn=True,
-            step=STEP_LABEL,
+    n_negative = int(counts["n_negative"] or 0)
+    if n_negative:
+        raise PValueTypeError(
+            "Cannot convert %s negative value(s) in -log10 p column %r. "
+            "Negative values are incompatible with -log10(p) and must be "
+            "handled by the study-level pvalue.max_negative_fraction gate."
+            % (_count(n_negative), pval_col)
         )
+    n_below = int(counts["n_below"] or 0)
+
+    adjusted_lp = (
+        pl.when(low_mask)
+        .then(pl.lit(min_lp))
+        .otherwise(values)
+        .alias("__lp_adjusted")
+    )
+    df = df.with_columns(adjusted_lp)
     if n_below:
         ctx.qc(
             "-log10 p floor",
@@ -545,24 +696,74 @@ def convert_negative_log10_to_p_value(
         )
 
     df = df.with_columns(
-        negative_log10_to_raw_p(
-            "__lp_clipped", policies.pvalue.clip_low, output_name="__raw_p",
-        )
+        negative_log10_to_raw_p("__lp_adjusted", output_name="__raw_p")
     )
 
-    # 10 ** -LP underflows to exactly 0 for very large LP; that is a p-value
-    # clipped at the bottom just as surely as the cap above.
-    underflow = pl.col("__raw_p") == 0
+    underflow_expr = (
+        pl.col("__lp_adjusted").is_finite()
+        & (pl.col("__lp_adjusted") >= 0.0)
+        & (pl.col("__raw_p") == 0.0)
+    ).fill_null(False)
+    row_column = "__pval_neglog_row"
+    if row_column in df.columns:
+        raise PValueTypeError(
+            "Input uses reserved internal p-value provenance column %r. Rename "
+            "that input column before harmonisation." % row_column
+        )
+    df = df.with_row_index(row_column)
+    underflow_rows = df.filter(underflow_expr).select(
+        row_column, source_col, "__lp_adjusted",
+    )
+    exact_indices = []
+    exact_values = []
+    for index, source_value, adjusted_value in underflow_rows.iter_rows():
+        original = _decimal_value(source_value)
+        if original is None or (
+            min_lp is not None and original < Decimal(str(min_lp))
+        ):
+            original = _decimal_value(adjusted_value)
+        if original is not None:
+            exact_indices.append(index)
+            exact_values.append(_raw_text_from_neglog10(original))
+    n_underflow = underflow_rows.height
+    if exact_indices:
+        exact_overrides = pl.DataFrame({
+            row_column: pl.Series(
+                row_column, exact_indices, dtype=df.schema[row_column],
+            ),
+            "__pval_exact_override": pl.Series(
+                "__pval_exact_override", exact_values, dtype=pl.String,
+            ),
+        })
+        df = df.join(
+            exact_overrides, on=row_column, how="left", coalesce=True,
+        )
+        exact_raw = pl.col("__pval_exact_override")
+    else:
+        exact_raw = pl.lit(None, dtype=pl.String)
+
     df = df.with_columns(
-        [
-            pl.when(underflow)
-            .then(pl.lit(policies.pvalue.clip_low))
-            .otherwise(pl.col("__raw_p"))
-            .alias(output_col),
-            (low_mask.fill_null(False)).alias(CLIPPED_HIGH_COLUMN),
-            (high_mask.fill_null(False) | underflow).alias(CLIPPED_LOW_COLUMN),
-        ]
-    ).drop(["__lp_clipped", "__raw_p"])
+        pl.when(~pl.col("__lp_adjusted").is_finite() | underflow_expr)
+        .then(None)
+        .otherwise(pl.col("__raw_p"))
+        .alias(output_col),
+        low_mask.fill_null(False).alias(CLIPPED_HIGH_COLUMN),
+        pl.lit(False).alias(CLIPPED_LOW_COLUMN),
+        underflow_expr.alias(FLOAT_UNDERFLOW_COLUMN),
+        pl.when(pl.col("__lp_adjusted").is_finite())
+        .then(-pl.col("__lp_adjusted") * math.log(10.0))
+        .otherwise(None)
+        .alias(LOG_P_COLUMN),
+        exact_raw.alias(EXACT_RAW_P_COLUMN),
+        pl.lit(False).alias(REPORTED_ZERO_COLUMN),
+    )
+    df = df.drop([
+        column
+        for column in (
+            "__lp_adjusted", "__raw_p", row_column, "__pval_exact_override",
+        )
+        if column in df.columns
+    ])
 
     mlogp_stats = df.select(
         pl.col(output_col).min().alias("min_PVAL"),
@@ -571,116 +772,172 @@ def convert_negative_log10_to_p_value(
         pl.col(output_col).median().alias("median_PVAL"),
     ).to_dicts()[0]
 
-    mlogp_stats["mlogp_values_total_clipped"] = n_clipped
-    mlogp_stats["mlogp_values_clipped_at_max"] = n_above
+    mlogp_stats["mlogp_values_total_clipped"] = n_below
     mlogp_stats["mlogp_values_clipped_at_min"] = n_below
     mlogp_stats["mlogp_max_observed"] = counts["max_lp_seen"]
-
+    mlogp_stats["pvalue_float_underflow"] = n_underflow
     ctx.info(
         "Converted -log10 p to plain p-values in '%s': minimum %s, maximum %s, "
-        "median %s."
+        "median %s. %s values were smaller than positive Float64 and retain "
+        "their exact raw text and log probability without clipping."
         % (
             output_col,
             _fmt(mlogp_stats["min_PVAL"], "%.3e"),
             _fmt(mlogp_stats["max_PVAL"], "%.3e"),
             _fmt(mlogp_stats["median_PVAL"], "%.3e"),
+            _count(n_underflow),
         )
     )
 
     sample_column_dict["pval_col"] = output_col
+    sample_column_dict[P_VALUE_LOG_KEY] = LOG_P_COLUMN
+    sample_column_dict[P_VALUE_EXACT_RAW_KEY] = EXACT_RAW_P_COLUMN
     return df, mlogp_stats, sample_column_dict
 
 
 # ---------------------------------------------------------------------------
 # 5.  The step itself
 # ---------------------------------------------------------------------------
-def _harmonise_raw_pvalues(
-    df, pval_col, output_col, policies, ctx, rejects, qc_info, chromosome,
-    entry_counts=None,
+def _harmonise_canonical_pvalues(
+    df, pval_col, input_scale, policies, ctx, rejects, qc_info, chromosome,
 ):
-    """Bring plain p-values into the allowed range, recording every removal.
+    """Validate one canonical raw-p column after either input-scale branch.
 
     Three gates, in this order:
 
-    1. a missing p-value is unusable                    -> ``pval_null``
-    2. below 0 or above ``pvalue.tolerance_above_one``  -> not a p-value at all
-    3. outside ``[clip_low, clip_high]``                -> ``pvalue.out_of_range``
+    1. source/conversion missing without exact provenance -> ``pval_null``
+    2. source non-finite, scale-invalid, or impossible raw value -> range policy
+    3. literal raw zero or rounding excess above ``clip_high`` -> range policy
 
-    Gates 1 and 2 remove the variant, which is what this module always did -
-    silently.  Gate 3 is the one ``pvalue.out_of_range`` governs, and its
-    default, ``clip``, is exactly the clip that was hardcoded here before.
+    Source-status flags are materialised before conversion, so missing and
+    non-finite -log10 cells cannot collapse into the same anonymous null.
+    Positive probabilities below Float64 retain exact raw/log provenance and
+    are explicitly exempt from the missing gate.
     """
     tolerance = policies.pvalue.tolerance_above_one
     clip_low = policies.pvalue.clip_low
     clip_high = policies.pvalue.clip_high
     action = policies.pvalue.out_of_range
 
-    if entry_counts is None:
-        values = pl.col(pval_col)
-        counts = df.select(
-            [
-                values.is_null().sum().alias("n_null"),
-                (values < 0.0).sum().alias("n_lt0"),
-                (values > tolerance).sum().alias("n_gt_tolerance"),
-                ((values >= 0.0) & (values < clip_low)).sum().alias("n_below_clip"),
-                ((values > clip_high) & (values <= tolerance)).sum().alias("n_above_clip"),
-            ]
-        ).to_dicts()[0]
-    else:
-        counts = entry_counts
+    missing_clip_columns = [
+        name for name in CLIPPED_COLUMNS if name not in df.columns
+    ]
+    if missing_clip_columns:
+        df = df.with_columns(
+            [pl.lit(False).alias(name) for name in missing_clip_columns]
+        )
+
+    exact_underflow = (
+        pl.col(FLOAT_UNDERFLOW_COLUMN).fill_null(False)
+        & pl.col(LOG_P_COLUMN).is_finite()
+        & pl.col(EXACT_RAW_P_COLUMN).is_not_null()
+    )
+    values = pl.col(pval_col).cast(pl.Float64, strict=False)
+    source_missing = pl.col(SOURCE_MISSING_STATUS_COLUMN).fill_null(False)
+    source_nonfinite = pl.col(SOURCE_NONFINITE_STATUS_COLUMN).fill_null(False)
+    source_negative = pl.col(SOURCE_NEGATIVE_STATUS_COLUMN).fill_null(False)
+    scale_invalid = (
+        source_negative if input_scale == "neglog10" else pl.lit(False)
+    )
+    source_invalid = source_nonfinite | scale_invalid
+    missing = (
+        source_missing
+        | (values.is_null() & ~exact_underflow & ~source_invalid)
+    ).fill_null(False)
+    below_zero = (values.is_finite() & (values < 0.0)).fill_null(False)
+    above_tolerance = (
+        values.is_finite() & (values > tolerance)
+    ).fill_null(False)
+    unsalvageable = (source_invalid | below_zero | above_tolerance).fill_null(False)
+    reported_zero = pl.col(REPORTED_ZERO_COLUMN).fill_null(False)
+    too_high = (
+        values.is_finite()
+        & (values > clip_high)
+        & (values <= tolerance)
+    ).fill_null(False)
+    counts = df.select(
+        [
+            missing.sum().alias("n_null"),
+            source_missing.sum().alias("n_source_missing"),
+            source_nonfinite.sum().alias("n_source_nonfinite"),
+            source_negative.sum().alias("n_source_negative"),
+            below_zero.sum().alias("n_lt0"),
+            above_tolerance.sum().alias("n_gt_tolerance"),
+            unsalvageable.sum().alias("n_unsalvageable"),
+            reported_zero.sum().alias("n_below_clip"),
+            too_high.sum().alias("n_above_clip"),
+        ]
+    ).to_dicts()[0]
     n_null = int(counts["n_null"] or 0)
+    n_source_missing = int(counts["n_source_missing"] or 0)
+    n_source_nonfinite = int(counts["n_source_nonfinite"] or 0)
+    n_source_negative = int(counts["n_source_negative"] or 0)
     n_lt0 = int(counts["n_lt0"] or 0)
     n_gt_tolerance = int(counts["n_gt_tolerance"] or 0)
+    n_unsalvageable = int(counts["n_unsalvageable"] or 0)
     n_below_clip = int(counts["n_below_clip"] or 0)
     n_above_clip = int(counts["n_above_clip"] or 0)
-    n_unsalvageable = n_lt0 + n_gt_tolerance
     n_out_of_range = n_below_clip + n_above_clip
 
     total_before = df.height
 
     if action == "fail" and (n_unsalvageable or n_out_of_range):
         raise PValueTypeError(
-            "Chromosome %s: %s p-values are outside 0 to 1 (%s below 0, %s above "
-            "%s) and %s more are outside the kept range %s to %s. Policy "
+            "Chromosome %s: %s %s-source or canonical p-values are unusable "
+            "(%s non-finite source values, %s negative source values, %s "
+            "canonical values below 0, %s above %s), and %s more are literal "
+            "zero or above %s. Policy "
             "'pvalue.out_of_range' is 'fail'."
             % (
                 chromosome,
                 _count(n_unsalvageable),
+                input_scale,
+                _count(n_source_nonfinite),
+                _count(n_source_negative),
                 _count(n_lt0),
                 _count(n_gt_tolerance),
                 _fmt(tolerance),
                 _count(n_out_of_range),
-                _fmt(clip_low),
                 _fmt(clip_high),
             )
         )
 
     # 1. missing
     if n_null:
-        df = _drop_or_reject(
+        df, _ = reject_rows(
             df,
-            pl.col(pval_col).is_null(),
-            "pval_null",
-            None,
-            "%s variants have no p-value at all." % (_count(n_null),),
-            "p-value present",
-            ctx,
-            rejects,
+            missing,
+            step_label=STEP_LABEL,
+            reason="pval_null",
+            context=ctx,
+            collector=rejects,
+            detail=None,
+            description=(
+                "%s variants have a missing or unparseable source p-value, or "
+                "conversion produced no canonical probability and no exact "
+                "log-probability provenance." % (_count(n_null),)
+            ),
+            check_name="p-value present",
+            warn_on_remove=True,
         )
 
-    # 2. impossible values
-    unsalvageable = (
-        (pl.col(pval_col) < 0.0) | (pl.col(pval_col) > tolerance)
-    ).fill_null(False)
+    # 2. impossible values. Under 'clip' they are rejected rather than forced
+    # into range: no finite correction can recover a non-finite source value or
+    # a negative -log10(p) without inventing p=1.
     if n_unsalvageable:
         plain = (
-            "%s variants have a p-value below 0 or above %s (%s below 0, %s "
-            "above the tolerance), which no rounding error explains."
+            "%s variants have an unusable %s source or canonical p-value (%s "
+            "non-finite source values, %s negative source values, %s canonical "
+            "values below 0, %s above %s), which no rounding correction can "
+            "repair."
             % (
                 _count(n_unsalvageable),
-                _fmt(tolerance),
+                input_scale,
+                _count(n_source_nonfinite),
+                _count(n_source_negative),
                 _count(n_lt0),
                 _count(n_gt_tolerance),
+                _fmt(tolerance),
             )
         )
         if action == "null":
@@ -702,65 +959,58 @@ def _harmonise_raw_pvalues(
                 step=STEP_LABEL,
             )
         else:
-            df = _drop_or_reject(
+            df, _ = reject_rows(
                 df,
                 unsalvageable,
-                "pval_out_of_range",
-                "outside 0 to %s" % (tolerance,),
-                plain,
-                "p-value range",
-                ctx,
-                rejects,
+                step_label=STEP_LABEL,
+                reason="pval_out_of_range",
+                context=ctx,
+                collector=rejects,
+                detail="non-finite, scale-invalid, or outside 0 to %s" % tolerance,
+                description=plain,
+                check_name="p-value range",
+                warn_on_remove=True,
             )
 
-    # 3. inside the tolerance but outside the kept range
-    too_low = ((pl.col(pval_col) >= 0.0) & (pl.col(pval_col) < clip_low)).fill_null(
-        False
-    )
-    too_high = (pl.col(pval_col) > clip_high).fill_null(False)
+    # 3. literal zero or a rounding excess above one. Positive p-values are
+    # valid at every representable magnitude and are not floored.
+    too_low = pl.col(REPORTED_ZERO_COLUMN).fill_null(False)
     if action == "reject" and n_out_of_range:
-        df = _drop_or_reject(
+        df, _ = reject_rows(
             df,
             too_low | too_high,
-            "pval_out_of_range",
-            "outside %s to %s" % (clip_low, clip_high),
-            "%s variants have a p-value outside the kept range %s to %s (%s too "
-            "small, %s above 1)."
-            % (
-                _count(n_out_of_range),
-                _fmt(clip_low),
-                _fmt(clip_high),
-                _count(n_below_clip),
-                _count(n_above_clip),
+            step_label=STEP_LABEL,
+            reason="pval_out_of_range",
+            context=ctx,
+            collector=rejects,
+            detail="literal zero or above %s" % clip_high,
+            description=(
+                "%s variants have a literal-zero p-value or a value above %s (%s "
+                "zero, %s above 1)."
+                % (
+                    _count(n_out_of_range),
+                    _fmt(clip_high),
+                    _count(n_below_clip),
+                    _count(n_above_clip),
+                )
             ),
-            "p-value range",
-            ctx,
-            rejects,
-        )
-        df = df.with_columns(
-            [
-                pl.lit(False).alias(CLIPPED_HIGH_COLUMN),
-                pl.lit(False).alias(CLIPPED_LOW_COLUMN),
-            ]
+            check_name="p-value range",
+            warn_on_remove=True,
         )
     elif action == "null" and n_out_of_range:
         before = df.height
         df = df.with_columns(
-            [
-                pl.when(too_low | too_high)
-                .then(None)
-                .otherwise(pl.col(pval_col))
-                .alias(pval_col),
-                pl.lit(False).alias(CLIPPED_HIGH_COLUMN),
-                pl.lit(False).alias(CLIPPED_LOW_COLUMN),
-            ]
+            pl.when(too_low | too_high)
+            .then(None)
+            .otherwise(pl.col(pval_col))
+            .alias(pval_col)
         )
         ctx.qc(
             "p-value range",
-            "%s variants have a p-value outside %s to %s. Policy "
+            "%s variants have a literal-zero p-value or a value above %s. Policy "
             "'pvalue.out_of_range' is 'null', so their p-value was blanked out "
             "and the variants kept."
-            % (_count(n_out_of_range), _fmt(clip_low), _fmt(clip_high)),
+            % (_count(n_out_of_range), _fmt(clip_high)),
             before,
             df.height,
             changed=n_out_of_range,
@@ -768,28 +1018,41 @@ def _harmonise_raw_pvalues(
             step=STEP_LABEL,
         )
     else:
-        # 'clip' - the default, and what this module always did.  The flags are
-        # what step 11 uses to find values corrected from above 1.
+        # 'clip' supplies an explicit approximation only for literal zero and
+        # corrects small rounding excesses above one.
         before = df.height
         df = df.with_columns(
             [
-                too_high.alias(CLIPPED_HIGH_COLUMN),
-                too_low.alias(CLIPPED_LOW_COLUMN),
+                (
+                    pl.col(CLIPPED_HIGH_COLUMN).fill_null(False) | too_high
+                ).alias(CLIPPED_HIGH_COLUMN),
+                (
+                    pl.col(CLIPPED_LOW_COLUMN).fill_null(False) | too_low
+                ).alias(CLIPPED_LOW_COLUMN),
             ]
         )
-        df = df.with_columns(pl.col(pval_col).clip(clip_low, clip_high).alias(pval_col))
+        df = df.with_columns(
+            pl.when(too_low)
+            .then(pl.lit(clip_low))
+            .when(too_high)
+            .then(pl.lit(clip_high))
+            .otherwise(pl.col(pval_col))
+            .alias(pval_col)
+        )
         if n_out_of_range:
             ctx.qc(
                 "p-value range",
-                "%s variants have a p-value outside %s to %s (%s too small, %s "
-                "above 1). Policy 'pvalue.out_of_range' is 'clip', so they were "
-                "forced back into the mathematically valid range."
+                "%s variants have a literal-zero p-value or a value above %s "
+                "(%s zero, %s above 1). Policy 'pvalue.out_of_range' is 'clip', "
+                "so zero was approximated by %s and rounding excesses were set "
+                "to %s."
                 % (
                     _count(n_out_of_range),
-                    _fmt(clip_low),
                     _fmt(clip_high),
                     _count(n_below_clip),
                     _count(n_above_clip),
+                    _fmt(clip_low),
+                    _fmt(clip_high),
                 ),
                 before,
                 df.height,
@@ -798,15 +1061,26 @@ def _harmonise_raw_pvalues(
                 step=STEP_LABEL,
             )
 
-    df = df.with_columns(pl.col(pval_col).alias(output_col))
+    df = _synchronise_log_from_raw_p(df, pval_col)
 
     qc_info.update(
         {
-            "raw_total_variants_with_pvalues": total_before,
+            "pvalue_validation_input_scale": input_scale,
+            "pvalue_validation_initial_variants": total_before,
             "after_filter_variants_with_pvalues": df.height,
             "variants_with_null_pvalues_removed": n_null,
-            "variants_with_lt0_pvalues_removed": n_lt0,
-            "variants_with_gt1_05_pvalues_removed": n_gt_tolerance,
+            "pvalue_source_missing_or_unparseable": n_source_missing,
+            "pvalue_source_non_finite": n_source_nonfinite,
+            "pvalue_source_negative": n_source_negative,
+            "variants_with_lt0_pvalues_removed": (
+                n_source_negative if action in ("clip", "reject") else 0
+            ),
+            "variants_with_non_finite_pvalues_removed": (
+                n_source_nonfinite if action in ("clip", "reject") else 0
+            ),
+            "variants_with_gt1_05_pvalues_removed": (
+                n_gt_tolerance if action in ("clip", "reject") else 0
+            ),
             "variants_with_zero_pvalues_replaced": n_below_clip,
             "variants_with_pvalues_clipped_low": n_below_clip,
             "variants_with_pvalues_clipped_high": n_above_clip,
@@ -814,8 +1088,21 @@ def _harmonise_raw_pvalues(
             "pvalue_clip_low": clip_low,
             "pvalue_clip_high": clip_high,
             "pvalue_tolerance_above_one": tolerance,
+            "pvalue_float_underflow": int(
+                df.select(pl.col(FLOAT_UNDERFLOW_COLUMN).sum()).item() or 0
+            ),
         }
     )
+    if input_scale == "raw":
+        qc_info["raw_total_variants_with_pvalues"] = total_before
+    else:
+        qc_info.update(
+            {
+                "mlogp_missing_or_unparseable": n_source_missing,
+                "mlogp_non_finite": n_source_nonfinite,
+                "mlogp_negative": n_source_negative,
+            }
+        )
     return df, qc_info
 
 
@@ -823,9 +1110,7 @@ def harmonise_p_values(
     chromosome: str,
     df: pl.DataFrame,
     sample_column_dict,
-    output_col: str = "LP",
     proportion_threshold: Optional[float] = None,
-    max_allowed_lp: Union[float, None, "_Unset"] = _UNSET,
     logger: Optional[Any] = None,
     policies: Optional[Any] = None,
     rejects: Optional[Any] = None,
@@ -834,12 +1119,10 @@ def harmonise_p_values(
     step_total: Optional[int] = None,
 ):
     """Detect the p-value scale (or apply the study-level decision) and leave a
-    plain p-value column behind.
+    plain p-value column in the configured ``pvalue.output_column``.
 
-    ``proportion_threshold`` and ``max_allowed_lp`` now default to
-    ``pvalue.mlogp_detect_proportion`` (0.001) and ``pvalue.mlogp_max`` (300.0),
-    the same numbers that used to be written into the signature.  Passing
-    ``max_allowed_lp=None`` turns the cap off.
+    ``proportion_threshold`` overrides the canonical detection fraction only
+    for this call. Positive -log10 values are never capped.
 
     Returns ``(df, qc_info, sample_column_dict)`` exactly as before.
     """
@@ -857,6 +1140,15 @@ def harmonise_p_values(
             "P-value column ('pval_col') is missing from the config or not "
             "present in the data frame for chromosome %s." % (chromosome,)
         )
+    output_col = policies.pvalue.output_column
+    if output_col in df.columns and output_col != pval_col:
+        raise PValueTypeError(
+            "Configured canonical raw p-value output column %r "
+            "(pvalue.output_column) already exists, but the selected input "
+            "p-value column is %r. Refusing to overwrite unrelated data; rename "
+            "the existing column or configure a distinct pvalue.output_column."
+            % (output_col, pval_col)
+        )
 
     with step_context(
         logger,
@@ -868,7 +1160,12 @@ def harmonise_p_values(
         rows_in=df.height,
         policy_keys=POLICY_KEYS,
     ) as ctx:
+        df, sample_column_dict = preserve_pvalue_source_text(
+            df, sample_column_dict
+        )
+        source_col = sample_column_dict[P_VALUE_SOURCE_TEXT_KEY]
         df = df.with_columns(pl.col(pval_col).cast(pl.Float64, strict=False))
+        df = _attach_pvalue_source_status(df, pval_col, source_col)
 
         initial_stats = df.select(
             [
@@ -880,36 +1177,22 @@ def harmonise_p_values(
                 (pl.col(pval_col) > policies.pvalue.tolerance_above_one)
                 .sum()
                 .alias("initial_variants_with_gt1_05_pvalues"),
-                (
-                    (pl.col(pval_col) >= 0.0)
-                    & (pl.col(pval_col) < policies.pvalue.clip_low)
-                ).sum().alias("__n_below_clip"),
-                (
-                    (pl.col(pval_col) > policies.pvalue.clip_high)
-                    & (
-                        pl.col(pval_col)
-                        <= policies.pvalue.tolerance_above_one
-                    )
-                ).sum().alias("__n_above_clip"),
                 pl.col(pval_col).min().alias("initial_min_pvalues"),
                 pl.col(pval_col).max().alias("initial_max_pvalues"),
                 pl.col(pval_col).mean().alias("initial_mean_pvalues"),
                 pl.col(pval_col).median().alias("initial_median_pvalues"),
             ]
         ).to_dicts()[0]
-        raw_entry_counts = {
-            "n_null": initial_stats["initial_variants_with_null_pvalues"],
-            "n_lt0": initial_stats["initial_variants_with_lt0_pvalues"],
-            "n_gt_tolerance": initial_stats["initial_variants_with_gt1_05_pvalues"],
-            "n_below_clip": initial_stats.pop("__n_below_clip"),
-            "n_above_clip": initial_stats.pop("__n_above_clip"),
-        }
         qc_info = initial_stats.copy()
         qc_info["pvalue_column"] = pval_col
+        qc_info["pvalue_input_column"] = pval_col
+        qc_info["pvalue_output_column"] = output_col
 
         ctx.info(
-            "P-values on entry: %s missing, %s exactly zero, %s below zero, %s "
-            "above one; minimum %s, median %s, maximum %s."
+            "Numeric p-value-column values on entry, before scale and source-token "
+            "interpretation: %s missing, %s numeric zero, %s below zero, %s above "
+            "one; minimum %s, median %s, maximum %s. A numeric zero can still be a "
+            "positive raw source token below Float64."
             % (
                 _count(initial_stats["initial_variants_with_null_pvalues"]),
                 _count(initial_stats["initial_variants_with_zero_pvalues"]),
@@ -967,8 +1250,19 @@ def harmonise_p_values(
             qc_info.update(
                 {
                     "n_values": evidence.get("n_usable"),
-                    "over_1.2_fraction": evidence.get("above_threshold_fraction"),
-                    "within_[0,1.05]_fraction": evidence.get("within_range_fraction"),
+                    "pvalue_above_detection_threshold_count": evidence.get(
+                        "n_above_threshold"
+                    ),
+                    "pvalue_above_detection_threshold_fraction": evidence.get(
+                        "above_threshold_fraction"
+                    ),
+                    "pvalue_detection_minimum_count": evidence.get("detect_min_count"),
+                    "pvalue_expected_neglog10_median": evidence.get(
+                        "expected_median_neglog10"
+                    ),
+                    "pvalue_neglog10_median_tolerance": evidence.get(
+                        "median_tolerance"
+                    ),
                     "median": evidence.get("median"),
                     "max": evidence.get("max"),
                 }
@@ -979,7 +1273,12 @@ def harmonise_p_values(
             _detection_sentence(evidence) if evidence is not None else decision_source,
             "%s (%s)" % (_SCALE_TEXT[scale], decision_source),
         )
-        if scale == "raw" and evidence is not None and evidence.get("max_above_raw_range"):
+
+        if (
+            scale == "raw"
+            and evidence is not None
+            and evidence.get("has_values_above_detection_threshold")
+        ):
             ctx.warn(
                 "The column is plain p-values, but its largest value is %s, "
                 "which no p-value can be. Only %s of values exceed %s, so those "
@@ -996,46 +1295,44 @@ def harmonise_p_values(
         # Apply
         # ------------------------------------------------------------------
         if scale == "raw":
-            # Preserve exact-zero provenance before the raw value is raised to
-            # pvalue.clip_low. This is a raw-input fact: an underflow while
-            # reconstructing a supplied -log10 p retains more information and
-            # must not be confused with a study that literally reported zero.
-            df = df.with_columns(
-                (pl.col(pval_col) == 0).fill_null(False).alias(REPORTED_ZERO_COLUMN)
+            df = _attach_raw_source_provenance(df, pval_col, source_col)
+            source_counts = df.select(
+                pl.col(REPORTED_ZERO_COLUMN).sum().alias("reported_zero"),
+                pl.col(FLOAT_UNDERFLOW_COLUMN).sum().alias("underflow"),
+            ).row(0, named=True)
+            qc_info["initial_variants_with_zero_pvalues"] = int(
+                source_counts["reported_zero"] or 0
             )
-            df, qc_info = _harmonise_raw_pvalues(
-                df, pval_col, output_col, policies, ctx, rejects, qc_info,
-                chromosome, entry_counts=raw_entry_counts,
+            qc_info["initial_positive_pvalues_below_float64"] = int(
+                source_counts["underflow"] or 0
             )
+            if output_col != pval_col:
+                df = df.with_columns(pl.col(pval_col).alias(output_col))
             sample_column_dict["pval_col"] = output_col
         else:
-            df = df.with_columns(pl.lit(False).alias(REPORTED_ZERO_COLUMN))
             total_before = df.height
-            scratch_col = None
-            if scale == "negln":
-                # Put it on the -log10 scale first, in a scratch column, so one
-                # code path and one set of policies handle both logs and the
-                # study's own column is left as it arrived.
-                scratch_col = "__lp_from_negln"
-                df = df.with_columns((pl.col(pval_col) / LN10).alias(scratch_col))
-                sample_column_dict["pval_col"] = scratch_col
-                ctx.info(
-                    "The column is on the natural-log scale, so it was divided "
-                    "by ln(10) = %s to become -log10 p before conversion. "
-                    "Reading it directly as -log10 p would make every p-value "
-                    "wrong by about four orders of magnitude." % (_fmt(LN10),)
-                )
+            # The low-level converter deliberately refuses negative LP values.
+            # Mask source-invalid cells for conversion while retaining their
+            # materialised status so the shared post-conversion gate can apply
+            # pvalue.out_of_range without ever turning a negative LP into p=1.
+            converter_invalid = (
+                pl.col(SOURCE_NONFINITE_STATUS_COLUMN).fill_null(False)
+                | pl.col(SOURCE_NEGATIVE_STATUS_COLUMN).fill_null(False)
+            )
+            df = df.with_columns(
+                pl.when(converter_invalid)
+                .then(None)
+                .otherwise(pl.col(pval_col))
+                .alias(pval_col)
+            )
             df, mlogp_stats, sample_column_dict = convert_negative_log10_to_p_value(
                 df=df,
                 sample_column_dict=sample_column_dict,
-                output_col="PVAL",
+                output_col=output_col,
                 min_lp=policies.pvalue.mlogp_min,
-                max_lp=max_allowed_lp,
                 policies=policies,
                 ctx=ctx,
             )
-            if scratch_col is not None and scratch_col in df.columns:
-                df = df.drop(scratch_col)
             qc_info.update(
                 {
                     "mlogp_total_variants_with_pvalues": total_before,
@@ -1045,17 +1342,51 @@ def harmonise_p_values(
             qc_info.update(mlogp_stats)
 
         pval_col = sample_column_dict["pval_col"]
+        df, qc_info = _harmonise_canonical_pvalues(
+            df,
+            pval_col,
+            scale,
+            policies,
+            ctx,
+            rejects,
+            qc_info,
+            chromosome,
+        )
+
+        sample_column_dict[P_VALUE_LOG_KEY] = LOG_P_COLUMN
+        sample_column_dict[P_VALUE_EXACT_RAW_KEY] = EXACT_RAW_P_COLUMN
 
         # Both branches must leave the flags behind for the effect-statistics
         # step, even when nothing was clipped.
-        for column in INTERNAL_PVALUE_COLUMNS:
+        for column in (
+            CLIPPED_HIGH_COLUMN,
+            CLIPPED_LOW_COLUMN,
+            REPORTED_ZERO_COLUMN,
+            FLOAT_UNDERFLOW_COLUMN,
+        ):
             if column not in df.columns:
                 df = df.with_columns(pl.lit(False).alias(column))
+        for column in (SOURCE_TEXT_COLUMN, EXACT_RAW_P_COLUMN):
+            if column not in df.columns:
+                df = df.with_columns(pl.lit(None, dtype=pl.String).alias(column))
+        if LOG_P_COLUMN not in df.columns:
+            df = df.with_columns(
+                pl.lit(None, dtype=pl.Float64).alias(LOG_P_COLUMN)
+            )
 
         final_stats = df.select(
             [
                 pl.len().alias("final_total_variants_with_pvalues"),
-                pl.col(pval_col).is_null().sum().alias("final_variants_with_null_pvalues"),
+                (
+                    pl.col(pval_col).is_null()
+                    & ~(
+                        pl.col(FLOAT_UNDERFLOW_COLUMN).fill_null(False)
+                        & pl.col(LOG_P_COLUMN).is_finite()
+                        & pl.col(EXACT_RAW_P_COLUMN).is_not_null()
+                    )
+                )
+                .sum()
+                .alias("final_variants_with_null_pvalues"),
                 (pl.col(pval_col) == 0).sum().alias("final_variants_with_zero_pvalues"),
                 (pl.col(pval_col) < 0).sum().alias("final_variants_with_lt0_pvalues"),
                 (pl.col(pval_col) > 1).sum().alias("final_variants_with_gt1_pvalues"),
@@ -1068,9 +1399,16 @@ def harmonise_p_values(
                 pl.col(pval_col).median().alias("final_median_pvalues"),
                 pl.col(CLIPPED_HIGH_COLUMN).sum().alias("pvalues_flagged_clipped_high"),
                 pl.col(CLIPPED_LOW_COLUMN).sum().alias("pvalues_flagged_clipped_low"),
+                pl.col(FLOAT_UNDERFLOW_COLUMN)
+                .sum()
+                .alias("pvalues_preserved_below_float64"),
             ]
         ).to_dicts()[0]
         qc_info.update(final_stats)
+
+        df = df.drop(
+            [name for name in SOURCE_STATUS_COLUMNS if name in df.columns]
+        )
 
         ctx.set_rows(df.height)
 

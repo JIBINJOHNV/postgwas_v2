@@ -1,4 +1,5 @@
 import os
+import math
 import multiprocessing
 from datetime import datetime
 from pathlib import Path
@@ -247,41 +248,76 @@ def auto_detect_ram_gb():
 
 
 
-def safe_thread_count(requested_threads, gb_per_thread = 20):
-    """
-    Ensure the number of threads does not exceed available memory.
-    Example: If each thread needs 20GB, auto-adjust threads based on RAM.
-    Parameters
-    ----------
-    requested_threads : int
-        Number of threads requested by user.
-    gb_per_thread : int
-        Minimum GB of RAM required per thread.
-    Returns
-    -------
-    int
-        Safe number of threads based on system memory.
-    """
-    try:
-        import psutil
-        total_ram_gb = psutil.virtual_memory().total / (1024**3)
-    except ImportError:
-        print("⚠️ psutil not installed → falling back to requested threads.")
-        return requested_threads
-    # Max threads based on memory
-    max_threads = int(total_ram_gb // gb_per_thread)
-    if max_threads < 1:
-        print(f"❌ Not enough RAM: {total_ram_gb:.1f} GB available, "
-              f"but require ≥ {gb_per_thread} GB per thread.")
-        return 1
-    if requested_threads > max_threads:
-        print(f"            ⚠️ Reducing threads from {requested_threads} → {max_threads} "
-              f"            (RAM available: {total_ram_gb:.1f} GB; {gb_per_thread} GB/thread)")
-        return max_threads
+def safe_thread_count(
+    requested_threads,
+    gb_per_thread=20,
+    *,
+    available_ram_gb=None,
+    reporter=print,
+    enforce_memory_budget=False,
+):
+    """Bound a parallel task count by an explicit or detected RAM budget.
 
-    print(f"    ✔ Using {requested_threads} threads "
-          f"    (RAM available: {total_ram_gb:.1f} GB; {gb_per_thread} GB/thread)")
-    return requested_threads
+    The historical name is retained because existing callers use this helper
+    for thread counts. ``available_ram_gb`` lets orchestration code apply its
+    already resolved ``--memory-gb`` budget instead of silently consulting host
+    RAM again. When it is omitted, :func:`auto_detect_ram_gb` supplies a
+    scheduler- and cgroup-aware fallback. Pass ``reporter=None`` when the caller
+    records the decision through its canonical logger.
+    ``enforce_memory_budget=True`` requires a finite explicit budget large
+    enough for one task; it never silently launches an over-budget worker.
+    """
+    requested = max(1, int(requested_threads))
+    memory_per_task = float(gb_per_thread)
+    if not math.isfinite(memory_per_task) or memory_per_task <= 0:
+        raise ValueError("gb_per_thread must be a finite value greater than zero")
+
+    if enforce_memory_budget and available_ram_gb is None:
+        raise ValueError(
+            "An explicit --memory-gb / execution.memory_gb budget is required "
+            "when enforcing worker memory."
+        )
+    total_ram_gb = (
+        float(auto_detect_ram_gb())
+        if available_ram_gb is None
+        else float(available_ram_gb)
+    )
+    if not math.isfinite(total_ram_gb) or total_ram_gb <= 0:
+        if enforce_memory_budget:
+            raise ValueError(
+                "--memory-gb / execution.memory_gb must be finite and greater "
+                "than zero."
+            )
+        if reporter is not None:
+            reporter(
+                "Available RAM could not be determined; keeping %d parallel task(s)."
+                % requested
+            )
+        return requested
+
+    if enforce_memory_budget and total_ram_gb < memory_per_task:
+        raise ValueError(
+            "The --memory-gb / execution.memory_gb budget (%.3f GB) cannot "
+            "fit one worker requiring %.3f GB. Increase the memory budget "
+            "before starting analysis."
+            % (total_ram_gb, memory_per_task)
+        )
+    memory_limit = max(1, int(total_ram_gb // memory_per_task))
+    selected = min(requested, memory_limit)
+    if reporter is not None:
+        if selected < requested:
+            reporter(
+                "Reducing parallel tasks from %d to %d for %.1f GB available "
+                "and %.1f GB per task."
+                % (requested, selected, total_ram_gb, memory_per_task)
+            )
+        else:
+            reporter(
+                "Using %d parallel task(s) within %.1f GB available at %.1f GB "
+                "per task."
+                % (selected, total_ram_gb, memory_per_task)
+            )
+    return selected
 
 
 

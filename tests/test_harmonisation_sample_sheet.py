@@ -85,6 +85,7 @@ class HarmonisationSampleSheetTests(unittest.TestCase):
             Path(values["output_folder"]),
             FIXTURE_DIR / row.dataset_id / "harmonisation",
         )
+        self.assertEqual(Path(values["output_root"]), FIXTURE_DIR)
 
     def test_engine_output_root_uses_the_configured_dataset_layout(self):
         row = load_harmonisation_sample_sheet(MANIFEST)[0]
@@ -311,6 +312,46 @@ class HarmonisationSampleSheetTests(unittest.TestCase):
             ok, problems = validate_config(
                 values,
                 policies=load_policies(config.modules.harmonisation.policies),
+                external_reference_delimiters={"eaffile": "auto"},
+            )
+
+        self.assertTrue(ok, [str(problem) for problem in problems])
+
+    def test_external_reference_delimiter_is_independent_of_study_delimiter(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            frequency = root / "panel_chr1.tsv"
+            frequency.write_text(
+                "CHROM\tPOS\tREF\tALT\tEUR\n1\t10\tA\tG\t0.2\n",
+                encoding="utf-8",
+            )
+            template = root / "panel_chr{chromosome}.tsv"
+            manifest = root / "manifest.csv"
+            self._write_manifest_with_values(
+                manifest,
+                delimiter="space",
+                effect_allele_frequency_column="NA",
+                external_eaf_file=str(template),
+                external_eaf_column="EUR",
+            )
+            row = load_harmonisation_sample_sheet(manifest)[0]
+            config = load_configuration()
+            values = to_harmonisation_input(
+                row,
+                resource_directory=FIXTURE_DIR,
+                output_directory=root,
+                output_layout={"dataset_directory": "{dataset_id}"},
+            )
+            policies = load_policies(
+                config.modules.harmonisation.policies
+            ).with_overrides({"input.delimiter": "space"})
+
+            ok, problems = validate_config(
+                values,
+                policies=policies,
+                external_reference_delimiters={"eaffile": "auto"},
             )
 
         self.assertTrue(ok, [str(problem) for problem in problems])
@@ -344,6 +385,22 @@ class HarmonisationSampleSheetTests(unittest.TestCase):
         self.assertEqual(row.p_value_type, "auto")
         self.assertEqual(row.delimiter, "auto")
         self.assertEqual(len(row.normalisation_warnings), 4)
+
+    def test_natural_log_pvalue_declaration_is_not_supported(self):
+        text = MANIFEST.read_text(encoding="utf-8").replace(
+            ",raw,", ",negln,", 1
+        )
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            temporary = Path(directory) / "manifest.csv"
+            temporary.write_text(text, encoding="utf-8")
+            row = load_harmonisation_sample_sheet(temporary)[0]
+
+        self.assertEqual(row.p_value_type, "auto")
+        self.assertTrue(
+            any("p_value_type" in warning for warning in row.normalisation_warnings)
+        )
 
     def test_duplicate_dataset_ids_are_case_insensitive(self):
         lines = MANIFEST.read_text(encoding="utf-8").splitlines()

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+from typing import get_args
 
 from postgwas.config import load_configuration
+from postgwas.config.models.modules.fine_mapping import FineMappingEngine
 from postgwas.core.ui import (
     AlignedRichHelpFormatter,
     format_cli_default,
     help_with_default,
+    style_cli_requirement,
 )
 from postgwas.core.execution.runtime import validate_path
 
@@ -26,7 +29,7 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
     grp.add_argument(
         "--finemap-method",
         metavar="METHOD",
-        choices=["susie", "finemap"],
+        choices=get_args(FineMappingEngine),
         default=argparse.SUPPRESS,
         help=help_with_default(
             "Fine-mapping method to use",
@@ -39,41 +42,45 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
         metavar="FILE",
         type=validate_path(must_exist=True, must_be_file=True),
         default=argparse.SUPPRESS,
-        help=(
-            "[bold bright_red]Required[/bold bright_red]: Path to the file "
-            "defining genomic regions. "
+        help=style_cli_requirement(
+            "Path to a predefined "
+            "locus file. "
             "\n- If [bold]locus_type[/bold] is 'range': Must contain "
-            "[cyan]CHROM, START, END[/cyan] columns. "
+            "[cyan]CHR, START, END, LP[/cyan] columns. Use "
+            "[italic]--window-kb 0[/italic] to preserve START/END as the exact "
+            "fine-mapping boundaries. "
             "\n- If [bold]locus_type[/bold] is 'point': Must contain "
-            "[cyan]CHROM, POS[/cyan] columns."
+            "[cyan]CHR, POS, LP[/cyan] columns.",
+            required=True,
         ),
     )
     grp.add_argument(
-            "--locus-type",
-            choices=["range", "point"],
-            default=argparse.SUPPRESS,
-            help=(
-                "Determines how boundaries are constructed (%s):"
-                "\n[bold]range[/bold]: Uses START/END columns. [italic]--window-kb[/italic] acts as an optional flank. "
-                "\n[bold]point[/bold]: Uses the POS column. [italic]--window-kb[/italic] is used to create the window."
-            ) % format_cli_default(
-                fine_mapping_defaults.locus_type,
-            ),
-        )
+        "--locus-type",
+        choices=["range", "point"],
+        default=argparse.SUPPRESS,
+        help=(
+            "Determines how boundaries are constructed (%s):"
+            "\n[bold]range[/bold]: Uses START/END columns. [italic]--window-kb[/italic] acts as an optional flank. "
+            "\n[bold]point[/bold]: Uses the POS column. [italic]--window-kb[/italic] is used to create the window."
+        ) % format_cli_default(
+            fine_mapping_defaults.locus_type,
+        ),
+    )
     grp.add_argument(
-            "--window-kb",
-            metavar="INT",
-            type=int,
-            default=argparse.SUPPRESS,
-            help=(
-                "The distance (in Kilobases) to extend the locus boundaries."
-                "\n- [bold]point[/bold] mode: Creates a symmetric window ([italic]POS ± window_kb[/italic]). "
-                "\n- [bold]range[/bold] mode: Adds a flank to the existing coordinates ([italic]START - window_kb[/italic] and [italic]END + window_kb[/italic])."
-                "\nSet to 0 if you want to use the exact coordinates in 'range' mode. %s."
-            ) % format_cli_default(
-                fine_mapping_defaults.locus_window_kb,
-            ),
-        )
+        "--window-kb",
+        metavar="INT",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=(
+            "The flank, in kilobases on each side, used to construct the "
+            "fine-mapping boundary."
+            "\n- [bold]point[/bold] mode: Creates a symmetric window ([italic]POS ± window_kb[/italic]). "
+            "\n- [bold]range[/bold] mode: Adds a flank to the existing coordinates ([italic]START - window_kb[/italic] and [italic]END + window_kb[/italic])."
+            "\nSet to 0 if you want to use the exact coordinates in 'range' mode. %s."
+        ) % format_cli_default(
+            fine_mapping_defaults.locus_window_kb,
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Locus selection / tuning
@@ -192,10 +199,11 @@ def get_finemap_common_parser(add_help=False, *, include_genome_build=False):
         "--finemap-ld-reference",
         metavar="PREFIX",
         default=argparse.SUPPRESS,
-        help=(
-            "[bold bright_red]Required[/bold bright_red]: Prefix of the PLINK LD "
+        help=style_cli_requirement(
+            "Prefix of the PLINK LD "
             "reference panel (e.g., 1000G EUR). Should correspond to files: "
-            "PREFIX.bed, PREFIX.bim, PREFIX.fam."
+            "PREFIX.bed, PREFIX.bim, PREFIX.fam.",
+            required=True,
         ),
     )
 
@@ -216,11 +224,11 @@ def get_finemap_susie_inputs_parser(add_help=False):
         metavar="PATH",
         type=validate_path(must_exist=True, must_be_file=True),
         default=argparse.SUPPRESS,
-        help=(
-            "[bold bright_red]Required[/bold bright_red]: "
-            "Fine-mapping–ready summary statistics file. "
-            "Should be generated by the postgwas formatter module."
-        )
+        help=style_cli_requirement(
+            "Fine-mapping–ready summary statistics file. Should be generated "
+            "by the postgwas formatter module.",
+            required=True,
+        ),
     )
 
     return parser
@@ -423,9 +431,11 @@ def get_finemap_finemap_arguments(add_help=False):
         metavar="PATH",
         type=validate_path(must_exist=True, must_be_file=True),
         default=argparse.SUPPRESS,
-        help=(
-            "FINEMAP input file created by `postgwas formatter --format finemap`."
-        )
+        help=style_cli_requirement(
+            "FINEMAP input file created by `postgwas formatter --format "
+            "finemap`.",
+            required=True,
+        ),
     )
 
     return parser

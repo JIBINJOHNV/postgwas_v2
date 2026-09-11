@@ -6,6 +6,9 @@ from pydantic import Field, field_validator, model_validator
 from postgwas.config.models.common import GenomeBuild, ModuleConfig, StrictModel
 
 
+FineMappingEngine = Literal["susie", "finemap"]
+
+
 class SusieFittingConfig(StrictModel):
     main_max_iter: int = Field(ge=1)
 
@@ -176,10 +179,73 @@ class FineMappingValidationConfig(StrictModel):
     ld_eigenvalue_tolerance: float = Field(gt=0)
 
 
+class FineMappingInputConfig(StrictModel):
+    """Direct inputs; pipeline execution replaces generated entries in memory."""
+
+    locus_file: Path | None = None
+    susie_summary_statistics_file: Path | None = None
+    finemap_summary_statistics_file: Path | None = None
+    ld_reference_prefix: Path | None = None
+
+
 class FineMappingRuntimeConfig(StrictModel):
     tool_version_timeout_seconds: int = Field(gt=0)
     software_version_timeout_seconds: int = Field(gt=0)
     fallback_memory_gb: float = Field(gt=0)
+
+
+class FineMappingCredibleSetFileColumnsConfig(StrictModel):
+    """Column contract for the authoritative FLAMES-compatible set files."""
+
+    rank: str
+    variant_id: str
+    posterior_probability: str
+
+    @field_validator("*")
+    @classmethod
+    def nonempty_column_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("must be a non-empty column name")
+        return cleaned
+
+    @model_validator(mode="after")
+    def distinct_columns(self):
+        values = (self.rank, self.variant_id, self.posterior_probability)
+        if len(set(values)) != len(values):
+            raise ValueError("credible-set file column names must be distinct")
+        return self
+
+
+class FineMappingHtmlReportConfig(StrictModel):
+    """Presentation-only controls for the self-contained scientific report."""
+
+    page_size: int = Field(ge=1, le=500)
+    probability_significant_digits: int = Field(ge=2, le=12)
+    credible_set_file_columns: FineMappingCredibleSetFileColumnsConfig
+    credible_set_columns: list[str] = Field(min_length=1)
+    locus_status_columns: list[str] = Field(min_length=1)
+    overlap_columns: list[str] = Field(min_length=1)
+    preflight_columns: list[str] = Field(min_length=1)
+    susie_recovery_columns: list[str] = Field(min_length=1)
+    finemap_model_columns: list[str] = Field(min_length=1)
+
+    @field_validator(
+        "credible_set_columns",
+        "locus_status_columns",
+        "overlap_columns",
+        "preflight_columns",
+        "susie_recovery_columns",
+        "finemap_model_columns",
+    )
+    @classmethod
+    def unique_nonempty_columns(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("must contain only non-empty column names")
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("must not contain duplicate column names")
+        return cleaned
 
 
 class FineMappingOutputLayoutConfig(StrictModel):
@@ -223,6 +289,8 @@ class FineMappingOutputLayoutConfig(StrictModel):
     susie_qc_file: str
     susie_failed_loci_file: str
     susie_locus_progress_file: str
+    preflight_validation_file: str
+    html_report_file: str
     finemap_input_qc_file: str
     finemap_task_skips_file: str
     finemap_locus_status_file: str
@@ -321,7 +389,9 @@ class FineMappingOutputLayoutConfig(StrictModel):
                 self.susie_combined_results_file,
                 self.susie_combined_credible_sets_file,
             ],
+            self.results_directory: [self.html_report_file],
             self.quality_control_directory: [
+                self.preflight_validation_file,
                 self.susie_qc_file,
                 self.susie_failed_loci_file,
                 self.susie_locus_progress_file,
@@ -353,9 +423,15 @@ class FineMappingOutputLayoutConfig(StrictModel):
             self.susie_qc_file,
             self.susie_failed_loci_file,
             self.susie_locus_progress_file,
+            self.html_report_file,
         ]
         if any("{dataset_id}" not in value for value in dataset_patterns):
-            raise ValueError("SuSiE output file patterns must contain {dataset_id}")
+            raise ValueError(
+                "Dataset-specific fine-mapping output file patterns must contain "
+                "{dataset_id}"
+            )
+        if not self.html_report_file.lower().endswith(".html"):
+            raise ValueError("html_report_file must end with .html")
         file_values = [
             value
             for name, value in self.model_dump().items()
@@ -434,7 +510,7 @@ class FineMappingOverlapResolutionConfig(StrictModel):
 
 
 class FineMappingConfig(ModuleConfig):
-    engine: Literal["susie", "finemap"]
+    engine: FineMappingEngine
     genome_build: GenomeBuild
     locus_type: Literal["range", "point"]
     locus_window_kb: int = Field(ge=0)
@@ -445,10 +521,12 @@ class FineMappingConfig(ModuleConfig):
     mhc_end: int = Field(gt=0)
     memory_per_worker_gb: float = Field(gt=0)
     credible_set_coverage: float = Field(gt=0, le=1)
+    input: FineMappingInputConfig
     sample_size: FineMappingSampleSizeConfig
     ld_resource_guard: FineMappingLdResourceGuardConfig
     validation: FineMappingValidationConfig
     runtime: FineMappingRuntimeConfig
+    html_report: FineMappingHtmlReportConfig
     output_layout: FineMappingOutputLayoutConfig
     summary_statistics_preparation: FineMappingSummaryStatisticsPreparationConfig
     overlap_resolution: FineMappingOverlapResolutionConfig

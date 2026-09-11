@@ -8,12 +8,12 @@ before chromosome partitions are written or worker processes are started.
 from __future__ import annotations
 
 import csv
-import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from postgwas.core.io.delimiters import open_text, resolve_delimiter
 from postgwas.core.processes import run_checked_command
+from postgwas.core.vcf import annotation_vcf_fields, declared_vcf_tag_definitions
 
 
 _RESOURCE_LABELS = {
@@ -170,15 +170,6 @@ def _vcf_index_state(
     return contigs, None
 
 
-def _required_info_tags(columns: Sequence[str]) -> set[str]:
-    tags = set()
-    for configured in columns:
-        source = str(configured).split(":=", 1)[-1].lstrip("+.-")
-        if source.startswith("INFO/") and len(source) > len("INFO/"):
-            tags.add(source[len("INFO/"):])
-    return tags
-
-
 def _vcf_info_definitions(
     path: Path, bcftools: str, logger=None,
 ) -> tuple[dict[str, dict[str, str]], str | None]:
@@ -190,21 +181,10 @@ def _vcf_info_definitions(
         )
     except RuntimeError as exc:
         return {}, "VCF header is unreadable: %s" % exc
-    definitions = {}
-    for line in header.splitlines():
-        if not line.startswith("##INFO=<"):
-            continue
-        attributes = {}
-        for name in ("ID", "Number", "Type"):
-            match = re.search(r"(?:<|,)%s=([^,>]+)" % name, line)
-            if match:
-                attributes[name] = match.group(1)
-        if set(attributes) == {"ID", "Number", "Type"}:
-            definitions[attributes["ID"]] = {
-                "number": attributes["Number"],
-                "type": attributes["Type"],
-            }
-    return definitions, None
+    try:
+        return declared_vcf_tag_definitions(header, "INFO"), None
+    except ValueError as exc:
+        return {}, "VCF header is ambiguous: %s" % exc
 
 
 def _fasta_index_state(path: Path) -> tuple[set[str], str | None]:
@@ -384,9 +364,12 @@ def validate_harmonisation_resource_maps(
     gff_cache: dict[str, str | None] = {}
     chain_cache: dict[str, tuple[dict[str, set[str]], str | None]] = {}
 
-    expected_info_tags = _required_info_tags(
-        vcf_config["external_frequency_columns"]
-    )
+    expected_info_tags = {
+        field.split("/", 1)[1]
+        for field in annotation_vcf_fields(
+            vcf_config["external_frequency_columns"], "INFO",
+        )
+    }
     required_keys = list(_ALWAYS_REQUIRED_KEYS)
     if require_default_eaf:
         required_keys.insert(0, "default_eaf_file")
@@ -452,22 +435,22 @@ def validate_harmonisation_resource_maps(
                             )
                         invalid = sorted(
                             tag for tag in expected_info_tags.intersection(definitions)
-                            if definitions[tag]["type"] != "Float"
-                            or definitions[tag]["number"] not in ("A", "1")
+                            if definitions[tag].get("type") != "Float"
+                            or definitions[tag].get("number") != "A"
                         )
                         if invalid:
                             details = ", ".join(
                                 "%s(Number=%s,Type=%s)" % (
                                     tag,
-                                    definitions[tag]["number"],
-                                    definitions[tag]["type"],
+                                    definitions[tag].get("number", "missing"),
+                                    definitions[tag].get("type", "missing"),
                                 )
                                 for tag in invalid
                             )
                             _add_issue(
                                 issues, chromosome, label, path,
-                                "configured frequency INFO tags must be numeric "
-                                "allele values (Number=A or 1, Type=Float): %s"
+                                "configured frequency INFO tags must be alternate-"
+                                "allele values (Number=A, Type=Float): %s"
                                 % details,
                             )
 

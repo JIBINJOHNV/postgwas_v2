@@ -51,6 +51,8 @@ from postgwas.modules.harmonisation.shared.runtime import (
     emit_message,
 )
 from postgwas.modules.harmonisation.shared.variant_columns import (
+    canonical_chromosome_expression,
+    canonical_position_expression,
     has_canonical_variant_columns,
 )
 
@@ -301,7 +303,12 @@ def _first_data_line(path: str) -> str:
     return ""
 
 
-def read_summary_statistics_header(path: str, policies=None) -> Tuple[List[str], str]:
+def read_summary_statistics_header(
+    path: str,
+    policies=None,
+    *,
+    configured_delimiter: Optional[str] = None,
+) -> Tuple[List[str], str]:
     """Return ``(header_names, separator)`` having read a single line.
 
     The names are the *raw* names as written in the file, so a repeated name is
@@ -312,9 +319,14 @@ def read_summary_statistics_header(path: str, policies=None) -> Tuple[List[str],
     line = _first_data_line(path)
     if not line:
         return [], "\t"
+    delimiter = (
+        str(policies.get("input.delimiter"))
+        if configured_delimiter is None
+        else str(configured_delimiter)
+    )
     separator = resolve_delimiter(
         path,
-        str(policies.get("input.delimiter")),
+        delimiter,
         candidates=list(policies.get("input.delimiter_candidates")),
         minimum_columns=int(policies.get("input.delimiter_min_columns")),
         maximum_columns=int(policies.get("input.delimiter_max_columns")),
@@ -494,6 +506,8 @@ def _first_bytes_readable(path):
 def _check_external_column(
     file_key: str,
     column_key: str,
+    delimiter_config_key: str,
+    configured_delimiter: str,
     cfg: Dict[str, Any],
     policies,
     problems: List[Problem],
@@ -511,9 +525,30 @@ def _check_external_column(
         return
     if not matches:
         return
+    if not configured_delimiter:
+        problems.append(
+            Problem(
+                config_key=delimiter_config_key,
+                configured_value=None,
+                issue="no delimiter was resolved for the external reference",
+                suggestion=(
+                    "Resolve the canonical external-reference mapping before "
+                    "configuration validation."
+                ),
+                category="missing_key",
+                stage="config",
+            )
+        )
+        return
     inspected_path = str(matches[0])
     try:
-        header, _sep = read_summary_statistics_header(inspected_path, policies)
+        # An external reference is an independent table and must use the
+        # delimiter from its resolved canonical mapping, not the study table.
+        header, _sep = read_summary_statistics_header(
+            inspected_path,
+            policies,
+            configured_delimiter=configured_delimiter,
+        )
     except Exception as exc:
         problems.append(
             Problem(
@@ -673,7 +708,13 @@ def _check_required_inputs(cfg, requirements=None, policies=None):
     return problems
 
 
-def validate_config(cfg, policies=None, logger=None):
+def validate_config(
+    cfg,
+    policies=None,
+    logger=None,
+    *,
+    external_reference_delimiters=None,
+):
     # type: (Dict[str, Any], Any, Any) -> Tuple[bool, List[Problem]]
     """Stage 1 — everything that can be decided without opening the input file.
 
@@ -688,6 +729,7 @@ def validate_config(cfg, policies=None, logger=None):
     problems = []  # type: List[Problem]
     policies = _resolve_policies(policies, problems)
     cfg = cfg or {}
+    external_reference_delimiters = external_reference_delimiters or {}
 
     # ---- 1. what the dataset must supply ----------------------------
     #
@@ -731,8 +773,24 @@ def validate_config(cfg, policies=None, logger=None):
         )
 
     # ---- 7. external files contain the column they supply -----------
-    _check_external_column("eaffile", "eafcolumn", cfg, policies, problems)
-    _check_external_column("infofile", "infocolumn", cfg, policies, problems)
+    _check_external_column(
+        "eaffile",
+        "eafcolumn",
+        "modules.harmonisation.external_eaf_mapping.delimiter",
+        _clean(external_reference_delimiters.get("eaffile")),
+        cfg,
+        policies,
+        problems,
+    )
+    _check_external_column(
+        "infofile",
+        "infocolumn",
+        "modules.harmonisation.external_info_mapping.delimiter",
+        _clean(external_reference_delimiters.get("infofile")),
+        cfg,
+        policies,
+        problems,
+    )
 
     # ---- 8. scalar sample sizes -------------------------------------
     minimum = int(policies.get("sample_size.min_value"))
@@ -1181,19 +1239,15 @@ def validate_content(cfg, df, policies=None, logger=None):
         applied = []
         if chr_col in columns:
             mask = mask & (
-                pl.col(chr_col)
-                .cast(pl.Utf8, strict=False)
-                .str.strip_chars()
-                .str.replace(r"(?i)^chr", "", literal=False)
-                .str.to_uppercase()
+                canonical_chromosome_expression(
+                    pl.col(chr_col), policies,
+                )
                 .is_in(allowed)
             )
             applied.append("chromosome")
         if pos_col in columns:
             mask = mask & (
-                pl.col(pos_col)
-                .cast(pl.Float64, strict=False)
-                .cast(pl.Int64, strict=False)
+                canonical_position_expression(pl.col(pos_col))
                 >= min_position
             )
             applied.append("position")

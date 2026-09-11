@@ -2,7 +2,7 @@ enabled: false
 engine: susie
 genome_build: GRCh37
 locus_type: range
-locus_window_kb: 1500
+locus_window_kb: 500
 locus_lp_threshold: 7.3
 skip_mhc: true
 mhc_chromosome: 6
@@ -10,6 +10,11 @@ mhc_start: 25000000
 mhc_end: 35000000
 memory_per_worker_gb: 14
 credible_set_coverage: 0.95
+input:
+  locus_file: null
+  susie_summary_statistics_file: null
+  finemap_summary_statistics_file: null
+  ld_reference_prefix: null
 sample_size:
   policy: warn
   summary_statistic: median
@@ -28,6 +33,82 @@ runtime:
   tool_version_timeout_seconds: 15
   software_version_timeout_seconds: 20
   fallback_memory_gb: 16.0
+html_report:
+  page_size: 50
+  probability_significant_digits: 4
+  credible_set_file_columns:
+    rank: index
+    variant_id: cred1
+    posterior_probability: prob1
+  credible_set_columns:
+    - analysis_round
+    - final_genomic_locus
+    - source_primary_genomic_loci
+    - credible_set
+    - n_variants
+    - target_coverage
+    - achieved_component_coverage
+    - achieved_coverage
+    - global_pip_sum
+    - component_log10bf
+    - min_abs_ld
+    - model_k
+    - model_posterior_probability
+    - warning_reason
+    - final_selection_reason
+  locus_status_columns:
+    - genomic_locus
+    - status
+    - stage
+    - converged
+    - outcome_reason
+    - recovery_method
+    - warning_reason
+    - failure_reason
+    - input_variant_count
+    - n_variants
+    - selected_nef
+    - nef_relative_range
+    - ld_z_mismatch_lambda
+    - ld_min_eigenvalue
+    - estimated_peak_ld_memory_gb
+  overlap_columns:
+    - overlap_group_id
+    - primary_genomic_locus
+    - chromosome
+    - primary_start
+    - primary_end
+    - joint_genomic_locus
+    - resolution_status
+    - resolution_reason
+    - primary_warning_reason
+    - joint_warning_reason
+    - joint_failure_reason
+  preflight_columns: [category, check, status, value, path, detail]
+  susie_recovery_columns:
+    - genomic_locus
+    - sequence
+    - stage
+    - action
+    - status
+    - reason
+    - ld_status
+    - repairable
+    - L
+    - max_iter
+    - timeout_seconds
+    - ld_z_mismatch_lambda
+    - ld_min_eigenvalue
+    - details
+  finemap_model_columns:
+    - Locus
+    - File_Name
+    - K_Causal
+    - Posterior_Prob
+    - Selected
+    - Validation_Status
+    - Failure_Reason
+    - Failure_Detail
 output_layout:
   results_directory: results
   combined_results_directory: results/combined_results
@@ -67,6 +148,8 @@ output_layout:
   susie_qc_file: quality_control/{dataset_id}_susie_locus_qc.tsv
   susie_failed_loci_file: quality_control/{dataset_id}_susie_failed_loci.tsv
   susie_locus_progress_file: quality_control/{dataset_id}_susie_locus_progress.tsv
+  preflight_validation_file: quality_control/input_and_resource_validation.tsv
+  html_report_file: results/{dataset_id}_fine_mapping_report.html
   finemap_input_qc_file: quality_control/finemap_input_harmonization_qc.tsv
   finemap_task_skips_file: quality_control/finemap_task_generation_skips.tsv
   finemap_locus_status_file: quality_control/finemap_locus_status.tsv

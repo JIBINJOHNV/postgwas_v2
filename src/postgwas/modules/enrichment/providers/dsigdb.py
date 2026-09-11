@@ -7,6 +7,7 @@
 import rpy2.robjects as ro
 from rpy2.robjects.vectors import StrVector
 from pathlib import Path
+import shutil
 
 
 def run_dsigd_ora_webgestalt(
@@ -38,8 +39,10 @@ def run_dsigd_ora_webgestalt(
 
     # Load WebGestaltR
     ro.r("library(WebGestaltR)")
-    # Ensure ZIP command is set correctly for the environment
-    ro.r('Sys.setenv(R_ZIPCMD = "/opt/conda/envs/enricher/bin/zip")')
+    zip_command = shutil.which("zip")
+    if zip_command is None:
+        raise RuntimeError("The zip executable required by WebGestaltR was not found")
+    ro.r["Sys.setenv"](R_ZIPCMD=zip_command)
 
     # ---------------------------------------------------------
     # Convert inputs to R objects

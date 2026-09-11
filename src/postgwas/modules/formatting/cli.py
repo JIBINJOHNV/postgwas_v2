@@ -6,10 +6,7 @@ import argparse
 import sys
 from typing import get_args
 
-from rich.console import Console
-
 from postgwas.cli.common import (
-    get_bcftools_binary_parser,
     get_common_out_parser,
     get_formatter_parser,
     get_inputvcf_parser,
@@ -18,7 +15,9 @@ from postgwas.cli.common import (
 from postgwas.cli.compute import get_compute_parser
 from postgwas.config.models.modules.formatting import FormattingCustomField
 from postgwas.core.errors import ConfigurationError
-from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples
+from postgwas.core.ui import (
+    AlignedRichHelpFormatter, format_cli_examples, print_screen_message,
+)
 from postgwas.modules.formatting.service import run_formatter_direct
 from postgwas.modules.formatting.table import FormattingError
 
@@ -159,7 +158,6 @@ def build_parser() -> argparse.ArgumentParser:
             get_inputvcf_parser(),
             get_formatter_parser(direct_controls=True),
             get_common_out_parser(),
-            get_bcftools_binary_parser(),
             get_ldsc_merge_alleles_parser(),
         ],
     )
@@ -167,7 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
     for action in parser._actions:
         if action.dest in {"vcf", "output_directory"}:
             action.required = True
-        if action.dest in {"bcftools", "dataset_id", "output_directory"}:
+        if action.dest in {"dataset_id", "output_directory"}:
             action.default = argparse.SUPPRESS
     return parser
 
@@ -182,8 +180,8 @@ def main(argv=None):
     try:
         run_formatter_direct(args)
     except (FormattingError, ConfigurationError, OSError, ValueError) as exc:
-        Console(stderr=True).print(
-            "\n[bold red]Formatter failed.[/bold red] %s\n" % exc
+        print_screen_message(
+            "error", "Formatter failed. %s" % exc, stderr=True,
         )
         return 1
     return 0

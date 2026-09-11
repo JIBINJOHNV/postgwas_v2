@@ -22,13 +22,15 @@ module help additionally shows the module-specific input artifacts that the user
 must provide directly.
 
 Terminal display is enabled by the canonical `logging.show_screen: true`
-default. Every scientific module and pipeline accepts `--show-screen` and
-`--hide-screen`; the explicit flag overrides YAML for that run. Both settings
-append the complete standard-output and standard-error stream to
+default. Every scientific module and pipeline accepts `--hide-screen` as a
+one-way command-line override for that run. Visible and hidden runs append the
+complete standard-output and standard-error stream to
 `<run.output_directory>/<logging.screen_log_file>`. The packaged transcript
 path is `run_metadata/screen.log`, and schema validation requires it to remain
 relative to the output directory. `--hide-screen` changes display only and does
-not disable the transcript or the module's canonical scientific logs.
+not disable the transcript or the module's canonical scientific logs. To
+enable display when YAML has disabled it, set `logging.show_screen: true` in the
+run configuration.
 Measured external-tool progress is refreshed from append-only native output at
 the schema-validated `logging.progress_refresh_seconds` interval (default: one
 second). The monitor reads only newly appended bytes: it can count completed
@@ -41,6 +43,14 @@ module-specific default. PostGWAS atomically records the resolved-configuration
 digest, tracked input and output SHA-256 checksums, software identity,
 scientific completion status, and upstream checkpoint dependencies. A completed
 boundary is reused only when all of that evidence still matches.
+
+For large immutable references, the checkpoint also records the file device,
+inode, size, modification time, and change time observed with each SHA-256.
+PostGWAS reuses the recorded content hash only while that complete filesystem
+identity is unchanged. Any identity change triggers a fresh SHA-256 calculation;
+an input that changes during an active execution prevents checkpoint creation.
+This avoids repeatedly reading multi-gigabyte reference panels without weakening
+the tracked content fingerprint.
 
 The packaged policy is:
 
@@ -71,11 +81,13 @@ externally modified tracked input, a modified output, a symlink, an unknown
 artifact, or a path outside the output root is not automatically replaced
 because ownership and scientific integrity cannot be proved.
 
-`--no-resume` disables checkpoint reuse for one invocation while retaining
-normal collision protection. `run.overwrite: true` or `--overwrite` explicitly
-forces replacement and takes precedence over resume. Automatic policy restart
-does not silently change the resolved overwrite setting. Decisions and warnings
-are appended to the configured checkpoint audit log.
+Set `run.resume: false` in YAML to disable checkpoint reuse while retaining
+normal collision protection. `run.overwrite: true` or `--overwrite` starts the
+analysis from its first step and replaces files created by the previous run.
+The command-line `--resume` and `--overwrite` options are mutually exclusive;
+an overwrite setting in YAML takes precedence over resume. Automatic policy
+restart does not silently change the resolved overwrite setting. Decisions and
+warnings are appended to the configured checkpoint audit log.
 
 Resume and overwrite are execution controls, not result-defining parameters, so
 they are excluded from the checkpoint content digest and are never restored from
@@ -118,7 +130,8 @@ a validated configuration object and stop defining fallback values internally.
 Harmonisation has one packaged source of truth:
 `src/postgwas/config/defaults/modules/harmonisation.yaml`. Its `module` section
 contains module-level defaults, while the remaining sections contain the
-validated scientific policy registry. There is no second defaults file inside
+validated scientific policy registry and schema-checked export presentation
+metadata. There is no second defaults file inside
 the harmonisation implementation package.
 
 Validate a complete file:
@@ -183,6 +196,10 @@ policies follow analysis order, and sequences such as chromosome sets are kept
 on one line.
 
 ```console
+# Common harmonisation settings, including run controls and post-merge QC rules
+postgwas config export --module harmonisation --scope common \
+  --output harmonisation.yaml
+
 # Complete explanations for every harmonisation policy
 postgwas config export --module harmonisation --style full > harmonisation.yaml
 
@@ -205,6 +222,60 @@ postgwas config export --pipeline finemap magma > analysis_pipeline.yaml
 
 Use `--output PATH` instead of shell redirection when preferred. Pipeline
 export can also resolve values from an existing run file with `--run-config PATH`.
+
+### A shorter harmonisation configuration
+
+Use `--scope common` for a practical starting file. Set `resources.root` and
+`run.output_directory`, then run:
+
+```console
+postgwas harmonisation --sample-sheet studies.csv --run-config harmonisation.yaml
+```
+
+The common export is a **full-run-shaped** file: global `run`, `execution`,
+`resources`, and `logging` settings are followed by `modules.harmonisation`
+and the supporting `modules.qc_summary.rules`. Dataset paths and source-column
+mappings remain in the sample sheet. In contrast, `--scope all` (the existing
+default) exports the **module-only** configuration, with `policies` at its root.
+Both shapes are accepted by harmonisation; existing key names are unchanged.
+
+Within harmonisation, the order is reference selection → dataset/chromosome
+policies → post-merge checks → advanced file, column and adapter definitions.
+Policy groups name the processing-log steps that consume them; settings used at
+several steps appear only once. Comments distinguish variant rejection during
+harmonisation from the report-only post-merge QC assessment. The palindromic
+ambiguity interval is not a blanket filter on every variant's EAF.
+
+`--scope` controls **which settings** appear; `--style full|minimal|values`
+controls **how much explanation** appears. `minimal` is the default style.
+Common scope is currently supported only by `--module harmonisation`; pipeline
+and other module exports remain complete.
+
+To shorten an existing configuration without losing its resolved custom values:
+
+```console
+postgwas config export --module harmonisation --scope common \
+  --run-config existing.yaml --output harmonisation.yaml
+```
+
+Every non-default value is retained, even an advanced setting not in the common
+selection, or a global/supporting-module override. Includes are resolved first;
+the exported file does not depend on the original include files. Consequently,
+a heavily customized common export may be longer than the default template.
+Omitted settings still inherit the **installed version's** defaults: archive the
+run's resolved configuration and software version for reproducibility. Exported
+compute budgets are resolved for this computer; use `auto` for `execution.threads`
+and `execution.memory_gb` when you want them resolved again on another computer.
+
+To inspect every harmonisation setting, including advanced definitions and full
+policy explanations, export `--scope all --style full`. To archive every resolved
+run setting (including global and supporting modules), use
+`postgwas config show --config harmonisation.yaml --output resolved.yaml`.
+This restructuring changes presentation and export selection, not analysis
+defaults, allele handling, filtering, or transformations.
+
+### Other module and pipeline exports
+
 For `--module formatting`, `--format FORMAT [FORMAT ...]` writes shared
 formatter settings plus only the selected target-specific sections. Omit it to
 retain the complete formatter configuration. The option is rejected with

@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 
-from rich.console import Console
-
 from postgwas.cli.common import (
     get_common_out_parser,
     get_flames_common_parser,
@@ -15,8 +13,10 @@ from postgwas.cli.common import (
 from postgwas.cli.compute import get_compute_parser
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.ui import (
+    print_screen_message,
     AlignedRichHelpFormatter,
     format_cli_examples,
+    mark_cli_required_help,
 )
 from postgwas.modules.flames.errors import FlamesError
 
@@ -56,7 +56,6 @@ def get_flames_pipeline_examples():
                 "reference/FLAMES/Annotation_data",
                 "--flames-genome-build GRCh37",
                 "--plink plink",
-                "--bcftools bcftools",
                 "--dataset-id STUDY",
                 "--output-directory results",
             ),
@@ -166,6 +165,16 @@ def build_parser() -> argparse.ArgumentParser:
         }:
             action.default = argparse.SUPPRESS
             action.type = None
+    mark_cli_required_help(
+        parser,
+        (
+            "credible_sets_directory",
+            "magma_gene_results_file",
+            "magma_covariate_results_file",
+            "pops_scores_file",
+            "annotation_resource_directory",
+        ),
+    )
     return parser
 
 
@@ -176,8 +185,8 @@ def main(argv=None):
     try:
         run_flames_direct(args)
     except (FlamesError, ConfigurationError, OSError, ValueError) as exc:
-        Console(stderr=True).print(
-            "\n[bold red]FLAMES analysis failed.[/bold red] %s\n" % exc
+        print_screen_message(
+            "error", "FLAMES analysis failed. %s" % exc, stderr=True,
         )
         return 1
     return 0

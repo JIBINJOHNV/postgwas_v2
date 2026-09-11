@@ -36,6 +36,14 @@ The mappings from harmonised GWAS-VCF are:
 | `P` | `10^-FORMAT/LP` | Raw association p-value |
 | `N` | `FORMAT/SS` | Total study sample size |
 
+For formatter-created input, the completed `.ma` preparation stage displays
+and records every resolved source-to-output mapping in schema order. It reports
+the selected rsID or configured unique-ID construction, identifies unchanged
+fields as copied without a numerical transformation, shows the configured
+`LP`-to-raw-`P` calculation, and retains the written, excluded, and minimum-P
+bound counts. Direct mode reports only validation of the supplied `.ma` file;
+it does not claim that PostGWAS extracted or transformed VCF fields.
+
 Effective sample size is not substituted for `N`. Records missing a required
 value, with non-finite effects, non-positive SE or N, or with frequency outside
 the open interval `(0, 1)` cannot be represented safely in GCTA `.ma` input.
@@ -60,6 +68,16 @@ validates:
 - chromosome overlap between gene coordinates and the LD reference; and
 - GCTA version at or above the configured minimum.
 
+The direct command and the single-module pipeline display these checks as
+structured stage outcomes, using the same validation evidence rather than
+rescanning the inputs for reporting. The screen and canonical log identify the
+summary-statistics input and schema, required PLINK companion files, BIM
+structure and identifier universe, declared build and population provenance,
+gene-coordinate structure, and the selected prepared-set or GMT pathway
+resource. GMT mode also reports exact pathway/gene overlap and the final
+BIM-identifier set resource; prepared-set mode reports set-block structure and
+the GWAS/BIM membership intersection.
+
 In direct mode, PostGWAS compares every `SNP` value in `--gcta-input-file`
 against PLINK BIM column 2 and reports the number of unique IDs in each file,
 the exact shared IDs, summary-statistic IDs absent from the BIM, and BIM IDs
@@ -69,24 +87,21 @@ PostGWAS passes the original table to GCTA without renaming IDs, removing rows,
 or writing a replacement summary-statistics table. The analysis stops when no
 exact IDs are shared or when a shared ID has an incompatible allele pair; a
 partial exact-ID overlap alone does not stop direct mode and is not evaluated
-against the pipeline reconciliation minimum.
+against the pipeline exact-overlap minimum.
 
-In pipeline mode, the module uses the same harmonised GWAS-VCF supplied to the
-formatter to reconcile identifier namespaces. Exact BIM IDs have priority.
-When `variant_harmonisation.coordinate_fallback` is enabled, a summary variant
-whose rsID is absent from the BIM can be renamed to BIM column 2 only when its
-chromosome, position, and unordered REF/ALT pair identify one unambiguous BIM
-record. This supports references whose BIM uses either rsIDs or coordinate-based
-unique IDs without parsing or synthesizing an identifier. Direct ID matches
-with conflicting coordinates or alleles stop the analysis. Ambiguous matches
-remain unresolved, unresolved rows are reported and removed, and the analysis
-stops if the resolved fraction is below
-`variant_harmonisation.minimum_overlap_fraction`. The exact GCTA-ready table is
-saved at `output_layout.harmonised_input`, and all matching counts are recorded
-in the canonical log. The packaged `0.50` minimum applies only to pipeline
-reconciliation and is a configurable PostGWAS fail-fast safety policy, not a
-threshold defined by GCTA; the resolved fraction is always reported so a study
-can adopt a stricter policy.
+In pipeline mode, the formatter records whether the selected BIM uses rsIDs or
+the configured coordinate-and-allele identifier template. The formatter then
+creates the GCTA `.ma` once, selecting that BIM-compatible identifier expression
+while extracting the harmonised GWAS-VCF and converting `LP = -log10(P)` to raw
+`P`. The GCTA module validates that same file against BIM column 2 and the BIM
+allele pairs. It does not extract the VCF again, rename identifiers, remove
+additional rows, or write a second reconciled `.ma`. Summary IDs absent from the
+BIM are counted and reported because GCTA will not use them. The analysis stops
+when the exact overlap is empty, a shared allele pair is incompatible, or the
+exact shared fraction is below `variant_harmonisation.minimum_overlap_fraction`.
+The packaged `0.50` minimum is a configurable PostGWAS fail-fast safety policy,
+not a threshold defined by GCTA; the observed fraction and all four intersection
+counts are written to the terminal summary and canonical log.
 
 `fastbat_gene` and `mbat_combo` require `gene_annotation.file`.
 `fastbat_segment` requires the positive configured `segment_size_kb` and does
@@ -122,9 +137,51 @@ the configured banner pattern as the version-probe contract and records the
 probe exit code; the actual gene-test command still requires a zero exit code
 and all configured outputs.
 
-GCTA performs its configured A1-frequency comparison for mBAT-combo. Removed
+GCTA performs its configured A1-frequency comparison for every fastBAT mode
+and mBAT-combo. PostGWAS passes `frequency_difference_max` explicitly through
+`--diff-freq` and records it in the canonical log and HTML parameters for all
+four methods. The packaged threshold of `0.2` matches GCTA's upstream default;
+it is not a PostGWAS-only prefilter. GCTA's
+[option implementation](https://github.com/JianYang-Lab/GCTA/blob/main/main/option.cpp)
+sets this threshold before dispatching any of these methods, and the
+[fastBAT implementation](https://github.com/JianYang-Lab/GCTA/blob/main/main/sbat.cpp)
+uses the shared summary-statistics initialization and frequency check. Removed
 variants are retained in the official `.freq.badsnps` output when GCTA creates
-that file.
+that file. Changing the threshold changes the analysis identity.
+
+## MHC and chromosome analysis scope
+
+The GCTA module exposes the same four MHC policies as MAGMA through
+`mhc.policy`/`--mhc-policy`: `include`, `exclude_snps`, `exclude_genes`, and
+`exclude_both`. The packaged default is `exclude_both`. The MHC coordinates
+come from `resources.genomes.<genome_build>.regions.mhc`; all three
+`--mhc-chrom`, `--mhc-start`, and `--mhc-end` options must be supplied to use
+an analysis-specific override. `chromosomes.exclude`/`--exclude-chromosomes`
+removes the declared chromosomes, with packaged defaults `Y` and `MT`; X is
+retained unless it is listed explicitly.
+
+SNP exclusion is performed with GCTA's documented `--exclude` option. During
+the existing BIM validation pass, PostGWAS copies every excluded variant's
+exact BIM-column-2 identifier into a deterministic run-owned list and supplies
+that list to GCTA. The formatter-created or directly supplied `.ma` remains
+unchanged. Counts are reported separately for full-reference variants and for
+GWAS/BIM-shared variants, so the analyzable intersection remains auditable.
+
+For `fastbat_gene` and `mbat_combo`, gene exclusion creates a scoped copy of
+the coordinate file. A gene is excluded when its tested interval—the original
+coordinates plus the configured GCTA gene window—overlaps the MHC interval,
+or when it lies on an excluded chromosome. The original and scoped files are
+both fingerprinted in the completion manifest. For GMT-derived `fastbat_set`,
+PostGWAS first evaluates the configured minimum coordinate-reference coverage
+by the GMT, then removes scope-excluded matched genes before BIM mapping. Such
+genes are reported separately from GMT identifiers genuinely absent from the
+reference.
+
+Fixed segments and prepared SNP-set files do not encode gene identities. Their
+SNP exclusions are still enforceable, but `exclude_genes` alone is rejected as
+inapplicable instead of being silently ignored. With `exclude_both`, the SNP
+component remains effective for those modes and the gene component has no
+coordinate-defined unit to remove.
 
 ## Gene-list resource preparation
 
@@ -157,11 +214,32 @@ checksum, and every tracked audit-output checksum still match.
 For GMT input, PostGWAS forms the exact analyzable universe as the validated
 GWAS/BIM intersection before mapping BIM positions to genes. Pathway variants
 are then deduplicated, empty and oversized policies are applied to those final
-analyzable memberships, and the GCTA block file is written. The configured
-`output_layout.analysis_set_list` is still independently validated from that
-resource before execution. This defence-in-depth check matches GCTA's SNP
-availability rules while preventing a zero-SNP or oversized set from reaching
-fastBAT. Sets with no shared variants follow
+analyzable memberships, and the final GCTA block file is written once. That
+validated GMT-derived file is passed directly to GCTA; PostGWAS does not create
+a second analysis-set copy. This matches GCTA's SNP-availability rules while
+preventing a zero-SNP or oversized set from reaching fastBAT. Before BIM
+mapping, the unique GMT gene universe is compared with the gene-coordinate
+identifiers. PostGWAS reports the comparison in both directions.
+**Coordinate-reference coverage by the GMT** is the number of matched
+identifiers divided by all identifiers in the coordinate reference; it must
+meet `set_annotation.conversion.minimum_gene_id_overlap_fraction` (packaged
+default `0.50`). **GMT gene mappability** is the same matched count divided by
+the number of unique genes in the GMT. It is reported but is not the stopping
+criterion. Counts absent in both directions are reported. Only matched genes
+can contribute intervals and variants; unmatched GMT genes are reported or
+rejected according to `unmapped_gene_policy`.
+
+This coverage threshold is a configurable PostGWAS validation policy, not a
+GCTA requirement. It intentionally rejects a focused GMT when that collection
+represents less than the configured fraction of the coordinate reference; set
+a different threshold explicitly when such a focused analysis is intended.
+
+The pathway mapping table additionally records, for every pathway, its
+`gene_id_mappability_fraction` and `analyzable_gene_fraction`, plus the counts
+used to calculate them. The screen summary and manifest report how many
+pathways have complete, partial, or no gene-ID mapping. These pathway metrics
+are audit evidence; they do not introduce a second implicit pathway threshold.
+Sets with no shared variants follow
 `set_annotation.conversion.empty_pathway_policy`: `omit` records and excludes
 them, while `error` stops before GCTA. The canonical log records input,
 retained, and omitted set counts and variant-membership counts. The GMT,
@@ -220,12 +298,36 @@ file, staging directory, bytes written, estimate, remaining space, audit level,
 and safe restart boundary; incomplete staging is never published.
 
 With the packaged `logging.show_progress: true`, a direct `fastbat_set` run
-displays seven measurable GCTA stages beneath the mandatory one-operation
-module progress. Pipeline reconciliation with its GWAS-VCF displays nine. GMT input
-adds eight nested preparation stages: input/GMT scanning, gene-boundary
-resolution, analyzable BIM mapping, pathway-membership validation, pathway and
-disk preflight, set and normalized-audit writing, provenance and checksum
-writing, and atomic publication. The BIM
+displays its measurable module stages beneath the mandatory one-operation module
+progress. A single-module pipeline uses one method-aware progress plan across
+both formatter and GCTA execution instead of presenting formatter work as a
+separate analysis. For GMT-driven fastBAT-set, the ordered plan is:
+
+1. validate the harmonised GWAS-VCF;
+2. validate the PLINK reference and determine the BIM identifier format;
+3. validate the GCTA gene-coordinate file;
+4. validate the original GMT;
+5. enforce the configured minimum coordinate-reference coverage by the GMT;
+6. create and validate the one BIM-compatible GCTA `.ma`;
+7. map analyzable BIM variants to matched gene intervals;
+8. create candidate pathway-to-variant memberships;
+9. apply duplicate, empty-set, and set-size policies and write final sets;
+10. run GCTA fastBAT-set;
+11. validate the raw GCTA result;
+12. add and validate nominal, Bonferroni, and BH-FDR results; and
+13. validate and publish outputs and display the association summary.
+
+Every completed stage displays a concise validated outcome and writes the same
+stage number, title, status, and metrics to the GCTA canonical log. After stage
+6, a separate input-validation summary reports the summary and BIM universes,
+their exact intersection and differences, allele compatibility, and the fact
+that the formatter `.ma` was not rewritten. Gene, segment, prepared-set, and
+mBAT-combo modes reuse the applicable VCF, PLINK, `.ma`, execution, result
+validation, correction, publication, and summary stages while omitting stages
+that do not apply to their inputs.
+
+GMT conversion still exposes measured counters inside the relevant pipeline
+stages. The BIM
 mapping stage has its own measured counter: its denominator is the validated
 reference-variant count from the earlier PLINK stage, and its numerator advances
 only after a BIM row has been fully mapped. Refreshes follow
@@ -284,16 +386,20 @@ The canonical defaults are in
 - `method`: `fastbat_gene`, `fastbat_segment`, `fastbat_set`, or `mbat_combo`;
 - `genome_build`, shared by all three coordinate-bearing inputs;
 - `reference.prefix` and `reference.population`;
-- `variant_harmonisation`, including coordinate fallback, chromosome-label,
-  minimum-overlap, and strand-complement policies;
+- `variant_harmonisation`, including chromosome-label, minimum exact-BIM-overlap,
+  and strand-complement policies;
+- `mhc.policy` and optional `mhc.region_override`, controlling MHC SNP and
+  coordinate-defined gene exclusion;
+- `chromosomes.exclude`, controlling chromosome-wide SNP and gene exclusion;
 - `gene_annotation.file`;
 - `set_annotation.file` or `set_annotation.gmt_file`, which are mutually exclusive;
 - `set_annotation.maximum_set_variants`, the validated GCTA custom-set limit;
 - `set_annotation.oversized_set_policy`, which controls sets above GCTA's
   20,000-variant hard limit;
 - `set_annotation.conversion`, including chromosome, duplicate-gene,
-  unmapped-gene, empty-pathway, bounded chromosome-worker, audit level,
-  Parquet compression/batch size, disk preflight, and output-name policies;
+  unmapped-gene, minimum coordinate-reference coverage, empty-pathway, bounded
+  chromosome-worker, audit level, Parquet compression/batch size, disk
+  preflight, and output-name policies;
 - `segment_size_kb`;
 - `gene_window_kb`;
 - `reference_maf_min`;
@@ -301,10 +407,14 @@ The canonical defaults are in
 - `mbat_svd_gamma`;
 - `frequency_difference_max`;
 - `print_component_p_values`;
-- `write_snpset`, mapped to the official mode-specific fastBAT or mBAT flag; and
+- `write_snpset`, mapped to the official mode-specific fastBAT or mBAT flag;
 - `reporting`, which controls the number of ranked associations displayed,
   p-value precision, nominal, family-wise, and FDR alpha levels, correction
-  column names, and method-specific chromosome columns.
+  column names, and method-specific chromosome columns;
+- `html_report.page_size`, which controls browser pagination without changing
+  result content; and
+- `html_report.columns`, which declares the complete table columns separately
+  for `fastbat_gene`, `fastbat_segment`, `fastbat_set`, and `mbat_combo`.
 
 The GCTA analysis thresholds declared in the packaged YAML follow documented
 GCTA defaults or examples and remain user-selectable; PostGWAS validation
@@ -328,22 +438,39 @@ the smallest p-value, and the counts meeting nominal, BH-FDR, and Bonferroni
 criteria. It also lists the lowest-p-value genes, segments, or sets with raw,
 BH-adjusted, and Bonferroni-adjusted p-values. For mBAT-combo, ranked entries
 also show `P_mBAT` and `P_fastBAT` when GCTA was configured to emit them.
-Analysis warnings identify unresolved GWAS variants and custom sets omitted
-by the configured empty- or oversized-set policies. For gene, mBAT-combo, and
+Analysis warnings identify unresolved GWAS variants, variants and genes removed
+by the configured analysis scope, and custom sets omitted by the configured
+empty- or oversized-set policies. For gene, mBAT-combo, and
 segment results, the reporting configuration also declares the result chromosome
 column; PostGWAS reports chromosome coverage and warns when a chromosome shared
 by the annotation/reference inputs has no tested units in the result. The same
 findings and each ranked association are recorded in the canonical log.
+Every successful method also writes a standalone searchable HTML results
+report at `output_layout.html_report`. The report is built only from the
+validated normalized result and the same association summary used by the
+terminal. It contains all tested rows, initially ordered by the method's primary
+p-value, plus input/reference coverage, MHC and chromosome scope, nominal,
+Bonferroni and BH-FDR results, interpretation, warnings, parameters, and links
+to the native result, normalized TSV, manifest, and canonical log. Browser page
+size and displayed columns are presentation settings; they never filter the
+underlying result family.
+
 Reporting-only changes do not invalidate an otherwise matching completion
 manifest or rerun GCTA. If correction alpha levels or output-column names
 change, a resumed run atomically regenerates the normalized table from the
 checksum-validated raw GCTA result and refreshes its completion-manifest
-fingerprint without re-executing GCTA.
+fingerprint without re-executing GCTA. HTML-only changes regenerate only the
+report. A legacy completion manifest without an HTML output is upgraded by a
+validated resume, also without re-executing GCTA.
 
 After a successful analysis, `output_layout.completion_manifest` records the
 resolved module configuration, GCTA version, SHA-256 fingerprints of the exact
-summary input, annotation, PLINK reference companions, raw result, normalized
-result, and validated result metrics. Resume skips GCTA only when every recorded
+summary input, source and scoped annotations, variant-exclusion list, PLINK
+reference companions, raw result, normalized result, HTML report, and validated
+result metrics. The report has a separate presentation-configuration digest and
+output fingerprint, so analysis reuse is independent of report layout while
+an externally changed published report is never silently overwritten. Resume
+skips GCTA only when every recorded
 value still matches; a missing or changed manifest, input, or result fails with
 an instruction to review and use `--overwrite`.
 
@@ -442,13 +569,17 @@ Pipeline resume is enabled by default. When the formatter step completed in an
 earlier attempt, PostGWAS verifies its completion manifest, input VCF checksum,
 resolved formatter configuration, output schemas, and output checksums before
 supplying the saved GCTA input to this module. Existing GCTA and GMT-conversion
-results are likewise reused only through their validated resume contracts. Pass
-`--no-resume` to disable continuation for a run.
+results are likewise reused only through their validated resume contracts. Set
+`run.resume: false` in YAML to disable checkpoint reuse without replacing files,
+or pass `--overwrite` to rerun the analysis from its first step.
 
 ## References
 
 - [Official GCTA fastBAT documentation](https://yanglab.westlake.edu.cn/software/gcta/#fastBAT)
 - [Official GCTA mBAT-combo documentation](https://yanglab.westlake.edu.cn/software/gcta/#mBAT-combo)
+- [MSigDB collection guidance](https://www.gsea-msigdb.org/gsea/msigdb/collections.jsp),
+  which recommends choosing a focused collection instead of using the entire
+  Human MSigDB as one analysis universe;
 - [Official GCTA mBAT-combo source](https://github.com/JianYang-Lab/GCTA/blob/main/main/mbat.cpp),
   which logs the mapped-gene total and flushes one output row after each tested
   gene;

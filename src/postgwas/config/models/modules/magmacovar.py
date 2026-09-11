@@ -4,28 +4,105 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from postgwas.config.models.common import ModuleConfig, StrictModel
+from postgwas.config.models.common import (
+    ModuleConfig,
+    MultipleTestingSelectionConfig,
+    PValueCorrectionMethod,
+    StrictModel,
+)
 
 
 MagmaCovarDirection = Literal["two-sided", "greater", "smaller"]
+MagmaCovarMissingValues = Literal["drop", "median", "mean"]
+MagmaCovarMissingGenes = Literal["drop", "fill"]
 
 
 class MagmaCovarInputConfig(StrictModel):
     gene_results_file: Path | None = None
     covariates_file: Path | None = None
-    missing_values: Literal["drop", "median", "mean"]
+    missing_values: MagmaCovarMissingValues
     maximum_missing_fraction: float = Field(ge=0, le=0.2)
-    missing_genes: Literal["drop", "fill"]
+    missing_genes: MagmaCovarMissingGenes
 
 
 class MagmaCovarOutputLayout(StrictModel):
     output_prefix: str
     results_file: str
+    corrected_results_file: str
     native_log_file: str
     service_log_file: str
     resolved_config_file: str
     completion_manifest: str
     staging_directory: str
+
+
+class MagmaCovarMultipleTestingConfig(MultipleTestingSelectionConfig):
+    reporting_method_labels: dict[PValueCorrectionMethod, str]
+
+    @field_validator("reporting_method_labels")
+    @classmethod
+    def nonempty_reporting_labels(cls, values: dict[str, str]) -> dict[str, str]:
+        if not values or any(not label.strip() for label in values.values()):
+            raise ValueError("must provide non-empty reporting labels")
+        return values
+
+    @model_validator(mode="after")
+    def labels_cover_selected_methods(self):
+        missing = sorted(set(self.methods) - set(self.reporting_method_labels))
+        if missing:
+            raise ValueError(
+                "reporting_method_labels is missing configured methods: %s"
+                % ", ".join(missing)
+            )
+        return self
+
+
+class MagmaCovarResultSchema(StrictModel):
+    variable_column: str
+    type_column: str
+    gene_count_column: str
+    beta_column: str
+    standardized_beta_column: str
+    standard_error_column: str
+    p_value_column: str
+    adjusted_p_value_column_pattern: str
+    primary_correction_method_column: str
+    primary_adjusted_p_value_column: str
+    primary_significant_column: str
+    delimiter: Literal["\t", ","]
+    null_value: str
+
+    @field_validator(
+        "variable_column", "type_column", "gene_count_column", "beta_column",
+        "standardized_beta_column", "standard_error_column", "p_value_column",
+        "primary_correction_method_column", "primary_adjusted_p_value_column",
+        "primary_significant_column", "null_value",
+    )
+    @classmethod
+    def nonempty_value(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("must not be empty")
+        return cleaned
+
+    @field_validator("adjusted_p_value_column_pattern")
+    @classmethod
+    def valid_adjusted_p_value_pattern(cls, value: str) -> str:
+        cleaned = value.strip()
+        if "{method}" not in cleaned:
+            raise ValueError("must contain '{method}'")
+        try:
+            cleaned.format(method="bonferroni")
+        except (KeyError, ValueError) as exc:
+            raise ValueError("must be a valid format pattern") from exc
+        return cleaned
+
+
+class MagmaCovarReportingConfig(StrictModel):
+    highlight_method: PValueCorrectionMethod
+    top_property_count: int = Field(ge=1)
+    p_value_significant_digits: int = Field(ge=1, le=10)
+    effect_significant_digits: int = Field(ge=1, le=10)
 
 
 class MagmaCovarModelModifierConfig(StrictModel):
@@ -91,6 +168,9 @@ class MagmaCovarConfig(ModuleConfig):
     direction: MagmaCovarDirection
     minimum_genes: int = Field(ge=1)
     input: MagmaCovarInputConfig
+    multiple_testing: MagmaCovarMultipleTestingConfig
+    result_schema: MagmaCovarResultSchema
+    reporting: MagmaCovarReportingConfig
     output_layout: MagmaCovarOutputLayout
 
     @field_validator("model")
@@ -174,3 +254,35 @@ class MagmaCovarConfig(ModuleConfig):
                 raise ValueError(
                     "%s modifier %r does not accept a value" % (location, name)
                 )
+
+    @model_validator(mode="after")
+    def output_columns_do_not_collide(self):
+        schema = self.result_schema
+        fixed = [
+            schema.variable_column,
+            schema.type_column,
+            schema.gene_count_column,
+            schema.beta_column,
+            schema.standardized_beta_column,
+            schema.standard_error_column,
+            schema.p_value_column,
+            schema.primary_correction_method_column,
+            schema.primary_adjusted_p_value_column,
+            schema.primary_significant_column,
+        ]
+        generated = [
+            schema.adjusted_p_value_column_pattern.format(method=method)
+            for method in self.multiple_testing.methods
+        ]
+        columns = fixed + generated
+        if len(columns) != len(set(columns)):
+            raise ValueError(
+                "configured MAGMAcovar source, correction, and primary result "
+                "columns must be unique"
+            )
+        if self.reporting.highlight_method not in self.multiple_testing.methods:
+            raise ValueError(
+                "reporting.highlight_method must occur in "
+                "multiple_testing.methods"
+            )
+        return self

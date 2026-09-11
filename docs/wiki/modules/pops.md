@@ -9,7 +9,8 @@ implementation.
 
 ## What the analysis does
 
-PostGWAS validates and aligns MAGMA or custom target scores, the PoPS gene
+PostGWAS validates and aligns MAGMA gene Z-scores (`ZSTAT`) or custom gene
+scores, the PoPS gene
 annotation, and every feature-matrix chunk. It then invokes the published
 upstream algorithm, verifies its required outputs, and publishes them with
 resolved configuration and completion metadata.
@@ -26,39 +27,52 @@ gene identifiers and the same genome build. PostGWAS requires the build to be
 declared explicitly because these files do not carry enough metadata to infer it
 safely. The service validates gene overlap, duplicate identifiers, finite scores,
 feature-chunk dimensions, feature-name uniqueness, chromosome selections, and
-optional target covariance before starting PoPS.
+finite numeric matrix values, optional feature lists, and optional gene-score
+covariance before starting PoPS.
 
-For MAGMA targets, preflight also requires `.genes.out` and `.genes.raw` to
+For MAGMA gene Z-scores, preflight also requires `.genes.out` and `.genes.raw` to
 contain the same unique genes in the same order, because the raw file supplies
 gene covariates and covariance metadata in that order. Every feature-row gene
 must occur in the PoPS annotation because it can receive a prediction, and every
-target-scored gene must occur in both the annotation and feature rows. Extra
+gene with an input score must occur in both the annotation and feature rows. Extra
 annotation genes are harmless and are allowed. Incompatibility is a hard failure
 reported with counts, example identifiers, and source paths under the default
-`strict` policy; PostGWAS never silently intersects or discards target genes.
+`strict` policy; PostGWAS never silently intersects or discards genes with input
+scores.
 Shared MAGMA and annotation genes must also have identical chromosome labels;
 intersection cannot safely repair a chromosome disagreement.
 
+The MAGMA raw-file preflight also checks the technical-covariate fields used by
+PoPS (`NSNPS`, `NPARAM`, and `MAC`) for finite positive values and reconstructs
+every chromosome covariance block to verify finite symmetric structure before
+the PoPS model starts.
+
 For MAGMA inputs only, `--gene-universe-policy intersect` explicitly restricts
-the target universe to genes present in both the PoPS annotation and feature
-rows. This is an opt-in scientific transformation. Original MAGMA files remain
+the MAGMA Z-score gene universe to genes present in both the PoPS annotation and
+feature rows. This is an opt-in scientific transformation. Original MAGMA files
+remain
 unchanged. PostGWAS reconstructs covariance-preserving principal submatrices and
 publishes separate compatible and excluded `.genes.out`/`.genes.raw` pairs, a
-gene-level audit table, and a structured compatibility report. Custom target
+gene-level audit table, and a structured compatibility report. Custom gene-score
 files must be aligned by the user and do not support this policy.
 
 PoPS scores rank genes by learned feature similarity to genome-wide association
 patterns. They are not calibrated probabilities that a gene is causal.
 
-The completion screen reports the number of genes scored, the number with
-MAGMA or custom target scores, the genes used for training, selected feature
-count, and a configurable top-ranked gene list. PoPS does not define a universal
+The completion screen reports the number of genes receiving finite PoPS scores,
+the scored genes with and without input gene scores, the genes used to fit the
+PoPS model, the genes with input scores not used for model fitting, the selected
+feature count, and a configurable top-ranked gene list. The official program
+calls this stage “Training” in its source code: it constructs `X_train` and
+`Y_train` and estimates regression coefficients. This is model fitting within
+the PoPS analysis, not training a separate externally supplied machine-learning
+model. PoPS does not define a universal
 significance cutoff or a statistically significant gene count: scores are
 relative rankings rather than p-values. A top-ranked set should therefore be
 prespecified for reporting and supported with independent genetic or functional
-evidence. The screen flags incomplete target-gene or chromosome coverage because
-such omissions can make a technically completed model scientifically unsuitable
-for genome-wide interpretation.
+evidence. The screen flags incomplete input-score gene or chromosome coverage
+because such omissions can make a technically completed model scientifically
+unsuitable for genome-wide interpretation.
 
 - A declared `GRCh37` or `GRCh38` genome build.
 - A feature prefix with the configured row file and every declared matrix and
@@ -66,11 +80,14 @@ for genome-wide interpretation.
 - A gene annotation containing the configured gene-ID, chromosome, and TSS
   columns.
 - Either a MAGMA prefix with non-empty `.genes.out` and `.genes.raw` files, or a
-  custom target-score table.
+  custom gene-score table supplied through `--target-score-file` (the option
+  name is retained for compatibility).
 - Dataset ID and output directory, supplied by CLI or run configuration.
 
 Pipeline mode supplies the MAGMA prefix from the validated preceding MAGMA step.
-PoPS feature resources are preflighted before any pipeline analysis begins.
+It also passes the validated annotated MAGMA gene-result artifact directly to
+PoPS for result enrichment; no path is guessed from filenames. PoPS feature
+resources are preflighted before any pipeline analysis begins.
 
 PoPS does **not** consume the output of `postgwas magmacovar`. Its
 `--use-magma-covariates` option refers to technical gene covariates reconstructed
@@ -81,6 +98,8 @@ file or to `--covariate-model`.
 For a standard MAGMA-backed PoPS run, supply:
 
 - `--magma-association-prefix`, shared by `.genes.out` and `.genes.raw`;
+- optionally, `--magma-annotated-results-file`, which enriches the integrated
+  output with gene symbols, gene intervals, and corrected MAGMA p-values;
 - `--feature-matrix-prefix` and the exact `--feature-matrix-chunks` count;
 - `--pops-gene-location-file`, using the same Ensembl gene identifiers and
   genome build as MAGMA and the feature rows;
@@ -99,6 +118,7 @@ postgwas pops --magma-association-prefix PREFIX [options]
 ```console
 postgwas pops \
   --magma-association-prefix magma/STUDY \
+  --magma-annotated-results-file magma/STUDY_magma_genes_annotated.tsv \
   --feature-matrix-prefix reference/pops/features_munged/pops_features \
   --feature-matrix-chunks 2 \
   --pops-gene-location-file reference/pops/gene_annot.tsv \
@@ -165,10 +185,44 @@ for every input schema, model, feature-selection, output, and continuation key.
 
 ## Processing steps
 
-PostGWAS validates all resources, writes the resolved configuration, and runs
-upstream PoPS in an isolated staging directory. Required output files are checked
-for existence and content before publication. A completion manifest is written
-last; outputs without this manifest are incomplete and are never resumed.
+The direct PoPS screen and canonical log report these stages in order:
+
+1. validate the MAGMA gene Z-scores or custom gene scores and optional
+   gene-score covariates and covariance;
+2. validate the PoPS gene annotation, including its gene-ID, chromosome, and
+   transcription-start-site (TSS) columns;
+3. validate the feature-row file and every configured column/matrix chunk,
+   including dimensions, numeric data type, finite values, and globally unique
+   feature names;
+4. validate optional feature-subset and control-feature lists against the full
+   matrix feature universe, and ensure a supplied subset does not silently
+   remove requested controls;
+5. compare input-score, annotation, and feature-row gene identifiers and apply
+   the configured gene-universe policy;
+6. load the gene scores used to fit PoPS—MAGMA gene Z-scores (`ZSTAT`) for a
+   MAGMA-backed run or the configured score column for a custom gene-score run;
+7. adjust those PoPS fitting scores for configured covariates;
+8. test and select predictive features;
+9. fit the prediction model;
+10. calculate genome-wide PoPS scores; and
+11. validate the official PoPS outputs, build the integrated full-union TSV and
+    HTML report, and publish all required results atomically.
+
+A PoPS-only pipeline first displays the eight gene-only MAGMA prerequisite
+stages—beginning with validation of the input summary-statistics VCF, PLINK LD
+reference, and MAGMA gene-location reference—then the eleven PoPS stages above.
+Pathway stages are not included because PoPS consumes MAGMA gene-association
+results, not MAGMA pathway results.
+
+PoPS uses the configured TSS column to apply its chromosome 6 HLA-region
+exclusions during covariate projection, feature selection, and model training
+when those policies are enabled. The annotation is not used to redefine MAGMA
+gene intervals.
+
+PostGWAS writes the resolved configuration and runs upstream PoPS in an isolated
+staging directory. Required output files are checked for existence and content
+before publication. A completion manifest is written last; outputs without this
+manifest are incomplete and are never resumed.
 
 ## Outputs
 
@@ -176,7 +230,52 @@ With the default output prefix `<output>/<dataset>_pops`, the published upstream
 files are `.preds`, `.coefs`, `.marginals`, and `.log`. Optional `.traindata` and
 `.matdata` files are published when matrix saving is enabled. PostGWAS also
 writes a structured service log, resolved configuration, and completion manifest.
-The prediction table contains `ENSGID` and `PoPS_Score`.
+The prediction table contains `ENSGID`, `PoPS_Score`, the input gene score `Y`,
+and the upstream feature-selection and model-fitting flags. Every feature-matrix
+row receives a PoPS score, including a feature-row gene whose `Y` is missing.
+Such a gene was not used to select features or fit coefficients, but it may
+still have a high or low PoPS score because the fitted coefficients are applied
+to all feature rows. PostGWAS preserves this official behavior and identifies
+those genes explicitly instead of silently removing them.
+
+Two additional outputs are always published:
+
+- `<dataset>_pops.integrated_gene_results.tsv`: a full outer union of genes in
+  the official `.preds` file and the original MAGMA or custom gene-score table;
+- `<dataset>_pops.integrated_gene_results.html`: a standalone searchable,
+  sortable, paginated view of the same records, with a TSV download link and
+  category counts.
+
+The integrated table does not replace or modify any authoritative source file.
+Its leading columns are arranged for interpretation: gene identity and PoPS
+coordinates, PoPS score and rank, analysis status, and the principal MAGMA
+association statistics. Detailed input-score alignment, model-use, availability,
+and reference-coordinate fields follow as an audit trail. It records source
+availability, the original input row number and gene score, PoPS score and rank,
+the `Y` and optional covariate-adjusted `Y_proj` values written
+by PoPS, covariate-projection/feature-selection/model-fitting flags, compatibility
+decisions, PoPS annotation chromosome/TSS, and available MAGMA statistics and
+annotations. When an annotated MAGMA table is supplied, its gene set,
+chromosomes, and Z statistics must agree with `.genes.out`/`.genes.raw` before
+PoPS starts. Without it, fields available directly from `.genes.out` are still
+included and enrichment-only fields are `NA`; custom gene-score runs leave all
+MAGMA-specific fields `NA`.
+
+`gene_analysis_status` gives every union row one unambiguous category:
+
+- `scored_and_used_for_model_fitting`;
+- `scored_with_target_not_used_for_model_fitting` (for example, a gene removed
+  from fitting by the configured chromosome or HLA policy);
+- `scored_without_input_target_score`;
+- `input_target_excluded_from_pops` (possible only with explicit MAGMA
+  intersection).
+
+The distinction between `input_target_score` and `pops_target_score` is
+intentional. These machine-readable column names are retained for compatibility.
+The first comes from the original MAGMA/custom gene-score table; the second is
+the `Y` value written into `.preds` by upstream PoPS after its validated gene
+alignment. PostGWAS requires the two to agree for every retained gene with an
+input score.
 
 With `gene_universe_policy: intersect`, six additional owned outputs are
 published:
@@ -196,11 +295,17 @@ expected by upstream PoPS; scientific values and ordering are unchanged.
 
 ## QC and logs
 
-Review the declared genome build, shared-gene counts, feature chunk dimensions,
-feature count, chromosome/HLA policies, method and seed, upstream log, structured
-service log, resolved configuration, and completion manifest. For intersection
-runs, also review retained/excluded counts and percentages, missing-resource
-categories, every gene-level decision, and per-chromosome statistics.
+Review the declared genome build, input gene-score structure, gene-annotation
+columns and TSS range, shared-gene counts, optional control-list compatibility,
+chromosome/HLA policies, method and seed, upstream log, structured service log,
+resolved configuration, and completion manifest. PostGWAS validates every
+feature chunk's dimensions, numeric type, and finite values. To keep a 116-chunk
+run readable, the terminal shows only the configured number of successful file
+sections and counts the remainder; the canonical input-validation YAML retains
+every column and matrix file with its individual checks. For intersection runs,
+also review
+retained/excluded counts and percentages, missing-resource categories, every
+gene-level decision, and per-chromosome statistics.
 
 ## Interpretation
 

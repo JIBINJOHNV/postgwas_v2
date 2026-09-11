@@ -8,6 +8,12 @@ defined once in the schema-validated
 copies the effective settings to its output directory so results can be audited
 without inspecting source code.
 
+Direct input paths may be supplied by CLI or under `modules.fine_mapping.input`:
+`locus_file`, the selected engine's summary-statistics file, and
+`ld_reference_prefix`. FINEMAP's `bgenix`, `ldstore`, and `finemap` programs,
+and the shared PLINK/Rscript programs, resolve from `resources.executables`.
+Command names are not embedded in the engine runners.
+
 Runnable direct and dependency-complete pipeline commands are provided in the
 [fine-mapping examples](../../../examples/fine_mapping/README.md).
 
@@ -32,9 +38,39 @@ Those details remain available without loss in
 `run_metadata/pipeline_summary.log`; machine-readable progress remains in
 `run_metadata/pipeline_progress.tsv`, and locus-specific evidence remains in
 the QC files and locus logs described below. The global schema-validated
-`logging.show_progress` setting controls the live eight-stage display, and
+`logging.show_progress` setting controls subordinate detail; the shared
+top-level progress remains mandatory unless screen output is hidden.
 `logging.terminal_label_width` controls its alignment. The CLI introduces no
 independent display defaults.
+The final summary uses the same shared field renderer and directory-aware path
+wrapping at the active console width. Wrapped values retain their value-column
+indentation; the shared screen printer prevents a second, unaligned Rich wrap.
+
+The first stage validates the complete selected summary-statistics table and
+locus file, then reports input variants, variants inside eligible boundaries,
+input/eligible/excluded loci, and chromosomes. The second stage validates the
+PLINK BED/BIM/FAM set, its variant and sample dimensions, the variant-major BED
+byte count, locus-variant ID and coordinate concordance with BIM, the number of
+eligible loci containing at least one usable reference variant, and every
+engine-specific runtime. Loci lacking overlap are reported here and remain
+eligible for the engine's locus-scoped failure handling, so other independent
+loci can continue. SuSiE additionally proves that its required R packages are
+available; FINEMAP resolves PLINK 2, BGENIX, LDstore, and FINEMAP. Genome build
+remains an explicit declaration because it cannot be inferred reliably from
+BED/BIM/FAM contents.
+
+Runtime provenance uses native informational commands: PLINK `--version`,
+BGENIX `-help`, and LDstore/FINEMAP `--help`. The latter tools publish their
+versions in welcome banners, and BGENIX writes its banner to stderr. Preflight
+reads both streams and requires a successful exit, no native error diagnostic,
+and exactly one version matching the selected tool's documented banner grammar.
+An error, empty output, or an unrecognised banner is never recorded as a software
+version. These command and output conventions are upstream protocol invariants,
+verified against the installed tools and their
+[BGENIX help documentation](https://enkre.net/cgi-bin/code/bgen/info/ba37911abab440350e0e8c231f7a113e17dec890003df3100487b98de3c39fcb)
+and [LDstore/FINEMAP documentation](https://www.christianbenner.com/).
+FINEMAP's saved software-version table reuses this preflight evidence rather
+than executing duplicate probes after fitting.
 
 ## Progress records
 
@@ -56,11 +92,11 @@ The same event is written to the human-readable pipeline log as a
 `[PROGRESS]` entry. A failed run retains the last completed percentage and
 remaining count and adds a final `failed` event; it does not claim 100%.
 
-FINEMAP pipeline stages are initialization, dependency validation, input
-preparation, task generation, locus execution, output formatting, and
-completion. SuSiE uses initialization, dependency validation, locus
-preparation, locus splitting, worker execution, merge/validation, and
-completion. Separate scope rows report per-locus or per-worker progress.
+The shared screen stages begin with input validation and resource validation,
+then proceed through locus preparation, model-input preparation, locus fitting,
+primary publication, primary summarisation, and post-primary overlap
+resolution. The engine audit TSV retains its lower-level orchestration events.
+Separate scope rows report per-locus or per-worker progress.
 
 ## Output layout and retention
 
@@ -70,6 +106,7 @@ all working data into one intermediate category:
 ```text
 fine_mapping/
 ├── results/
+│   ├── <dataset>_fine_mapping_report.html
 │   ├── combined_results/
 │   ├── primary_credible_sets/
 │   └── diagnostic_plots/
@@ -107,10 +144,90 @@ successful workers. Empty
 annotation directories are not created by fine-mapping; FLAMES materializes
 annotations when it runs.
 
+## Scientific HTML report
+
+`output_layout.html_report_file` controls the schema-validated report path;
+the packaged value is `results/{dataset_id}_fine_mapping_report.html`.
+`html_report` controls only presentation: browser table page size, displayed
+probability precision,
+the three authoritative handoff column names, and the columns shown from each
+retained QC table. It cannot change a fit, credible-set membership, posterior
+probability, locus status, or overlap decision.
+
+The report is built only after overlap resolution has produced the
+authoritative combined TSV. It validates and embeds every authoritative set
+member, then presents:
+
+- a result-level summary without hiding warned or failed primary loci;
+- engine-specific explanations of SuSiE component coverage/model-wide PIP and
+  FINEMAP SNP posterior/model `Post-Pr`;
+- one searchable credible-set browser with expandable sets, every member variant
+  and its recorded details, plus locus-QC, overlap, preflight, and
+  recovery/model-selection tables;
+- the exact resolved model settings, validated inputs and runtimes; and
+- relative links to durable results, QC, metadata, logs, and downstream input
+  that actually exist for the run.
+
+No PIP threshold is applied. Each expandable set contains all its member
+variants, ordered by posterior probability, with a bar and numeric value for
+every member. Expand a variant for its rank, identifiers and recorded warnings;
+set statistics and the source file are available within the same set. Set
+summaries keep analysis round and warnings visible while collapsed. Search
+finds members inside collapsed sets and opens matching sets; clearing search
+restores the prior expansion state. Native
+[`details` disclosures](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/details)
+work without JavaScript. Bar widths use the displayed probability on a zero-to-one
+scale; a zero probability has zero width, and small values are not inflated to
+a minimum visible width. Numeric values remain available for every variant.
+
+The former `html_report.plotted_variants_per_credible_set` setting has been
+removed from the canonical YAML and schema because all members are now drawn;
+remove that key from older custom YAML files before loading them.
+
+A completed SuSiE fit with no retained set
+receives an explicit no-credible-set report and no FLAMES handoff. Invalid or
+inconsistent final probabilities, coverage targets, row counts, or required
+audit files stop report publication rather than producing a misleading page.
+
+Report structure, membership, escaping, boundary probabilities and configuration
+are tested by `tests/test_fine_mapping_reporting.py`. To check search and
+expansion behavior in an emitted report, run
+`node tests/test_fine_mapping_report_interactions.cjs /path/to/report.html`.
+This uses a DOM fixture and does not replace visual or native-keyboard checks
+in a real browser.
+
+Pipeline fine-mapping also receives earlier module results through the shared
+service boundary. Its “Locus selection and earlier pipeline details” section links explicit
+`html_report` paths recorded by those modules, including LD clumping and
+formatting. The shared report collector supports nested target results and
+deduplicates repeated paths within each module. Links are relative to the
+fine-mapping report; recorded missing files remain visible as unavailable,
+without an active link. File availability does not imply scientific success.
+The direct command has no upstream result context and does not search nearby
+directories or infer reports from another run. This presentation does not
+change inputs, scientific results, checkpoint decisions, or configuration.
+
+Earlier reports' static main content is embedded directly, with LD clumping
+expanded by default before the fine-mapping locus table. This preserves the
+published table text and explanations, including clumping boundaries, lead
+and independent significant SNPs, exclusions, warnings and policy settings.
+The shared HTML reader retains structural markup and table text while removing
+source scripts, styling, controls, IDs and active links. The original report
+link remains available. A report without static main content is explicitly
+labelled rather than silently shown as an empty panel. No source HTML is
+executed and no scientific values are recalculated.
+
+Fine-mapping's own tables now contain all rows in their initial HTML. JavaScript
+adds search, sorting and pagination; it is no longer required to see locus or
+audit rows. This also keeps the complete content readable offline or when an
+HTML viewer does not execute scripts. Clumping selection boundaries and actual
+fine-mapping regions retain their separate source descriptions.
+
 ## FINEMAP audit files
 
 | File | Contents |
 |---|---|
+| `quality_control/input_and_resource_validation.tsv` | Shared preflight evidence for summary statistics, loci, PLINK reference dimensions/consistency, ID/coordinate concordance, per-locus reference coverage, and resolved runtimes. |
 | `run_metadata/pipeline_summary.log` | Ordered orchestration stages, counts, paths, warnings, and exceptions. |
 | `run_metadata/pipeline_progress.tsv` | Pipeline and locus percentage/remaining records. |
 | `run_metadata/run_configuration.json` | Inputs, analysis controls, resource calculation, software identity, and resolved output layout. |
@@ -129,6 +246,7 @@ annotations when it runs.
 
 | File | Contents |
 |---|---|
+| `quality_control/input_and_resource_validation.tsv` | Shared preflight evidence for summary statistics, loci, PLINK reference dimensions/consistency, ID/coordinate concordance, per-locus reference coverage, PLINK, R, and the required R package stack. |
 | `run_metadata/pipeline_summary.log` | Python orchestration, splitting, worker collection, merging, validation, cleanup, and exceptions. |
 | `run_metadata/pipeline_progress.tsv` | Pipeline and worker percentage/remaining records. |
 | `run_metadata/run_configuration.json` | Inputs, analysis controls, resources, software identity, resolved SuSiE configuration, output layout, configuration path, and SHA-256 checksum. |
@@ -228,6 +346,16 @@ planning estimates, not guaranteed measurements. Worker concurrency is reduced
 using the largest estimate, and a warning is retained when the estimate exceeds
 reserved worker memory.
 
+Both engines resolve `execution.threads`, `execution.memory_gb`, and
+`execution.random_seed` from canonical YAML plus explicit CLI overrides.
+Worker selection uses this resolved memory budget, never the larger host RAM.
+Preflight fails before reference/tool validation if the budget cannot fit one
+configured worker. Before fitting, the largest dense-LD estimate may further
+reduce concurrency or fail if one estimated task exceeds the total budget.
+`run_configuration.json` records `resource_parameters.memory_budget_gb` and
+the selected worker count. These are planning bounds, not an operating-system
+memory limit or a guarantee of actual peak usage.
+
 Override the canonical YAML value for a planned high-memory analysis or use
 `--maximum-variants-per-locus COUNT`. The CLI parser assigns no independent
 default. Increasing the limit does not make a large model scientifically more
@@ -248,6 +376,46 @@ variants independently. The post-primary joint rerun reuses the same chromosome
 cache and writes a new exact union file with no additional flank.
 
 ## Post-primary overlap resolution
+
+The HTML report presents the initial fine-mapping results first. “Results at a
+glance” counts loci analysed, loci with credible sets, credible sets found,
+completed loci without a set, failed or skipped loci, and loci with warnings.
+Initial set counts come from the retained initial FLAMES index, checked against
+the engine's initial count; they are never inferred from the final result after
+overlap processing. A failed locus is not counted as a completed no-set locus.
+Input and reference counts appear with the input checks, outside the overview.
+
+Initial-locus warning explanations show NEF heterogeneity and, for SuSiE,
+LD/z-score mismatch separately, even when both codes occur in one QC field.
+Each explanation gives its meaning, the affected-locus count, observed ranges,
+resolved configuration thresholds, implications and review steps. The measured
+ranges use only loci carrying that warning. Missing or nonfinite diagnostic
+values are labelled as incompletely recorded rather than displayed as zero.
+The original combined codes and all other warnings/failures remain available
+in an expandable audit table; counts for different warnings are not additive.
+
+The NEF explanation distinguishes the configured scalar median approximation
+from correction of heterogeneous samples. The LD explanation identifies
+`estimate_s_rss` lambda as a consistency diagnostic, not genomic inflation or
+an error percentage, and distinguishes configured decision thresholds from
+guarantees of accurate inference. Neither explanation attributes a cause to a
+specific run. These interpretations follow the
+[SuSiE-RSS paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC9337707/), particularly
+its discussion of sample consistency and reference LD, and the
+[official diagnostic documentation](https://stephenslab.github.io/susieR/articles/susierss_diagnostic.html).
+The report reads existing QC and settings; it does not reclassify loci, change
+thresholds, correct data or rerun an analysis.
+
+The next results section explains the overlap check: why overlapping regions
+may need to be analysed together, what happened in this run, and how the final
+sets were selected. When there are no overlapping completed loci, it explicitly
+states that no additional fine-mapping was needed and the initial sets were
+kept unchanged. Otherwise it reports the groups producing sets, groups completed
+without sets, and groups failed or excluded. Initial locus details precede this
+explanation; final credible sets follow it. Completion labels describe execution
+and retain warnings or exclusions, rather than implying scientific certainty.
+This presentation change does not alter fits, filtering, coverage, overlap
+decisions, output tables, configuration defaults or downstream inputs.
 
 `overlap_resolution.policy: rerun_connected_groups` deliberately waits until
 the complete primary locus-wise pass has finished. It then forms connected
@@ -311,7 +479,7 @@ authoritative final set can be produced.
   loader. Missing resolved controls fail before locus processing; R does not
   supply alternative scientific, recovery, timeout, memory, or plotting
   defaults.
-- Help renders the configured-default label in bold green and its YAML value in
+- Help renders the `Default:` label in bold green and its YAML value in
   cyan. The displayed value is informational and is not assigned by the parser.
 - The selected worker count is derived from requested threads and named RAM
   requirements, then recorded; it is not an unexplained literal in workflow
@@ -322,7 +490,27 @@ authoritative final set can be produced.
 
 FINEMAP option definitions and upstream defaults were checked against the
 [FINEMAP 1.4.2 command-line documentation](https://www.christianbenner.com/).
+The installed 1.4.2 binary rejects an explicit `--pvalue-snps 1.0`, despite
+documenting the unfiltered endpoint as its default, and can exit zero after
+printing an `Error :` diagnostic. PostGWAS therefore omits only this endpoint
+from the native command, records the resolved value and reason, and passes
+every stricter configured threshold unchanged. A native three-SNP fixture,
+including a zero-effect SNP with p=1, confirms that omission retains all SNPs.
+Native error diagnostics fail the locus even at exit zero; required credible
+and configuration outputs still undergo the existing downstream validation.
+Native 1.4.2 credible files annotate the posterior header as
+`Post-Pr(# of causal SNPs is K)`. The parser accepts that form as well as the
+supported unannotated `Post-Pr` form, requires an annotated count to match the
+`.credK` filename, and retains the exactly-one finite probability in [0, 1]
+invariant. The native regression fixture validates its real generated headers;
+malformed, duplicate, nonfinite and count-mismatched headers fail.
 `prior_k` remains disabled unless explicitly requested, and PostGWAS rejects
 that request before analysis until its master-file generator supports the
 required K-file column. The undocumented historical `--collinear-tol` option
 has been removed from the PostGWAS interface.
+
+PLINK reference validation follows the official
+[PLINK binary fileset specification](https://www.cog-genomics.org/plink2/formats):
+BED must begin with the variant-major `6c 1b 01` header and contain one
+`ceil(samples / 4)`-byte block for every BIM variant. This detects truncated or
+desynchronised BED/BIM/FAM inputs before LD calculation.

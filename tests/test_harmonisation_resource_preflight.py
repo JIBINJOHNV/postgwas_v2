@@ -14,6 +14,8 @@ from postgwas.modules.harmonisation.resource_preflight import (
     validate_harmonisation_resource_maps,
 )
 from postgwas.modules.harmonisation.service import (
+    _DatasetPreparation,
+    _prepare_dataset_for_chromosome_processing,
     build_resource_map,
     harmonise_chromosomes,
     preflight_harmonisation_resources,
@@ -106,7 +108,7 @@ def _mock_bcftools(arguments, _purpose, **_kwargs):
         return "%s\t100\t1\n" % chromosome
     if arguments[1:3] == ["view", "--header-only"]:
         return "\n".join(
-            "##INFO=<ID=%s,Number=1,Type=Float,Description=frequency>" % tag
+            "##INFO=<ID=%s,Number=A,Type=Float,Description=frequency>" % tag
             for tag in ("AFR", "EAS", "EUR", "SAS")
         )
     raise AssertionError("unexpected command: %r" % (arguments,))
@@ -337,12 +339,71 @@ def test_frequency_vcf_tags_must_be_numeric_allele_values(
         )
 
 
-def test_exact_resource_preflight_precedes_partition_and_worker_launch():
-    source = inspect.getsource(harmonise_chromosomes)
+def test_frequency_vcf_tags_must_be_alt_allele_cardinality(
+    monkeypatch, tmp_path,
+):
+    resources = _resource_maps(tmp_path)["1"]
 
-    assert source.index("preflight_harmonisation_resources(") < source.index(
+    def scalar_header(arguments, purpose, **kwargs):
+        if arguments[1:3] == ["view", "--header-only"]:
+            return "\n".join(
+                "##INFO=<ID=%s,Number=%s,Type=Float,Description=frequency>"
+                % (tag, "1" if tag == "EUR" else "A")
+                for tag in ("AFR", "EAS", "EUR", "SAS")
+            )
+        return _mock_bcftools(arguments, purpose, **kwargs)
+
+    monkeypatch.setattr(
+        "postgwas.modules.harmonisation.resource_preflight.run_checked_command",
+        scalar_header,
+    )
+
+    with pytest.raises(ResourcePreflightError, match="EUR.*Number=1"):
+        validate_harmonisation_resource_maps(
+            {"1": resources},
+            bcftools="bcftools",
+            vcf_config=VCF_CONFIG,
+            default_eaf_colmap=MAPPING,
+            external_eaf_colmap=MAPPING,
+            external_info_colmap=MAPPING,
+            policies=default_policies(),
+            require_default_eaf=True,
+        )
+
+
+def test_exact_resource_preflight_precedes_partition_and_worker_launch():
+    preparation_source = inspect.getsource(
+        _prepare_dataset_for_chromosome_processing
+    )
+    fanout_source = inspect.getsource(harmonise_chromosomes)
+
+    assert preparation_source.index(
+        "enforce_x_chromosome_z_only_policy("
+    ) < preparation_source.index(
+        "infer_genome_build("
+    )
+    assert preparation_source.index(
+        "enforce_x_chromosome_z_only_policy("
+    ) < preparation_source.index(
+        "preflight_harmonisation_resources("
+    )
+    assert preparation_source.index(
+        "preflight_harmonisation_resources("
+    ) < preparation_source.index(
         "write_chromosome_partitions("
     )
-    assert source.index("write_chromosome_partitions(") < source.index(
+    assert preparation_source.index(
+        "write_chromosome_partitions("
+    ) < preparation_source.index(
+        "stage_shared_external_reference_files("
+    )
+    assert fanout_source.index(
+        "_prepare_dataset_for_chromosome_processing("
+    ) < fanout_source.index(
         "_run_one_round("
     )
+
+
+def test_dataset_preparation_result_does_not_retain_the_full_study_frame():
+    assert "df" not in _DatasetPreparation.__dataclass_fields__
+    assert "dataframe" not in _DatasetPreparation.__dataclass_fields__

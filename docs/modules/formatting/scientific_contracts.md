@@ -8,10 +8,10 @@ extension is retained only when a later PostGWAS stage needs it.
 |---|---|---|---|---|
 | MAGMA | SNP-location: headerless `SNP CHR BP`; p-values: headed `SNP P` plus per-variant `N_COL` | None | Total sample size, including case-control results | Pipeline mode scans BIM field 2 and selects the MAGMA target's `rsid` or configured `unique` convention. The shared duplicate policy defaults to excluding every conflicting selected-ID group; P-value ranking requires an explicit override. Pipeline MAGMA consumes these exact paired formatter artifacts. Formatter retains `REF ALT` for optional exact-ID/coordinate/allele intersection; the MAGMA runner writes only the required headerless first three columns. `N_COL <- FORMAT/SS`; never use `NEF` here |
 | GCTA fastBAT | `SNP P` | None | None | Bound `10^-LP` using the configured minimum raw p-value |
-| GCTA mBAT-combo | `SNP A1 A2 freq BETA SE P N` | Effect-allele frequency | Total sample size | `A1 <- ALT`, `A2 <- REF`, `freq <- AF`, and `N <- SS` |
+| GCTA COJO / mBAT-combo | `SNP A1 A2 freq BETA SE P N` | Effect-allele frequency | Total sample size | `A1 <- ALT`, `A2 <- REF`, `freq <- AF`, and `N <- SS`. The `.ma` schema is shared; pipeline reports identify the resolved downstream COJO mode and configured fixed SNP count without claiming that formatting differs by analysis mode |
 | FINEMAP | `rsid chromosome position allele1 allele2 maf beta se` | Minor allele frequency | `n_samples` in the master file | `maf <- min(EAF, 1-EAF)`; retain `NEF` so the PostGWAS adapter can create locus-specific `n_samples` |
 | SuSiE-RSS | Z scores, an allele-aligned LD matrix, and the configured PostGWAS identity/coordinate fields | Optional in `susie_rss`; used only when a MAF threshold is requested | `n` is recommended | The current PostGWAS engine uses `EZ`, LD, and median `NEF`; it does not pass MAF, so `AF` is not exported |
-| PRED-LD | `snp chr pos A1 A2 beta SE`; `A1=ALT`, `A2=REF` | Study AF is not an input; `--maf` filters the reference resource | None | `NC SS AF LP SI` remain carry-through metadata because PostGWAS re-harmonises the imputed results. Only normalized chromosomes in the configured `chromosomes` list are published; excluded labels and row counts are recorded explicitly |
+| PRED-LD | `snp chr pos A1 A2 beta SE`; `A1=ALT`, `A2=REF` | Study AF is not an input; `--maf` filters the reference resource | None | `NC SS AF LP SI` remain carry-through metadata because PostGWAS re-harmonises the imputed results. Only canonical chromosomes in the configured `chromosomes` list are published; excluded labels and row counts are recorded explicitly |
 | CBIIT LDSC | `SNP A1 A2 P`, a signed statistic, and sample size | `FRQ` is optional QC input; `munge_sumstats.py` converts allele frequency to MAF for filtering | Binary: `N_CAS` and `N_CON`; quantitative: `N` | Infer binary when any `FORMAT/NC` value exists; infer quantitative only when `NC` is entirely missing and `FORMAT/NCO` is present. For quantitative traits, write `N <- NCO`. For binary traits, calculate each valid variant's `NC/(NC+NCO)` and reduce it with configured `median` (default) or `mean`; never sum repeated variant-level counts. When `--merge-alleles` is supplied, select by rsID plus LDSC-compatible allele order/strand before duplicate-ID validation; the heritability pipeline reuses the same file during munging |
 | MiXeR `fit1`/`test1` | `SNP CHR BP A1 A2 N Z` | Not required | Binary: effective `N = 4/(1/Ncase + 1/Ncontrol)`; quantitative: total `N` | Write harmonised `ALT` as effect allele `A1`, `REF` as other allele `A2`, and `FORMAT/NEF` as `N`; apply configured INFO, sample-size, and SNP checks before export |
 
@@ -26,24 +26,28 @@ All formatter extraction and output schemas are declared in
 typed configuration model. The mappings and reporting semantics have these
 explicit configuration layers:
 
-1. `vcf_fields`: canonical formatter-table column → bcftools query expression.
-2. `canonical_columns`: semantic roles, including the canonical `-log10(P)`,
+1. `input_contract`: accepted PostGWAS provenance and genome-build metadata,
+   supported builds, and canonical chromosome/allele patterns. These values are
+   validated; the formatter never repairs or re-harmonises VCF labels or alleles.
+2. `vcf_fields`: canonical formatter-table column → bcftools query expression.
+3. `canonical_columns`: semantic roles, including the canonical `-log10(P)`,
    effect-allele-frequency, and four sample-size sources used to report exact
    statistical representations and saved headers.
-3. `sample_size_reporting`: trait-aware meanings and target-use notes for the
+4. `sample_size_reporting`: trait-aware meanings and target-use notes for the
    total, effective, case, and control/quantitative-total sample-size roles.
-4. `variant_identifiers`: general default and per-target ID type and duplicate
+5. `variant_identifiers`: general default and per-target ID type and duplicate
    policy, extraction pattern, and unique-ID template.
-5. `ldsc_reference`: optional merge-alleles path, input columns, delimiter
+6. `ldsc_reference`: optional merge-alleles path, input columns, delimiter
    detection, and table-reading constraints for LDSC preselection.
-6. `ldsc_sample_prevalence`: the schema-limited `median` or `mean` reduction of
+7. `ldsc_sample_prevalence`: the schema-limited `median` or `mean` reduction of
    valid per-variant case fractions for binary-trait pipeline handoff.
-7. `exports.<target>`: canonical formatter-table column → downstream tool column.
-8. `custom_output.field_contracts`: canonical source, transformation, and
+8. `exports.<target>`: canonical formatter-table column → downstream tool column.
+9. `custom_output.field_contracts`: canonical source, transformation, and
    validity rule used when direct CLI custom columns are requested.
 
 The same YAML also owns output filename patterns, named transformations,
-numeric parsing, validation columns, chromosome-label normalization,
+numeric parsing, validation columns, external-reference chromosome-label
+normalization,
 variant-ID selection, study-design count columns, chromosome
 selection, pipeline-to-format dependencies (`module_formats`), stable execution
 order (`format_order`), input null markers, table delimiter, output null value,
@@ -113,6 +117,16 @@ group, ranked-winner, unresolved-group, duplicate-row, and required-value counts
 are recorded separately in the terminal summary, canonical log, result metadata,
 and completion manifest. Multi-table targets such as MAGMA receive one resolved
 frame, preserving identical unique-ID sets and row order.
+
+Targets with the same resolved `(identifier type, duplicate policy)` reuse one
+validated selection from the common canonical frame. The cache stores only
+selections needed by multiple targets and releases each frame after its final
+consumer. LDSC selection with `--merge-alleles` remains outside this cache
+because its reference join changes the candidate set. Before any exporter is
+called, the formatter independently verifies that the final candidate contains
+no missing, empty, or duplicated selected IDs. The validation result and whether
+the selection was reused are recorded for every target; a failed invariant stops
+before a scientific artifact is written.
 
 In pipeline mode, `run_magma_runner` passes these exact filtered formatter
 artifacts to the MAGMA service. The service still validates identifier,

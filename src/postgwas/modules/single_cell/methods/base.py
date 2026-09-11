@@ -31,8 +31,8 @@ class SingleCellMethod(Protocol):
     def prepare_pipeline_args(self, args: argparse.Namespace) -> None:
         """Apply method-owned pipeline bindings before configuration resolution."""
 
-    def preflight_pipeline(self, args: argparse.Namespace, configuration) -> None:
-        """Validate resources available before upstream pipeline stages run."""
+    def preflight_pipeline(self, args: argparse.Namespace, configuration) -> object:
+        """Return evidence for resources available before upstream stages run."""
 
     def preflight_direct(
         self,

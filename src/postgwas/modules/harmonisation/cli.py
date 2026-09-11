@@ -31,6 +31,10 @@ from postgwas.modules.harmonisation.qc_reporting import (
     effect_scale_description,
     summarise_strand_orientation,
 )
+from postgwas.modules.harmonisation.html_report import (
+    write_dataset_report as write_dataset_html_report,
+    write_run_report as write_run_html_report,
+)
 from postgwas.core.pipeline_logging import write_log_record as _append_run_log
 from postgwas.modules.harmonisation.service import (
     ConfigError,
@@ -74,6 +78,7 @@ _RUN_SUMMARY_FIELDS = (
     "input_ready_variants",
     "input_ready_snps",
     "input_ready_indels_or_other_variants",
+    "parsed_variants",
     # Dataset step 5: genome-build inference.
     "genome_build",
     "genome_build_detected",
@@ -107,13 +112,22 @@ _RUN_SUMMARY_FIELDS = (
     "strand_forward_swapped",
     "strand_reverse_complement",
     "strand_reverse_complement_swapped",
+    "strand_reference_unmatched_detected",
+    "strand_reference_unmatched_retained",
     "strand_reference_unmatched",
+    "strand_palindromic_frequency_conflict",
+    "strand_palindromic_orientation_unavailable",
+    "strand_palindromic_frequency_discordant",
     "strand_palindromic_ambiguous",
     "strand_reference_ambiguous",
     "strand_removed_total",
     "strand_accounting_balanced",
     # Chromosome processing and GWAS-to-VCF export.
     "pre_vcf_invalid_effect_statistic_removals",
+    "rejected_variants",
+    "unprocessed_failed_chromosome_variants",
+    "row_accounting_balanced",
+    "row_accounting_complete",
     "harmonised_variants",
     # Post-merge step 2: population-frequency similarity.
     "closest_population",
@@ -139,9 +153,18 @@ _RUN_SUMMARY_FIELDS = (
     "af_difference_cutoff",
     "qc_passed_missing_or_invalid_neff",
     "qc_passed_missing_imputation_score",
+    "neff_reference_quantile",
+    "neff_reference_value",
+    "neff_minimum_fraction_of_reference",
+    "neff_minimum_threshold",
+    "raw_low_neff_variants",
+    "raw_low_neff_percent",
+    "qc_passed_low_neff_variants",
+    "qc_passed_low_neff_percent",
     "qc_passed_neff_upper_outliers",
     "manifest",
     "screen_report",
+    "html_report",
 )
 
 
@@ -158,11 +181,18 @@ CLI_OVERRIDE_PATHS = {
     "zero_p_se_action": (
         "modules.harmonisation.policies.pvalue.zero_missing_se"
     ),
+    "keep_gwas2vcf_intermediate": (
+        "modules.harmonisation.policies.vcf.keep_gwas2vcf_intermediate"
+    ),
 }
 
 
 class RunSummaryError(PipelineError):
     """The required multi-dataset harmonisation summary could not be written."""
+
+
+class HtmlReportError(RunSummaryError):
+    """A required harmonisation HTML report could not be written."""
 
 
 class ScreenReportError(PipelineError):
@@ -172,11 +202,14 @@ class ScreenReportError(PipelineError):
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
-def _screen_report_paths(
+def _dataset_output_paths(
     config,
     rows: list[HarmonisationSampleSheetRow],
+    *,
+    output_key: str,
+    error_type: type[PipelineError],
 ) -> dict[str, Path]:
-    """Resolve the configured screen-report path for every selected dataset."""
+    """Resolve one configured dataset-root output for every selected row."""
     output_root = Path(config.run.output_directory).expanduser().resolve()
     layout = config.modules.harmonisation.output_layout.root
     paths = {}
@@ -184,16 +217,68 @@ def _screen_report_paths(
         dataset_root = configured_output_path(
             output_root,
             layout["dataset_directory"],
-            error_type=ScreenReportError,
+            error_type=error_type,
             dataset_id=row.dataset_id,
         )
         paths[row.dataset_id] = configured_output_path(
             dataset_root,
-            layout["screen_report"],
-            error_type=ScreenReportError,
+            layout[output_key],
+            error_type=error_type,
             dataset_id=row.dataset_id,
         )
     return paths
+
+
+def _screen_report_paths(
+    config,
+    rows: list[HarmonisationSampleSheetRow],
+) -> dict[str, Path]:
+    """Resolve the configured screen-report path for every selected dataset."""
+    return _dataset_output_paths(
+        config, rows, output_key="screen_report", error_type=ScreenReportError,
+    )
+
+
+def _html_report_paths(
+    config,
+    rows: list[HarmonisationSampleSheetRow],
+) -> tuple[dict[str, Path], Path]:
+    """Resolve the per-dataset and combined HTML-report paths."""
+    dataset_paths = _dataset_output_paths(
+        config, rows, output_key="html_report", error_type=HtmlReportError,
+    )
+    output_root = Path(config.run.output_directory).expanduser().resolve()
+    metadata = _runtime_path(config, output_root, "top_metadata_directory")
+    run_path = _runtime_path(config, metadata, "run_html_report")
+    return dataset_paths, run_path
+
+
+def _html_report_context(
+    config,
+    row: HarmonisationSampleSheetRow,
+    *,
+    sample_sheet: str | Path | None = None,
+) -> dict[str, Any]:
+    """Reuse resolved inputs for presentation, including before analysis starts.
+
+    This context belongs to the HTML view only. It does not modify the engine
+    manifest, resolved policies, input mappings or the run-summary CSV schema.
+    """
+    harmonisation = config.modules.harmonisation
+    return {
+        "input_mapping": row.model_dump(mode="json"),
+        "sample_sheet_warnings": list(row.normalisation_warnings),
+        "sample_sheet": str(sample_sheet) if sample_sheet is not None else None,
+        "concordance_requested": harmonisation.concordance_validation.enabled,
+        "configuration": {
+            "harmonisation": harmonisation.model_dump(mode="json"),
+            "qc_summary": config.modules.qc_summary.model_dump(mode="json"),
+        },
+        "resource_directory": (
+            str(config.resources.root) if config.resources.root is not None else None
+        ),
+        "output_directory": str(config.run.output_directory),
+    }
 
 
 class _DatasetScreenRouter:
@@ -441,6 +526,17 @@ def get_harmonisation_parser(add_help: bool = False) -> argparse.ArgumentParser:
             "selected same-build merged VCF. Disabled by default."
         ),
     )
+    files.add_argument(
+        "--keep_gwas2vcf_intermediate",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Keep the merged raw GWAS-to-VCF adapter VCF and its index after "
+            "successful final validation. Without this option, that intermediate "
+            "is deleted; the final GRCh37 and GRCh38 VCFs are always retained",
+            policy_defaults.get("vcf.keep_gwas2vcf_intermediate"),
+        ),
+    )
     frequency.add_argument(
         "--comparison-af-column",
         default=argparse.SUPPRESS,
@@ -488,13 +584,15 @@ def _module_policy_block(config) -> dict[str, Any]:
     configured = {
         "execution": {
             "total_cpu_budget": config.execution.threads,
+            "memory_budget_gb": config.execution.memory_gb,
         },
         "logging": {"level": config.logging.file_level},
     }
     return deep_merge(configured, harmonisation.policies)
 
 
-def _harmonisation_executables(config) -> dict[str, str]:
+def harmonisation_executable_requirements(config) -> dict[str, str]:
+    """Return the configured binaries required by harmonisation execution."""
     executables = config.resources.executables
     return {
         "bash": executables.bash,
@@ -523,7 +621,7 @@ def _engine_defaults(config, resolved_executables=None) -> dict[str, Any]:
         "executables": dict(
             resolved_executables
             if resolved_executables is not None
-            else _harmonisation_executables(config)
+            else harmonisation_executable_requirements(config)
         ),
         "executables_prevalidated": resolved_executables is not None,
         "compression_executable": config.resources.executables.pigz,
@@ -548,6 +646,15 @@ def _engine_defaults(config, resolved_executables=None) -> dict[str, Any]:
         "vcf_processing": harmonisation.vcf_processing.model_dump(),
         "qc_summary": config.modules.qc_summary.model_dump(mode="json"),
         "population_frequency_qc": harmonisation.population_frequency_qc.model_dump(),
+        "external_reference_staging": (
+            harmonisation.external_reference_staging.model_dump()
+        ),
+        # Resolved global presentation settings are passed through to the
+        # engine; this is not a second user-configurable default.
+        "terminal_progress": {
+            "enabled": config.logging.show_progress,
+            "outcome_label_width": config.logging.terminal_label_width,
+        },
         "policies": policy_block,
     }
 
@@ -711,6 +818,32 @@ def _qc_run_summary_fields(
             "effective_sample_size_missing_or_invalid"
         ),
         "qc_passed_missing_imputation_score": passed.get("format_si_missing"),
+        "neff_reference_quantile": assessment.get(
+            "sample_size_reference_quantile"
+        ),
+        "neff_reference_value": raw.get(
+            "effective_sample_size_reference_quantile_value"
+        ),
+        "neff_minimum_fraction_of_reference": assessment.get(
+            "sample_size_minimum_fraction_of_reference"
+        ),
+        "neff_minimum_threshold": raw.get(
+            "effective_sample_size_minimum_threshold"
+        ),
+        "raw_low_neff_variants": raw.get(
+            "effective_sample_size_below_minimum_threshold"
+        ),
+        "raw_low_neff_percent": _percentage_value(
+            raw.get("effective_sample_size_below_minimum_threshold"),
+            raw.get("effective_sample_size_available"),
+        ),
+        "qc_passed_low_neff_variants": passed.get(
+            "effective_sample_size_below_minimum_threshold"
+        ),
+        "qc_passed_low_neff_percent": _percentage_value(
+            passed.get("effective_sample_size_below_minimum_threshold"),
+            passed.get("effective_sample_size_available"),
+        ),
         "qc_passed_neff_upper_outliers": passed.get(
             "effective_sample_size_above_outlier_threshold"
         ),
@@ -728,6 +861,7 @@ def _run_summary_record(
     comparison_af_panel: str,
     comparison_af_population: str,
     failure: Any = None,
+    report_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Flatten already-calculated dataset and chromosome evidence into one row."""
     record = _initial_run_summary_record(row)
@@ -743,6 +877,10 @@ def _run_summary_record(
         manifest,
         required=str(status).upper() in {"OK", "PARTIAL", "CONCORDANCE_FAILED"},
     )
+    if report_context is not None:
+        # Preserve the already-loaded rule and diagnostic evidence for the HTML
+        # view; do not reopen the QC JSON or reread any scientific data.
+        report_context["qc_assessment"] = assessment
     reconciliation = dataset.get("reconciliation") or {}
     inferred_build = build.get("inferred_build")
     forced_build = build.get("forced") is True
@@ -796,7 +934,22 @@ def _run_summary_record(
         "strand_reverse_complement_swapped": strand.get(
             "reverse_complement_swapped"
         ),
+        "strand_reference_unmatched_detected": strand.get(
+            "reference_unmatched_detected"
+        ),
+        "strand_reference_unmatched_retained": strand.get(
+            "reference_unmatched_retained"
+        ),
         "strand_reference_unmatched": strand.get("reference_unmatched"),
+        "strand_palindromic_frequency_conflict": strand.get(
+            "palindromic_frequency_conflict"
+        ),
+        "strand_palindromic_orientation_unavailable": strand.get(
+            "palindromic_orientation_unavailable"
+        ),
+        "strand_palindromic_frequency_discordant": strand.get(
+            "palindromic_frequency_discordant"
+        ),
         "strand_palindromic_ambiguous": strand.get("palindromic_ambiguous"),
         "strand_reference_ambiguous": strand.get("reference_ambiguous"),
         "strand_removed_total": strand.get("removed_total"),
@@ -819,6 +972,13 @@ def _run_summary_record(
         "input_ready_indels_or_other_variants": pre_vcf.get(
             "total_variant_ready_indels_or_other"
         ),
+        "parsed_variants": reconciliation.get("rows_read"),
+        "rejected_variants": reconciliation.get("rejected"),
+        "unprocessed_failed_chromosome_variants": reconciliation.get(
+            "unprocessed_failed_chromosome_rows"
+        ),
+        "row_accounting_balanced": reconciliation.get("balanced"),
+        "row_accounting_complete": reconciliation.get("complete"),
         "harmonised_variants": (
             pre_vcf.get("total_variant_passed_chromosome_harmonisation")
             if pre_vcf.get("total_variant_passed_chromosome_harmonisation")
@@ -860,11 +1020,52 @@ def _write_run_summary(
         ) from exc
 
 
+def _write_html_reports(
+    *,
+    run_path: Path,
+    records: dict[str, dict[str, Any]],
+    manifests: dict[str, dict[str, Any]],
+    dataset_paths: dict[str, Path],
+    changed_dataset: str | None = None,
+) -> None:
+    """Write HTML views of existing records without rereading scientific data."""
+    dataset_ids = (
+        [changed_dataset]
+        if changed_dataset is not None
+        else list(records)
+    )
+    for dataset_id in dataset_ids:
+        try:
+            write_dataset_html_report(
+                dataset_paths[dataset_id],
+                records[dataset_id],
+                manifests.get(dataset_id) or {},
+            )
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            path = dataset_paths.get(dataset_id, dataset_id)
+            raise HtmlReportError(
+                "Cannot write the required dataset harmonisation HTML report "
+                "%s: %s" % (path, exc)
+            ) from exc
+    try:
+        write_run_html_report(
+            run_path,
+            list(records.values()),
+            manifests,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise HtmlReportError(
+            "Cannot write the required combined harmonisation HTML report %s: %s"
+            % (run_path, exc)
+        ) from exc
+
+
 def _run_summary_block(
     path: Path,
+    html_path: Path,
     records: list[dict[str, Any]],
 ) -> str:
-    """Show the final location and dataset-status composition of the CSV."""
+    """Show final report locations and dataset-status composition."""
     successful = sum(
         str(record.get("status") or "").upper() == "OK" for record in records
     )
@@ -893,6 +1094,10 @@ def _run_summary_block(
             "info", "CSV", path,
             indent=8, label_width=18,
         ),
+        screen_field(
+            "info", "HTML", html_path,
+            indent=8, label_width=18,
+        ),
     ])
 
 
@@ -900,10 +1105,13 @@ def _write_preflight_failure_run_summary(
     config,
     rows: list[HarmonisationSampleSheetRow],
     failure: Any,
+    *,
+    sample_sheet: str | Path | None = None,
 ) -> Path:
     """Represent every selected dataset when command preflight stops the run."""
     output_root = Path(config.run.output_directory).expanduser().resolve()
     report_paths = _screen_report_paths(config, rows)
+    html_paths, run_html_path = _html_report_paths(config, rows)
     top_metadata = _runtime_path(
         config, output_root, "top_metadata_directory",
     )
@@ -915,6 +1123,7 @@ def _write_preflight_failure_run_summary(
             "status": "PREFLIGHT_FAILED",
             "failure_reason": _single_line(failure),
             "screen_report": str(report_paths[row.dataset_id]),
+            "html_report": str(html_paths[row.dataset_id]),
         })
         records.append(record)
         report = "\n".join([
@@ -936,6 +1145,20 @@ def _write_preflight_failure_run_summary(
                 % (report_paths[row.dataset_id], exc)
             ) from exc
     _write_run_summary(path, records)
+    record_map = {record["dataset_id"]: record for record in records}
+    _write_html_reports(
+        run_path=run_html_path,
+        records=record_map,
+        manifests={
+            row.dataset_id: {
+                "report_context": _html_report_context(
+                    config, row, sample_sheet=sample_sheet,
+                ),
+            }
+            for row in rows
+        },
+        dataset_paths=html_paths,
+    )
     return path
 
 
@@ -1140,12 +1363,26 @@ def _run_validated_rows(
     run_summary_path = _runtime_path(
         config, top_metadata, "run_summary_file",
     )
+    html_report_paths, run_html_report_path = _html_report_paths(config, rows)
     run_summary_records = {}
+    run_summary_manifests: dict[str, dict[str, Any]] = {}
     for row in rows:
         record = _initial_run_summary_record(row)
         record["screen_report"] = str(screen_router.report_path(row.dataset_id))
+        record["html_report"] = str(html_report_paths[row.dataset_id])
         run_summary_records[row.dataset_id] = record
+        run_summary_manifests[row.dataset_id] = {
+            "report_context": _html_report_context(
+                config, row, sample_sheet=sample_sheet,
+            ),
+        }
     _write_run_summary(run_summary_path, list(run_summary_records.values()))
+    _write_html_reports(
+        run_path=run_html_report_path,
+        records=run_summary_records,
+        manifests=run_summary_manifests,
+        dataset_paths=html_report_paths,
+    )
 
     defaults = _engine_defaults(config, resolved_executables=resolved_executables)
     results: dict[str, Any] = {}
@@ -1163,29 +1400,51 @@ def _run_validated_rows(
         failure: Any = None,
     ) -> None:
         """Persist one dataset state while retaining all other selected rows."""
+        manifest_document = (
+            manifest
+            if manifest is not None
+            else _read_summary_manifest(manifest_path, required=False)
+        )
+        report_context = run_summary_manifests[row.dataset_id]["report_context"]
         record = _run_summary_record(
             row,
             status=status,
             manifest_path=manifest_path,
-            manifest=(
-                manifest
-                if manifest is not None
-                else _read_summary_manifest(manifest_path, required=False)
-            ),
+            manifest=manifest_document,
             strand_reference_panel=strand_reference.source,
             strand_reference_population=strand_reference.column,
             comparison_af_panel=comparison_reference.source,
             comparison_af_population=comparison_reference.column,
             failure=failure,
+            report_context=report_context,
         )
         record["screen_report"] = str(screen_router.report_path(row.dataset_id))
+        record["html_report"] = str(html_report_paths[row.dataset_id])
         run_summary_records[row.dataset_id] = record
+        run_summary_manifests[row.dataset_id] = {
+            **manifest_document,
+            "report_context": report_context,
+        }
         _write_run_summary(run_summary_path, list(run_summary_records.values()))
+        _write_html_reports(
+            run_path=run_html_report_path,
+            records=run_summary_records,
+            manifests=run_summary_manifests,
+            dataset_paths=html_report_paths,
+            changed_dataset=row.dataset_id,
+        )
 
     for dataset_index, row in enumerate(rows, start=1):
         screen_router.select(row.dataset_id)
         run_summary_records[row.dataset_id]["status"] = "RUNNING"
         _write_run_summary(run_summary_path, list(run_summary_records.values()))
+        _write_html_reports(
+            run_path=run_html_report_path,
+            records=run_summary_records,
+            manifests=run_summary_manifests,
+            dataset_paths=html_report_paths,
+            changed_dataset=row.dataset_id,
+        )
         dataset_start = _dataset_start_block(
             dataset_index=dataset_index,
             dataset_count=dataset_count,
@@ -1337,6 +1596,9 @@ def _run_validated_rows(
                             "Concordance validation failed for dataset %s; see %s"
                             % (row.dataset_id, validation["reports"]["summary"])
                         )
+                    manifest_document = _read_summary_manifest(
+                        reported_manifest, required=True,
+                    )
                 dataset_status = str(
                     result.get("status")
                     or manifest_document.get("status")
@@ -1357,6 +1619,7 @@ def _run_validated_rows(
                 result["screen_report"] = str(
                     screen_router.report_path(row.dataset_id)
                 )
+                result["html_report"] = str(html_report_paths[row.dataset_id])
                 results[row.dataset_id] = result
                 if dataset_status == "OK":
                     _append_run_log(
@@ -1402,13 +1665,13 @@ def _run_validated_rows(
                         top_log,
                         "ERROR",
                         "The dataset failure also could not be saved to the required "
-                        "run summary: %s" % update_exc,
+                        "run reports: %s" % update_exc,
                     )
                 _append_run_log(
-                    dataset_log, "ERROR", "Required run-summary failure: %s" % exc,
+                    dataset_log, "ERROR", "Required reporting failure: %s" % exc,
                 )
                 _append_run_log(
-                    top_log, "ERROR", "Required run-summary failure: %s" % exc,
+                    top_log, "ERROR", "Required reporting failure: %s" % exc,
                 )
                 raise
             except KeyboardInterrupt:
@@ -1484,13 +1747,20 @@ def _run_validated_rows(
                     failures.append((row.dataset_id, exc))
     screen_router.select(None)
     summary_block = _run_summary_block(
-        run_summary_path, list(run_summary_records.values()),
+        run_summary_path,
+        run_html_report_path,
+        list(run_summary_records.values()),
     )
     print("\n" + summary_block)
     _append_run_log(
         top_log,
         "INFO",
         "Harmonisation run summary: %s" % run_summary_path,
+    )
+    _append_run_log(
+        top_log,
+        "INFO",
+        "Harmonisation HTML run report: %s" % run_html_report_path,
     )
     ok_count = sum(
         str(record.get("status") or "").upper() == "OK"
@@ -1547,12 +1817,19 @@ def _run_validated_rows(
     return results
 
 
-def run_harmonisation(args):
+def run_harmonisation(
+    args,
+    *,
+    configuration=None,
+    resolved_executables=None,
+):
     if not hasattr(args, "sample_sheet"):
         raise ConfigurationError("--sample-sheet is required")
 
     overrides = explicit_overrides(args, CLI_OVERRIDE_PATHS)
-    config = load_configuration(getattr(args, "run_config", None), cli_overrides=overrides)
+    config = configuration or load_configuration(
+        getattr(args, "run_config", None), cli_overrides=overrides,
+    )
     preflight_log = _top_run_log(config, config.run.output_directory)
     rows: list[HarmonisationSampleSheetRow] = []
     try:
@@ -1565,16 +1842,19 @@ def run_harmonisation(args):
                     % (args.dataset_id, args.sample_sheet)
                 )
         _validate_info_fallback(rows, _fixed_info_cli_value(args, config))
-        resolved_executables = require_binaries(
-            _harmonisation_executables(config),
-            plugins=(config.modules.harmonisation.vcf_processing.liftover_plugin,),
-        )
+        if resolved_executables is None:
+            resolved_executables = require_binaries(
+                harmonisation_executable_requirements(config),
+                plugins=(
+                    config.modules.harmonisation.vcf_processing.liftover_plugin,
+                ),
+            )
     except Exception as exc:
         _append_run_log(preflight_log, "ERROR", "Harmonisation preflight failed: %s" % exc)
         if rows:
             try:
                 summary_path = _write_preflight_failure_run_summary(
-                    config, rows, exc,
+                    config, rows, exc, sample_sheet=args.sample_sheet,
                 )
                 _append_run_log(
                     preflight_log,
@@ -1586,7 +1866,7 @@ def run_harmonisation(args):
                     preflight_log,
                     "ERROR",
                     "The preflight failure could not be written to the required "
-                    "run summary: %s" % summary_exc,
+                    "run reports: %s" % summary_exc,
                 )
         raise
     return _run_validated_rows(

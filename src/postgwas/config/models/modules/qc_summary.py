@@ -13,6 +13,7 @@ from postgwas.config.models.common import (
     StrictModel,
 )
 from postgwas.core.paths import validate_filename_component
+from postgwas.core.variant_qc import MAXIMUM_SUPPORTED_INFO_SCORE
 from postgwas.core.vcf import VCF_TAG
 
 
@@ -42,7 +43,9 @@ class QCSummaryRulesConfig(StrictModel):
     maf_min: float = Field(ge=0, le=0.5, allow_inf_nan=False)
     missing_af_action: Literal["keep", "remove"]
     info_min: float = Field(ge=0, le=1, allow_inf_nan=False)
-    info_max: float = Field(ge=0, le=100, allow_inf_nan=False)
+    info_max: float = Field(
+        ge=0, le=MAXIMUM_SUPPORTED_INFO_SCORE, allow_inf_nan=False,
+    )
     missing_info_action: Literal["keep", "remove"]
     maximum_af_difference: float = Field(ge=0, le=1, allow_inf_nan=False)
     include_indels: bool
@@ -53,6 +56,12 @@ class QCSummaryRulesConfig(StrictModel):
     mhc_regions: dict[GenomeBuild, QCSummaryMHCRegionConfig]
     sample_size_outlier_standard_deviations: float = Field(
         gt=0, allow_inf_nan=False,
+    )
+    sample_size_reference_quantile: float = Field(
+        gt=0, le=1, allow_inf_nan=False,
+    )
+    sample_size_minimum_fraction_of_reference: float = Field(
+        gt=0, le=1, allow_inf_nan=False,
     )
 
     @model_validator(mode="after")
@@ -157,8 +166,11 @@ class QCSummaryOutputLayoutConfig(StrictModel):
     metric_report: str
     rule_report: str
     assessment_json: str
+    summary_csv: str
+    html_report: str
     temporary_table_prefix: str
     resolved_config_file: str
+    preflight_log_file: str
     service_log_file: str
     completion_manifest: str
 
@@ -182,15 +194,35 @@ class QCSummaryOutputLayoutConfig(StrictModel):
         if len(values) != len(set(values)):
             raise ValueError("QC output path patterns must be unique")
         for field in type(self).model_fields:
+            if field == "preflight_log_file":
+                if "{build}" in getattr(self, field):
+                    raise ValueError(
+                        "preflight_log_file must not contain {build} because it "
+                        "records failures before the VCF build is inferred"
+                    )
+                continue
             if "{build}" not in getattr(self, field):
                 raise ValueError("%s must contain {build}" % field)
+        return self
+
+    @model_validator(mode="after")
+    def report_extensions_match_formats(self):
+        expected_extensions = {
+            "metric_report": ".tsv",
+            "rule_report": ".tsv",
+            "assessment_json": ".json",
+            "summary_csv": ".csv",
+            "html_report": ".html",
+        }
+        for field, extension in expected_extensions.items():
+            if not getattr(self, field).endswith(extension):
+                raise ValueError("%s must end with %s" % (field, extension))
         return self
 
 
 class QCSummaryConfig(ModuleConfig):
     inputs: QCSummaryInputsConfig
     output_directory: Path | None = None
-    target_build: GenomeBuild
     reference_af_column: str
     rules: QCSummaryRulesConfig
     vcf_fields: QCSummaryVcfFieldsConfig

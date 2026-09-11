@@ -15,11 +15,25 @@ from typing import Any
 
 import numpy as np
 import polars as pl
-from scipy.stats import norm
 
-from ..coordinates import position_text_expression
-from ..p_values import harmonise_p_values
-from ..shared.allele_join import allele_oriented_left_join
+from postgwas.core.statistics import normal_z_magnitude_from_ln_p
+
+from ..p_values import P_VALUE_LOG_KEY, harmonise_p_values
+from ..shared.allele_join import allele_oriented_left_join, unused_column_name
+from ..shared.variant_columns import (
+    canonical_allele_expression,
+    canonical_chromosome_expression,
+    canonical_position_expression,
+    minimal_allele_representation_series,
+    palindromic_snp_expression,
+    position_text_expression,
+    reverse_complement_expression,
+)
+from ..strand import (
+    EXPORTABLE_STRAND_ACTIONS,
+    RESOLVED_STRAND_ACTIONS,
+    STRAND_ACTION_COLUMN,
+)
 
 
 INPUT_SOURCE_ROW_COLUMN = "__concordance_input_source_row"
@@ -86,30 +100,6 @@ class ConcordanceAnalysis:
     vcf_duplicates: pl.DataFrame | pl.LazyFrame
 
 
-def _chromosome(expr: pl.Expr) -> pl.Expr:
-    value = (
-        expr.cast(pl.String, strict=False)
-        .str.strip_chars()
-        .str.to_uppercase()
-        .str.replace(r"^CHR", "")
-    )
-    return value.replace({"23": "X", "24": "Y", "25": "XY", "26": "MT", "M": "MT"})
-
-
-def _allele(expr: pl.Expr) -> pl.Expr:
-    return expr.cast(pl.String, strict=False).str.strip_chars().str.to_uppercase()
-
-
-def _complement(expr: pl.Expr) -> pl.Expr:
-    return (
-        pl.when(expr == "A").then(pl.lit("T"))
-        .when(expr == "T").then(pl.lit("A"))
-        .when(expr == "C").then(pl.lit("G"))
-        .when(expr == "G").then(pl.lit("C"))
-        .otherwise(None)
-    )
-
-
 def _canonical_key(chrom: str, pos: str, first: str, second: str) -> pl.Expr:
     left = pl.col(first)
     right = pl.col(second)
@@ -129,6 +119,12 @@ def _numeric(frame: pl.DataFrame, name: str | None) -> pl.Expr:
     return pl.col(name).cast(pl.Float64, strict=False)
 
 
+def _source_text(frame: pl.DataFrame, name: str | None) -> pl.Expr:
+    if not name or name not in frame.columns:
+        return pl.lit(None, dtype=pl.String)
+    return pl.col(name).cast(pl.String, strict=False).str.strip_chars()
+
+
 def _input_coordinates(row, policies) -> tuple[pl.Expr, pl.Expr]:
     if row.chromosome_column and row.position_column:
         return pl.col(row.chromosome_column), pl.col(row.position_column)
@@ -146,17 +142,17 @@ def _input_coordinates(row, policies) -> tuple[pl.Expr, pl.Expr]:
 def input_chromosome_expression(row, policies) -> pl.Expr:
     """Return the canonical chromosome expression shared by staging and analysis."""
     chromosome, _ = _input_coordinates(row, policies)
-    return _chromosome(chromosome)
+    return canonical_chromosome_expression(chromosome, policies)
 
 
-def reference_chromosome_expression(column: str) -> pl.Expr:
+def reference_chromosome_expression(column: str, policies) -> pl.Expr:
     """Return the canonical chromosome expression for a configured reference column."""
-    return _chromosome(pl.col(column))
+    return canonical_chromosome_expression(pl.col(column), policies)
 
 
-def vcf_chromosome_expression() -> pl.Expr:
+def vcf_chromosome_expression(policies) -> pl.Expr:
     """Return the canonical chromosome expression for the extracted VCF table."""
-    return _chromosome(pl.col("CHROM"))
+    return canonical_chromosome_expression(pl.col("CHROM"), policies)
 
 
 def _attach_harmonised_p_values(
@@ -165,21 +161,22 @@ def _attach_harmonised_p_values(
     policies,
 ) -> pl.DataFrame:
     """Attach the exact raw-P and LP representation used by harmonisation."""
-    mapping = {"pval_col": "input_p"}
+    mapping = {"pval_col": "input_p_source"}
     harmonised, _, mapping = harmonise_p_values(
         chromosome="concordance",
-        df=frame.select("input_row", "input_p"),
+        df=frame.select("input_row", "input_p_source"),
         sample_column_dict=mapping,
-        output_col="__concordance_raw_p",
         policies=policies,
         decision=p_value_type,
     )
     raw_column = mapping["pval_col"]
+    log_column = mapping[P_VALUE_LOG_KEY]
     expected = harmonised.select(
         "input_row",
         pl.col(raw_column).cast(pl.Float64, strict=False).alias("input_p_harmonised"),
+        pl.col(log_column).cast(pl.Float64, strict=False).alias("input_ln_p"),
     ).with_columns(
-        (-pl.col("input_p_harmonised").log10()).alias("input_lp")
+        (-pl.col("input_ln_p") / math.log(10.0)).alias("input_lp")
     )
     return frame.join(expected, on="input_row", how="left")
 
@@ -195,8 +192,9 @@ def prepare_input_table(
     settings,
     policies,
 ) -> pl.DataFrame:
-    """Normalize only representation; indels are never reference-normalized."""
+    """Normalize audit fields; indels are never reference-left-aligned."""
     chrom, pos = _input_coordinates(row, policies)
+    minimum_position = int(policies.get("position.min_value"))
     effect = _numeric(frame, row.effect_column)
     beta = (
         pl.when(effect > 0).then(effect.log()).otherwise(None)
@@ -222,6 +220,7 @@ def prepare_input_table(
     )
     input_af = _numeric(frame, row.effect_allele_frequency_column)
     p_value = _numeric(frame, row.p_value_column)
+    p_value_source = _source_text(frame, row.p_value_column)
     duplicate_action = (
         [pl.col("duplicate_action").cast(pl.String, strict=False)]
         if "duplicate_action" in frame.columns else []
@@ -240,15 +239,20 @@ def prepare_input_table(
         indexed
         .select(
             pl.col(INPUT_SOURCE_ROW_COLUMN).cast(pl.UInt32).alias("input_row"),
-            _chromosome(chrom).alias("input_chrom"),
-            pos.cast(pl.Int64, strict=False).alias("input_pos"),
-            _allele(pl.col(row.effect_allele_column)).alias("input_effect_allele"),
-            _allele(pl.col(row.other_allele_column)).alias("input_other_allele"),
+            canonical_chromosome_expression(chrom, policies).alias("input_chrom"),
+            canonical_position_expression(pos).alias("input_pos"),
+            canonical_allele_expression(
+                pl.col(row.effect_allele_column)
+            ).alias("input_effect_allele"),
+            canonical_allele_expression(
+                pl.col(row.other_allele_column)
+            ).alias("input_other_allele"),
             beta.alias("input_beta"),
             standard_error.alias("input_se"),
             supplied_z.alias("input_z_supplied"),
             input_af.alias("input_af"),
             p_value.alias("input_p"),
+            p_value_source.alias("input_p_source"),
             *duplicate_action,
             *duplicate_input_row,
         )
@@ -277,20 +281,19 @@ def prepare_input_table(
         .drop("_can_z_from_se")
     )
 
-    # Reuse the production p-value step so clipping, raw/-log10/-ln conversion,
+    # Reuse the production p-value step so clipping and raw/-log10 conversion,
     # and invalid-value handling cannot drift between harmonisation and this
     # audit. The resulting LP is also the expected GWAS-VCF value.
     result = _attach_harmonised_p_values(result, p_value_type, policies)
 
-    # If neither supplied Z nor BETA/SE can provide Z, use the harmonised raw
-    # p-value and configured tail. scipy's survival function remains stable at
-    # genome-wide p-values where `1 - p` loses floating-point precision.
+    # If neither supplied Z nor BETA/SE can provide Z, use exact ln(p) and the
+    # configured tail. ndtri_exp remains stable when raw p is below Float64.
     needs_p = result.get_column("input_z").is_null().to_numpy()
     beta_values = result.get_column("input_beta").to_numpy()
-    raw_p = result.get_column("input_p_harmonised").to_numpy()
-    usable_p = needs_p & np.isfinite(beta_values) & np.isfinite(raw_p)
-    divisor = float(policies.get("pvalue.se_tail"))
-    calculated = np.sign(beta_values) * norm.isf(raw_p / divisor)
+    ln_p = result.get_column("input_ln_p").to_numpy()
+    usable_p = needs_p & np.isfinite(beta_values) & np.isfinite(ln_p)
+    tail = int(policies.get("pvalue.se_tail"))
+    calculated = np.sign(beta_values) * normal_z_magnitude_from_ln_p(ln_p, tail)
     calculated[~usable_p] = np.nan
     result = result.with_columns(pl.Series("_z_from_p", calculated, dtype=pl.Float64))
     result = result.with_columns(
@@ -326,11 +329,27 @@ def prepare_input_table(
         .alias("input_se_source"),
     )
 
+    # The source columns remain untouched. These private comparison fields
+    # remove only redundant VCF padding so the audit can recognize the same
+    # variant before and after downstream bcftools normalization. Without a
+    # FASTA this deliberately cannot left-align repeats.
+    result = result.with_columns(
+        minimal_allele_representation_series(
+            result,
+            "input_pos",
+            "input_effect_allele",
+            "input_other_allele",
+            position_output="input_key_pos",
+            first_allele_output="input_key_effect_allele",
+            second_allele_output="input_key_other_allele",
+        )
+    )
+
     result = result.with_columns(
         (
             pl.col("input_chrom").is_not_null()
             & pl.col("input_pos").is_not_null()
-            & (pl.col("input_pos") > 0)
+            & (pl.col("input_pos") >= minimum_position)
             & pl.col("input_effect_allele").str.contains(r"^[ACGT]+$")
             & pl.col("input_other_allele").str.contains(r"^[ACGT]+$")
             & (pl.col("input_effect_allele") != pl.col("input_other_allele"))
@@ -353,20 +372,21 @@ def prepare_input_table(
         .then(pl.lit("indel"))
         .otherwise(pl.lit("other"))
         .alias("input_variant_type"),
-        (
-            pl.col("input_is_snp")
-            & (
-                ((pl.col("input_effect_allele") == "A") & (pl.col("input_other_allele") == "T"))
-                | ((pl.col("input_effect_allele") == "T") & (pl.col("input_other_allele") == "A"))
-                | ((pl.col("input_effect_allele") == "C") & (pl.col("input_other_allele") == "G"))
-                | ((pl.col("input_effect_allele") == "G") & (pl.col("input_other_allele") == "C"))
-            )
+        palindromic_snp_expression(
+            pl.col("input_effect_allele"), pl.col("input_other_allele")
         ).alias("input_is_palindromic"),
-        _complement(pl.col("input_effect_allele")).alias("input_effect_complement"),
-        _complement(pl.col("input_other_allele")).alias("input_other_complement"),
+        reverse_complement_expression(
+            pl.col("input_effect_allele")
+        ).alias("input_effect_complement"),
+        reverse_complement_expression(
+            pl.col("input_other_allele")
+        ).alias("input_other_complement"),
     ).with_columns(
         _canonical_key(
-            "input_chrom", "input_pos", "input_effect_allele", "input_other_allele"
+            "input_chrom",
+            "input_key_pos",
+            "input_key_effect_allele",
+            "input_key_other_allele",
         ).alias("direct_key"),
         pl.when(pl.col("input_is_snp"))
         .then(_canonical_key(
@@ -385,22 +405,48 @@ def _attach_external_eaf_to_matches(
     external_eaf_mapping,
     policies,
 ) -> pl.DataFrame:
-    """Reconstruct source EAF after the final VCF allele orientation is known."""
+    """Reconstruct source EAF from the full pre-normalisation allele pair."""
     if external_eaf_mapping is None or not row.external_eaf_column:
         raise ValueError(
             "External EAF data require a column mapping and frequency column."
         )
-    external_vcf_af = "__concordance_external_vcf_af"
-    while external_vcf_af in matched.columns:
-        external_vcf_af += "_"
+    reference_alt = unused_column_name(
+        "__concordance_reference_alt", matched, external_eaf_frame
+    )
+    reference_ref = unused_column_name(
+        "__concordance_reference_ref", matched, external_eaf_frame
+    )
+    external_vcf_af = unused_column_name(
+        "__concordance_external_vcf_af", matched, external_eaf_frame
+    )
+    source_effect = (
+        pl.when(pl.col("_match_basis") == "listed")
+        .then(pl.col("input_effect_allele"))
+        .otherwise(pl.col("input_effect_complement"))
+    )
+    source_other = (
+        pl.when(pl.col("_match_basis") == "listed")
+        .then(pl.col("input_other_allele"))
+        .otherwise(pl.col("input_other_complement"))
+    )
+    study_for_join = matched.with_columns(
+        pl.when(pl.col("_effect_is_alt"))
+        .then(source_effect)
+        .otherwise(source_other)
+        .alias(reference_alt),
+        pl.when(pl.col("_effect_is_alt"))
+        .then(source_other)
+        .otherwise(source_effect)
+        .alias(reference_ref),
+    )
     joined, orientation_column, _ = allele_oriented_left_join(
-        matched,
+        study_for_join,
         external_eaf_frame,
         study_columns={
-            "chr": "vcf_chrom",
-            "pos": "vcf_pos",
-            "ea": "vcf_alt",
-            "oa": "vcf_ref",
+            "chr": "input_chrom",
+            "pos": "input_pos",
+            "ea": reference_alt,
+            "oa": reference_ref,
         },
         reference_columns={
             "chr": external_eaf_mapping.chromosome,
@@ -408,6 +454,7 @@ def _attach_external_eaf_to_matches(
             "ea": external_eaf_mapping.effect_allele,
             "oa": external_eaf_mapping.other_allele,
         },
+        policies=policies,
         value_column=row.external_eaf_column,
         output_column=external_vcf_af,
         duplicate_exact_action=policies.get(
@@ -416,23 +463,32 @@ def _attach_external_eaf_to_matches(
         duplicate_non_identical_action=policies.get(
             "external_reference.non_identical_duplicate_action"
         ),
-        orientations=("direct", "swap"),
-        swapped_value="one_minus",
+        orientations=("direct",),
+        swapped_value="same",
         prefer_non_null_value=True,
         study_columns_canonical=True,
         error_type=ValueError,
         reference_label="external EAF reference used by concordance",
     )
-    # Harmonisation first establishes reference REF/ALT, then attaches external
-    # EAF. Convert that ALT-aligned value back to the raw study effect allele;
-    # the normal concordance orientation step will independently convert it to
-    # final VCF ALT and can therefore detect any exported AF discrepancy.
+    # Harmonisation attaches the panel value before bcftools normalises the VCF.
+    # Reproduce that allele-specific lookup with the full original strings,
+    # oriented to reference ALT/REF by the independently matched final VCF.
+    # Looking up the final minimal VCF strings is unsafe in tandem repeats: a
+    # distinct panel variant can have that literal allele pair at the same
+    # coordinate. Convert the selected ALT frequency back to the source effect
+    # allele; the normal concordance step then independently returns it to final
+    # VCF ALT orientation and can detect an exported AF discrepancy.
     return joined.with_columns(
         pl.when(pl.col("_effect_is_alt"))
         .then(pl.col(external_vcf_af))
         .otherwise(1.0 - pl.col(external_vcf_af))
         .alias("input_af")
-    ).drop(orientation_column, external_vcf_af)
+    ).drop(
+        orientation_column,
+        external_vcf_af,
+        reference_alt,
+        reference_ref,
+    )
 
 
 def _apply_duplicate_report(
@@ -449,7 +505,8 @@ def _apply_duplicate_report(
 
     # These labels are the complete schema-validated duplicate protocol:
     # consistent groups have one kept row and removed alternatives; conflicting
-    # groups have no kept row and carry the configured dataset action.
+    # and swapped-orientation groups have no kept row and carry the configured
+    # dataset action.
     actions = {value for value in valid_report["duplicate_action"].unique() if value}
     unknown_actions = actions - {"kept", "removed", "remove_all", "fail_dataset"}
     if unknown_actions or valid_report["duplicate_action"].null_count():
@@ -502,12 +559,18 @@ def _apply_duplicate_report(
         "direct_key", "input_beta", "input_se", "input_z_supplied",
         "input_af", "input_p",
     ]
+    report_suffix = "__duplicate_report"
     verified_report = input_table.join(
         valid_report.select(["duplicate_input_row"] + match_columns),
-        left_on=["input_row"] + match_columns,
-        right_on=["duplicate_input_row"] + match_columns,
+        left_on="input_row",
+        right_on="duplicate_input_row",
         how="inner",
-        nulls_equal=True,
+        suffix=report_suffix,
+    ).filter(
+        pl.all_horizontal([
+            pl.col(column).eq_missing(pl.col(column + report_suffix))
+            for column in match_columns
+        ])
     )
     if verified_report.height != valid_report.height:
         raise ValueError(
@@ -545,27 +608,40 @@ def _apply_duplicate_report(
     return retained, duplicate_input
 
 
-def prepare_vcf_table(frame: pl.DataFrame) -> pl.DataFrame:
+def prepare_vcf_table(frame: pl.DataFrame, policies) -> pl.DataFrame:
     indexed = (
         frame
         if VCF_SOURCE_ROW_COLUMN in frame.columns
         else frame.with_row_index(VCF_SOURCE_ROW_COLUMN, offset=1)
     )
-    result = (
-        indexed
-        .select(
-            pl.col(VCF_SOURCE_ROW_COLUMN).cast(pl.UInt32).alias("vcf_row"),
-            _chromosome(pl.col("CHROM")).alias("vcf_chrom"),
-            pl.col("POS").cast(pl.Int64, strict=False).alias("vcf_pos"),
-            pl.col("ID").cast(pl.String, strict=False).alias("vcf_id"),
-            _allele(pl.col("REF")).alias("vcf_ref"),
-            _allele(pl.col("ALT")).alias("vcf_alt"),
-            pl.col("ES").cast(pl.Float64, strict=False).alias("vcf_effect"),
-            pl.col("SE").cast(pl.Float64, strict=False).alias("vcf_se"),
-            pl.col("EZ").cast(pl.Float64, strict=False).alias("vcf_z"),
-            pl.col("AF").cast(pl.Float64, strict=False).alias("vcf_af"),
-            pl.col("LP").cast(pl.Float64, strict=False).alias("vcf_lp"),
+    result = indexed.select(
+        pl.col(VCF_SOURCE_ROW_COLUMN).cast(pl.UInt32).alias("vcf_row"),
+        canonical_chromosome_expression(
+            pl.col("CHROM"), policies
+        ).alias("vcf_chrom"),
+        pl.col("POS").cast(pl.Int64, strict=False).alias("vcf_pos"),
+        pl.col("ID").cast(pl.String, strict=False).alias("vcf_id"),
+        canonical_allele_expression(pl.col("REF")).alias("vcf_ref"),
+        canonical_allele_expression(pl.col("ALT")).alias("vcf_alt"),
+        pl.col("ES").cast(pl.Float64, strict=False).alias("vcf_effect"),
+        pl.col("SE").cast(pl.Float64, strict=False).alias("vcf_se"),
+        pl.col("EZ").cast(pl.Float64, strict=False).alias("vcf_z"),
+        pl.col("AF").cast(pl.Float64, strict=False).alias("vcf_af"),
+        pl.col("LP").cast(pl.Float64, strict=False).alias("vcf_lp"),
+    )
+    result = result.with_columns(
+        minimal_allele_representation_series(
+            result,
+            "vcf_pos",
+            "vcf_ref",
+            "vcf_alt",
+            position_output="vcf_key_pos",
+            first_allele_output="vcf_key_ref",
+            second_allele_output="vcf_key_alt",
         )
+    )
+    result = (
+        result
         .with_columns(
             (
                 pl.col("vcf_chrom").is_not_null()
@@ -585,7 +661,9 @@ def prepare_vcf_table(frame: pl.DataFrame) -> pl.DataFrame:
                 pl.col("vcf_ref").str.len_chars()
                 != pl.col("vcf_alt").str.len_chars()
             ).fill_null(False).alias("vcf_is_indel"),
-            _canonical_key("vcf_chrom", "vcf_pos", "vcf_ref", "vcf_alt").alias("vcf_key")
+            _canonical_key(
+                "vcf_chrom", "vcf_key_pos", "vcf_key_ref", "vcf_key_alt"
+            ).alias("vcf_key")
         )
         .with_columns(
             pl.when(~pl.col("valid_vcf_variant"))
@@ -599,6 +677,60 @@ def prepare_vcf_table(frame: pl.DataFrame) -> pl.DataFrame:
         )
     )
     return result
+
+
+def prepare_strand_action_table(
+    frame: pl.DataFrame, policies,
+) -> pl.DataFrame:
+    """Validate archived per-row orientation evidence for exact VCF alleles."""
+    required = ("CHROM", "POS", "REF", "ALT", STRAND_ACTION_COLUMN)
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            "Archived strand-orientation data is missing columns: %s"
+            % ", ".join(missing)
+        )
+    prepared = frame.select(
+        canonical_chromosome_expression(
+            pl.col("CHROM"), policies,
+        ).alias("orientation_chrom"),
+        pl.col("POS").cast(pl.Int64, strict=False).alias("orientation_pos"),
+        canonical_allele_expression(pl.col("REF")).alias("orientation_ref"),
+        canonical_allele_expression(pl.col("ALT")).alias("orientation_alt"),
+        pl.col(STRAND_ACTION_COLUMN).cast(pl.String, strict=False),
+    )
+    invalid = (
+        prepared.filter(
+            ~pl.col(STRAND_ACTION_COLUMN)
+            .is_in(list(EXPORTABLE_STRAND_ACTIONS))
+            .fill_null(False)
+        )
+        .get_column(STRAND_ACTION_COLUMN)
+        .drop_nulls()
+        .unique()
+        .sort()
+        .to_list()
+    )
+    if invalid or prepared.get_column(STRAND_ACTION_COLUMN).null_count():
+        raise ValueError(
+            "Archived strand-orientation data contains unsupported actions: %s"
+            % (", ".join(str(value) for value in invalid) or "missing value")
+        )
+    keys = [
+        "orientation_chrom", "orientation_pos", "orientation_ref",
+        "orientation_alt",
+    ]
+    conflicts = (
+        prepared.group_by(keys)
+        .agg(pl.col(STRAND_ACTION_COLUMN).n_unique().alias("action_count"))
+        .filter(pl.col("action_count") != 1)
+    )
+    if conflicts.height:
+        raise ValueError(
+            "Archived strand-orientation data assigns conflicting actions to "
+            "%s exact VCF allele row(s)." % conflicts.height
+        )
+    return prepared.unique(subset=keys, maintain_order=True)
 
 
 def _join_matches(input_unique: pl.DataFrame, vcf_unique: pl.DataFrame, allow_complement: bool):
@@ -666,6 +798,14 @@ def _safe_number(value):
     return number if math.isfinite(number) else None
 
 
+def _safe_correlation(value):
+    """Return a numerically stable correlation within its mathematical bounds."""
+    number = _safe_number(value)
+    if number is None:
+        return None
+    return max(-1.0, min(1.0, round(number, 14)))
+
+
 def _metric_aggregate_expressions(name: str, observed: str) -> list[pl.Expr]:
     """Build one metric's expressions for a shared single-pass aggregation."""
     expected = "expected_%s" % name
@@ -723,11 +863,11 @@ def _metric_summary_from_stats(stats: dict[str, Any], name: str) -> dict[str, An
         "mismatches": checked - concordant,
         "concordance_fraction": concordant / checked if checked else None,
         "pearson": (
-            _safe_number(stats.get(prefix + "pearson"))
+            _safe_correlation(stats.get(prefix + "pearson"))
             if observed_count >= 2 else None
         ),
         "spearman": (
-            _safe_number(stats.get(prefix + "spearman"))
+            _safe_correlation(stats.get(prefix + "spearman"))
             if observed_count >= 2 else None
         ),
         "sign_concordance": _safe_number(stats.get(prefix + "sign")),
@@ -1343,13 +1483,28 @@ def compare_input_to_vcf(
     external_eaf_frame: pl.DataFrame | None = None,
     external_eaf_mapping=None,
     duplicate_report_frame: pl.DataFrame | None = None,
+    strand_action_frame: pl.DataFrame | None = None,
 ) -> ConcordanceAnalysis:
     input_table = prepare_input_table(
         input_frame, row, effect_type=effect_type, se_scale=se_scale,
         p_value_type=p_value_type,
         eaf_is_maf=eaf_is_maf, settings=settings, policies=policies,
     )
-    vcf_table = prepare_vcf_table(vcf_frame)
+    vcf_table = prepare_vcf_table(vcf_frame, policies)
+    if strand_action_frame is not None:
+        strand_actions = prepare_strand_action_table(
+            strand_action_frame, policies,
+        )
+        vcf_table = vcf_table.join(
+            strand_actions,
+            left_on=["vcf_chrom", "vcf_pos", "vcf_ref", "vcf_alt"],
+            right_on=[
+                "orientation_chrom", "orientation_pos", "orientation_ref",
+                "orientation_alt",
+            ],
+            how="left",
+            coalesce=True,
+        )
 
     input_invalid = input_table.filter(~pl.col("valid_input_variant")).with_columns(
         pl.lit("invalid_coordinate_or_allele").alias("not_retained_reason")
@@ -1403,18 +1558,41 @@ def compare_input_to_vcf(
     )
     listed_effect_is_alt = (
         pl.when(pl.col("_match_basis") == "listed")
-        .then(pl.col("input_effect_allele") == pl.col("vcf_alt"))
-        .otherwise(pl.col("input_effect_complement") == pl.col("vcf_alt"))
+        .then(pl.col("input_key_effect_allele") == pl.col("vcf_key_alt"))
+        .otherwise(pl.col("input_effect_complement") == pl.col("vcf_key_alt"))
     )
-    if (
+    has_row_actions = STRAND_ACTION_COLUMN in matched.columns
+    use_row_actions = (
+        has_row_actions
+        and settings.palindromic_action == "compare_resolved"
+    )
+    row_action_resolved = (
+        pl.col(STRAND_ACTION_COLUMN).is_in(list(RESOLVED_STRAND_ACTIONS))
+        if use_row_actions else pl.lit(False)
+    ).fill_null(False)
+    row_action_swapped = (
+        pl.col(STRAND_ACTION_COLUMN).str.ends_with("_swapped")
+        if use_row_actions else pl.lit(False)
+    ).fill_null(False)
+    global_palindromic_resolved = (
         settings.palindromic_action == "compare_resolved"
-        and strand_consensus == "reverse"
-    ):
-        effect_is_alt = pl.when(pl.col("input_is_palindromic")).then(
-            pl.col("input_effect_complement") == pl.col("vcf_alt")
-        ).otherwise(listed_effect_is_alt)
-    else:
-        effect_is_alt = listed_effect_is_alt
+        and strand_consensus in ("forward", "reverse")
+    )
+    palindromic_effect_is_alt = (
+        pl.when(row_action_resolved)
+        .then(~row_action_swapped)
+        .when(
+            pl.lit(
+                global_palindromic_resolved
+                and strand_consensus == "reverse"
+            )
+        )
+        .then(pl.col("input_effect_complement") == pl.col("vcf_alt"))
+        .otherwise(listed_effect_is_alt)
+    )
+    effect_is_alt = pl.when(pl.col("input_is_palindromic")).then(
+        palindromic_effect_is_alt
+    ).otherwise(listed_effect_is_alt)
     matched = matched.with_columns(effect_is_alt.alias("_effect_is_alt"))
     if external_eaf_frame is not None:
         matched = _attach_external_eaf_to_matches(
@@ -1425,11 +1603,7 @@ def compare_input_to_vcf(
             policies,
         )
 
-    palindromic_resolved = (
-        settings.palindromic_action == "compare_resolved"
-        and strand_consensus in ("forward", "reverse")
-    )
-    if palindromic_resolved:
+    if global_palindromic_resolved:
         palindromic_aligned = "palindromic_%s" % (
             "forward" if strand_consensus == "forward" else "reverse_complement"
         )
@@ -1438,10 +1612,18 @@ def compare_input_to_vcf(
         palindromic_aligned = "palindromic_as_listed"
         palindromic_swapped = "palindromic_swapped"
 
+    per_row_palindromic_type = (
+        pl.concat_str([
+            pl.lit("palindromic_"), pl.col(STRAND_ACTION_COLUMN),
+        ])
+        if use_row_actions else pl.lit(None, dtype=pl.String)
+    )
     matched = matched.with_columns(
         pl.when(pl.col("input_is_palindromic"))
         .then(
-            pl.when(pl.col("_effect_is_alt"))
+            pl.when(row_action_resolved)
+            .then(per_row_palindromic_type)
+            .when(pl.col("_effect_is_alt"))
             .then(pl.lit(palindromic_aligned))
             .otherwise(pl.lit(palindromic_swapped))
         )
@@ -1463,11 +1645,14 @@ def compare_input_to_vcf(
         .alias("orientation_factor"),
     )
     include_palindromic = (
-        settings.palindromic_action == "compare_as_listed"
-        or palindromic_resolved
+        pl.lit(settings.palindromic_action == "compare_as_listed")
+        | row_action_resolved
+        | pl.lit(global_palindromic_resolved)
     )
-    orientation = (
-        pl.lit(True) if include_palindromic else ~pl.col("input_is_palindromic")
+    orientation = pl.when(pl.col("input_is_palindromic")).then(
+        include_palindromic
+    ).otherwise(
+        pl.lit(True)
     )
     matched = matched.with_columns(orientation.alias("orientation_comparable"))
     matched = _metric_columns(
@@ -1590,14 +1775,24 @@ def compare_input_to_vcf(
         matched,
         position_counts,
     )
-    palindromic_total = sum(
-        int(count)
-        for match_type, count in match_counts.items()
-        if str(match_type).startswith("palindromic_")
-    )
-    palindromic_compared = palindromic_total if include_palindromic else 0
+    palindromic_total = matched.filter(pl.col("input_is_palindromic")).height
+    palindromic_compared = matched.filter(
+        pl.col("input_is_palindromic") & pl.col("orientation_comparable")
+    ).height
     palindromic_excluded = palindromic_total - palindromic_compared
-    if palindromic_resolved:
+    row_resolved_palindromes = (
+        matched.filter(
+            pl.col("input_is_palindromic") & row_action_resolved
+        ).height
+        if use_row_actions else 0
+    )
+    if row_resolved_palindromes:
+        palindromic_basis = (
+            "per_variant_strand_action"
+            if row_resolved_palindromes == palindromic_compared
+            else "per_variant_strand_action_with_manifest_consensus_fallback"
+        )
+    elif global_palindromic_resolved:
         palindromic_basis = "study_wide_%s_strand_consensus" % strand_consensus
     elif settings.palindromic_action == "compare_as_listed":
         palindromic_basis = "listed_allele_order"

@@ -17,6 +17,7 @@ from postgwas.core.errors import ConfigurationError
 from postgwas.core.paths import configured_output_path
 from postgwas.cli.compute import get_compute_parser, memory_limit, resolve_compute_args
 from postgwas.modules.harmonisation.cli import (
+    HtmlReportError,
     RunSummaryError,
     ScreenReportError,
     _run_validated_rows,
@@ -114,6 +115,7 @@ class HarmonisationCLITests(unittest.TestCase):
             "validate",
             "fixed_info",
             "zero_p_se_action",
+            "keep_gwas2vcf_intermediate",
             "show_screen",
         }
         actions = {action.dest: action for action in parser._actions}
@@ -136,17 +138,18 @@ class HarmonisationCLITests(unittest.TestCase):
         self.assertIn("Default: fail", help_text)
         self.assertIn("--fixed-info", help_text)
         self.assertIn("between 0 and 1", help_text)
-        self.assertIn("--show-screen", help_text)
+        self.assertIn("--keep_gwas2vcf_intermediate", help_text)
+        self.assertIn("Default: false", help_text)
+        self.assertNotIn("--show-screen", help_text)
         self.assertIn("--hide-screen", help_text)
         self.assertIn("Default: true", help_text)
 
-    def test_screen_display_cli_flags_are_mutually_exclusive(self):
+    def test_hide_screen_is_the_only_screen_display_cli_flag(self):
         parser = get_harmonisation_parser()
         self.assertFalse(hasattr(parser.parse_args([]), "show_screen"))
-        self.assertTrue(parser.parse_args(["--show-screen"]).show_screen)
         self.assertFalse(parser.parse_args(["--hide-screen"]).show_screen)
         with self.assertRaises(SystemExit):
-            parser.parse_args(["--show-screen", "--hide-screen"])
+            parser.parse_args(["--show-screen"])
 
     def test_comparison_af_source_accepts_only_supported_panels(self):
         parser = get_harmonisation_parser()
@@ -169,6 +172,26 @@ class HarmonisationCLITests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(SystemExit):
                 parser.parse_args(["--fixed-info", invalid])
 
+    def test_keep_gwas2vcf_intermediate_is_explicit_only(self):
+        parser = get_harmonisation_parser()
+        self.assertFalse(
+            hasattr(parser.parse_args([]), "keep_gwas2vcf_intermediate")
+        )
+        self.assertTrue(
+            parser.parse_args([
+                "--keep_gwas2vcf_intermediate"
+            ]).keep_gwas2vcf_intermediate
+        )
+        config = load_configuration(cli_overrides={
+            "modules.harmonisation.policies.vcf."
+            "keep_gwas2vcf_intermediate": True,
+        })
+        self.assertTrue(
+            config.modules.harmonisation.policies["vcf"][
+                "keep_gwas2vcf_intermediate"
+            ]
+        )
+
     def test_legacy_flags_are_not_part_of_the_parser(self):
         options = {
             option
@@ -184,6 +207,7 @@ class HarmonisationCLITests(unittest.TestCase):
         parser = get_compute_parser()
         actions = {action.dest: action for action in parser._actions}
         self.assertEqual(actions["threads"].default, argparse.SUPPRESS)
+        self.assertIn("CPU-thread budget", actions["threads"].help)
         self.assertEqual(actions["memory_gb"].default, argparse.SUPPRESS)
         self.assertEqual(actions["seed"].default, argparse.SUPPRESS)
         args = resolve_compute_args(Namespace())
@@ -208,6 +232,7 @@ class HarmonisationCLITests(unittest.TestCase):
             memory_gb=20,
             fixed_info=0.99,
             zero_p_se_action="approximate",
+            keep_gwas2vcf_intermediate=True,
             show_screen=False,
         )
         fake_config = unittest.mock.Mock()
@@ -240,6 +265,12 @@ class HarmonisationCLITests(unittest.TestCase):
         )
         self.assertEqual(
             overrides["modules.harmonisation.fixed_info.value"], 0.99
+        )
+        self.assertTrue(
+            overrides[
+                "modules.harmonisation.policies.vcf."
+                "keep_gwas2vcf_intermediate"
+            ]
         )
         self.assertFalse(
             overrides["logging.show_screen"]
@@ -386,6 +417,20 @@ class HarmonisationCLITests(unittest.TestCase):
                 self.assertEqual(
                     result[row.dataset_id]["screen_report"], str(report_path)
                 )
+                html_path = (
+                    output
+                    / row.dataset_id
+                    / "harmonisation"
+                    / (row.dataset_id + "_harmonisation_report.html")
+                ).resolve()
+                self.assertEqual(summary_row["html_report"], str(html_path))
+                self.assertEqual(
+                    result[row.dataset_id]["html_report"], str(html_path),
+                )
+                html = html_path.read_text(encoding="utf-8")
+                self.assertIn(row.dataset_id, html)
+                self.assertIn("Input and harmonisation accounting", html)
+                self.assertIn("VCF content and virtual QC", html)
                 report = report_path.read_text(encoding="utf-8")
                 self.assertIn("Preparing PostGWAS harmonisation", report)
                 self.assertIn("Starting dataset", report)
@@ -395,6 +440,14 @@ class HarmonisationCLITests(unittest.TestCase):
                 other = "study_two" if row.dataset_id == "study_one" else "study_one"
                 self.assertNotIn("ENGINE OUTPUT %s" % other, report)
                 self.assertNotIn("— %s" % other, report)
+            run_html = (
+                output / "run_metadata" / "harmonisation_run_report.html"
+            ).read_text(encoding="utf-8")
+            self.assertIn("study_one", run_html)
+            self.assertIn("study_two", run_html)
+            self.assertEqual(
+                run_html.count("Input and harmonisation accounting"), 2,
+            )
 
     def test_hide_screen_suppresses_stdout_but_still_writes_complete_report(self):
         fixture = (
@@ -450,6 +503,30 @@ class HarmonisationCLITests(unittest.TestCase):
                 with self.assertRaisesRegex(ScreenReportError, "screen report"):
                     _run_validated_rows(Namespace(), config, rows)
 
+    def test_html_report_initialization_failure_stops_before_analysis(self):
+        fixture = (
+            Path(__file__).parent / "data" / "harmonisation" / "manifest_v2.csv"
+        )
+        rows = load_harmonisation_sample_sheet(fixture)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            resources = root / "resources"
+            resources.mkdir()
+            config = load_configuration(cli_overrides={
+                "resources.root": str(resources),
+                "run.output_directory": str(root / "output"),
+                "execution.retries": 0,
+            })
+            with patch(
+                "postgwas.modules.harmonisation.cli.write_run_html_report",
+                side_effect=OSError("read only"),
+            ), patch(
+                "postgwas.modules.harmonisation.cli.run_harmonisation_pipeline",
+            ) as engine:
+                with self.assertRaisesRegex(HtmlReportError, "HTML report"):
+                    _run_validated_rows(Namespace(), config, rows)
+            engine.assert_not_called()
+
     def test_run_summary_combines_study_and_chromosome_evidence(self):
         fixture = (
             Path(__file__).parent / "data" / "harmonisation" / "manifest_v2.csv"
@@ -495,16 +572,24 @@ class HarmonisationCLITests(unittest.TestCase):
                             "af_difference_above_cutoff": 2,
                             "study_af_missing": 1,
                             "external_af_missing": 5,
+                            "effective_sample_size_available": 25,
+                            "effective_sample_size_reference_quantile_value": 1000,
+                            "effective_sample_size_minimum_threshold": 666.6666667,
+                            "effective_sample_size_below_minimum_threshold": 3,
                         },
                         "qc_passed": {
                             "num_records": 24,
                             "num_snps": 22,
                             "effective_sample_size_missing_or_invalid": 0,
+                            "effective_sample_size_available": 24,
+                            "effective_sample_size_below_minimum_threshold": 2,
                             "format_si_missing": 0,
                             "effective_sample_size_above_outlier_threshold": 1,
                         },
                         "active_rule_count": 6,
                         "af_difference_cutoff": 0.2,
+                        "sample_size_reference_quantile": 0.9,
+                        "sample_size_minimum_fraction_of_reference": 2 / 3,
                     }),
                     encoding="utf-8",
                 )
@@ -530,7 +615,14 @@ class HarmonisationCLITests(unittest.TestCase):
                         "1": {"status": "ok"},
                         "2": {"status": "ok"},
                     },
-                    "reconciliation": {"rows_exported": 25},
+                    "reconciliation": {
+                        "rows_read": 30,
+                        "rejected": 5,
+                        "rows_exported": 25,
+                        "unprocessed_failed_chromosome_rows": 0,
+                        "balanced": True,
+                        "complete": True,
+                    },
                     "chromosome_summaries": {
                         chromosome: {
                             "stage_qc": {
@@ -598,6 +690,8 @@ class HarmonisationCLITests(unittest.TestCase):
             self.assertEqual(record["strand_metadata_complete"], "true")
             self.assertEqual(record["strand_variants_evaluated"], "30")
             self.assertEqual(record["strand_matched"], "25")
+            self.assertEqual(record["strand_reference_unmatched_detected"], "2")
+            self.assertEqual(record["strand_reference_unmatched_retained"], "0")
             self.assertEqual(record["strand_forward"], "22")
             self.assertEqual(record["strand_forward_swapped"], "2")
             self.assertEqual(record["strand_reverse_complement_swapped"], "1")
@@ -619,6 +713,13 @@ class HarmonisationCLITests(unittest.TestCase):
             self.assertEqual(
                 record["input_ready_indels_or_other_variants"], "2",
             )
+            self.assertEqual(record["parsed_variants"], "30")
+            self.assertEqual(record["rejected_variants"], "5")
+            self.assertEqual(
+                record["unprocessed_failed_chromosome_variants"], "0",
+            )
+            self.assertEqual(record["row_accounting_balanced"], "true")
+            self.assertEqual(record["row_accounting_complete"], "true")
             self.assertEqual(record["harmonised_variants"], "25")
             self.assertEqual(record["final_vcf_variants"], "25")
             self.assertEqual(record["qc_passed_variants"], "24")
@@ -642,6 +743,23 @@ class HarmonisationCLITests(unittest.TestCase):
             )
             self.assertEqual(record["qc_passed_missing_or_invalid_neff"], "0")
             self.assertEqual(record["qc_passed_missing_imputation_score"], "0")
+            self.assertEqual(float(record["neff_reference_quantile"]), 0.9)
+            self.assertEqual(record["neff_reference_value"], "1000")
+            self.assertAlmostEqual(
+                float(record["neff_minimum_fraction_of_reference"]),
+                2 / 3,
+            )
+            self.assertAlmostEqual(
+                float(record["neff_minimum_threshold"]),
+                666.6666667,
+            )
+            self.assertEqual(record["raw_low_neff_variants"], "3")
+            self.assertEqual(float(record["raw_low_neff_percent"]), 12.0)
+            self.assertEqual(record["qc_passed_low_neff_variants"], "2")
+            self.assertAlmostEqual(
+                float(record["qc_passed_low_neff_percent"]),
+                100.0 * 2.0 / 24.0,
+            )
             self.assertEqual(record["qc_passed_neff_upper_outliers"], "1")
             fields = list(record)
             self.assertLess(fields.index("input_ready_snps"), fields.index("genome_build"))
@@ -708,6 +826,14 @@ class HarmonisationCLITests(unittest.TestCase):
                 manifest_path = Path(result["manifest"])
                 document = json.loads(manifest_path.read_text(encoding="utf-8"))
                 document["status"] = "PARTIAL"
+                document["dataset"]["reconciliation"] = {
+                    "rows_read": 1000,
+                    "rejected": 130,
+                    "rows_exported": 480,
+                    "unprocessed_failed_chromosome_rows": 390,
+                    "balanced": True,
+                    "complete": False,
+                }
                 manifest_path.write_text(json.dumps(document), encoding="utf-8")
                 result["status"] = "PARTIAL"
                 return result
@@ -727,6 +853,14 @@ class HarmonisationCLITests(unittest.TestCase):
             ) as handle:
                 record = next(csv.DictReader(handle))
             self.assertEqual(record["status"], "PARTIAL")
+            self.assertEqual(record["parsed_variants"], "1000")
+            self.assertEqual(record["rejected_variants"], "130")
+            self.assertEqual(record["harmonised_variants"], "480")
+            self.assertEqual(
+                record["unprocessed_failed_chromosome_variants"], "390",
+            )
+            self.assertEqual(record["row_accounting_balanced"], "true")
+            self.assertEqual(record["row_accounting_complete"], "false")
             run_log = (
                 output / "run_metadata" / config.logging.filename
             ).read_text(encoding="utf-8")
@@ -890,6 +1024,16 @@ class HarmonisationCLITests(unittest.TestCase):
             self.assertIn(
                 "bcftools plugin unavailable",
                 report_path.read_text(encoding="utf-8"),
+            )
+            html_path = Path(records[0]["html_report"])
+            self.assertTrue(html_path.is_file())
+            html = html_path.read_text(encoding="utf-8")
+            self.assertIn("PREFLIGHT FAILED", html)
+            self.assertIn("bcftools plugin unavailable", html)
+            run_html = output / "run_metadata" / "harmonisation_run_report.html"
+            self.assertIn(
+                "bcftools plugin unavailable",
+                run_html.read_text(encoding="utf-8"),
             )
 
     def test_user_interruption_is_recorded_before_propagation(self):

@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import argparse
 
-from rich.console import Console
-
-from postgwas.cli.common import get_common_out_parser, get_magma_binary_parser
-from postgwas.cli.compute import get_compute_parser
+from postgwas.cli.common import get_common_out_parser
+from postgwas.cli.compute import get_compute_parser, positive_float
 from postgwas.config import load_configuration
+from postgwas.config.models.modules.magma import (
+    MAGMA_ALTERNATE_GENE_ID_DUPLICATE_POLICIES,
+    MAGMA_DUPLICATE_POLICIES,
+    MAGMA_GENE_SET_MISMATCH_ACTIONS,
+    MAGMA_GENE_IDENTIFIER_TYPES,
+    MAGMA_MHC_POLICIES,
+)
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.ui import (
+    print_screen_message,
     AlignedRichHelpFormatter,
     format_cli_examples,
     help_with_default,
@@ -23,10 +29,12 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
     """Return reusable MAGMA options without assigning CLI-owned defaults."""
     defaults = load_configuration()
     module = defaults.modules.magma
-    parser = argparse.ArgumentParser(
-        add_help=add_help,
-        parents=[get_magma_binary_parser()],
+    bim_identifier_column = module.input.bim_columns.index("variant_id") + 1
+    alternate_gene_column = (
+        module.input.gene_location_columns.index("alternate_gene_id") + 1
+        if "alternate_gene_id" in module.input.gene_location_columns else None
     )
+    parser = argparse.ArgumentParser(add_help=add_help)
 
     inputs = parser.add_argument_group("MAGMA inputs")
     inputs.add_argument(
@@ -66,6 +74,56 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         help=(
             "Optional standard GMT or native MAGMA set-annotation file for "
             "competitive gene-set analysis."
+        ),
+    )
+    positional = parser.add_argument_group(
+        "MAGMA positional gene-location declaration"
+    )
+    positional_definition = module.mapping.definitions["positional"]
+    positional.add_argument(
+        "--magma-positional-gene-id-type",
+        choices=MAGMA_GENE_IDENTIFIER_TYPES,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Identifier system stored in column 1 of the positional MAGMA "
+            "gene-location file",
+            positional_definition.gene_id_type,
+        ),
+    )
+    positional.add_argument(
+        "--magma-positional-source-name",
+        metavar="TEXT",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Name of the source that supplied the positional gene-location file",
+            positional_definition.source_name,
+        ),
+    )
+    positional.add_argument(
+        "--magma-positional-source-version",
+        metavar="TEXT",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Version of the positional gene-location source",
+            positional_definition.source_version,
+        ),
+    )
+    positional.add_argument(
+        "--magma-positional-source-url",
+        metavar="URL",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Provenance URL for the positional gene-location source",
+            positional_definition.source_url,
+        ),
+    )
+    positional.add_argument(
+        "--magma-positional-context",
+        metavar="TEXT",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Scientific context represented by the positional gene-location file",
+            positional_definition.context,
         ),
     )
     settings = parser.add_argument_group("MAGMA analysis settings")
@@ -135,7 +193,8 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         default=argparse.SUPPRESS,
         help=help_with_default(
             "Minimum fraction of unique formatter variants that must have exact "
-            "BIM field-2 matches when --resolve-variants-to-reference is enabled",
+            "BIM field-%d matches when --resolve-variants-to-reference is enabled"
+            % bim_identifier_column,
             module.snp_harmonisation.minimum_overlap_fraction,
         ),
     )
@@ -150,14 +209,129 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         ),
     )
     settings.add_argument(
+        "--gene-set-identifier-mismatch",
+        choices=MAGMA_GENE_SET_MISMATCH_ACTIONS,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Action when gene-set identifiers are incompatible with the selected "
+            "gene mapping: skip preserves gene-association analysis and omits "
+            "competitive pathway analysis; error stops the complete MAGMA run",
+            module.gene_sets.identifier_mismatch_action,
+        ),
+    )
+    settings.add_argument(
+        "--alternate-gene-id-duplicate-policy",
+        choices=MAGMA_ALTERNATE_GENE_ID_DUPLICATE_POLICIES,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Handling when gene-location column %s is selected for positional "
+            "MAGMA but one alternate identifier labels multiple intervals: "
+            "longest_interval retains the longest interval and error stops "
+            "pathway-compatible reference preparation"
+            % (alternate_gene_column or "alternate"),
+            module.gene_sets.alternate_id_duplicate_policy,
+        ),
+    )
+    settings.add_argument(
+        "--gene-location-alternate-id-type",
+        choices=MAGMA_GENE_IDENTIFIER_TYPES,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Identifier system stored in the optional alternate gene-location "
+            "column and used by a derived positional MAGMA reference when it "
+            "matches the pathway file",
+            module.input.alternate_gene_id_type,
+        ),
+    )
+    settings.add_argument(
+        "--duplicate-policy",
+        choices=MAGMA_DUPLICATE_POLICIES,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Handling for repeated SNP IDs after optional LD-reference filtering: "
+            "err stops, lowest_p retains one row with the lowest valid p-value, "
+            "and remove excludes every row in each duplicated-ID group",
+            module.snp_harmonisation.duplicate_policy,
+        ),
+    )
+    settings.add_argument(
         "--resolve-variants-to-reference",
         action=argparse.BooleanOptionalAction,
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Compare formatter-created variant IDs with BIM field 2 and retain "
-            "only exact coordinate-and-allele-consistent reference matches. When "
+            "Compare formatter-created variant IDs with the configured BIM "
+            "variant-ID field and retain only exact identifier matches. When "
             "disabled, use the formatter files directly without reference filtering",
             module.snp_harmonisation.resolve_variants_to_reference,
+        ),
+    )
+    settings.add_argument(
+        "--magma-memory-per-worker-gb",
+        type=positive_float,
+        default=argparse.SUPPRESS,
+        metavar="GB",
+        help=help_with_default(
+            "Memory budget assigned to each concurrent MAGMA gene-association "
+            "worker. PostGWAS limits the worker count using this value and the "
+            "total --memory-gb budget; it does not impose a memory limit on MAGMA",
+            "%g GB" % module.batching.memory_per_process_gb,
+        ),
+    )
+    exclusions = parser.add_argument_group("MAGMA analysis scope")
+    exclusions.add_argument(
+        "--mhc-policy",
+        choices=MAGMA_MHC_POLICIES,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "MHC handling: include keeps all MHC SNPs and genes; exclude_snps "
+            "removes MHC SNPs before annotation and gene testing; exclude_genes "
+            "removes overlapping annotated units from gene and competitive "
+            "gene-set analysis; exclude_both applies both exclusions",
+            module.mhc.policy,
+        ),
+    )
+    genome_region = defaults.resources.genomes[module.genome_build.value].regions["mhc"]
+    exclusions.add_argument(
+        "--mhc-chrom",
+        metavar="CHROM",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Override the MHC chromosome. Supply all three MHC override options "
+            "together",
+            genome_region.chromosome,
+        ),
+    )
+    exclusions.add_argument(
+        "--mhc-start",
+        metavar="POSITION",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Override the one-based inclusive MHC start position. Supply all "
+            "three MHC override options together",
+            genome_region.start,
+        ),
+    )
+    exclusions.add_argument(
+        "--mhc-end",
+        metavar="POSITION",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Override the one-based inclusive MHC end position. Supply all three "
+            "MHC override options together",
+            genome_region.end,
+        ),
+    )
+    exclusions.add_argument(
+        "--exclude-chromosomes",
+        metavar="CHROM",
+        nargs="+",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Chromosomes excluded from SNP, gene, and competitive gene-set "
+            "analysis. X is retained unless explicitly listed",
+            " ".join(module.chromosomes.exclude),
         ),
     )
     if direct_controls:
@@ -303,8 +477,8 @@ def main(argv=None):
     try:
         run_magma_direct(args)
     except (MagmaError, ConfigurationError, OSError, ValueError) as exc:
-        Console(stderr=True).print(
-            "\n[bold red]MAGMA analysis failed.[/bold red] %s\n" % exc
+        print_screen_message(
+            "error", "MAGMA analysis failed. %s" % exc, stderr=True,
         )
         return 1
     return 0

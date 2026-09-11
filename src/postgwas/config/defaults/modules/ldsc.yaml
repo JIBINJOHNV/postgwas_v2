@@ -22,6 +22,13 @@ print_delete_values: false
 sample_prevalence: null
 population_prevalence: null
 
+# Compare an explicit pipeline sample prevalence with the GWAS-VCF case
+# fraction returned by the formatting step. A difference must be greater than
+# 0.01 (one percentage point) to produce a scientific warning; the explicit
+# value remains authoritative.
+sample_prevalence_comparison:
+  warning_absolute_difference: 0.01
+
 # munge_sumstats.py defaults
 minimum_info: 0.9
 minimum_maf: 0.01

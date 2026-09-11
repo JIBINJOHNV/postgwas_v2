@@ -1,4 +1,4 @@
-# Pipeline SuSiE example. Reference paths remain explicit CLI inputs.
+# Pipeline SuSiE example using standard LD-reference clumping.
 config_version: 1
 
 run:
@@ -12,17 +12,14 @@ execution:
   memory_gb: 32
 
 pipeline:
-  modules: [ld_annotation, formatting, ld_clumping, fine_mapping]
+  modules: [ld_clumping, formatting, fine_mapping]
 
 modules:
-  ld_annotation:
-    enabled: true
-    genome_build: GRCh37
-    populations: [EUR]
   formatting:
     enabled: true
   ld_clumping:
     enabled: true
+    methods: [standard]
     population: EUR
   fine_mapping:
     enabled: true

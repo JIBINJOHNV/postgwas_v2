@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-KPOPS_COMMIT="8acd49ed8c96565b17c2997420f514f24b65e096"
-KPOPS_ARCHIVE_SHA256="e162e01c59e084c3cb395c6f9171609ec535a2f6e769a213f042872f590745d3"
-CALDERA_COMMIT="81a8a0308741ae986660f711bbf6a7abbd3bca19"
-CALDERA_ARCHIVE_SHA256="8ab5259671afe93767bca9db22e9088cb47d674b9cdf3733006fba09958a62b5"
+script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/setup/software_versions.env
+source "$script_directory/../setup/software_versions.env"
+
+KPOPS_COMMIT="$POSTGWAS_KPOPS_COMMIT"
+KPOPS_ARCHIVE_SHA256="$POSTGWAS_KPOPS_SHA256"
+CALDERA_COMMIT="$POSTGWAS_CALDERA_COMMIT"
+CALDERA_ARCHIVE_SHA256="$POSTGWAS_CALDERA_SHA256"
 GENE_ANNOTATION_SHA256="940086e0781e9b244da76d27f02cc25dd45c957ee4415915cd1ced37b63d1e72"
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 --resource-root PATH [--python PATH] [--prepare-linear-kernel]" \
+        "Usage: $0 --resource-root PATH [--python PATH] [--software-only] [--prepare-linear-kernel]" \
         "" \
         "Downloads pinned K-POPS and CALDERA sources into versioned resource" \
         "directories. Supplying --python installs both tools into that environment." \
+        "--software-only skips validation of separately supplied PoPS feature data." \
         "With --prepare-linear-kernel, it also derives the standardized GRCh37" \
         "linear kernel from an existing PoPS munged feature matrix."
 }
@@ -20,6 +25,7 @@ usage() {
 resource_root=""
 python_bin=""
 prepare_kernel=false
+software_only=false
 while (($#)); do
     case "$1" in
         --resource-root)
@@ -32,6 +38,10 @@ while (($#)); do
             ;;
         --prepare-linear-kernel)
             prepare_kernel=true
+            shift
+            ;;
+        --software-only)
+            software_only=true
             shift
             ;;
         --help|-h)
@@ -52,6 +62,10 @@ if [[ -z "$resource_root" ]]; then
 fi
 if [[ "$prepare_kernel" == true && -z "$python_bin" ]]; then
     printf '%s\n' "--python is required with --prepare-linear-kernel" >&2
+    exit 2
+fi
+if [[ "$prepare_kernel" == true && "$software_only" == true ]]; then
+    printf '%s\n' "--prepare-linear-kernel cannot be combined with --software-only" >&2
     exit 2
 fi
 for executable in curl tar shasum mktemp; do
@@ -202,12 +216,14 @@ fi
 
 gene_annotation="${resource_root}/pops/GRCh37_gene_annot_jun10.txt"
 feature_prefix="${resource_root}/pops/features_munged/pops_features"
-printf '%s  %s\n' "$GENE_ANNOTATION_SHA256" "$gene_annotation" \
-    | shasum -a 256 --check --status || {
-        printf 'The existing GRCh37 PoPS annotation is missing or differs from upstream: %s\n' \
-            "$gene_annotation" >&2
-        exit 1
-    }
+if [[ "$software_only" == false ]]; then
+    printf '%s  %s\n' "$GENE_ANNOTATION_SHA256" "$gene_annotation" \
+        | shasum -a 256 --check --status || {
+            printf 'The existing GRCh37 PoPS annotation is missing or differs from upstream: %s\n' \
+                "$gene_annotation" >&2
+            exit 1
+        }
+fi
 
 if [[ "$prepare_kernel" == true ]]; then
     "$python_bin" - "$gene_annotation" "$feature_prefix" <<'PY'
@@ -293,9 +309,12 @@ fi
 
 printf '%s\n' \
     "K-POPS script: ${kpops_destination}/k-pops.py" \
-    "K-POPS annotation: ${gene_annotation}" \
-    "K-POPS feature prefix: ${feature_prefix}" \
     "CALDERA repository: ${caldera_destination}"
+if [[ "$software_only" == false ]]; then
+    printf '%s\n' \
+        "K-POPS annotation: ${gene_annotation}" \
+        "K-POPS feature prefix: ${feature_prefix}"
+fi
 if [[ "$prepare_kernel" == true ]]; then
     printf 'K-POPS kernel prefix: %s\n' "$kernel_prefix"
 fi

@@ -38,8 +38,10 @@ import polars as pl
 
 from postgwas.core.values import format_number as _fmt, optional_text
 
+from .shared.allele_join import unused_column_name
 from .shared.runtime import (
     emit_high_visibility_warning,
+    format_inference_warning,
     resolve_policies,
     step_context,
 )
@@ -409,19 +411,16 @@ def detect_or_standard_error_scale(
             return decision, evidence
 
     if pvalue_col and pvalue_col in numeric.columns and pvalue_type in (
-        "raw", "neglog10", "negln"
+        "raw", "neglog10"
     ):
         values = numeric.get_column(pvalue_col).to_numpy()
         if pvalue_type == "raw":
             valid_p = np.isfinite(values) & (values > 0.0) & (values <= 1.0)
             with np.errstate(divide="ignore", invalid="ignore"):
                 observed = -np.log10(values)
-        elif pvalue_type == "neglog10":
-            valid_p = np.isfinite(values) & (values >= 0.0)
-            observed = values
         else:
             valid_p = np.isfinite(values) & (values >= 0.0)
-            observed = values / math.log(10.0)
+            observed = values
 
         try:
             expected_log = two_sided_negative_log10_p_from_z(candidate_log)
@@ -495,13 +494,35 @@ def _decision_sentence(decision, evidence):
     )
 
 
-def _automatic_inference_warning(effect_type, evidence):
+def _automatic_inference_warning(effect_type, evidence, *, screen=False):
     """Explain the scientific limitation whenever an inferred type is applied."""
     processing = (
         "Values will be converted using BETA = ln(effect)."
         if effect_type == "odds_ratio"
         else "Values will be treated directly as beta coefficients."
     )
+    if screen:
+        usable = int(evidence["n_usable"])
+        non_positive = int(evidence["non_positive_value_count"])
+        fraction = 100.0 * non_positive / usable
+        threshold = 100.0 * float(evidence["max_non_positive_fraction"])
+        low, high = evidence["median_range"]
+        evidence_fields = [
+            ("Usable values", "{:,}".format(usable)),
+            ("Zero or negative", "%s / %s (%.3f%%); OR rule: at most %s%%" % (
+                "{:,}".format(non_positive), "{:,}".format(usable), fraction, _fmt(threshold))),
+            ("Median effect", "%s; OR rule: %s to %s inclusive" % (
+                _fmt(evidence["median"]), _fmt(low), _fmt(high))),
+        ]
+        return format_inference_warning(
+            "Effect type automatically inferred",
+            input_column=evidence["effect_col"],
+            inferred_type="Odds ratio" if effect_type == "odds_ratio" else "Beta coefficient",
+            evidence=evidence_fields,
+            planned_action=processing,
+            reason="These values fit the %s detection rule, but cannot confirm the column's meaning." % effect_type,
+            recommendation="Check the study documentation. If confirmed, set effect_type = %s in the sample sheet, or effect.type in YAML." % effect_type,
+        )
     return (
         "AUTOMATIC EFFECT-TYPE INFERENCE: column %r was inferred as %r from "
         "its value distribution (%.3f%% of %s usable values are zero or "
@@ -582,6 +603,15 @@ def harmonise_effect_estimates(
             "Effect size column ('beta_or_col') is missing from the config or "
             "not present in the data frame for chromosome %s." % (chromosome,)
         )
+    se_col = optional_text(sample_column_dict.get("se_col"))
+    if se_col is not None and se_col == effect_col:
+        raise EffectTypeError(
+            "Chromosome %s maps the effect size and standard error to the same "
+            "input column %r. These are distinct statistics and cannot share a "
+            "column. Correct effect_column and standard_error_column in the "
+            "sample sheet before harmonisation."
+            % (chromosome, effect_col)
+        )
 
     with step_context(
         logger,
@@ -594,41 +624,47 @@ def harmonise_effect_estimates(
         policy_keys=POLICY_KEYS,
     ) as ctx:
         # ------------------------------------------------------------------
-        # Cast to a number.  effect.cast_strict is true by default, which is
-        # what this module did before: one unparseable cell aborts the
-        # chromosome.  false turns those cells into nulls and reports them.
+        # Cast to a number. The default non-strict policy matches the shared
+        # input reader: an unparseable cell becomes null, is counted here and
+        # follows the existing missing-effect rejection/provenance path.
+        # Users may explicitly select strict mode to fail the chromosome.
         # ------------------------------------------------------------------
         strict = bool(policies.effect.cast_strict)
         qc_info["effect_cast_strict"] = strict
-        if strict:
-            df = df.with_columns(pl.col(effect_col).cast(pl.Float64, strict=True))
-        else:
-            n_unparseable = int(
-                df.select(
-                    (
-                        pl.col(effect_col).is_not_null()
-                        & pl.col(effect_col).cast(pl.Float64, strict=False).is_null()
-                    )
-                    .sum()
-                    .alias("n")
-                ).item()
-                or 0
+        original_effect = df.get_column(effect_col)
+        try:
+            numeric_effect = original_effect.cast(pl.Float64, strict=False)
+        except pl.exceptions.PolarsError as exc:
+            raise EffectTypeError(
+                "Chromosome %s effect column %r cannot be converted to numeric "
+                "values: %s" % (chromosome, effect_col, exc)
+            ) from exc
+        n_unparseable = max(
+            0, numeric_effect.null_count() - original_effect.null_count()
+        )
+        qc_info["effect_unparseable_values"] = n_unparseable
+        if strict and n_unparseable:
+            raise EffectTypeError(
+                "Chromosome %s effect column %r contains %s non-missing value(s) "
+                "that cannot be parsed as numbers. Policy effect.cast_strict=true "
+                "requires the chromosome to fail. Correct those values or set "
+                "effect.cast_strict=false to convert them to missing and retain "
+                "their original values in rejection provenance."
+                % (chromosome, effect_col, "{:,}".format(n_unparseable))
             )
-            before = df.height
-            df = df.with_columns(pl.col(effect_col).cast(pl.Float64, strict=False))
-            qc_info["effect_unparseable_values"] = n_unparseable
-            if n_unparseable:
-                ctx.qc(
-                    "effect size is a number",
-                    "%s values in '%s' are not numbers. Policy 'effect.cast_strict' "
-                    "is false, so they were blanked out instead of stopping the "
-                    "chromosome." % ("{:,}".format(n_unparseable), effect_col),
-                    before,
-                    df.height,
-                    changed=n_unparseable,
-                    warn=True,
-                    step=STEP_LABEL,
-                )
+        df = df.with_columns(numeric_effect.alias(effect_col))
+        if n_unparseable:
+            ctx.qc(
+                "effect size is a number",
+                "%s values in '%s' are not numbers. Policy 'effect.cast_strict' "
+                "is false, so they were blanked out instead of stopping the "
+                "chromosome." % ("{:,}".format(n_unparseable), effect_col),
+                df.height,
+                df.height,
+                changed=n_unparseable,
+                warn=True,
+                step=STEP_LABEL,
+            )
 
         # ------------------------------------------------------------------
         # Which decision applies?
@@ -674,7 +710,10 @@ def harmonise_effect_estimates(
             if decision_source == "automatic detection":
                 warning = _automatic_inference_warning(effect_type, evidence)
                 qc_info["effect_type_inference_warning"] = warning
-                emit_high_visibility_warning(logger, warning)
+                emit_high_visibility_warning(
+                    logger, warning,
+                    screen_message=_automatic_inference_warning(effect_type, evidence, screen=True),
+                )
 
         if evidence is None:
             evidence = {"effect_col": effect_col}
@@ -807,54 +846,12 @@ def harmonise_effect_estimates(
                         detail=detail,
                     )
 
-            if action == "keep":
-                # No blanking: log(0) is -inf and log(negative) is NaN, and the
-                # effect-statistics gate downstream is what removes them.
-                df = df.with_columns(pl.col(effect_col).log().alias("beta"))
-                if n_non_positive:
-                    ctx.qc(
-                        "non-positive odds ratios",
-                        "%s Policy 'effect.or_non_positive' is 'keep', so they were "
-                        "left in place; the logarithm is infinite or not a number "
-                        "for those variants." % (plain,),
-                        df.height,
-                        df.height,
-                        changed=n_non_positive,
-                        warn=True,
-                        step=STEP_LABEL,
-                    )
-            else:
-                # 'null' (the default, and what this module always did) and the
-                # remainder of 'reject', where the rows are already gone.
-                df = df.with_columns(
-                    pl.when(pl.col(effect_col) > 0.0)
-                    .then(pl.col(effect_col).log())
-                    .otherwise(None)
-                    .alias("beta")
-                )
-                if n_non_positive and action == "null":
-                    ctx.qc(
-                        "non-positive odds ratios",
-                        "%s Policy 'effect.or_non_positive' is 'null', so their "
-                        "effect size was blanked out and the variants kept."
-                        % (plain,),
-                        df.height,
-                        df.height,
-                        changed=n_non_positive,
-                        warn=True,
-                        step=STEP_LABEL,
-                    )
-
-            sample_column_dict["beta_col"] = "beta"
-            sample_column_dict["beta_or_col"] = "beta"
-            sample_column_dict["harmonised_effect_type"] = "beta"
-            beta_col = "beta"
-            qc_info["conversion"] = "OR_to_Beta_log_transform_applied"
-
-            # The standard error, if it arrived on the odds-ratio scale.
-            se_col = optional_text(sample_column_dict.get("se_col"))
+            # The standard error, if it arrived on the odds-ratio scale. Check
+            # this before changing the effect column so a failed declaration
+            # cannot leave a partially transformed local frame.
             rescaled = False
-            if se_col is not None and se_col in df.columns and resolved_se_scale is None:
+            se_available = se_col is not None and se_col in df.columns
+            if se_available and resolved_se_scale is None:
                 raise EffectTypeError(
                     "Chromosome %s has odds ratios and a supplied standard-error "
                     "column, but the study-level SE-scale decision is missing. Run "
@@ -862,22 +859,82 @@ def harmonise_effect_estimates(
                     "effect.se_scale to 'log_odds' or 'as_given'."
                     % chromosome
                 )
-            if resolved_se_scale == "as_given":
-                if se_col is not None and se_col in df.columns:
-                    df = df.with_columns(
-                        pl.when(pl.col(effect_col) > 0.0)
-                        .then(
-                            pl.col(se_col).cast(pl.Float64, strict=False)
-                            / pl.col(effect_col)
-                        )
-                        .otherwise(None)
-                        .alias(se_col)
+
+            # Preserve an unrelated input column literally named ``beta``.
+            # In-place conversion is safe only when that column is itself the
+            # selected OR source. The returned mapping makes the allocated
+            # working name authoritative for every downstream step.
+            beta_col = (
+                effect_col
+                if effect_col == "beta"
+                else unused_column_name("beta", df)
+            )
+            collision_avoided = beta_col != "beta"
+            if collision_avoided:
+                ctx.info(
+                    "The input already contains a column named 'beta' that is not "
+                    "the selected effect column '%s'. It was preserved; log-odds "
+                    "were written to collision-safe column '%s'."
+                    % (effect_col, beta_col)
+                )
+
+            # Polars evaluates every expression in one with_columns call from
+            # the same input frame. Both transformations therefore read the
+            # original OR even when effect_col and beta_col are both ``beta``.
+            # This is scientifically required for SE_logOR = SE_OR / OR.
+            odds_ratio = pl.col(effect_col)
+            beta_expression = (
+                odds_ratio.log()
+                if action == "keep"
+                else pl.when(odds_ratio > 0.0)
+                .then(odds_ratio.log())
+                .otherwise(None)
+            )
+            transformations = [beta_expression.alias(beta_col)]
+            if resolved_se_scale == "as_given" and se_available:
+                transformations.append(
+                    pl.when(odds_ratio > 0.0)
+                    .then(
+                        pl.col(se_col).cast(pl.Float64, strict=False)
+                        / odds_ratio
                     )
-                    rescaled = True
+                    .otherwise(None)
+                    .alias(se_col)
+                )
+                rescaled = True
+            df = df.with_columns(transformations)
+
+            if action == "keep" and n_non_positive:
+                ctx.qc(
+                    "non-positive odds ratios",
+                    "%s Policy 'effect.or_non_positive' is 'keep', so they were "
+                    "left in place; the logarithm is infinite or not a number "
+                    "for those variants." % (plain,),
+                    df.height,
+                    df.height,
+                    changed=n_non_positive,
+                    warn=True,
+                    step=STEP_LABEL,
+                )
+            elif n_non_positive and action == "null":
+                ctx.qc(
+                    "non-positive odds ratios",
+                    "%s Policy 'effect.or_non_positive' is 'null', so their "
+                    "effect size was blanked out and the variants kept."
+                    % (plain,),
+                    df.height,
+                    df.height,
+                    changed=n_non_positive,
+                    warn=True,
+                    step=STEP_LABEL,
+                )
+
+            if resolved_se_scale == "as_given":
+                if se_available:
                     ctx.info(
                         "The study-level effect.se_scale decision is '%s', so the standard error "
-                        "'%s' was divided by the odds ratio to put it on the "
-                        "log-odds scale." % (resolved_se_scale, se_col)
+                        "'%s' was divided by the original odds ratio to put it on "
+                        "the log-odds scale." % (resolved_se_scale, se_col)
                     )
                 else:
                     ctx.warn(
@@ -886,14 +943,21 @@ def harmonise_effect_estimates(
                         "standard-error column is available."
                         % (resolved_se_scale,)
                     )
+
+            sample_column_dict["beta_col"] = beta_col
+            sample_column_dict["beta_or_col"] = beta_col
+            sample_column_dict["harmonised_effect_type"] = "beta"
+            qc_info["conversion"] = "OR_to_Beta_log_transform_applied"
+            qc_info["beta_output_column"] = beta_col
+            qc_info["beta_output_name_collision_avoided"] = collision_avoided
             qc_info["se_rescaled_by_or"] = rescaled
 
             post_stats = df.select(
                 [
-                    pl.col("beta").min().alias("min_post"),
-                    pl.col("beta").max().alias("max_post"),
-                    pl.col("beta").mean().alias("mean_post"),
-                    pl.col("beta").std().alias("std_post"),
+                    pl.col(beta_col).min().alias("min_post"),
+                    pl.col(beta_col).max().alias("max_post"),
+                    pl.col(beta_col).mean().alias("mean_post"),
+                    pl.col(beta_col).std().alias("std_post"),
                 ]
             ).to_dicts()[0]
             qc_info.update(

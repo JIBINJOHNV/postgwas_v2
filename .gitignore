@@ -1,34 +1,38 @@
-# ==========================
-# Project-specific ignores
-# ==========================
+# Local hand-off and assistant backup files
+.claude_transfer/
 
-# Ignore logs
-logs/
+# PostGWAS runtime output and local scientific data
+/cache/
+/logs/
+/output/
+/results/
+/data/
+/resource_file_preparation/
+/resourse_preparation_installation/
+imputed_harmonised/
+*.log
+*.vcf.gz
+*.tsv.gz
+*.bed
+*.bim
+*.fam
 
-# Ignore large raw data files (add if exists)
-data/
-legacy/
-resource_file_preparation/
-resourse_preparation_installation/
-README.md
-
-# Ignore helper scripts if they should not be versioned
+# Local helper scripts
 installation_comans.sh
 data_resourse_preparation.sh
 
-# ==========================
-# Python
-# ==========================
+# Python caches and build products
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Byte-compiled / optimized / DLL files
 *.so
 *.dylib
-
-# Distribution / Packaging
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 build/
 dist/
 *.egg-info/
@@ -44,17 +48,7 @@ venv/
 # Jupyter checkpoints
 .ipynb_checkpoints/
 
-# ==========================
-# System / IDE files
-# ==========================
+# System and editor files
 .DS_Store
 .idea/
 .vscode/
-# PostGWAS generated outputs
-imputed_harmonised/
-*.vcf.gz
-*.tsv.gz
-*.bed
-*.bim
-*.fam
-*.log

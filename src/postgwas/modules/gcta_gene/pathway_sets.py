@@ -26,6 +26,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
+from postgwas.core.gene_coordinates import read_gene_coordinates
+from postgwas.core.gene_sets import GeneSetFormat, GeneSetRow, GeneSetSource, validate_gene_set_source
 from postgwas.core.resource_preparation import (
     ResourcePreparationError,
     create_staging_directory,
@@ -44,15 +46,6 @@ OFFICIAL_FASTBAT_DOCUMENTATION = (
 
 
 @dataclass(frozen=True)
-class Pathway:
-    index: int
-    name: str
-    description: str
-    genes: tuple[str, ...]
-    duplicate_gene_entries: int
-
-
-@dataclass(frozen=True)
 class GeneInterval:
     chromosome: str
     start: int
@@ -68,127 +61,193 @@ class ChromosomeMappingTask:
     result_cache: Path
 
 
+@dataclass(frozen=True)
+class PathwayGenePreflight:
+    """Validated GMT and coordinate data reused by pipeline preparation."""
+
+    gmt: Path
+    gene_list: Path
+    pathway_count: int
+    requested_genes: frozenset[str]
+    all_gene_coordinates: dict[str, GeneInterval]
+    gene_coordinates: dict[str, GeneInterval]
+    intervals_by_chromosome: dict[str, list[GeneInterval]]
+    gene_chromosomes: frozenset[str]
+    missing_genes: frozenset[str]
+    gmt_gene_mappability_fraction: float
+    coordinate_genes_absent_from_gmt: frozenset[str]
+    coordinate_coverage_fraction: float
+    gmt_source: GeneSetSource
+
+
 def _normalize_chromosome(value: str, policy: str) -> str:
     if policy == "strip_chr_prefix" and value.lower().startswith("chr"):
         return value[3:]
     return value
 
 
-def _iter_gmt(path: Path, duplicate_gene_policy: str) -> Iterator[Pathway]:
-    """Validate and yield one GMT pathway at a time in source order."""
-    names: set[str] = set()
-    pathway_index = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, raw in enumerate(handle, 1):
-            if not raw.strip() or raw.lstrip().startswith("#"):
-                continue
-            fields = raw.rstrip("\r\n").split("\t")
-            if len(fields) < 3:
-                raise ResourcePreparationError(
-                    f"GMT line {line_number} must contain pathway, description, "
-                    "and at least one gene"
-                )
-            name = fields[0].strip()
-            description = fields[1].strip()
-            genes = [value.strip() for value in fields[2:]]
-            if not name or any(character.isspace() for character in name):
-                raise ResourcePreparationError(
-                    f"GMT line {line_number} has an empty or whitespace-containing "
-                    "pathway ID"
-                )
-            if name == "END":
-                raise ResourcePreparationError("GMT pathway ID END is reserved by GCTA")
-            if name in names:
-                raise ResourcePreparationError(f"GMT repeats pathway ID {name!r}")
-            if any(not gene for gene in genes):
-                raise ResourcePreparationError(
-                    f"GMT pathway {name!r} contains an empty gene identifier"
-                )
-            unique_genes = tuple(dict.fromkeys(genes))
-            duplicate_count = len(genes) - len(unique_genes)
-            if duplicate_count and duplicate_gene_policy == "error":
-                raise ResourcePreparationError(
-                    f"GMT pathway {name!r} contains {duplicate_count} duplicate "
-                    "gene entries"
-                )
-            names.add(name)
-            yield Pathway(
-                pathway_index, name, description, unique_genes, duplicate_count,
-            )
-            pathway_index += 1
-    if pathway_index == 0:
-        raise ResourcePreparationError(f"GMT file contains no pathways: {path}")
+def scan_gmt_pathways(
+    path: Path, duplicate_gene_policy: str, *, evidence: GeneSetSource | None = None,
+) -> GeneSetSource:
+    """Declare fastBAT conversion's existing GMT policies to the shared reader."""
+    return validate_gene_set_source(
+        path,
+        GeneSetFormat(
+            input_format="gmt", delimiter_pattern=None, comment_prefix="#",
+            compressed=False, empty_gene_policy="reject",
+            duplicate_gene_policy=duplicate_gene_policy,
+            reject_name_whitespace=True, reserved_names=("END",),
+        ),
+        error_type=ResourcePreparationError,
+        evidence=evidence,
+    )
 
 
-def _scan_gmt(
-    path: Path, duplicate_gene_policy: str,
-) -> tuple[int, set[str]]:
-    """Count pathways and collect the unique gene universe."""
-    pathway_count = 0
-    requested_genes: set[str] = set()
-    for pathway in _iter_gmt(path, duplicate_gene_policy):
-        requested_genes.update(pathway.genes)
-        pathway_count += 1
-    return pathway_count, requested_genes
-
-
-def _read_gene_intervals(
+def validate_gene_coordinate_reference(
     path: Path,
-    requested_genes: set[str],
     allowed_chromosomes: set[str],
     chromosome_policy: str,
     window_bp: int,
-) -> tuple[dict[str, GeneInterval], dict[str, list[GeneInterval]], set[str]]:
-    genes: set[str] = set()
-    requested: dict[str, GeneInterval] = {}
-    requested_chromosomes: set[str] = set()
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, raw in enumerate(handle, 1):
-            if not raw.strip():
-                continue
-            fields = raw.split()
-            if len(fields) != 4:
-                raise ResourcePreparationError(
-                    f"gene-list line {line_number} has {len(fields)} fields; expected 4"
-                )
-            raw_chromosome, start_text, end_text, gene = fields
-            chromosome = _normalize_chromosome(raw_chromosome, chromosome_policy)
-            try:
-                start, end = int(start_text), int(end_text)
-            except ValueError as exc:
-                raise ResourcePreparationError(
-                    f"gene-list line {line_number} has non-integer coordinates"
-                ) from exc
-            if chromosome not in allowed_chromosomes:
-                raise ResourcePreparationError(
-                    f"gene-list line {line_number} has disallowed chromosome "
-                    f"{raw_chromosome!r} after configured normalization"
-                )
-            if start < 1 or end < start or not gene:
-                raise ResourcePreparationError(
-                    f"gene-list line {line_number} has invalid coordinates or gene ID"
-                )
-            if gene in genes:
-                raise ResourcePreparationError(
-                    f"gene list repeats gene identifier {gene!r}"
-                )
-            genes.add(gene)
-            if gene in requested_genes:
-                requested[gene] = GeneInterval(
-                    chromosome,
-                    max(1, start - window_bp),
-                    end + window_bp,
-                    gene,
-                )
-                requested_chromosomes.add(chromosome)
-    if not genes:
-        raise ResourcePreparationError(f"gene list contains no genes: {path}")
+    column_roles: tuple[str, ...] | list[str],
+) -> tuple[dict[str, GeneInterval], set[str]]:
+    """Validate and read every gene interval using configured column roles."""
+    required_roles = {"chromosome", "start", "end", "gene"}
+    if len(column_roles) != len(required_roles) or set(column_roles) != required_roles:
+        raise ResourcePreparationError(
+            "gene-coordinate column roles must contain chromosome, start, end, and gene"
+        )
+    genes: dict[str, GeneInterval] = {}
+    chromosomes: set[str] = set()
+    rows = read_gene_coordinates(
+        path, column_roles=column_roles,
+        error_type=ResourcePreparationError,
+    )
+    for row in rows:
+        chromosome = _normalize_chromosome(row.chromosome, chromosome_policy)
+        if chromosome not in allowed_chromosomes:
+            raise ResourcePreparationError(
+                "gene-list gene %r has disallowed chromosome %r after configured normalization"
+                % (row.gene, row.chromosome)
+            )
+        genes[row.gene] = GeneInterval(
+            chromosome, max(1, row.start - window_bp), row.end + window_bp, row.gene,
+        )
+        chromosomes.add(chromosome)
+    return genes, chromosomes
+
+
+def validate_pathway_gene_compatibility(
+    *,
+    gmt: Path,
+    gene_list: Path,
+    allowed_chromosomes: set[str],
+    chromosome_policy: str,
+    window_bp: int,
+    column_roles: tuple[str, ...] | list[str],
+    duplicate_gene_policy: str,
+    unmapped_gene_policy: str,
+    minimum_gene_id_overlap_fraction: float,
+    all_gene_coordinates: dict[str, GeneInterval] | None = None,
+    pathway_scan: GeneSetSource | None = None,
+) -> PathwayGenePreflight:
+    """Validate GMT-to-coordinate compatibility before BIM mapping starts."""
+    if not 0 < float(minimum_gene_id_overlap_fraction) <= 1:
+        raise ResourcePreparationError(
+            "minimum coordinate-reference coverage fraction must be greater "
+            "than zero and at most one"
+        )
+    if all_gene_coordinates is None:
+        all_gene_coordinates, _ = validate_gene_coordinate_reference(
+            gene_list,
+            allowed_chromosomes,
+            chromosome_policy,
+            window_bp,
+            column_roles,
+        )
+    if not all_gene_coordinates:
+        raise ResourcePreparationError(
+            "gene-coordinate reference contains no genes"
+        )
+    gmt_source = scan_gmt_pathways(gmt, duplicate_gene_policy, evidence=pathway_scan)
+    pathway_count, requested_genes = gmt_source.gene_sets, set(gmt_source.genes)
+    gene_coordinates = {
+        gene: all_gene_coordinates[gene]
+        for gene in requested_genes
+        if gene in all_gene_coordinates
+    }
+    missing_genes = requested_genes - set(gene_coordinates)
+    gmt_gene_mappability_fraction = (
+        len(gene_coordinates) / len(requested_genes)
+    )
+    coordinate_genes_absent_from_gmt = (
+        set(all_gene_coordinates) - requested_genes
+    )
+    coordinate_coverage_fraction = (
+        len(gene_coordinates) / len(all_gene_coordinates)
+    )
+    if coordinate_coverage_fraction < float(minimum_gene_id_overlap_fraction):
+        examples = ", ".join(sorted(missing_genes)[:10])
+        raise ResourcePreparationError(
+            "Coordinate-reference coverage is %d/%d (%.2f%%): these "
+            "gene-coordinate identifiers occur exactly in the GMT, below the "
+            "configured minimum of %.2f%%. GMT gene mappability is %d/%d "
+            "(%.2f%%; reported only, not used as the stopping criterion), with "
+            "%d unique GMT genes absent from the coordinate reference. "
+            "Unmatched GMT genes cannot contribute variants%s."
+            % (
+                len(gene_coordinates),
+                len(all_gene_coordinates),
+                100 * coordinate_coverage_fraction,
+                100 * float(minimum_gene_id_overlap_fraction),
+                len(gene_coordinates),
+                len(requested_genes),
+                100 * gmt_gene_mappability_fraction,
+                len(missing_genes),
+                "; examples: %s" % examples if examples else "",
+            )
+        )
+    if missing_genes and unmapped_gene_policy == "error":
+        examples = ", ".join(sorted(missing_genes)[:10])
+        raise ResourcePreparationError(
+            "%d GMT genes are absent from the coordinate list under the "
+            "configured error policy. GMT gene mappability is %d/%d (%.2f%%); "
+            "coordinate-reference coverage is %d/%d (%.2f%%). "
+            "Examples: %s"
+            % (
+                len(missing_genes),
+                len(gene_coordinates),
+                len(requested_genes),
+                100 * gmt_gene_mappability_fraction,
+                len(gene_coordinates),
+                len(all_gene_coordinates),
+                100 * coordinate_coverage_fraction,
+                examples,
+            )
+        )
     intervals: dict[str, list[GeneInterval]] = {}
-    for interval in requested.values():
+    gene_chromosomes: set[str] = set()
+    for interval in gene_coordinates.values():
         intervals.setdefault(interval.chromosome, []).append(interval)
+        gene_chromosomes.add(interval.chromosome)
     for values in intervals.values():
         values.sort(key=lambda value: (value.start, value.end, value.gene))
-    return requested, intervals, requested_chromosomes
+    return PathwayGenePreflight(
+        gmt=gmt,
+        gene_list=gene_list,
+        pathway_count=pathway_count,
+        requested_genes=frozenset(requested_genes),
+        all_gene_coordinates=all_gene_coordinates,
+        gene_coordinates=gene_coordinates,
+        intervals_by_chromosome=intervals,
+        gene_chromosomes=frozenset(gene_chromosomes),
+        missing_genes=frozenset(missing_genes),
+        gmt_gene_mappability_fraction=gmt_gene_mappability_fraction,
+        coordinate_genes_absent_from_gmt=frozenset(
+            coordinate_genes_absent_from_gmt
+        ),
+        coordinate_coverage_fraction=coordinate_coverage_fraction,
+        gmt_source=gmt_source,
+    )
 
 
 def _split_bim_for_gene_mapping(
@@ -507,14 +566,25 @@ def _iter_pathway_gene_variants(
 
 
 def _pathway_gene_groups(
-    pathway: Pathway,
-    gene_coordinates: dict[str, GeneInterval],
+    pathway: GeneSetRow,
+    source_gene_coordinates: dict[str, GeneInterval],
+    eligible_gene_coordinates: dict[str, GeneInterval],
     gene_variants: dict[str, tuple[int, ...]],
-) -> tuple[list[str], list[str], list[str]]:
-    mapped = [gene for gene in pathway.genes if gene in gene_coordinates]
-    missing = [gene for gene in pathway.genes if gene not in gene_coordinates]
-    hit = [gene for gene in mapped if gene_variants.get(gene)]
-    return mapped, missing, hit
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    mapped = [
+        gene for gene in pathway.genes if gene in source_gene_coordinates
+    ]
+    excluded = [
+        gene for gene in mapped if gene not in eligible_gene_coordinates
+    ]
+    eligible = [
+        gene for gene in mapped if gene in eligible_gene_coordinates
+    ]
+    missing = [
+        gene for gene in pathway.genes if gene not in source_gene_coordinates
+    ]
+    hit = [gene for gene in eligible if gene_variants.get(gene)]
+    return mapped, excluded, missing, hit
 
 
 def _unique_pathway_variant_indexes(
@@ -603,13 +673,21 @@ reference, harmonised GWAS, and analysis configuration must use this same
 build. A {resource['gene_window_kb']} kb window was applied to both sides of
 each gene during gene-to-variant mapping.
 
-Pathways written: {validation['pathways_written']}  
-Pathways omitted: {validation['pathways_omitted']}  
-GMT genes not found in the coordinate list: {validation['unmapped_gene_entries']}  
-Unique BIM variants written across retained pathways: {validation['unique_variants_written']}
+- Pathways written: {validation['pathways_written']}
+- Pathways omitted: {validation['pathways_omitted']}
+- GMT gene mappability: {validation['genes_with_coordinates']}/{validation['input_unique_genes']} ({100 * validation['gmt_gene_mappability_fraction']:.2f}%; reported only)
+- Coordinate-reference coverage by the GMT: {validation['genes_with_coordinates']}/{validation['gene_coordinate_reference_genes']} ({100 * validation['coordinate_reference_coverage_fraction']:.2f}%; required minimum {100 * manifest['policies']['minimum_gene_id_overlap_fraction']:.2f}%)
+- GMT genes not found in the coordinate list: {validation['unmapped_gene_entries']}
+- Coordinate-reference genes absent from the GMT: {validation['coordinate_reference_genes_absent_from_gmt']}
+- Pathways with complete/partial/no gene-ID mapping: {validation['pathways_with_complete_gene_id_mapping']}/{validation['pathways_with_partial_gene_id_mapping']}/{validation['pathways_without_gene_id_mapping']}
+- Coordinate-matched genes excluded by the configured analysis scope: {validation['genes_excluded_by_analysis_scope']}
+- Unique BIM variants written across retained pathways: {validation['unique_variants_written']}
 
-`{outputs['pathway_mapping']}` reports gene and variant counts for every input
-pathway, and `{outputs['unmapped_genes']}` records each unresolved GMT gene.
+`{outputs['pathway_mapping']}` reports gene and variant counts plus gene-ID
+mappability and analyzable-gene fractions for every input pathway, and
+`{outputs['unmapped_genes']}` records each unresolved GMT gene.
+Genes deliberately removed by the chromosome/MHC scope are counted separately
+from unresolved GMT identifiers and never appear in the generated SNP sets.
 The configured audit level is `{manifest['policies']['audit']['level']}`.
 Normalized audit output stores pathway-to-gene and gene-to-BIM-ID relationships
 once in Parquet instead of repeating them for every pathway-gene-variant
@@ -629,15 +707,22 @@ Format source:
 def prepare_resource(
     args: argparse.Namespace,
     *,
+    pathway_gene_preflight: PathwayGenePreflight | None = None,
     stage_progress: StageProgress | None = None,
+    pipeline_args=None,
+    pipeline_logger=None,
+    measured_progress_enabled: bool | None = None,
     bim_variant_total: int | None = None,
     progress_refresh_seconds: float | None = None,
     mapping_workers: int,
     mapping_memory_gb: float,
     worker_memory_multiplier: float,
+    minimum_gene_id_overlap_fraction: float,
     bim_ids_prevalidated: bool = False,
     analyzable_variant_ids: set[str] | None = None,
     analysis_variant_source: Path | None = None,
+    excluded_gene_ids: set[str] | None = None,
+    analysis_scope: dict | None = None,
     maximum_set_variants: int,
     oversized_set_policy: str,
     audit_level: str,
@@ -647,8 +732,18 @@ def prepare_resource(
     minimum_free_disk_gb: float,
     disk_estimation_safety_factor: float,
 ) -> dict:
+    from postgwas.modules.gcta_gene.stages import (
+        complete_pipeline_stage,
+        start_pipeline_stage,
+    )
+
     progress = stage_progress or StageProgress(
         "GMT-to-fastBAT preparation", enabled=False,
+    )
+    show_measured_progress = (
+        progress.enabled
+        if measured_progress_enabled is None
+        else bool(measured_progress_enabled)
     )
     with progress.step(1, 8, "Validate inputs and scan GMT pathways"):
         gmt = required_file(args.gmt, "GMT pathway file")
@@ -727,7 +822,7 @@ def prepare_resource(
             raise ResourcePreparationError(
                 "disk estimation safety factor must be at least one"
             )
-        if progress.enabled and (
+        if show_measured_progress and (
             progress_refresh_seconds is None
             or float(progress_refresh_seconds) <= 0
         ):
@@ -737,26 +832,79 @@ def prepare_resource(
         allowed_chromosomes = unique_nonempty_values(
             args.allowed_chromosomes, "--allowed-chromosomes",
         )
-        pathway_count, requested_genes = _scan_gmt(
-            gmt, args.duplicate_gene_policy,
-        )
+        if pathway_gene_preflight is not None:
+            if (
+                pathway_gene_preflight.gmt != gmt
+                or pathway_gene_preflight.gene_list != gene_list
+            ):
+                raise ResourcePreparationError(
+                    "validated pathway/gene preflight does not match the current inputs"
+                )
+            pathway_count = pathway_gene_preflight.pathway_count
+            requested_genes = set(pathway_gene_preflight.requested_genes)
+            gmt_source = scan_gmt_pathways(
+                gmt, args.duplicate_gene_policy, evidence=pathway_gene_preflight.gmt_source,
+            )
+        else:
+            gmt_source = scan_gmt_pathways(
+                gmt, args.duplicate_gene_policy,
+            )
+            pathway_count, requested_genes = gmt_source.gene_sets, set(gmt_source.genes)
 
     with progress.step(2, 8, "Resolve genes and apply configured boundaries"):
         window_bp = args.gene_window_kb * 1000
-        gene_coordinates, intervals, gene_chromosomes = _read_gene_intervals(
-            gene_list,
-            requested_genes,
-            allowed_chromosomes,
-            args.chromosome_label_policy,
-            window_bp,
+        preflight = pathway_gene_preflight or validate_pathway_gene_compatibility(
+            gmt=gmt,
+            gene_list=gene_list,
+            allowed_chromosomes=allowed_chromosomes,
+            chromosome_policy=args.chromosome_label_policy,
+            window_bp=window_bp,
+            column_roles=args.gene_columns,
+            duplicate_gene_policy=args.duplicate_gene_policy,
+            unmapped_gene_policy=args.unmapped_gene_policy,
+            minimum_gene_id_overlap_fraction=(
+                minimum_gene_id_overlap_fraction
+            ),
+            pathway_scan=gmt_source,
         )
-        missing_genes = requested_genes - set(gene_coordinates)
-        if missing_genes and args.unmapped_gene_policy == "error":
-            examples = ", ".join(sorted(missing_genes)[:10])
+        if not math.isclose(
+            preflight.gmt_gene_mappability_fraction,
+            len(preflight.gene_coordinates) / len(preflight.requested_genes),
+        ):
             raise ResourcePreparationError(
-                f"{len(missing_genes)} GMT genes are absent from the coordinate list; "
-                f"examples: {examples}"
+                "validated pathway/gene overlap metrics are internally inconsistent"
             )
+        if not math.isclose(
+            preflight.coordinate_coverage_fraction,
+            len(preflight.gene_coordinates) / len(preflight.all_gene_coordinates),
+        ):
+            raise ResourcePreparationError(
+                "validated coordinate-reference coverage metrics are internally "
+                "inconsistent"
+            )
+        source_gene_coordinates = preflight.gene_coordinates
+        configured_excluded_gene_ids = set(excluded_gene_ids or ())
+        excluded_coordinate_genes = (
+            set(source_gene_coordinates) & configured_excluded_gene_ids
+        )
+        gene_coordinates = {
+            gene: interval
+            for gene, interval in source_gene_coordinates.items()
+            if gene not in excluded_coordinate_genes
+        }
+        if not gene_coordinates:
+            raise ResourcePreparationError(
+                "configured chromosome and MHC policies exclude every GMT gene "
+                "represented in the coordinate reference"
+            )
+        intervals: dict[str, list[GeneInterval]] = {}
+        gene_chromosomes: set[str] = set()
+        for interval in gene_coordinates.values():
+            intervals.setdefault(interval.chromosome, []).append(interval)
+            gene_chromosomes.add(interval.chromosome)
+        for values in intervals.values():
+            values.sort(key=lambda value: (value.start, value.end, value.gene))
+        missing_genes = set(preflight.missing_genes)
 
     staging: Path | None = None
     active_output_path: Path | None = None
@@ -764,12 +912,16 @@ def prepare_resource(
     retained_pathways = 0
     disk_preflight: dict = {}
     try:
+        if pipeline_args is not None:
+            start_pipeline_stage(
+                pipeline_args, "map_variants", pipeline_logger,
+            )
         with progress.step(3, 8, "Map analyzable BIM variants to genes"):
             staging = create_staging_directory(output_directory)
             mapping_workspace = Path(tempfile.mkdtemp(dir=staging))
             mapping_progress = MeasuredProgress(
                 "BIM-to-pathway mapping progress",
-                enabled=progress.enabled,
+                enabled=show_measured_progress,
             )
             mapping_title = "Map analyzable BIM variants to genes"
             mapping_progress.start(mapping_title, total=bim_variant_total)
@@ -837,29 +989,93 @@ def prepare_resource(
                     title="Validate BIM-to-pathway mapping",
                 )
 
+        if pipeline_args is not None:
+            complete_pipeline_stage(
+                pipeline_args,
+                "map_variants",
+                outcome_fields=[
+                    ("count", "PLINK BIM variants scanned", bim_metrics["bim_variants"]),
+                    (
+                        "count", "Analyzable BIM variants cached",
+                        bim_metrics["analyzable_bim_variants_cached"],
+                    ),
+                    (
+                        "success", "Variants mapped to matched genes",
+                        bim_metrics["bim_variants_mapped_to_requested_genes"],
+                    ),
+                    (
+                        "genetic", "Genes with at least one analyzable variant",
+                        len(bim_metrics["genes_with_at_least_one_bim_variant"]),
+                    ),
+                    (
+                        "genetic", "Shared chromosomes",
+                        ", ".join(sorted(shared_chromosomes)),
+                    ),
+                ],
+                logger=pipeline_logger,
+            )
+            start_pipeline_stage(
+                pipeline_args, "candidate_memberships", pipeline_logger,
+            )
+
         with progress.step(4, 8, "Validate pathway-to-variant memberships"):
             mapping_rows: list[dict] = []
             unmapped_entry_count = 0
             empty: list[str] = []
-            for pathway in _iter_gmt(gmt, args.duplicate_gene_policy):
-                mapped_genes, missing, hit_genes = _pathway_gene_groups(
-                    pathway, gene_coordinates, gene_variants,
+            pathways_with_complete_gene_id_mapping = 0
+            pathways_with_partial_gene_id_mapping = 0
+            pathways_without_gene_id_mapping = 0
+            for pathway in gmt_source.rows(error_type=ResourcePreparationError):
+                mapped_genes, excluded_genes, missing, hit_genes = (
+                    _pathway_gene_groups(
+                        pathway,
+                        source_gene_coordinates,
+                        gene_coordinates,
+                        gene_variants,
+                    )
                 )
                 status = "retained" if hit_genes else "omitted_empty"
                 if not hit_genes:
                     empty.append(pathway.name)
+                input_gene_count = len(pathway.genes)
+                mapped_gene_count = len(mapped_genes)
+                if mapped_gene_count == input_gene_count:
+                    pathways_with_complete_gene_id_mapping += 1
+                elif mapped_gene_count:
+                    pathways_with_partial_gene_id_mapping += 1
+                else:
+                    pathways_without_gene_id_mapping += 1
                 mapping_rows.append({
                     "pathway": pathway.name,
                     "description": pathway.description,
                     "input_genes": len(pathway.genes),
                     "duplicate_gene_entries_removed": pathway.duplicate_gene_entries,
-                    "genes_with_coordinates": len(mapped_genes),
+                    "genes_with_coordinates": mapped_gene_count,
+                    "gene_id_mappability_fraction": (
+                        mapped_gene_count / input_gene_count
+                    ),
+                    "genes_excluded_by_analysis_scope": len(excluded_genes),
+                    "genes_eligible_for_analysis": (
+                        len(mapped_genes) - len(excluded_genes)
+                    ),
                     "genes_with_analyzable_variants": len(hit_genes),
+                    "analyzable_gene_fraction": (
+                        len(hit_genes) / input_gene_count
+                    ),
                     "unmapped_genes": len(missing),
                     "unique_analyzable_variants": 0,
                     "status": status,
                 })
                 unmapped_entry_count += len(missing)
+            if (
+                pathways_with_complete_gene_id_mapping
+                + pathways_with_partial_gene_id_mapping
+                + pathways_without_gene_id_mapping
+                != pathway_count
+            ):
+                raise ResourcePreparationError(
+                    "pathway gene-ID mapping counts are internally inconsistent"
+                )
             if empty and args.empty_pathway_policy == "error":
                 examples = ", ".join(empty[:10])
                 raise ResourcePreparationError(
@@ -870,6 +1086,62 @@ def prepare_resource(
                 raise ResourcePreparationError(
                     "no pathways retain analyzable BIM variants"
                 )
+
+        if pipeline_args is not None:
+            complete_pipeline_stage(
+                pipeline_args,
+                "candidate_memberships",
+                outcome_fields=[
+                    ("count", "Input pathways", pathway_count),
+                    (
+                        "success", "Candidate non-empty pathways",
+                        pathway_count - len(empty),
+                    ),
+                    (
+                        "warning" if empty else "success",
+                        "Pathways without analyzable variants", len(empty),
+                    ),
+                    (
+                        "success",
+                        "Pathways with complete gene-ID mapping",
+                        pathways_with_complete_gene_id_mapping,
+                    ),
+                    (
+                        "warning"
+                        if pathways_with_partial_gene_id_mapping else "success",
+                        "Pathways with partial gene-ID mapping",
+                        pathways_with_partial_gene_id_mapping,
+                    ),
+                    (
+                        "warning" if pathways_without_gene_id_mapping else "success",
+                        "Pathways without gene-ID mapping",
+                        pathways_without_gene_id_mapping,
+                    ),
+                    (
+                        "success",
+                        "Pathway genes represented in coordinate reference",
+                        len(source_gene_coordinates),
+                    ),
+                    (
+                        "warning" if excluded_coordinate_genes else "success",
+                        "Matched genes excluded by analysis scope",
+                        len(excluded_coordinate_genes),
+                    ),
+                    (
+                        "success",
+                        "Matched genes eligible for analysis",
+                        len(gene_coordinates),
+                    ),
+                    (
+                        "warning" if missing_genes else "success",
+                        "Unmatched pathway genes", len(missing_genes),
+                    ),
+                ],
+                logger=pipeline_logger,
+            )
+            start_pipeline_stage(
+                pipeline_args, "set_policies", pipeline_logger,
+            )
 
         with progress.step(5, 8, "Preflight pathway sizes and disk requirements"):
             retained_genes: set[str] = set()
@@ -885,12 +1157,15 @@ def prepare_resource(
             expanded_raw_bytes = _tsv_row_bytes(
                 "pathway", "gene", "variant_id",
             )
-            for pathway in _iter_gmt(gmt, args.duplicate_gene_policy):
+            for pathway in gmt_source.rows(error_type=ResourcePreparationError):
                 row = mapping_rows[pathway.index]
                 if row["status"] != "retained":
                     continue
-                _, _, hit_genes = _pathway_gene_groups(
-                    pathway, gene_coordinates, gene_variants,
+                _, _, _, hit_genes = _pathway_gene_groups(
+                    pathway,
+                    source_gene_coordinates,
+                    gene_coordinates,
+                    gene_variants,
                 )
                 unique_indexes = list(_unique_pathway_variant_indexes(
                     hit_genes, gene_variants,
@@ -963,14 +1238,20 @@ def prepare_resource(
             mapping_columns = [
                 "pathway", "description", "input_genes",
                 "duplicate_gene_entries_removed", "genes_with_coordinates",
-                "genes_with_analyzable_variants", "unmapped_genes",
+                "gene_id_mappability_fraction",
+                "genes_excluded_by_analysis_scope", "genes_eligible_for_analysis",
+                "genes_with_analyzable_variants", "analyzable_gene_fraction",
+                "unmapped_genes",
                 "unique_analyzable_variants", "status",
             ]
             mapping_text = _table_text(mapping_columns, mapping_rows)
             unmapped_raw_bytes = _tsv_row_bytes("pathway", "gene")
-            for pathway in _iter_gmt(gmt, args.duplicate_gene_policy):
-                _, missing, _ = _pathway_gene_groups(
-                    pathway, gene_coordinates, gene_variants,
+            for pathway in gmt_source.rows(error_type=ResourcePreparationError):
+                _, _, missing, _ = _pathway_gene_groups(
+                    pathway,
+                    source_gene_coordinates,
+                    gene_coordinates,
+                    gene_variants,
                 )
                 unmapped_raw_bytes += sum(
                     _tsv_row_bytes(pathway.name, gene) for gene in missing
@@ -1074,7 +1355,7 @@ def prepare_resource(
                 relationship_writers.append(expanded_writer)
             writing_progress = MeasuredProgress(
                 "fastBAT pathway writing progress",
-                enabled=progress.enabled,
+                enabled=show_measured_progress,
             )
             writing_title = "Write validated pathway sets"
             writing_progress.start(writing_title, total=retained_pathways)
@@ -1082,11 +1363,14 @@ def prepare_resource(
             try:
                 active_output_path = output_file
                 with output_file.open("w", encoding="utf-8") as set_handle:
-                    for pathway in _iter_gmt(gmt, args.duplicate_gene_policy):
+                    for pathway in gmt_source.rows(error_type=ResourcePreparationError):
                         if mapping_rows[pathway.index]["status"] != "retained":
                             continue
-                        _, _, hit_genes = _pathway_gene_groups(
-                            pathway, gene_coordinates, gene_variants,
+                        _, _, _, hit_genes = _pathway_gene_groups(
+                            pathway,
+                            source_gene_coordinates,
+                            gene_coordinates,
+                            gene_variants,
                         )
                         unique_indexes = list(_unique_pathway_variant_indexes(
                             hit_genes, gene_variants,
@@ -1159,9 +1443,12 @@ def prepare_resource(
             with unmapped_file.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.writer(handle, delimiter="\t")
                 writer.writerow(["pathway", "gene"])
-                for pathway in _iter_gmt(gmt, args.duplicate_gene_policy):
-                    _, missing, _ = _pathway_gene_groups(
-                        pathway, gene_coordinates, gene_variants,
+                for pathway in gmt_source.rows(error_type=ResourcePreparationError):
+                    _, _, missing, _ = _pathway_gene_groups(
+                        pathway,
+                        source_gene_coordinates,
+                        gene_coordinates,
+                        gene_variants,
                     )
                     writer.writerows((pathway.name, gene) for gene in missing)
             unique_variants_written = sum(unique_variant_flags)
@@ -1187,7 +1474,7 @@ def prepare_resource(
                 "checksums": args.checksums_name,
             }
             manifest = {
-                "schema_version": "gcta_fastbat_pathway_resource.v2",
+                "schema_version": "gcta_fastbat_pathway_resource.v6",
                 "resource": {
                     "name": args.resource_name,
                     "genome_build": args.genome_build,
@@ -1224,6 +1511,9 @@ def prepare_resource(
                     "chromosome_label_policy": args.chromosome_label_policy,
                     "duplicate_gene_policy": args.duplicate_gene_policy,
                     "unmapped_gene_policy": args.unmapped_gene_policy,
+                    "minimum_gene_id_overlap_fraction": float(
+                        minimum_gene_id_overlap_fraction
+                    ),
                     "empty_pathway_policy": args.empty_pathway_policy,
                     "oversized_set_policy": oversized_set_policy,
                     "maximum_set_variants": int(maximum_set_variants),
@@ -1233,6 +1523,7 @@ def prepare_resource(
                         if analyzable_variant_ids is not None
                         else "plink_bim_reference"
                     ),
+                    "analysis_scope": analysis_scope,
                     "audit": {
                         "level": audit_level,
                         "format": audit_format,
@@ -1256,9 +1547,38 @@ def prepare_resource(
                     "pathways_omitted_empty": len(empty),
                     "pathways_omitted_oversized": len(oversized),
                     "input_unique_genes": len(requested_genes),
-                    "genes_with_coordinates": len(gene_coordinates),
+                    "genes_with_coordinates": len(source_gene_coordinates),
+                    "genes_eligible_for_analysis": len(gene_coordinates),
+                    "genes_excluded_by_analysis_scope": len(
+                        excluded_coordinate_genes
+                    ),
+                    "gmt_gene_mappability_fraction": (
+                        preflight.gmt_gene_mappability_fraction
+                    ),
+                    "gene_coordinate_reference_genes": len(
+                        preflight.all_gene_coordinates
+                    ),
+                    "coordinate_reference_coverage_fraction": (
+                        preflight.coordinate_coverage_fraction
+                    ),
+                    "coordinate_reference_genes_absent_from_gmt": len(
+                        preflight.coordinate_genes_absent_from_gmt
+                    ),
+                    "gene_coordinate_chromosomes": sorted({
+                        interval.chromosome
+                        for interval in preflight.all_gene_coordinates.values()
+                    }),
                     "unmapped_unique_genes": len(missing_genes),
                     "unmapped_gene_entries": unmapped_entry_count,
+                    "pathways_with_complete_gene_id_mapping": (
+                        pathways_with_complete_gene_id_mapping
+                    ),
+                    "pathways_with_partial_gene_id_mapping": (
+                        pathways_with_partial_gene_id_mapping
+                    ),
+                    "pathways_without_gene_id_mapping": (
+                        pathways_without_gene_id_mapping
+                    ),
                     "bim_variants": bim_metrics["bim_variants"],
                     "analyzable_bim_variants_cached": bim_metrics[
                         "analyzable_bim_variants_cached"
@@ -1334,6 +1654,29 @@ def prepare_resource(
 
         with progress.step(8, 8, "Publish validated pathway resource"):
             staging.replace(output_directory)
+        if pipeline_args is not None:
+            complete_pipeline_stage(
+                pipeline_args,
+                "set_policies",
+                outcome_fields=[
+                    ("count", "Input pathways", pathway_count),
+                    ("success", "Final fastBAT sets written", retained_pathways),
+                    (
+                        "warning" if empty else "success",
+                        "Empty pathways omitted", len(empty),
+                    ),
+                    (
+                        "warning" if oversized else "success",
+                        "Oversized pathways omitted", len(oversized),
+                    ),
+                    ("count", "Unique variants written", unique_variants_written),
+                    (
+                        "success", "Validated pathway resource",
+                        str(output_directory / args.output_name),
+                    ),
+                ],
+                logger=pipeline_logger,
+            )
     except BaseException as exc:
         disk_full = (
             isinstance(exc, OSError) and exc.errno == errno.ENOSPC
@@ -1443,6 +1786,7 @@ def main(argv: list[str] | None = None) -> int:
     args.manifest_name = names.manifest
     args.readme_name = names.readme
     args.checksums_name = names.checksums
+    args.gene_columns = configuration.modules.gcta_gene.gene_annotation.columns
     for value in (args.output_name, args.resource_name, args.genome_build):
         if not str(value).strip():
             parser.error("output name, resource name, and genome build must be non-empty")
@@ -1457,6 +1801,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
             worker_memory_multiplier=(
                 conversion.parallelism.worker_memory_multiplier
+            ),
+            minimum_gene_id_overlap_fraction=(
+                conversion.minimum_gene_id_overlap_fraction
             ),
             maximum_set_variants=(
                 configuration.modules.gcta_gene.set_annotation.maximum_set_variants
@@ -1489,3 +1836,12 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+__all__ = [
+    "PathwayGenePreflight",
+    "prepare_resource",
+    "scan_gmt_pathways",
+    "validate_gene_coordinate_reference",
+    "validate_pathway_gene_compatibility",
+]

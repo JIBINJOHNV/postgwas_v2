@@ -10,7 +10,7 @@ from postgwas.config import (
     load_run_configuration_for_module,
     write_resolved_configuration,
 )
-from postgwas.config.cli_overrides import explicit_overrides
+from postgwas.config.cli_overrides import explicit_overrides, get_dotted
 from postgwas.config.models.modules.single_cell import (
     single_cell_supporting_configurations,
 )
@@ -20,70 +20,123 @@ from postgwas.core.paths import (
     validate_filename_component,
 )
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
+from postgwas.core.preflight import (
+    PipelinePreflightEvidence,
+    pipeline_preflight_evidence,
+    require_pipeline_input_vcf,
+)
+from postgwas.core.required_arguments import RequiredArgument, require_resolved_arguments
 from postgwas.modules.single_cell.errors import SingleCellError
 from postgwas.modules.single_cell.methods.base import MethodRunContext
 from postgwas.modules.single_cell.methods.registry import get_single_cell_methods
 
 
+_MODULE_OPTION_PATHS = {
+    "tools": "tools",
+    "magma_gene_results_file": (
+        "magma_celltype.input.gene_results_file"
+    ),
+    "single_cell_covariates": (
+        "magma_celltype.input.covariates_file"
+    ),
+    "average_property": "magma_celltype.average_property",
+    "cell_type_correction": "multiple_testing.methods",
+    "primary_cell_type_correction": (
+        "multiple_testing.primary_method"
+    ),
+    "cell_type_significance_threshold": (
+        "multiple_testing.significance_threshold"
+    ),
+    "scdrs_h5ad_file": "scdrs.input.h5ad_file",
+    "scdrs_gene_set_file": "scdrs.input.gene_set_file",
+    "scdrs_magma_gene_results_file": (
+        "scdrs.input.magma_gene_results_file"
+    ),
+    "scdrs_gene_id_map": "scdrs.input.gene_identifier_map_file",
+    "scdrs_covariate_file": "scdrs.input.covariate_file",
+    "scdrs_gene_set_source": "scdrs.magma_gene_set.source",
+    "scdrs_source_gene_id_type": (
+        "scdrs.magma_gene_set.source_identifier_type"
+    ),
+    "scdrs_target_gene_id_type": (
+        "scdrs.magma_gene_set.target_identifier_type"
+    ),
+    "scdrs_h5ad_species": "scdrs.h5ad_species",
+    "scdrs_gene_set_species": "scdrs.gene_set_species",
+    "scdrs_matrix_state": "scdrs.matrix_state",
+    "scdrs_group_analysis": "scdrs.downstream.group_analysis",
+    "scdrs_correlation_analysis": (
+        "scdrs.downstream.correlation_analysis"
+    ),
+    "scdrs_gene_analysis": "scdrs.downstream.gene_analysis",
+    "scdrs_control_gene_sets": "scdrs.control_gene_sets",
+    "ldsc_celltype_sumstats_file": "ldsc_celltype.input.sumstats_file",
+    "ldsc_celltype_ldcts_file": "ldsc_celltype.input.ldcts_file",
+    "ldsc_celltype_baseline_prefix": (
+        "ldsc_celltype.input.baseline_ld_prefixes"
+    ),
+    "ldsc_celltype_weights_prefix": (
+        "ldsc_celltype.input.weights_ld_prefix"
+    ),
+    "ldsc_celltype_merge_alleles_file": (
+        "ldsc_celltype.input.merge_alleles_file"
+    ),
+    "ldsc_celltype_sumstats_source": "ldsc_celltype.input.source",
+    "ldsc_celltype_genome_build": "ldsc_celltype.genome_build",
+    "ldsc_celltype_population": "ldsc_celltype.population",
+}
+
+
+def single_cell_required_arguments(configuration, *, pipeline=False, args=None):
+    """Describe mode-specific inputs before any reference or native-tool work.
+
+    Pipeline bindings deliberately supply MAGMA gene sets and formatter tables,
+    never the biological atlas, crosswalk, or LD-score reference annotations.
+    """
+    module = configuration.modules.single_cell
+
+    def value(destination):
+        if args is not None and getattr(args, destination, None) is not None:
+            return getattr(args, destination)
+        return get_dotted(module, _MODULE_OPTION_PATHS[destination])
+
+    destinations = []
+    for tool in value("tools"):
+        if tool == "magma_celltype":
+            destinations.append("single_cell_covariates")
+            if not pipeline:
+                destinations.append("magma_gene_results_file")
+        elif tool == "scdrs":
+            destinations.append("scdrs_h5ad_file")
+            if pipeline or value("scdrs_gene_set_source") == "magma":
+                if module.scdrs.magma_gene_set.mapping_mode == "crosswalk":
+                    destinations.append("scdrs_gene_id_map")
+                if not pipeline:
+                    destinations.append("scdrs_magma_gene_results_file")
+            else:
+                destinations.append("scdrs_gene_set_file")
+        elif tool == "ldsc_celltype":
+            destinations.extend((
+                "ldsc_celltype_ldcts_file", "ldsc_celltype_baseline_prefix",
+                "ldsc_celltype_weights_prefix",
+            ))
+            if pipeline or value("ldsc_celltype_sumstats_source") == "formatter":
+                destinations.append("ldsc_celltype_merge_alleles_file")
+            if not pipeline:
+                destinations.append("ldsc_celltype_sumstats_file")
+    return tuple(
+        RequiredArgument(
+            "--" + destination.replace("_", "-"),
+            "modules.single_cell." + _MODULE_OPTION_PATHS[destination],
+            value(destination) or None,
+        )
+        for destination in destinations
+    )
+
+
 def resolve_single_cell_configuration(args: argparse.Namespace):
     """Resolve the effective single-cell settings and explicit CLI overrides."""
-    module_overrides = explicit_overrides(
-        args,
-        {
-            "tools": "tools",
-            "magma_gene_results_file": (
-                "magma_celltype.input.gene_results_file"
-            ),
-            "single_cell_covariates": (
-                "magma_celltype.input.covariates_file"
-            ),
-            "average_property": "magma_celltype.average_property",
-            "cell_type_correction": "multiple_testing.methods",
-            "primary_cell_type_correction": (
-                "multiple_testing.primary_method"
-            ),
-            "cell_type_significance_threshold": (
-                "multiple_testing.significance_threshold"
-            ),
-            "scdrs_h5ad_file": "scdrs.input.h5ad_file",
-            "scdrs_gene_set_file": "scdrs.input.gene_set_file",
-            "scdrs_magma_gene_results_file": (
-                "scdrs.input.magma_gene_results_file"
-            ),
-            "scdrs_gene_id_map": "scdrs.input.gene_identifier_map_file",
-            "scdrs_covariate_file": "scdrs.input.covariate_file",
-            "scdrs_gene_set_source": "scdrs.magma_gene_set.source",
-            "scdrs_source_gene_id_type": (
-                "scdrs.magma_gene_set.source_identifier_type"
-            ),
-            "scdrs_target_gene_id_type": (
-                "scdrs.magma_gene_set.target_identifier_type"
-            ),
-            "scdrs_h5ad_species": "scdrs.h5ad_species",
-            "scdrs_gene_set_species": "scdrs.gene_set_species",
-            "scdrs_matrix_state": "scdrs.matrix_state",
-            "scdrs_group_analysis": "scdrs.downstream.group_analysis",
-            "scdrs_correlation_analysis": (
-                "scdrs.downstream.correlation_analysis"
-            ),
-            "scdrs_gene_analysis": "scdrs.downstream.gene_analysis",
-            "scdrs_control_gene_sets": "scdrs.control_gene_sets",
-            "ldsc_celltype_sumstats_file": "ldsc_celltype.input.sumstats_file",
-            "ldsc_celltype_ldcts_file": "ldsc_celltype.input.ldcts_file",
-            "ldsc_celltype_baseline_prefix": (
-                "ldsc_celltype.input.baseline_ld_prefixes"
-            ),
-            "ldsc_celltype_weights_prefix": (
-                "ldsc_celltype.input.weights_ld_prefix"
-            ),
-            "ldsc_celltype_merge_alleles_file": (
-                "ldsc_celltype.input.merge_alleles_file"
-            ),
-            "ldsc_celltype_sumstats_source": "ldsc_celltype.input.source",
-            "ldsc_celltype_genome_build": "ldsc_celltype.genome_build",
-            "ldsc_celltype_population": "ldsc_celltype.population",
-        },
-    )
+    module_overrides = explicit_overrides(args, _MODULE_OPTION_PATHS)
     global_overrides = explicit_overrides(
         args,
         {
@@ -202,8 +255,8 @@ def _configured_paths(output: Path, dataset: str, module) -> dict[str, Path]:
     return paths
 
 
-def _fallback_log(args: argparse.Namespace, exc: BaseException) -> None:
-    fallback = load_configuration()
+def _fallback_log(args: argparse.Namespace, exc: BaseException, configuration=None) -> None:
+    fallback = configuration if configuration is not None else load_configuration()
     output = Path(
         getattr(args, "output_directory", None) or fallback.run.output_directory
     ).expanduser().resolve()
@@ -233,10 +286,19 @@ def _fallback_log(args: argparse.Namespace, exc: BaseException) -> None:
     )
 
 
-def preflight_single_cell_pipeline(args: argparse.Namespace) -> None:
+def preflight_single_cell_pipeline(
+    args: argparse.Namespace,
+    *,
+    preflight_evidence=None,
+) -> PipelinePreflightEvidence:
     """Validate each selected method before upstream GWAS work starts."""
+    require_pipeline_input_vcf(preflight_evidence)
+    configuration = None
     try:
         configuration = resolve_single_cell_configuration(args)
+        require_resolved_arguments(
+            single_cell_required_arguments(configuration, pipeline=True),
+        )
         methods = get_single_cell_methods(
             configuration.modules.single_cell.tools
         )
@@ -246,10 +308,20 @@ def preflight_single_cell_pipeline(args: argparse.Namespace) -> None:
         methods = get_single_cell_methods(
             configuration.modules.single_cell.tools
         )
-        for method in methods:
-            method.preflight_pipeline(args, configuration)
+        method_evidence = {
+            method.name: method.preflight_pipeline(args, configuration)
+            for method in methods
+        }
+        return pipeline_preflight_evidence(
+            "single_cell",
+            preflight_evidence,
+            resources={"configuration": configuration, "methods": method_evidence},
+            deferred_checks=(
+                "Validate pipeline-generated method-specific association inputs.",
+            ),
+        )
     except BaseException as exc:
-        _fallback_log(args, exc)
+        _fallback_log(args, exc, configuration)
         raise
 
 
@@ -298,8 +370,10 @@ def _publish_context(ctx, result: ModuleResult) -> None:
 
 def run_single_cell_direct(args: argparse.Namespace, ctx=None) -> ModuleResult:
     """Run selected methods from their exact direct or pipeline-supplied inputs."""
+    configuration = None
     try:
         configuration = resolve_single_cell_configuration(args)
+        require_resolved_arguments(single_cell_required_arguments(configuration))
         module = configuration.modules.single_cell
         output = Path(configuration.run.output_directory).expanduser().resolve()
         dataset = validate_filename_component(
@@ -314,7 +388,7 @@ def run_single_cell_direct(args: argparse.Namespace, ctx=None) -> ModuleResult:
             for method in methods
         }
     except BaseException as exc:
-        _fallback_log(args, exc)
+        _fallback_log(args, exc, configuration)
         raise
 
     logger = PipelineLogger(
@@ -392,4 +466,5 @@ __all__ = [
     "preflight_single_cell_pipeline",
     "resolve_single_cell_configuration",
     "run_single_cell_direct",
+    "single_cell_required_arguments",
 ]

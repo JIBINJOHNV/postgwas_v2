@@ -11,12 +11,48 @@ MISSING_TEXT = frozenset({
 })
 
 
+def missing_tokens(
+    values: Any = (),
+    *,
+    include_standard: bool = True,
+    exact: bool = False,
+) -> tuple[str, ...]:
+    """Return one deterministic missing-token vocabulary for a caller's context.
+
+    Normal text handling strips and upper-cases tokens. Table readers can pass
+    ``exact=True`` to preserve the configured, case-sensitive source tokens and
+    ``include_standard=False`` when adding scalar placeholders globally would
+    be unsafe for scientific fields such as indel alleles.
+    """
+    if values is None:
+        configured = ()
+    elif isinstance(values, (str, bytes)):
+        configured = (values,)
+    else:
+        try:
+            configured = tuple(values)
+        except TypeError:
+            configured = (values,)
+
+    supplied = tuple(sorted(MISSING_TEXT)) if include_standard else ()
+    tokens = []
+    for value in supplied + configured:
+        if value is None:
+            continue
+        text = str(value)
+        if not exact:
+            text = text.strip().upper()
+        if text not in tokens:
+            tokens.append(text)
+    return tuple(tokens)
+
+
 def optional_text(value: Any) -> str | None:
     """Return stripped text, or ``None`` for standard missing placeholders."""
     if value is None:
         return None
     text = str(value).strip()
-    return None if text.upper() in MISSING_TEXT else text
+    return None if text.upper() in missing_tokens() else text
 
 
 def parse_integer(value: Any) -> int | None:
@@ -94,6 +130,7 @@ __all__ = [
     "format_fraction_percentage",
     "format_number",
     "format_percentage",
+    "missing_tokens",
     "optional_text",
     "parse_integer",
 ]

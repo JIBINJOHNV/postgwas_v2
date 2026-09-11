@@ -68,7 +68,7 @@ Use the sample-sheet column names shown below. Do not add unsupported columns.
 | `standard_error_column` | Optional | Input standard-error column. PostGWAS can derive SE from other valid mapped statistics when the selected policy permits it. |
 | `z_score_column` | Alternative effect mapping | Input Z-score column. Supply this when `effect_column` is absent. |
 | `p_value_column` | Required | Input association P-value column. Its representation is declared by `p_value_type`. |
-| `p_value_type` | Optional/inferred | `raw`, `neglog10`, `negln`, or `auto`. Recognized aliases include `pvalue`, `-log10p`, `mlogp`, and `-ln`. |
+| `p_value_type` | Optional/inferred | `raw`, `neglog10`, or `auto`. Recognized aliases include `pvalue`, `-log10p`, and `mlogp`. Signed logarithms and natural-log representations must be converted to raw P or non-negative -log10 P first. |
 | `control_count_column` | At least one control/N source is required | Input column containing total analyzed N for quantitative traits or control N for case-control traits. Use this for per-variant counts. |
 | `control_count` | At least one control/N source is required | Positive whole-number constant used as total analyzed N for quantitative traits or control N for case-control traits. Use this when the count is the same for all variants. |
 | `case_count_column` | Required for case-control traits unless constant supplied | Input column containing case N. Use this for per-variant counts. Quantitative traits must not provide case-count fields. |

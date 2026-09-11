@@ -87,9 +87,10 @@ duplicate analysis.
 Development and diagnostic scripts belong in top-level `tools/`, not in the
 installable package. Module documentation belongs in `docs/modules/`.
 
-Historical, duplicate, incomplete, and experimental files that are retained
-for reference live under top-level `legacy/`. Production code, tests, package
-metadata, and CLI entry points must never import from `legacy/`.
+Historical, duplicate, incomplete, and experimental source files are not kept
+in the working tree. Git history provides recovery for superseded artifacts.
+Generated analysis results, scientific reference datasets, and third-party
+binaries must not be committed to the repository.
 
 ## Canonical registry
 
@@ -114,6 +115,82 @@ The executor accepts only this plan and never reconstructs dependencies.
 
 Repeated steps are explicit plan nodes. For example, a run containing imputation
 and downstream analyses formats once before imputation and once after imputation.
+The first pass creates only the imputation input from the original VCF; the
+second creates only the selected downstream inputs from the re-harmonised
+imputed VCF. A formatter pass extracts its current VCF once and fans that table
+out to every consumer assigned to that data state.
+
+## Validation and preparation boundary
+
+Before any pipeline stage creates scientific output, the orchestrator validates
+the indexed PostGWAS harmonised GWAS-VCF once and records reusable header,
+sample, build, record-count, index, and bcftools evidence. Every selected module
+then runs its registered preflight against that common VCF evidence and validates
+the external references, resource files, genome-build/population declarations,
+and executables that are knowable before generated inputs exist. Preflights
+return the shared `PipelinePreflightEvidence` contract; module-native validated
+resource evidence is retained in `RunContext` for formatter and analysis
+consumers.
+
+`core.input_validation.InputValidationSession` spans startup and execution.
+Registered preflights and stage runners use module scopes; shared validators
+record file path, role, exact checks, status, compact metrics, explanatory
+message, and consumers. Basic file checks record availability only. Existing
+module evidence is adapted explicitly by `pipeline.resource_validation`; no
+generic configuration walk guesses which objects are input files or which
+scientific checks ran. Independent module-preflight failures are collected
+together. Failure of the shared entry-VCF check blocks the dependent preflights.
+
+Reusable file validators include PLINK companion availability, FAM structure,
+BED dimensions, BIM identifier conventions, and gzip BED4 annotations. A
+read-only check uses `validate_once(paths, contract, operation)` only when its
+contract contains the validator identity and all relevant options. Reuse
+requires unchanged file size, modification/change times, device, and inode;
+the cache also checks identities after parsing, including resources inspected
+by nested cached validators. Reused checks acquire each
+consumer without rescanning. These are current-invocation identities, not
+durable content fingerprints; checkpoint validation remains separate, and
+sessions cannot be restored or reopened for another invocation.
+
+Input-dependent checks—such as exact variant overlap between a newly formatted
+table and a PLINK BIM—remain deferred until that table exists. Changed resources
+are refused where recorded identity evidence is reused. The formatter similarly
+reuses the validated VCF header and exact single-sample check, performs one full
+extraction for the current VCF state, and creates every assigned module input
+from that in-memory table. The method-specific compatibility rules remain with
+their scientific consumers; the common layer does not change allele conventions,
+sample-size semantics, missingness rules, or scientific thresholds.
+
+`core.validation_reporting` groups observed checks into file sections using the
+shared terminal styles; it does not read scientific inputs. Pipeline orchestration writes an
+atomic YAML audit at `pipeline.validation.report_file`, first for startup and
+again before announcing successful completion or when execution fails,
+including observed later checks and failures. The
+configured `logging.file_validation.max_screen_files` optionally limits passed
+file sections (the default is 20), never problems or saved records. Additional
+successful files are counted on screen and retained individually in the audit.
+Direct commands use a record-only context with the same renderer and an atomic
+audit, without activating pipeline caching or imposing new input requirements.
+Startup deferrals remain explicitly labelled; a successful
+pipeline is not used to invent passes for unrecorded checks. Unrecognised existing
+files and validated inputs cannot be overwritten as validation reports.
+
+This is an incremental consolidation, not a claim that every file now receives
+full-content validation. Opaque resource checks and some existing resource
+checks are availability-only; candidate-dependent checks and method-specific
+stage summaries remain. See [Pipeline Input Validation](wiki/core/pipeline-input-validation.md)
+for the current coverage and interpretation contract.
+
+## Shared HTML table interaction
+
+Every direct-module and pipeline HTML report is published through
+`core.io.reports.write_html_report`. The writer adds one self-contained,
+offline table controller: every column has a text filter and a sortable header,
+column filters combine, and numeric values sort numerically with missing values
+placed last. For JSON-backed paginated result tables, filtering and sorting use
+the complete embedded result set rather than only the visible page. These
+controls change presentation only; they do not modify, filter, or rewrite the
+scientific result files.
 
 ## Module contract
 

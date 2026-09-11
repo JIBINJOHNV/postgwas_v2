@@ -17,12 +17,21 @@ inputs:
   extract_snps: null
   exclude_snps: null
 input_validation:
-  minimum_reference_overlap_fraction: 0.50
+  # GCTA-usable overlap requires both a shared SNP ID and the same unordered
+  # allele pair. Missing and incompatible variants are excluded from LD/model
+  # fitting; analysis stops when fewer than this fraction remain usable.
+  minimum_reference_overlap_fraction: 0.70
   reference_sample_size_warning_threshold: 4000
+  minimum_summary_sample_size: 10
   sqlite_batch_size: 10000
   table_delimiter_pattern: '\s+'
+  summary_column_roles: [variant_id, effect_allele, other_allele, effect_allele_frequency, effect, standard_error, p_value, sample_size]
+  official_summary_header: [SNP, A1, A2, freq, b, se, p, N]
+  maximum_allele_mismatch_examples: 10
   temporary_database_prefix: .gcta_cojo_validation_
   temporary_database_suffix: .sqlite
+  temporary_exclusion_prefix: .gcta_cojo_allele_mismatch_
+  temporary_exclusion_suffix: .exclude.txt
 analysis:
   significance_threshold: 5.0e-8
   top_snp_count: 10
@@ -33,12 +42,29 @@ analysis:
   genomic_control: false
   genomic_control_lambda: null
   chromosome: null
+chromosome_execution:
+  # Genome-wide stepwise COJO is separable by chromosome because GCTA assumes
+  # complete linkage equilibrium between chromosomes. Every worker still reads
+  # the complete .ma file so phenotypic-variance estimation remains genome-wide.
+  enabled: true
+  max_workers: auto
+  threads_per_worker: 1
+  # The largest usable chromosome runs first as a memory pilot. The scheduler
+  # uses the larger of this floor or measured peak RSS times the safety factor.
+  minimum_memory_gb_per_worker: 1.0
+  memory_safety_factor: 1.25
+  memory_poll_interval_seconds: 0.1
+  # Only a failed chromosome is rerun. Retry workers are deliberately bounded
+  # separately so a memory-pressure failure is retried with lower concurrency.
+  failed_chromosome_retries: 1
+  retry_max_workers: 1
 reporting:
   top_result_count: 10
   p_value_significant_digits: 4
   finding_threshold: 5.0e-8
 log_parsing:
   warning_pattern: '(?i)\bwarning\b'
+  no_signals_pattern: '(?i)\bno SNPs have been selected\b'
   maximum_warning_messages: 20
 minimum_gcta_version: 1.94.1
 version_arguments: [--version]
@@ -58,8 +84,14 @@ output_layout:
     top_snps: 'raw/{dataset_id}_{mode}.jma.cojo'
     joint: 'raw/{dataset_id}_{mode}.jma.cojo'
     cond: 'raw/{dataset_id}_{mode}.cma.cojo'
-  ld_matrix_result: 'raw/{dataset_id}_{mode}.jma.ldr.cojo'
+  ld_matrix_result: 'raw/{dataset_id}_{mode}.ldr.cojo'
+  conditional_results: 'raw/{dataset_id}_{mode}.cma.cojo'
+  condition_snps_result: 'raw/{dataset_id}_{mode}.given.cojo'
   gcta_log_result: 'raw/{dataset_id}_{mode}.log'
+  allele_mismatch_exclusion: 'raw/{dataset_id}_{mode}.allele_mismatch.exclude.txt'
+  chromosome_output_prefix: 'chromosomes/chr{chromosome}/attempt{attempt}/{dataset_id}_{mode}_chr{chromosome}'
+  conditional_output_prefix: 'chromosomes/conditional/attempt{attempt}/{dataset_id}_{mode}_conditional'
+  selected_snp_list: 'chromosomes/{dataset_id}_{mode}_selected_snps.txt'
 results:
   delimiter: auto
   delimiter_candidates: [tab, whitespace]
@@ -73,6 +105,7 @@ results:
   estimation_status_column: estimation_status
   estimated_status: estimated
   not_estimable_status: not_estimable_collinearity
+  genomic_control_p_value_suffix: _GC
   schemas:
     slct:
       required_columns: [Chr, SNP, bp, freq, refA, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
@@ -85,9 +118,11 @@ results:
       chromosome_column: Chr
       position_column: bp
       marginal_p_value_column: p
-      p_value_column: pJ
-      adjusted_effect_column: bJ
-      adjusted_standard_error_column: bJ_se
+      marginal_effect_column: b
+      marginal_standard_error_column: se
+      model_p_value_column: pJ
+      model_effect_column: bJ
+      model_standard_error_column: bJ_se
     top_snps:
       required_columns: [Chr, SNP, bp, freq, refA, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
       numeric_columns: [bp, freq, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
@@ -99,9 +134,11 @@ results:
       chromosome_column: Chr
       position_column: bp
       marginal_p_value_column: p
-      p_value_column: pJ
-      adjusted_effect_column: bJ
-      adjusted_standard_error_column: bJ_se
+      marginal_effect_column: b
+      marginal_standard_error_column: se
+      model_p_value_column: pJ
+      model_effect_column: bJ
+      model_standard_error_column: bJ_se
     joint:
       required_columns: [Chr, SNP, bp, freq, refA, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
       numeric_columns: [bp, freq, b, se, p, n, freq_geno, bJ, bJ_se, pJ, LD_r]
@@ -113,9 +150,11 @@ results:
       chromosome_column: Chr
       position_column: bp
       marginal_p_value_column: p
-      p_value_column: pJ
-      adjusted_effect_column: bJ
-      adjusted_standard_error_column: bJ_se
+      marginal_effect_column: b
+      marginal_standard_error_column: se
+      model_p_value_column: pJ
+      model_effect_column: bJ
+      model_standard_error_column: bJ_se
     cond:
       required_columns: [Chr, SNP, bp, freq, refA, b, se, p, n, freq_geno, bC, bC_se, pC]
       numeric_columns: [bp, freq, b, se, p, n, freq_geno, bC, bC_se, pC]
@@ -127,6 +166,8 @@ results:
       chromosome_column: Chr
       position_column: bp
       marginal_p_value_column: p
-      p_value_column: pC
-      adjusted_effect_column: bC
-      adjusted_standard_error_column: bC_se
+      marginal_effect_column: b
+      marginal_standard_error_column: se
+      model_p_value_column: pC
+      model_effect_column: bC
+      model_standard_error_column: bC_se

@@ -114,7 +114,8 @@ def run_plink_extraction(
     bfile_prefix: str,
     snp_file: Path,
     out_prefix: Path,
-    plink_binary: str = "plink2",
+    *,
+    plink_binary: str,
     plink_memory_mb: int = DEFAULT_PLINK_MEMORY_MB,
 ):
     """Run PLINK 2 extraction and verify all BED outputs.
@@ -140,7 +141,8 @@ def run_plink_extraction(
 def run_plink_to_bgen(
     bfile_prefix: Path,
     out_prefix: Path,
-    plink_binary: str = "plink2",
+    *,
+    plink_binary: str,
     bgen_bits: int = DEFAULT_BGEN_BITS,
 ):
     """Convert the reconciled PLINK BED files to BGEN v1.2."""
@@ -158,13 +160,13 @@ def run_plink_to_bgen(
         raise RuntimeError(f"PLINK 2 did not create a usable BGEN file; see {log_file}")
 
 
-def run_bgen_indexing(bgen_file: Path):
+def run_bgen_indexing(bgen_file: Path, *, bgenix_binary: str):
     """Indexes BGEN file using bgenix."""
     log_file = bgen_file.with_suffix(".bgenix.log")
     if log_file.exists():
         log_file.unlink()
     _run_logged([
-        "bgenix", "-g", str(bgen_file), "-index", "-clobber"
+        str(bgenix_binary), "-g", str(bgen_file), "-index", "-clobber"
     ], log_file)
     bgi_file = Path(f"{bgen_file}.bgi")
     if not bgi_file.is_file() or bgi_file.stat().st_size == 0:
@@ -177,6 +179,7 @@ def run_ldstore(
     master_file: Path,
     threads: int = DEFAULT_EXTERNAL_TOOL_THREADS,
     *,
+    ldstore_binary: str,
     timeout_seconds: float,
     termination_grace_seconds: float,
 ):
@@ -227,7 +230,7 @@ def run_ldstore(
 
     # --- Step 1: Compute correlations (write-bcor) ---
     cmd_bcor = [
-        "ldstore",
+        str(ldstore_binary),
         "--in-files", str(master_path),
         "--read-only-bgen", "--write-bcor",
         "--n-threads", str(threads)
@@ -254,7 +257,7 @@ def run_ldstore(
 
     # --- Step 2: Convert to Text Matrix ---
     cmd_text = [
-        "ldstore",
+        str(ldstore_binary),
         "--in-files", str(master_path),
         "--bcor-to-text"
     ]
@@ -273,6 +276,7 @@ def run_finemap_binary(
     config: dict,
     threads: int = DEFAULT_EXTERNAL_TOOL_THREADS,
     *,
+    finemap_binary: str,
     timeout_seconds: float,
     termination_grace_seconds: float,
 ):
@@ -293,15 +297,18 @@ def run_finemap_binary(
         raise ValueError("FINEMAP algorithm must be 'sss' or 'cond'")
 
     cmd = [
-        "finemap",
+        str(finemap_binary),
         f"--{algorithm}",
         "--in-files", master_filename,
         "--n-threads", str(threads),
         "--n-causal-snps", str(config["n_causal_snps"]),
         "--prob-cred-set", str(config["prob_cred_set"]),
-        "--pvalue-snps", str(config["pvalue_snps"]),
         "--prior-std", str(config["prior_std"]),
     ]
+    # The probability endpoint 1 means no SNP filtering. FINEMAP 1.4.2 uses
+    # that endpoint when omitted but rejects an explicit --pvalue-snps 1.0.
+    if float(config["pvalue_snps"]) != 1.0:
+        cmd.extend(["--pvalue-snps", str(config["pvalue_snps"])])
     if algorithm == "sss":
         cmd.extend([
             "--n-iter", str(config["n_iter"]),
@@ -329,6 +336,11 @@ def run_finemap_binary(
     with open(log_file, "w") as f:
         f.write(f"{'='*20}\nRunning FINEMAP\n{'='*20}\n")
         f.write(f"Work Dir: {work_dir}\n")
+        f.write("Resolved SNP p-value threshold: %s%s\n" % (
+            config["pvalue_snps"],
+            " (native unfiltered endpoint; flag omitted)"
+            if float(config["pvalue_snps"]) == 1.0 else "",
+        ))
 
     # 2. Run inside work_dir so the master filename remains short.
     res = _run_logged(
@@ -341,6 +353,19 @@ def run_finemap_binary(
         stage="FINEMAP",
         check=False,
     )
+
+    # FINEMAP 1.4.2 may report its native error diagnostic with exit status 0.
+    native_errors = [
+        line.strip()
+        for output in (res.stdout, res.stderr)
+        for line in (output or "").splitlines()
+        if line.lstrip().startswith("Error :")
+    ]
+    if native_errors:
+        raise RuntimeError(
+            "FINEMAP reported an error: %s. See log: %s"
+            % ("; ".join(native_errors), log_file)
+        )
 
     # 4. Error Checking
     if res.returncode != 0:

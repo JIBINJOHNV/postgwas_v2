@@ -8,7 +8,8 @@ additional user-named table directly from CLI column options.
 
 ## What the analysis does
 
-The formatter extracts a typed canonical table with bcftools, selects configured
+The formatter first verifies the configured PostGWAS provenance, genome-build,
+and GWAS-VCF field declarations. It then extracts a typed canonical table with bcftools, selects configured
 variant IDs independently for each target, infers quantitative versus binary design from case/control count values,
 applies each target's required-field and numeric checks, transforms statistics,
 and writes outputs atomically. It can produce MAGMA, GCTA gene, SuSiE, FINEMAP,
@@ -24,11 +25,31 @@ it after imputation.
 
 ## Input requirements
 
-A harmonised, biallelic GWAS-VCF; dataset ID; output directory; `bcftools`; and
+A PostGWAS-harmonised, biallelic GWAS-VCF; a dataset ID used to name the new
+outputs; an output directory; `bcftools`; and
 at least one built-in format from CLI/YAML or `--custom-output` with `--id`.
-Required VCF fields depend on the chosen target and requested custom columns.
+Every configured structural and GWAS-VCF FORMAT field must be declared in the
+header; individual values may remain missing where a selected target does not
+require them.
 `--merge-alleles` is optional for a direct LDSC formatter run and required when
 the formatter is planned for the `heritability` workflow.
+
+The formatter is not a second harmonisation stage. The VCF must already contain
+the configured PostGWAS version, dataset, status, and genome-build metadata; its
+chromosome labels and REF/ALT alleles must already satisfy the configured
+canonical patterns. Noncanonical values cause an actionable failure and are
+never silently relabelled or uppercased. The numeric cast is still required:
+`bcftools query` emits a textual table, so POS and statistical/sample-size
+fields must be parsed before downstream calculations and validation. This
+contract mirrors the canonical metadata and fields written by the PostGWAS
+harmonisation VCF merge stage.
+
+For the current release, the formatter records the dataset declared in VCF
+provenance but does not require it to equal `--dataset-id`. The requested
+dataset ID controls output naming only. The VCF must contain exactly one sample
+column. A lone sample ID that differs from the run dataset ID is used with a
+warning; zero-sample and multi-sample VCFs fail before extraction.
+Dataset-identity validation is deferred in `urgent_attention_needed.md`.
 
 ## Command
 
@@ -106,9 +127,12 @@ postgwas formatter \
   --format magma gcta_gene susie finemap pred_ld ldsc mixer \
   --duplicate-id-policy exclude_all \
   --run-config formatting.yaml \
-  --resume \
-  --bcftools bcftools
+  --resume
 ```
+
+The formatter resolves `resources.executables.bcftools` (default `bcftools`)
+from the run configuration and validates that command on `PATH` before reading
+the VCF.
 
 ## Parameters
 
@@ -160,7 +184,7 @@ option requests one field and supplies its output header:
 | Option | Value written |
 |---|---|
 | `--id NAME` | Selected rsID or configured chromosome-position-REF-ALT unique ID |
-| `--chr NAME` | Normalized chromosome |
+| `--chr NAME` | Canonical chromosome from the harmonised VCF |
 | `--pos NAME` | One-based position |
 | `--ref NAME` | Other/non-effect allele |
 | `--alt NAME` | Effect allele |
@@ -186,6 +210,10 @@ freshness validation. If a completed run directory is copied, resume validates
 the copied files at the currently configured destinations, rebases every
 returned artifact and manifest path to that directory, and rejects a recorded
 artifact whose relative filename does not match the current configuration.
+The detailed formatter HTML report is a PostGWAS-owned, SHA-256-fingerprinted
+artifact under the same policy. Its links to formatter outputs are relative to
+the configured output root, so they remain valid after a completed pipeline
+stage is published or a validated run directory is copied.
 When LDSC reference selection is active, the completion manifest also validates
 the merge-alleles path, size, and SHA-256 digest.
 If every formatter artifact declared by a matching manifest is absent, formatter
@@ -201,20 +229,44 @@ the generated [Configuration Defaults](../reference/configuration-defaults.md).
 The formatter validates selection, renders every selected output destination,
 and rejects filename collisions before VCF extraction. This preflight includes
 named outputs and every configured chromosome partition. It then optionally
-validates a completion manifest, extracts `N_ALT=1` records once, types numeric
+validates a completion manifest, validates the PostGWAS header contract,
+extracts `N_ALT=1` records once, parses numeric
 fields, selects each target's configured ID convention, and runs each exporter
-in canonical order. Before an LDSC export with `--merge-alleles`, it joins the
-selected rsIDs to the configured reference columns and applies the
-strand-unambiguous allele check. The custom exporter reuses the same one-pass
-extraction and does not trigger study-design inference. Study design is inferred
-only when LDSC or MiXeR is selected,
+in canonical order. Targets sharing the same resolved identifier type and
+duplicate policy reuse one validated selection; the bounded cache retains only
+selections with another consumer and releases them after the last consumer.
+Every final candidate is checked for missing, empty, or duplicated selected IDs
+before its exporter can write a scientific artifact. Before an LDSC export with
+`--merge-alleles`, the formatter instead joins selected rsIDs to the configured
+reference columns, applies the strand-unambiguous allele check, and validates
+that separate result without using the shared cache. The custom exporter reuses
+the same one-pass extraction and does not trigger study-design inference. Study
+design is inferred only when LDSC or MiXeR is selected,
 because only those formatter contracts interpret sample size differently for
 binary and quantitative traits. MAGMA, SuSiE, and FINEMAP validate only their
 own configured fields and do not require case/control columns. Rows missing or
 violating a target's required fields are excluded for that target and counted.
-Before PRED-LD field validation, rows whose normalized chromosome is absent
+Before PRED-LD field validation, rows whose canonical chromosome is absent
 from the configured `chromosomes` list are excluded and counted by chromosome
 label.
+
+During a fresh run, the terminal shows two kinds of measurable formatter work:
+one stage validates and reads the harmonised GWAS-VCF, followed by one stage for
+each requested downstream format. The first completed-stage outcome reports the
+total biallelic input-variant count, validated genome build, and dataset/sample
+identity embedded in the VCF. Each output stage reports the same input total,
+the number written, and the number excluded. The completion summary then names
+the exact prepared files, the required-value exclusions, any configured
+minimum-P bounding, and the validated VCF provenance. These are formatter
+retention counts only: a downstream tool can retain fewer variants after its
+own LD-reference, analysis-scope, or mapping checks.
+
+When a BIM reference is provided for downstream identifier selection, formatter
+reports the identifier convention detected in BIM field 2 and the number of BIM
+records inspected. This inspection determines whether the prepared identifier
+column uses rsIDs or the configured chromosome-position-allele convention. It
+does **not** claim that the GWAS variants overlap the BIM reference; the
+downstream module applies and reports its configured reference-matching policy.
 
 For a MAGMA pipeline, the subsequent MAGMA runner receives the exact filtered
 `snp_loc_file` and `pval_file` returned by this formatter step. MAGMA preparation
@@ -260,6 +312,58 @@ The same structured report is written to the canonical formatter log under
 names, and binary or quantitative LDSC sample-size columns are reported as
 actually resolved for that run rather than described using fixed defaults.
 
+### Terminal completion summary
+
+The opening plan states that formatter creates downstream input files and does
+not run the downstream analysis. The completion summary uses four visible
+levels: the formatter result, major sections, target-specific subsections, and
+their aligned fields. Each selected target contains separate variant-accounting
+and identifier-handling subsections; the LDSC target also contains the GWAS-VCF
+case-fraction subsection.
+Reports and logs form a separate major section. Counts that represent a subset
+include a percentage and state their denominator. For LDSC reference selection,
+the summary reports the total number of unique rsIDs in the supplied LDSC
+SNP/allele reference, the fraction of
+GWAS-VCF variants retained, the fraction of reference variants represented in
+the formatter output, absent reference rsIDs, allele mismatches, and duplicate
+groups resolved by reference matching.
+
+The label `Variants written to LDSC files` describes variants written to the
+formatter's LDSC input table after its configured rsID, allele, duplicate, and
+required-field checks. It does not claim that every variant will enter the
+heritability regression: the later LDSC `munge_sumstats.py` stage may apply
+additional INFO, MAF, sample-size, and statistical-quality filters. The supplied
+LDSC SNP/allele reference is also kept distinct from the chromosome-split
+LD-score reference and weight files used later by `ldsc.py`.
+
+### Detailed HTML report
+
+Every successful fresh formatter run writes the self-contained report configured
+by `runtime.html_report_file`. The packaged path is
+`reports/{dataset_id}_formatter_report.html`. A validated resume reuses the exact
+checksum-matched report rather than regenerating it from potentially different
+presentation code.
+
+The report is rendered only from the same validated result metadata, resolved
+schema, and paths used by the terminal, canonical log, and completion manifest;
+it does not reopen the GWAS-VCF, exported tables, or LDSC reference. It contains:
+
+- GWAS-VCF and sample-count completeness evidence used for trait inference;
+- a target overview with retained/excluded counts and percentages;
+- disjoint exclusion accounting for every selected formatter target;
+- complete selected-identifier, reference-matching, duplicate-resolution, and
+  final uniqueness evidence;
+- the total supplied LDSC SNP/allele reference size, matched coverage, absent
+  rsIDs, allele mismatches, and reference-resolved duplicate groups;
+- the GWAS-VCF case-fraction formula, aggregation, contributing variants, value
+  range, and case/control count ranges;
+- every configured canonical-source to saved-column mapping and transformation;
+- P-value, allele-frequency, and sample-size semantics for each downstream tool;
+- the resolved formatter policies and canonical GWAS-VCF input contract; and
+- relative links to every generated artifact plus the canonical log, resolved
+  configuration, checksum completion manifest, input VCF, and executable
+  provenance.
+
 With the default configuration, the identifier and statistical representations
 are:
 
@@ -286,6 +390,8 @@ are:
 - LDSC: `<dataset>_ldsc_input.tsv`.
 - MiXeR: `<dataset>_mixer.sumstats.gz`.
 - Custom: the relative filename supplied to `--custom-output`.
+- Detailed HTML: `reports/<dataset>_formatter_report.html` by default; the path
+  comes from `runtime.html_report_file` in canonical YAML.
 - Provenance: `logs/<dataset>_formatter.log`,
   `run_metadata/resolved_config.yaml`, and
   `run_metadata/formatter_completion.yaml`.
@@ -297,12 +403,18 @@ in/out, exclusions for missing or invalid values,
 P values bounded at the configured numeric minimum, written schema, inferred
 study design when required, sample-size mode, and output fingerprints. PRED-LD additionally
 records `rows_excluded_unconfigured_chromosome` in its result and lists each
-excluded normalized chromosome with its row count in the canonical log.
+excluded canonical chromosome with its row count in the canonical log.
 Every format records duplicate selected-ID groups, the resolved policy, and the
-number of exact, ranked, ambiguous, and excluded rows; the same exclusion count
-appears in the terminal completion summary. LDSC reference selection additionally
-records unmatched rsIDs, allele mismatches, groups resolved uniquely by alleles,
-and groups still ambiguous after reference matching.
+number of exact, ranked, ambiguous, and excluded rows. The terminal completion
+summary reports detected duplicate groups and rows, reference-resolved groups,
+groups not retained by reference matching, groups still ambiguous after
+reference matching, exact rows collapsed, policy-resolved groups, rows removed
+by policy, final retained rows, percentages, and the successful uniqueness
+invariant. The canonical log and completion metadata also
+record whether a target reused an already validated identifier selection. LDSC
+reference selection additionally records unmatched rsIDs, allele mismatches,
+groups resolved uniquely by alleles, and groups still ambiguous after reference
+matching.
 The custom result additionally records its ordered field roles, output headers,
 identifier convention, and missing/invalid requested-field exclusions.
 

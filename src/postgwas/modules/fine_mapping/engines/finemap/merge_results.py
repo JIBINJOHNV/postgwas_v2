@@ -17,7 +17,10 @@ from postgwas.modules.fine_mapping.defaults import (
 logger = logging.getLogger("postgwas.modules.fine_mapping")
 _NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 _FINEMAP_CREDIBLE_FILE = re.compile(r"^(?P<locus>.+)\.cred(?P<model_size>\d+)$")
-_POSTERIOR_HEADER = re.compile(rf"^#\s*Post-Pr\s*=\s*({_NUMBER})\s*$")
+_POSTERIOR_HEADER = re.compile(
+    rf"^#\s*Post-Pr(?:\s*\(# of causal SNPs is (?P<model_size>\d+)\))?"
+    rf"\s*=\s*(?P<probability>{_NUMBER})\s*$"
+)
 INVALID_MODEL_PROBABILITY_REASON = "invalid_model_posterior_probability"
 
 
@@ -52,6 +55,7 @@ def parse_cred_header(file_path):
     FINEMAP defines ``Post-Pr`` as a probability for the represented causal-count
     model. Exactly one finite value in the closed interval [0, 1] is therefore a
     file-format invariant; invalid values must never participate in model ranking.
+    The native causal-count annotation, when present, must agree with .credK.
     """
     file_path = Path(file_path)
     probabilities = []
@@ -70,7 +74,18 @@ def parse_cred_header(file_path):
                     raise InvalidModelProbabilityError(
                         file_path, "malformed Post-Pr header"
                     )
-                probabilities.append(float(match.group(1)))
+                model_size = match.group("model_size")
+                if model_size is not None:
+                    filename_match = _FINEMAP_CREDIBLE_FILE.fullmatch(file_path.name)
+                    if (
+                        int(model_size) < 1
+                        or filename_match is None
+                        or int(model_size) != int(filename_match.group("model_size"))
+                    ):
+                        raise InvalidModelProbabilityError(
+                            file_path, "Post-Pr causal count does not match .credK filename"
+                        )
+                probabilities.append(float(match.group("probability")))
     except InvalidModelProbabilityError:
         raise
     except (OSError, UnicodeError, ValueError) as exc:

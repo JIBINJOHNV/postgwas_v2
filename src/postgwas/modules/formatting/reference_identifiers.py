@@ -34,36 +34,42 @@ def configure_reference_variant_identifiers(
     identifier_policy = formatting_config.variant_identifiers
     observations = dict(getattr(args, "variant_id_observations", None) or {})
     target_types = dict(identifier_policy.target_types)
-    detected_by_target: dict[str, tuple[str, str]] = {}
+    target_types.update(getattr(args, "variant_id_types", None) or {})
+    detected_by_target = {
+        target: (str(observation["variant_id_type"]), ", ".join(observation.get("consumers", (target,))))
+        for target, observation in observations.items()
+    }
+    detected_by_target.update(getattr(args, "_variant_id_requirements", None) or {})
 
     for requirement in requirements:
         resolved_bim = Path(requirement.bim_file).expanduser().resolve()
         cached = observations.get(requirement.formatter_target, {})
         cached_consumers = set(cached.get("consumers", ()))
-        if cached.get("bim_file") == str(resolved_bim):
-            detected_type = str(cached["variant_id_type"])
-            observation = dict(cached)
-        else:
-            summary = inspect_bim_identifier_type(
-                resolved_bim,
-                column_roles=list(requirement.column_roles),
-                delimiter_pattern=requirement.delimiter_pattern,
-                rsid_pattern=identifier_policy.rsid_pattern,
-                unique_id_template=identifier_policy.unique_id_template,
-                chromosome_prefix_pattern=(
-                    formatting_config.chromosome_labels.prefix_pattern
-                ),
-                chromosome_aliases=formatting_config.chromosome_labels.aliases,
-            )
-            detected_type = summary.identifier_type
-            observation = {
-                "bim_file": str(summary.bim_file),
-                "variant_id_type": detected_type,
-                "variants": summary.variants,
-                "rsids": summary.rsids,
-                "unique_ids": summary.unique_ids,
-                "other_ids": summary.other_ids,
-            }
+        # Reuse belongs to the shared file-identity/contract cache, never to a
+        # formatter target or a path-only observation from an earlier call.
+        summary = inspect_bim_identifier_type(
+            resolved_bim,
+            column_roles=list(requirement.column_roles),
+            delimiter_pattern=requirement.delimiter_pattern,
+            rsid_pattern=identifier_policy.rsid_pattern,
+            unique_id_template=identifier_policy.unique_id_template,
+            chromosome_prefix_pattern=(
+                formatting_config.chromosome_labels.prefix_pattern
+            ),
+            chromosome_aliases=formatting_config.chromosome_labels.aliases,
+        )
+        detected_type = summary.identifier_type
+        observation = {
+            "bim_file": str(summary.bim_file),
+            "variant_id_type": detected_type,
+            "variants": summary.variants,
+            "rsids": summary.rsids,
+            "unique_ids": summary.unique_ids,
+            "other_ids": summary.other_ids,
+            "missing_ids": summary.missing_ids,
+            "duplicate_ids": summary.duplicate_ids,
+            "duplicate_rows": summary.duplicate_rows,
+        }
 
         previous = detected_by_target.get(requirement.formatter_target)
         if previous is not None and previous[0] != detected_type:
@@ -89,10 +95,14 @@ def configure_reference_variant_identifiers(
         observation["consumers"] = sorted(
             cached_consumers | {requirement.consumer}
         )
+        references = dict(cached.get("references", {}))
+        references[str(resolved_bim)] = dict(observation)
+        observation["references"] = references
         observations[requirement.formatter_target] = observation
 
     args.variant_id_types = target_types
     args.variant_id_observations = observations
+    args._variant_id_requirements = detected_by_target
     return observations
 
 
@@ -126,6 +136,9 @@ def configure_required_variant_identifier_type(
         )
     target_types[formatter_target] = required_type
     args.variant_id_types = target_types
+    requirements = dict(getattr(args, "_variant_id_requirements", None) or {})
+    requirements[formatter_target] = (required_type, consumer)
+    args._variant_id_requirements = requirements
 
 
 __all__ = [

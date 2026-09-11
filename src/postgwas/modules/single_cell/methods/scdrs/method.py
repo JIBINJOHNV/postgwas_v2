@@ -54,8 +54,8 @@ class ScdrsMethod:
     def prepare_pipeline_args(self, args: argparse.Namespace) -> None:
         args.scdrs_gene_set_source = "magma"
 
-    def preflight_pipeline(self, args: argparse.Namespace, configuration) -> None:
-        preflight_scdrs(
+    def preflight_pipeline(self, args: argparse.Namespace, configuration) -> ScdrsPreflight:
+        return preflight_scdrs(
             configuration.modules.single_cell.scdrs,
             configuration.resources.executables.scdrs,
             dataset_id=configuration.run.dataset_id,

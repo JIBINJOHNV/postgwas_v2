@@ -36,21 +36,21 @@ postgwas finemap \
 ## Pipeline mode
 
 Pipeline mode starts from a harmonised, bgzip-compressed, tabix-indexed
-GWAS-VCF and executes LD-block annotation, formatter export, standard LD
-clumping, and fine-mapping. The GWAS-VCF must contain `ES`, `SE`, `EZ`, `LP`,
-`AF`, and `NEF` FORMAT values for one study sample.
+GWAS-VCF and executes standard LD clumping, formatter export, and fine-mapping.
+The GWAS-VCF must contain `ES`, `SE`, `EZ`, `LP`, `AF`, and `NEF` FORMAT values
+for one study sample. Standard clumping does not require LD-block annotation;
+that preceding step is added only when `region` is also selected.
 
 The example expects:
 
-- `reference/ld_blocks/GRCh37_EUR_ldetect.bed.gz` plus its tabix index. The BED
-  columns are chromosome, start, end, and block identifier.
-- `reference/pairwise_ld/EUR_chr1.ld.gz` through the analysed chromosomes, each
-  with a tabix index and seven columns: chromosome A, position A, variant A,
-  chromosome B, position B, variant B, and r-squared. The current clumper
-  queries the tabix index by the variant-A coordinate. Every potential index
-  SNP must therefore occur as variant A, for example by storing symmetric
-  pairwise rows. Otherwise that SNP is explicitly logged as self-only and its
-  inferred locus may be narrower than intended.
+- `reference/pairwise_ld/ld_reference.yaml` and, for every chromosome containing
+  a genome-wide-significant variant, the format-version-2 files produced by
+  `tools/resource_preparation/ld_file_preparation.sh`: forward
+  `EUR_chr<CHR>.ld.gz` plus `.tbi`, reverse
+  `EUR_chr<CHR>.reverse.ld.gz` plus `.tbi`, and allele-aware inventory
+  `EUR_chr<CHR>.variants.tsv.gz` plus `.tbi`. The forward and reverse indexes
+  let the clumper find a variant at either endpoint of PLINK's upper-triangle
+  output; do not replace them with the old one-file layout.
 - `reference/1000G_EUR.{bed,bim,fam}` for locus LD construction.
 - One consistent unique identifier convention across VCF, pairwise-LD tables,
   and PLINK BIM. This command uses
@@ -60,18 +60,16 @@ The example expects:
 ```bash
 postgwas pipeline \
   --modules finemap \
+  --clumping-methods standard \
   --run-config examples/fine_mapping/pipeline_susie.yaml \
   --vcf study_GRCh37.vcf.gz \
   --genome-build GRCh37 \
-  --ld-region-dir reference/ld_blocks \
-  --ld-block-populations EUR \
   --ld-folder reference/pairwise_ld \
   --population EUR \
   --variant-id-type unique \
   --finemap-method susie \
   --finemap-ld-reference reference/1000G_EUR \
   --plink plink \
-  --bcftools bcftools \
   --dataset-id STUDY \
   --output-directory results/pipeline_susie
 ```
@@ -84,9 +82,13 @@ postgwas config validate --config examples/fine_mapping/pipeline_susie.yaml
 ```
 
 Successful runs finish with `overall status: success`. Inspect
+`results/STUDY_fine_mapping_report.html`,
 `results/combined_results/final_combined_credible_sets.tsv`,
 `quality_control/overlap_resolution_summary.tsv`, the engine QC summary under
 `quality_control/`, and the resolved configuration under `run_metadata/`
 before downstream analysis. The authoritative FLAMES handoff is
 `downstream_inputs/flames/`. A converged run with no credible set is a valid
-analysis outcome, not a successful FLAMES handoff.
+analysis outcome, not a successful FLAMES handoff. The HTML report contains
+all final credible-set members and the primary-locus warnings/failures; its
+small per-set bar display is visual orientation only and never filters the
+complete table.

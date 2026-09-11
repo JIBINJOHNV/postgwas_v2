@@ -61,8 +61,8 @@ class LdscCelltypeMethod:
     def prepare_pipeline_args(self, args: argparse.Namespace) -> None:
         args.ldsc_celltype_sumstats_source = "formatter"
 
-    def preflight_pipeline(self, args: argparse.Namespace, configuration) -> None:
-        preflight_ldsc_celltype(
+    def preflight_pipeline(self, args: argparse.Namespace, configuration) -> LdscCelltypePreflight:
+        return preflight_ldsc_celltype(
             configuration.modules.single_cell.ldsc_celltype,
             configuration.resources.executables.ldsc,
             configuration.resources.executables.munge_sumstats,

@@ -2,14 +2,45 @@
 
 from enum import Enum
 from pathlib import Path
+from typing import get_args, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from postgwas.core.io.delimiters import NAMED_DELIMITERS
 
 
+PValueCorrectionMethod = Literal["bonferroni", "sidak", "holm", "fdr_bh"]
+MHCPolicy = Literal[
+    "include", "exclude_snps", "exclude_genes", "exclude_both",
+]
+MHC_POLICIES = get_args(MHCPolicy)
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+class MultipleTestingSelectionConfig(StrictModel):
+    """Shared selection and primary-decision contract for adjusted p-values."""
+
+    methods: list[PValueCorrectionMethod] = Field(min_length=1)
+    primary_method: PValueCorrectionMethod
+    significance_threshold: float = Field(gt=0, le=1, allow_inf_nan=False)
+
+    @field_validator("methods")
+    @classmethod
+    def unique_methods(
+        cls, values: list[PValueCorrectionMethod],
+    ) -> list[PValueCorrectionMethod]:
+        if len(values) != len(set(values)):
+            raise ValueError("must contain unique correction methods")
+        return values
+
+    @model_validator(mode="after")
+    def primary_is_selected(self):
+        if self.primary_method not in self.methods:
+            raise ValueError("primary_method must occur in methods")
+        return self
 
 
 class GenomeBuild(str, Enum):
@@ -79,6 +110,37 @@ class GenomicRegion(StrictModel):
         if self.end <= self.start:
             raise ValueError("end must be greater than start")
         return self
+
+
+class MHCAnalysisScopeConfig(StrictModel):
+    """Shared policy for excluding MHC variants and coordinate-defined units."""
+
+    policy: MHCPolicy
+    region_override: GenomicRegion | None = None
+
+    @property
+    def excludes_snps(self) -> bool:
+        return self.policy in {"exclude_snps", "exclude_both"}
+
+    @property
+    def excludes_genes(self) -> bool:
+        return self.policy in {"exclude_genes", "exclude_both"}
+
+
+class ChromosomeAnalysisScopeConfig(StrictModel):
+    """Shared normalized chromosome-exclusion list."""
+
+    exclude: list[str]
+
+    @field_validator("exclude")
+    @classmethod
+    def normalized_unique_labels(cls, values: list[str]) -> list[str]:
+        normalized = [str(value).strip().upper() for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("must not contain empty chromosome labels")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("must contain unique chromosome labels")
+        return normalized
 
 
 class InputOutputConfig(StrictModel):

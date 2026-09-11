@@ -11,7 +11,7 @@ import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Literal, Sequence, TextIO
+from typing import BinaryIO, Iterator, Literal, Sequence, TextIO
 
 
 NAMED_DELIMITERS = {
@@ -42,27 +42,41 @@ def delimiter_character(name: str) -> str:
         raise ValueError("Unknown configured delimiter name: %s" % name) from exc
 
 
+def pandas_csv_engine(separator: str) -> Literal["c", "python"]:
+    """Select the fastest pandas engine that honours the separator contract.
+
+    Pandas' C engine supports literal one-character separators and its explicit
+    ``\\s+`` whitespace exception. Other multi-character separators are regular
+    expressions and therefore require the Python engine.
+    """
+    if not separator:
+        raise ValueError("separator must not be empty")
+    return "c" if len(separator) == 1 or separator == r"\s+" else "python"
+
+
+def _zip_data_members(archive: zipfile.ZipFile) -> list[str]:
+    """Return user-data members while ignoring directories and macOS metadata."""
+    return [
+        name for name in archive.namelist()
+        if not name.endswith("/") and not name.startswith("__MACOSX/")
+    ]
+
+
 @contextmanager
-def open_text(path: str | Path) -> Iterator[TextIO]:
-    """Open one plain or supported compressed text file without loading it."""
+def open_binary(path: str | Path) -> Iterator[BinaryIO]:
+    """Open one plain or supported compressed file as a binary stream."""
     source = Path(path)
     lowered = source.name.lower()
     if lowered.endswith(".zip"):
         with zipfile.ZipFile(source) as archive:
-            members = [
-                name for name in archive.namelist()
-                if not name.endswith("/") and not name.startswith("__MACOSX/")
-            ]
+            members = _zip_data_members(archive)
             if len(members) != 1:
                 raise ValueError(
                     "ZIP archive must contain exactly one data file; found %d in %s"
                     % (len(members), source)
                 )
-            with archive.open(members[0]) as raw:
-                with io.TextIOWrapper(
-                    raw, encoding="utf-8", errors="replace",
-                ) as text:
-                    yield text
+            with archive.open(members[0]) as handle:
+                yield handle
         return
     opener = open
     if lowered.endswith((".gz", ".bgz")):
@@ -71,8 +85,18 @@ def open_text(path: str | Path) -> Iterator[TextIO]:
         opener = bz2.open
     elif lowered.endswith((".xz", ".lzma")):
         opener = lzma.open
-    with opener(source, "rt", encoding="utf-8", errors="replace") as handle:
+    with opener(source, "rb") as handle:
         yield handle
+
+
+@contextmanager
+def open_text(path: str | Path) -> Iterator[TextIO]:
+    """Open one plain or supported compressed text file without loading it."""
+    with open_binary(path) as raw:
+        with io.TextIOWrapper(
+            raw, encoding="utf-8", errors="replace",
+        ) as text:
+            yield text
 
 
 def _sample_lines(
@@ -172,6 +196,8 @@ __all__ = [
     "NAMED_DELIMITERS",
     "delimiter_character",
     "detect_delimiter",
+    "open_binary",
     "open_text",
+    "pandas_csv_engine",
     "resolve_delimiter",
 ]

@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
+from postgwas.modules.harmonisation.sample_sheet import HarmonisationSampleSheetRow
 from postgwas.pipeline.registry import REGISTRY
 
 
@@ -17,6 +18,9 @@ REPOSITORY_ROOT = Path(__file__).parents[1]
 ROOT_README = REPOSITORY_ROOT / "README.md"
 BUILDER = REPOSITORY_ROOT / "tools" / "docs" / "build_wiki.py"
 CLI_VALIDATOR = REPOSITORY_ROOT / "tools" / "docs" / "validate_wiki_cli.py"
+README_POLICY_SYNCHRONIZER = (
+    REPOSITORY_ROOT / "tools" / "docs" / "update_readme_harmonisation_policies.py"
+)
 MODULE_TEMPLATE = REPOSITORY_ROOT / "docs" / "templates" / "module-page.md"
 MANIFEST = REPOSITORY_ROOT / "docs" / "wiki.yml"
 MODULE_DIRECTORY = REPOSITORY_ROOT / "docs" / "wiki" / "modules"
@@ -97,7 +101,7 @@ def test_harmonisation_wiki_preserves_the_runtime_processing_order():
         "**Dataset step 3 — Read and clean the study.**",
         "**Dataset step 4 — Check the parsed values.**",
         "**Dataset step 5 — Determine the genome build.**",
-        "**Dataset step 6 — Determine strand consensus.**",
+        "**Dataset step 6 — Determine strand policy and consensus.**",
         "**Dataset step 7 — Determine statistic types.**",
         "**Dataset step 8 — Split by chromosome.**",
     ]
@@ -153,6 +157,60 @@ def test_readme_uses_current_repository_and_version_two_interfaces():
     assert "jibinjv/postgwas:1.3" not in text
     assert "sumstat_file" not in text
     assert "--sample-sheet studies.csv" in text
+
+
+def test_readme_documents_the_complete_harmonisation_runtime_order():
+    text = ROOT_README.read_text(encoding="utf-8")
+    start = text.index("#### Complete harmonisation workflow and decision reference")
+    end = text.index("### Direct mode: run one module", start)
+    section = text[start:end]
+
+    stage_headings = [
+        "##### Stage 1 — preflight before the large input is read",
+        "##### Stage 2 — eight complete-dataset steps",
+        "##### Stage 3 — sixteen steps repeated for every chromosome",
+        "##### Stage 4 — chromosome retry and row reconciliation",
+        "##### Stage 5 — five post-merge steps",
+        "##### Stage 6 — optional input-to-VCF concordance",
+        "##### Stage 7 — multi-dataset summary and final states",
+    ]
+    positions = [section.index(heading) for heading in stage_headings]
+    assert positions == sorted(positions)
+
+    def numbered_rows(first_heading: str, second_heading: str) -> list[int]:
+        table = section[
+            section.index(first_heading) : section.index(second_heading)
+        ]
+        return [
+            int(value)
+            for value in re.findall(r"^\| (\d+) \|", table, flags=re.MULTILINE)
+        ]
+
+    assert numbered_rows(stage_headings[1], stage_headings[2]) == list(range(1, 9))
+    assert numbered_rows(stage_headings[2], stage_headings[3]) == list(range(1, 17))
+    assert numbered_rows(stage_headings[4], stage_headings[5]) == list(range(1, 6))
+
+
+def test_readme_documents_every_harmonisation_sample_sheet_field():
+    text = ROOT_README.read_text(encoding="utf-8")
+    start = text.index("<summary>Complete version-2 sample-sheet field contract</summary>")
+    contract = text[start : text.index("</details>", start)]
+
+    for field in HarmonisationSampleSheetRow.model_fields:
+        assert f"`{field}`" in contract, field
+
+
+def test_readme_harmonisation_policy_reference_matches_canonical_yaml():
+    completed = subprocess.run(
+        [sys.executable, str(README_POLICY_SYNCHRONIZER), "--check"],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "README harmonisation policy reference is synchronized." in completed.stdout
 
 
 def test_readme_indexes_every_manifest_page_in_order():

@@ -8,20 +8,16 @@ from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples
 # IMPORTS
 # ---------------------------------------------------------
 from postgwas.cli.common import (
-    get_bcftools_binary_parser,
     get_common_out_parser,
-    get_genome_build_parser,
     get_inputvcf_parser,
     sumstat_summary_arg_parser,
 )
-from postgwas.config import load_configuration
 
 
 # =========================================================
 # MAIN CLI
 # =========================================================
 def build_parser() -> argparse.ArgumentParser:
-    configuration = load_configuration()
     parser = argparse.ArgumentParser(
         prog="postgwas qc",
         usage="postgwas qc --vcf PATH [options]",
@@ -41,13 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
             get_compute_parser(),
             get_inputvcf_parser(),
             get_common_out_parser(),
-            get_genome_build_parser(
-                available_builds=list(configuration.resources.genomes),
-                default_build=configuration.modules.qc_summary.target_build.value,
-                suppress_default=True,
-            ),
             sumstat_summary_arg_parser(),
-            get_bcftools_binary_parser(),
         ],
         formatter_class=AlignedRichHelpFormatter,
     )

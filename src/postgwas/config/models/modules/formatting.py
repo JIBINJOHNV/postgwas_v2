@@ -26,6 +26,7 @@ FormattingTransform = Literal[
 FormattingDuplicatePolicy = Literal[
     "exclude_all",
     "error",
+    "lowest_p",
     "most_significant",
     "highest_maf",
     "highest_info",
@@ -62,6 +63,75 @@ class FormattingVcfFields(RootModel[dict[str, str]]):
         return self
 
 
+class FormattingProvenanceHeaders(StrictModel):
+    """PostGWAS origin markers required in a formatter input VCF."""
+
+    version: str
+    dataset_id: str
+    status: str
+
+    @field_validator("*")
+    @classmethod
+    def valid_metadata_name(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", value):
+            raise ValueError("must be a valid VCF metadata name")
+        return value
+
+    @model_validator(mode="after")
+    def unique_metadata_names(self):
+        values = list(self.model_dump().values())
+        if len(values) != len(set(values)):
+            raise ValueError("provenance metadata names must be unique")
+        return self
+
+
+class FormattingInputContract(StrictModel):
+    """Structural and canonical-value contract for harmonised GWAS-VCFs."""
+
+    genome_build_metadata: str
+    supported_genome_builds: list[str]
+    provenance_headers: FormattingProvenanceHeaders
+    chromosome_pattern: str
+    allele_pattern: str
+
+    @field_validator("genome_build_metadata")
+    @classmethod
+    def valid_genome_build_metadata(cls, value: str) -> str:
+        if value.count("{build}") != 1 or "=" not in value:
+            raise ValueError(
+                "must contain {build} exactly once after a metadata name"
+            )
+        if value.startswith("#"):
+            raise ValueError("must omit the VCF ## protocol prefix")
+        metadata_name = value.split("=", 1)[0]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", metadata_name):
+            raise ValueError("must begin with a valid VCF metadata name")
+        return value
+
+    @field_validator("supported_genome_builds")
+    @classmethod
+    def valid_supported_builds(cls, values: list[str]) -> list[str]:
+        if (
+            not values
+            or len(values) != len(set(values))
+            or any(
+                not value.strip() or value != value.strip()
+                for value in values
+            )
+        ):
+            raise ValueError("must contain unique non-empty genome builds")
+        return values
+
+    @field_validator("chromosome_pattern", "allele_pattern")
+    @classmethod
+    def valid_contract_pattern(cls, value: str) -> str:
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise ValueError("must be a valid regular expression") from exc
+        return value
+
+
 class FormattingValidationConfig(StrictModel):
     required_columns: list[str] = Field(default_factory=list)
     positive_columns: list[str] = Field(default_factory=list)
@@ -79,6 +149,7 @@ class FormattingValidationConfig(StrictModel):
 
 class FormattingTableConfig(StrictModel):
     output_file: str
+    include_header: bool
     columns: dict[str, str]
     transformations: dict[str, FormattingTransform] = Field(default_factory=dict)
     integer_columns: list[str] = Field(default_factory=list)
@@ -248,7 +319,7 @@ class FormattingSampleSizeReportingConfig(StrictModel):
 
 
 class FormattingChromosomeLabels(StrictModel):
-    """Configured normalization used before coordinates enter any export."""
+    """Normalization used only while inspecting external reference IDs."""
 
     prefix_pattern: str
     aliases: dict[str, str]
@@ -465,6 +536,7 @@ class FormattingStudyDesign(StrictModel):
 
 class FormattingRuntimeConfig(StrictModel):
     log_file: str
+    html_report_file: str
     resolved_config_file: str
     completion_manifest_file: str
     temporary_table_prefix: str
@@ -478,7 +550,8 @@ class FormattingRuntimeConfig(StrictModel):
     io_buffer_bytes: int = Field(gt=0)
 
     @field_validator(
-        "log_file", "resolved_config_file", "completion_manifest_file",
+        "log_file", "html_report_file", "resolved_config_file",
+        "completion_manifest_file",
         "temporary_table_prefix",
         "temporary_table_suffix", "atomic_output_suffix",
         "atomic_uncompressed_suffix", "output_null_value",
@@ -487,6 +560,13 @@ class FormattingRuntimeConfig(StrictModel):
     def nonempty_runtime_value(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("must not be empty")
+        return value
+
+    @field_validator("html_report_file")
+    @classmethod
+    def html_report_suffix(cls, value: str) -> str:
+        if not value.endswith(".html"):
+            raise ValueError("html_report_file must end with .html")
         return value
 
     @field_validator("table_delimiter")
@@ -576,6 +656,7 @@ class FormattingConfig(ModuleConfig):
     module_formats: dict[str, list[FormattingTarget]]
     chromosomes: list[str]
     minimum_p_value: float = Field(gt=0, le=1)
+    input_contract: FormattingInputContract
     vcf_fields: FormattingVcfFields
     numeric_columns: list[str]
     canonical_columns: FormattingCanonicalColumns

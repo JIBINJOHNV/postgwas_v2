@@ -53,7 +53,6 @@ ENUM_ALIASES = {
         "-log10": "neglog10",
         "-log10p": "neglog10",
         "mlogp": "neglog10",
-        "-ln": "negln",
     },
     "delimiter": {
         "\\t": "tab",
@@ -68,7 +67,7 @@ ENUM_ALIASES = {
 ALLOWED_ENUMS = {
     "trait_type": {"auto", "quantitative", "case_control"},
     "effect_type": {"auto", "beta", "odds_ratio"},
-    "p_value_type": {"auto", "raw", "neglog10", "negln"},
+    "p_value_type": {"auto", "raw", "neglog10"},
     "delimiter": {"auto", "tab", "comma", "semicolon", "space", "whitespace"},
 }
 
@@ -169,7 +168,7 @@ class HarmonisationSampleSheetRow(BaseModel):
     standard_error_column: str | None = None
     z_score_column: str | None = None
     p_value_column: str
-    p_value_type: Literal["auto", "raw", "neglog10", "negln"] = "auto"
+    p_value_type: Literal["auto", "raw", "neglog10"] = "auto"
     control_count_column: str | None = None
     case_count_column: str | None = None
     control_count: int | None = None
@@ -496,6 +495,7 @@ def to_harmonisation_input(
         "eafcolumn": value(row.external_eaf_column),
         "provided_external_eaf_file": value(row.external_eaf_file),
         "resource_folder": str(Path(resource_directory).expanduser().resolve()),
+        "output_root": str(Path(output_directory).expanduser().resolve()),
         "output_folder": str(configured_output_path(
             output_directory,
             output_layout["dataset_directory"],

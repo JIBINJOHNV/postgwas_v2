@@ -6,15 +6,24 @@ reference:
   prefix: /path/to/1000G_EUR
   population: EUR
 variant_harmonisation:
-  coordinate_fallback: true
   chromosome_label_policy: strip_chr_prefix
   minimum_overlap_fraction: 0.50
   allow_strand_complement: false
+mhc:
+  # include, exclude_snps, exclude_genes, or exclude_both
+  policy: exclude_both
+  # null uses resources.genomes.<genome_build>.regions.mhc
+  region_override: null
+chromosomes:
+  # X remains included unless it is listed explicitly.
+  exclude: [Y, MT]
 gene_annotation:
   file: /path/to/glist_ensgid_hg19_v40.txt
 set_annotation:
   file: null
   gmt_file: null
+  conversion:
+    minimum_gene_id_overlap_fraction: 0.50
 # For method: fastbat_set, set exactly one of set_annotation.file or
 # set_annotation.gmt_file. GMT conversion uses gene_annotation.file and the
 # PLINK BIM belonging to reference.prefix.

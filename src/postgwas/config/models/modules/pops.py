@@ -27,6 +27,133 @@ def _optional_nonempty(value: str | None) -> str | None:
     return value
 
 
+class PopsMagmaAnnotatedSchema(StrictModel):
+    delimiter: str
+    gene_id_column: str
+    chromosome_column: str
+    start_column: str
+    end_column: str
+    snp_count_column: str
+    parameter_count_column: str
+    sample_size_column: str
+    zstat_column: str
+    pvalue_column: str
+    reference_chromosome_column: str
+    reference_start_column: str
+    reference_end_column: str
+    reference_strand_column: str
+    gene_symbol_column: str
+    bonferroni_pvalue_column: str
+    fdr_pvalue_column: str
+
+    @field_validator("delimiter")
+    @classmethod
+    def one_character_delimiter(cls, value: str) -> str:
+        if len(value) != 1:
+            raise ValueError("must contain exactly one character")
+        return value
+
+    @model_validator(mode="after")
+    def unique_nonempty_columns(self):
+        columns = [
+            value
+            for name, value in self.model_dump().items()
+            if name.endswith("_column")
+        ]
+        if any(not value.strip() for value in columns):
+            raise ValueError("MAGMA annotated column names must not be empty")
+        if len(columns) != len(set(columns)):
+            raise ValueError("MAGMA annotated column names must be unique")
+        return self
+
+
+class PopsIntegratedResultColumns(StrictModel):
+    gene_id: str
+    gene_symbol: str
+    pops_chromosome: str
+    pops_tss: str
+    pops_score: str
+    pops_rank: str
+    gene_analysis_status: str
+    magma_zstat: str
+    magma_pvalue: str
+    magma_bonferroni_pvalue: str
+    magma_fdr_pvalue: str
+    magma_chromosome: str
+    magma_start: str
+    magma_end: str
+    magma_snp_count: str
+    magma_parameter_count: str
+    magma_sample_size: str
+    pops_adjusted_target_score: str
+    used_for_model_fitting: str
+    used_for_feature_selection: str
+    used_for_covariate_projection: str
+    target_source: str
+    input_target_score: str
+    compatibility_decision: str
+    retained_as_pops_target: str
+    present_in_pops_annotation: str
+    present_in_feature_rows: str
+    target_row: str
+    input_target_score_available: str
+    pops_score_available: str
+    pops_target_score_available: str
+    pops_target_score: str
+    magma_result_available: str
+    magma_reference_chromosome: str
+    magma_reference_start: str
+    magma_reference_end: str
+    magma_reference_strand: str
+
+    @model_validator(mode="after")
+    def unique_nonempty_columns(self):
+        columns = list(self.model_dump().values())
+        if any(not value.strip() for value in columns):
+            raise ValueError("integrated result column names must not be empty")
+        if len(columns) != len(set(columns)):
+            raise ValueError("integrated result column names must be unique")
+        return self
+
+
+class PopsIntegratedStatusLabels(StrictModel):
+    scored_and_fitted: str
+    scored_with_target_not_fitted: str
+    scored_without_target: str
+    target_excluded_from_pops: str
+
+    @model_validator(mode="after")
+    def unique_nonempty_labels(self):
+        labels = list(self.model_dump().values())
+        if any(not value.strip() for value in labels):
+            raise ValueError("integrated result status labels must not be empty")
+        if len(labels) != len(set(labels)):
+            raise ValueError("integrated result status labels must be unique")
+        return self
+
+
+class PopsIntegratedResultsConfig(StrictModel):
+    delimiter: str
+    null_value: str
+    html_page_size: int = Field(ge=1)
+    columns: PopsIntegratedResultColumns
+    status_labels: PopsIntegratedStatusLabels
+
+    @field_validator("delimiter")
+    @classmethod
+    def one_character_delimiter(cls, value: str) -> str:
+        if len(value) != 1:
+            raise ValueError("must contain exactly one character")
+        return value
+
+    @field_validator("null_value")
+    @classmethod
+    def nonempty_null_value(cls, value: str) -> str:
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
 class PopsInputSchema(StrictModel):
     table_delimiter_pattern: str
     target_table_delimiter: str
@@ -44,8 +171,13 @@ class PopsInputSchema(StrictModel):
     magma_genes_out_suffix: str
     magma_genes_raw_suffix: str
     prediction_score_column: str
+    prediction_target_column: str
+    prediction_projected_target_column: str
+    prediction_covariate_projection_column: str
+    prediction_feature_selection_column: str
     prediction_training_column: str
     marginal_selected_column: str
+    magma_annotated: PopsMagmaAnnotatedSchema
 
     @field_validator("table_delimiter_pattern")
     @classmethod
@@ -68,7 +200,10 @@ class PopsInputSchema(StrictModel):
         "gene_annotation_chromosome_column",
         "gene_annotation_tss_column", "magma_gene_id_column",
         "magma_score_column", "target_gene_id_column", "target_score_column",
-        "prediction_score_column", "prediction_training_column",
+        "prediction_score_column", "prediction_target_column",
+        "prediction_projected_target_column",
+        "prediction_covariate_projection_column",
+        "prediction_feature_selection_column", "prediction_training_column",
         "marginal_selected_column",
     )
     @classmethod
@@ -117,6 +252,8 @@ class PopsOutputLayout(StrictModel):
     excluded_genes_raw_suffix: str
     gene_compatibility_table_suffix: str
     gene_compatibility_report_suffix: str
+    integrated_results_suffix: str
+    integrated_report_suffix: str
 
     @field_validator("output_prefix", "staging_directory", "service_log_file")
     @classmethod
@@ -140,6 +277,7 @@ class PopsOutputLayout(StrictModel):
         "compatible_genes_out_suffix", "compatible_genes_raw_suffix",
         "excluded_genes_out_suffix", "excluded_genes_raw_suffix",
         "gene_compatibility_table_suffix", "gene_compatibility_report_suffix",
+        "integrated_results_suffix", "integrated_report_suffix",
     )
     @classmethod
     def safe_output_suffix(cls, value: str) -> str:
@@ -157,6 +295,7 @@ class PopsOutputLayout(StrictModel):
             self.excluded_genes_out_suffix, self.excluded_genes_raw_suffix,
             self.gene_compatibility_table_suffix,
             self.gene_compatibility_report_suffix,
+            self.integrated_results_suffix, self.integrated_report_suffix,
         ]
         if len(suffixes) != len(set(suffixes)):
             raise ValueError("output suffixes must be unique")
@@ -171,6 +310,7 @@ class PopsConfig(ModuleConfig):
     minimum_gene_count: int = Field(ge=1)
     gene_universe_policy: PopsGeneUniversePolicy
     magma_association_prefix: str | None = None
+    magma_annotated_results_file: str | None = None
     feature_matrix_prefix: str | None = None
     feature_matrix_chunks: int = Field(ge=1)
     gene_location_file: str | None = None
@@ -194,11 +334,13 @@ class PopsConfig(ModuleConfig):
     save_matrix_files: bool
     verbose: bool
     reporting: GeneRankingReportingConfig
+    integrated_results: PopsIntegratedResultsConfig
     input_schema: PopsInputSchema
     output_layout: PopsOutputLayout
 
     @field_validator(
-        "magma_association_prefix", "feature_matrix_prefix", "gene_location_file",
+        "magma_association_prefix", "magma_annotated_results_file",
+        "feature_matrix_prefix", "gene_location_file",
         "control_features_file", "target_score_file", "target_covariates_file",
         "target_error_covariance_file", "feature_subset_file",
     )
@@ -233,6 +375,13 @@ class PopsConfig(ModuleConfig):
         ):
             raise ValueError(
                 "target covariates and covariance require target_score_file"
+            )
+        if (
+            self.magma_annotated_results_file is not None
+            and self.magma_association_prefix is None
+        ):
+            raise ValueError(
+                "magma_annotated_results_file requires magma_association_prefix"
             )
         if (
             self.gene_universe_policy == "intersect"
@@ -273,6 +422,7 @@ class PopsConfig(ModuleConfig):
 __all__ = [
     "PopsConfig",
     "PopsGeneUniversePolicy",
+    "PopsIntegratedResultsConfig",
     "PopsMethod",
     "PopsReporting",
 ]

@@ -19,28 +19,38 @@ from postgwas.config import (
     write_resolved_configuration,
 )
 from postgwas.config.cli_overrides import explicit_overrides
-from postgwas.core.paths import configured_output_path, validate_filename_component
+from postgwas.core.matrix_validation import read_unique_names, validate_feature_matrix_bundle
+from postgwas.core.paths import (
+    configured_output_path,
+    require_nonempty_file,
+    validate_filename_component,
+)
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
+from postgwas.core.preflight import (
+    PipelinePreflightEvidence,
+    pipeline_preflight_evidence,
+    require_pipeline_input_vcf,
+)
 from postgwas.core.required_arguments import (
     RequiredAlternative,
     RequiredArgument,
     require_resolved_arguments,
 )
-from postgwas.core.io.reports import write_yaml_report
+from postgwas.core.gene_annotation_validation import validate_gene_tss_annotation
+from postgwas.core.io.tables import read_pandas_table, require_table_columns
+from postgwas.core.io.reports import write_delimited_report, write_yaml_report
 from postgwas.core.ui.progress import StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
+from postgwas.core.validation_reporting import register_file_validation_bundle
+from postgwas.core.values import format_percentage
 from postgwas.modules.pops.errors import PopsError
-
-
-_POPS_PROGRESS_STAGES = (
-    "Validate PoPS inputs and reference resources",
-    "Load target gene scores",
-    "Adjust target scores for configured covariates",
-    "Test and select predictive features",
-    "Fit the PoPS prediction model",
-    "Calculate genome-wide PoPS scores",
-    "Validate and publish PoPS results",
+from postgwas.modules.pops.reporting import write_integrated_gene_report
+from postgwas.modules.pops.stages import (
+    POPS_STAGES,
+    pops_pipeline_stage_numbers,
 )
+
+
 _POPS_UPSTREAM_PROGRESS_ORDER = (
     "target_loading",
     "covariate_adjustment",
@@ -50,14 +60,304 @@ _POPS_UPSTREAM_PROGRESS_ORDER = (
 )
 
 
-def _progress_outcome_fields(stage: str, metrics: dict) -> list[tuple[str, str, object]]:
+def _score_wording(source: str) -> dict[str, str]:
+    """Return source-specific terms without changing PoPS's generic interface."""
+    if source == "MAGMA":
+        return {
+            "heading": "MAGMA gene Z-score inputs",
+            "source": "MAGMA gene-level association Z-scores (ZSTAT)",
+            "plural": "MAGMA gene Z-scores",
+            "coverage": "MAGMA Z-scores",
+            "column": "MAGMA gene Z-score column",
+            "loaded": "MAGMA gene Z-scores loaded",
+        }
+    return {
+        "heading": "Custom gene-score inputs",
+        "source": "custom gene scores",
+        "plural": "custom gene scores",
+        "coverage": "custom gene scores",
+        "column": "Custom gene-score column",
+        "loaded": "Custom gene scores loaded",
+    }
+
+
+def _target_validation_fields(module, outcome: dict) -> list[tuple[str, str, object]]:
+    wording = _score_wording(outcome["label"])
+    if outcome["label"] == "MAGMA":
+        fields = [
+            ("analysis", wording["heading"]),
+            ("genetic", "Scores used to fit PoPS", wording["source"]),
+            ("info", "MAGMA gene-statistic file", outcome["output_path"].name),
+            ("info", "MAGMA covariance file", outcome["raw_path"].name),
+            ("count", wording["plural"], outcome["gene_count"]),
+            ("genetic", wording["column"], outcome["score_column"]),
+            (
+                "genetic",
+                "Chromosomes in covariance metadata",
+                ", ".join(outcome["raw_chromosomes"]),
+            ),
+            (
+                "success",
+                "Gene identity and order",
+                "identical in .genes.out and .genes.raw",
+            ),
+            (
+                "success",
+                "MAGMA technical-covariate metadata",
+                "finite and strictly positive",
+            ),
+            (
+                "success",
+                "MAGMA covariance blocks",
+                "%d finite symmetric blocks" % outcome["covariance_blocks"],
+            ),
+            ("success", "Gene-score input validation", "passed"),
+        ]
+        if outcome.get("annotated") is None:
+            fields.append((
+                "info", "Annotated MAGMA enrichment", "not supplied",
+            ))
+        else:
+            fields.extend((
+                (
+                    "info", "Annotated MAGMA gene-results file",
+                    outcome["annotated"]["path"].name,
+                ),
+                (
+                    "success", "Annotated MAGMA consistency",
+                    "gene IDs, chromosomes, and Z statistics validated",
+                ),
+            ))
+        return fields
+    fields = [
+        ("analysis", wording["heading"]),
+        ("genetic", "Scores used to fit PoPS", wording["source"]),
+        ("info", "Custom gene-score file", outcome["path"].name),
+        ("count", wording["plural"], outcome["gene_count"]),
+        ("genetic", wording["column"], outcome["score_column"]),
+    ]
+    if outcome["covariates_path"] is None:
+        fields.append(("info", "Custom gene-score covariates", "not requested"))
+    else:
+        fields.extend((
+            (
+                "info", "Custom gene-score covariates file",
+                outcome["covariates_path"].name,
+            ),
+            ("count", "Custom gene-score covariates", outcome["covariate_count"]),
+            ("success", "Gene-score/covariate gene IDs", "identical"),
+        ))
+    covariance = outcome.get("covariance")
+    if covariance is None:
+        fields.append(("info", "Custom gene-error covariance", "not requested"))
+    else:
+        fields.extend((
+            (
+                "info", "Custom gene-error covariance file",
+                covariance["path"].name,
+            ),
+            (
+                "count",
+                "Custom gene-error covariance dimensions",
+                "%d × %d" % (covariance["dimension"], covariance["dimension"]),
+            ),
+            ("analysis", "Covariance representation", covariance["representation"]),
+            (
+                "success",
+                "Covariance validation",
+                "finite, symmetric, and positive definite",
+            ),
+        ))
+    fields.append(("success", "Gene-score input validation", "passed"))
+    return fields
+
+
+def _annotation_validation_fields(
+    module, annotation: dict,
+) -> list[tuple[str, str, object]]:
+    schema = module.input_schema
+    return [
+        ("analysis", "PoPS gene-location annotation"),
+        ("info", "Reference file", annotation["path"].name),
+        ("genetic", "Declared genome build", module.genome_build.value),
+        ("count", "Annotated genes", annotation["gene_count"]),
+        (
+            "genetic",
+            "Chromosomes represented",
+            ", ".join(annotation["chromosomes"]),
+        ),
+        ("genetic", "Gene-ID column", schema.gene_annotation_id_column),
+        ("genetic", "Chromosome column", schema.gene_annotation_chromosome_column),
+        (
+            "genetic",
+            "Transcription-start-site column",
+            schema.gene_annotation_tss_column,
+        ),
+        (
+            "count",
+            "Transcription-start-site range",
+            "%g–%g" % (annotation["tss_minimum"], annotation["tss_maximum"]),
+        ),
+        (
+            "success" if annotation["name_column_present"] else "info",
+            "Optional gene-name column",
+            (
+                schema.gene_annotation_name_column
+                if annotation["name_column_present"] else "not supplied"
+            ),
+        ),
+        ("success", "Gene-location validation", "passed"),
+    ]
+
+
+def _feature_validation_fields(
+    module, features: dict,
+) -> list[tuple[str, str, object]]:
+    fields = [
+        ("analysis", "PoPS feature matrices"),
+        ("info", "Feature prefix", Path(module.feature_matrix_prefix).name),
+        ("info", "Feature-row file", features["rows_path"].name),
+        ("count", "Feature-matrix genes", features["row_count"]),
+        ("count", "Matrix chunks", len(features["chunks"])),
+        ("count", "Total features", features["feature_count"]),
+        (
+            "success",
+            "Column companion files",
+            "%s · %d/%d present and non-empty"
+            % (
+                module.input_schema.feature_columns_pattern,
+                len(features["chunks"]),
+                module.feature_matrix_chunks,
+            ),
+        ),
+        (
+            "success",
+            "Matrix companion files",
+            "%s · %d/%d present and non-empty"
+            % (
+                module.input_schema.feature_matrix_pattern,
+                len(features["chunks"]),
+                module.feature_matrix_chunks,
+            ),
+        ),
+    ]
+    for metrics in features["chunks"]:
+        fields.append((
+            "analysis",
+            "Chunk %d dimensions" % metrics["chunk"],
+            "%s genes × %s features · %s"
+            % (metrics["rows"], metrics["columns"], metrics["dtype"]),
+        ))
+    fields.extend((
+        ("success", "Matrix dimensions", "match row and column companion files"),
+        ("success", "Matrix numeric-value validation", "finite numeric values"),
+        ("success", "Feature-matrix validation", "passed"),
+    ))
+    return fields
+
+
+def _feature_control_validation_fields(
+    controls: dict,
+) -> list[tuple[str, str, object]]:
+    fields = [("analysis", "PoPS feature controls")]
+    for key, label in (
+        ("feature_subset", "Feature-subset file"),
+        ("controls", "Control-features file"),
+    ):
+        resource = controls[key]
+        if resource is None:
+            fields.append(("info", label, "not requested"))
+        else:
+            fields.extend((
+                ("info", label, resource["path"].name),
+                (
+                    "count",
+                    "%s entries" % label.removesuffix(" file"),
+                    resource["count"],
+                ),
+                (
+                    "success",
+                    "%s compatibility" % label.removesuffix(" file"),
+                    "all names found in feature matrices",
+                ),
+            ))
+    retained = controls["controls_retained_by_subset"]
+    if retained is not None:
+        fields.append((
+            "success",
+            "Controls retained by feature subset",
+            "%d/%d" % (retained, controls["controls"]["count"]),
+        ))
+    fields.append(("success", "Feature-control validation", "passed"))
+    return fields
+
+
+def _gene_compatibility_fields(
+    module, features: dict, annotation: dict, outcome: dict,
+) -> list[tuple[str, str, object]]:
+    compatibility = outcome["compatibility"]
+    retained = compatibility["retained_target_genes"]
+    original = compatibility["original_target_genes"]
+    excluded = compatibility["excluded_target_genes"]
+    fields = [
+        ("analysis", "PoPS gene-identifier compatibility"),
+        ("count", "Original genes with input scores", original),
+        ("genetic", "Gene-location identifiers", annotation["gene_count"]),
+        ("genetic", "Feature-row identifiers", features["row_count"]),
+        (
+            "success",
+            "Genes with scores shared by all inputs",
+            "%s/%s (%s)"
+            % (retained, original, format_percentage(retained, original)),
+        ),
+        (
+            "warning" if compatibility["absent_from_annotation"] else "success",
+            "Scored genes absent from annotation",
+            compatibility["absent_from_annotation"],
+        ),
+        (
+            "warning" if compatibility["absent_from_features"] else "success",
+            "Scored genes absent from feature rows",
+            compatibility["absent_from_features"],
+        ),
+        (
+            "warning" if excluded else "success",
+            "Scored genes excluded",
+            excluded,
+        ),
+        ("info", "Required compatible genes", module.minimum_gene_count),
+    ]
+    if outcome.get("pipeline_genome_build") is not None:
+        fields.append((
+            "success",
+            "GWAS/MAGMA and PoPS genome build",
+            "%s matched" % outcome["pipeline_genome_build"],
+        ))
+    fields.extend((
+        ("decision", "Gene-universe policy", module.gene_universe_policy),
+        (
+            "success",
+            "Compatibility decision",
+            (
+                "use all genes with input scores"
+                if not excluded else "derive aligned MAGMA inputs"
+            ),
+        ),
+    ))
+    return fields
+
+
+def _progress_outcome_fields(
+    stage: str, metrics: dict, *, score_source: str,
+) -> list[tuple[str, str, object]]:
     """Translate upstream stage metrics into stable, scientific screen fields."""
     if stage == "target_loading":
+        wording = _score_wording(score_source)
         return [
-            ("genetic", "Target source", metrics["target_source"]),
-            ("count", "Target genes loaded", metrics["target_genes"]),
-            ("count", "Target covariates", metrics["covariates"]),
-            ("analysis", "Error covariance", metrics["error_covariance"]),
+            ("genetic", "Scores used to fit PoPS", wording["source"]),
+            ("count", wording["loaded"], metrics["target_genes"]),
+            ("count", "Gene-score covariates", metrics["covariates"]),
+            ("analysis", "Gene-error covariance", metrics["error_covariance"]),
         ]
     if stage == "covariate_adjustment":
         return [
@@ -76,7 +376,7 @@ def _progress_outcome_fields(stage: str, metrics: dict) -> list[tuple[str, str, 
     if stage == "model_fitting":
         fields = [
             ("analysis", "Prediction model", metrics["method"]),
-            ("count", "Training genes", metrics["training_genes"]),
+            ("count", "Genes used to fit the model", metrics["training_genes"]),
             ("count", "Model features", metrics["model_features"]),
         ]
         if metrics.get("selected_cv_alpha") is not None:
@@ -86,7 +386,10 @@ def _progress_outcome_fields(stage: str, metrics: dict) -> list[tuple[str, str, 
         return fields
     if stage == "gene_scoring":
         return [
-            ("count", "Genes assigned PoPS scores", metrics["genes_scored"]),
+            (
+                "count", "Feature-row genes receiving PoPS scores",
+                metrics["genes_scored"],
+            ),
             ("count", "Features contributing to scores", metrics["model_features"]),
             ("success", "Output tables written", metrics["outputs_written"]),
         ]
@@ -121,6 +424,7 @@ def _resolved_configuration(args: argparse.Namespace):
         "genome_build": "genome_build",
         "pops_genome_build": "genome_build",
         "magma_association_prefix": "magma_association_prefix",
+        "magma_annotated_results_file": "magma_annotated_results_file",
         "feature_matrix_prefix": "feature_matrix_prefix",
         "feature_matrix_chunks": "feature_matrix_chunks",
         "gene_universe_policy": "gene_universe_policy",
@@ -167,12 +471,7 @@ def _resolved_configuration(args: argparse.Namespace):
 
 
 def _required_file(value: str | None, label: str) -> Path:
-    if value is None:
-        raise PopsError("%s is required." % label)
-    path = Path(value).expanduser().resolve()
-    if not path.is_file() or path.stat().st_size <= 0:
-        raise PopsError("%s does not exist or is empty: %s" % (label, path))
-    return path
+    return require_nonempty_file(value, label, error_type=PopsError)
 
 
 def _prefix_file(prefix: str | None, suffix: str, label: str) -> Path:
@@ -181,106 +480,140 @@ def _prefix_file(prefix: str | None, suffix: str, label: str) -> Path:
     return _required_file(str(Path(prefix).expanduser()) + suffix, label)
 
 
-def _read_names(path: Path, label: str) -> np.ndarray:
-    values = np.atleast_1d(np.loadtxt(path, dtype=str)).reshape(-1)
-    if values.size == 0 or any(not str(value).strip() for value in values):
-        raise PopsError("%s contains no usable names: %s" % (label, path))
-    if len(values) != len(set(values.tolist())):
-        raise PopsError("%s contains duplicate names: %s" % (label, path))
-    return values
-
-
-def _read_table(path: Path, delimiter: str, label: str) -> pd.DataFrame:
-    try:
-        table = pd.read_csv(path, sep=delimiter)
-    except (OSError, ValueError, pd.errors.ParserError) as exc:
-        raise PopsError("Cannot read %s %s: %s" % (label, path, exc)) from exc
-    if table.empty:
-        raise PopsError("%s contains no data rows: %s" % (label, path))
-    return table
-
-
-def _require_columns(table: pd.DataFrame, columns: list[str], label: str) -> None:
-    missing = [column for column in columns if column not in table.columns]
-    if missing:
-        raise PopsError(
-            "%s is missing required columns: %s"
-            % (label, ", ".join(missing))
-        )
-
-
 def _validate_feature_resources(module) -> dict:
+    """Reuse a complete, unchanged matrix-bundle check within this pipeline only."""
     schema = module.input_schema
     prefix = module.feature_matrix_prefix
     rows_path = _prefix_file(prefix, schema.feature_rows_suffix, "PoPS feature rows")
-    rows = _read_names(rows_path, "PoPS feature rows")
-    all_columns: list[str] = []
-    chunk_metrics = []
-    for chunk in range(module.feature_matrix_chunks):
-        columns_path = _prefix_file(
-            prefix,
-            schema.feature_columns_pattern.format(chunk=chunk),
-            "PoPS feature columns chunk %d" % chunk,
+    chunks = tuple(
+        (
+            _prefix_file(
+                prefix, schema.feature_columns_pattern.format(chunk=chunk),
+                "PoPS feature columns chunk %d" % chunk,
+            ),
+            _prefix_file(
+                prefix, schema.feature_matrix_pattern.format(chunk=chunk),
+                "PoPS feature matrix chunk %d" % chunk,
+            ),
         )
-        matrix_path = _prefix_file(
-            prefix,
-            schema.feature_matrix_pattern.format(chunk=chunk),
-            "PoPS feature matrix chunk %d" % chunk,
-        )
-        columns = _read_names(columns_path, "PoPS feature columns chunk %d" % chunk)
-        try:
-            matrix = np.load(matrix_path, mmap_mode="r", allow_pickle=False)
-        except (OSError, ValueError) as exc:
-            raise PopsError("Cannot read feature matrix %s: %s" % (matrix_path, exc)) from exc
-        if matrix.ndim != 2 or matrix.shape != (len(rows), len(columns)):
-            raise PopsError(
-                "Feature matrix chunk %d has shape %s; expected (%d, %d)."
-                % (chunk, matrix.shape, len(rows), len(columns))
-            )
-        all_columns.extend(columns.tolist())
-        chunk_metrics.append({"chunk": chunk, "rows": matrix.shape[0], "columns": matrix.shape[1]})
-    if len(all_columns) != len(set(all_columns)):
-        raise PopsError("Feature names must be unique across all matrix chunks.")
-    for value, label in (
-        (module.feature_subset_file, "PoPS feature-subset file"),
-        (module.control_features_file, "PoPS control-features file"),
+        for chunk in range(module.feature_matrix_chunks)
+    )
+    features = validate_feature_matrix_bundle(
+        rows_path, chunks, error_type=PopsError,
+    )
+    bundle_paths = tuple(
+        path
+        for chunk in features["chunks"]
+        for path in (chunk["columns_path"], chunk["matrix_path"])
+    )
+    register_file_validation_bundle(
+        bundle_paths,
+        "PoPS feature matrix bundle",
+        (
+            ("count", "pops_feature_chunks", len(features["chunks"])),
+            (
+                "success",
+                "pops_feature_column_files",
+                "%d / %d"
+                % (len(features["chunks"]), module.feature_matrix_chunks),
+            ),
+            (
+                "success",
+                "pops_feature_matrix_files",
+                "%d / %d"
+                % (len(features["chunks"]), module.feature_matrix_chunks),
+            ),
+            ("count", "genes", features["row_count"]),
+            ("count", "features", features["feature_count"]),
+            (
+                "count",
+                "pops_matrix_dtypes",
+                sorted({chunk["dtype"] for chunk in features["chunks"]}),
+            ),
+            ("count", "pops_unique_bundle_files", len(bundle_paths)),
+            (
+                "success",
+                "pops_matrix_validation",
+                "unique feature names; companion dimensions matched; all "
+                "matrix values finite and numeric",
+            ),
+        ),
+        covered_checks=(
+            "nonempty unique names",
+            "companion dimensions",
+            "all values finite and numeric",
+            "unique feature names across all chunks",
+            "matrix column-count agreement",
+            "matrix shape agrees with companion files",
+            "all values: finite numeric data",
+        ),
+        covered_metric_keys=(
+            "names", "chunk", "features", "rows", "columns", "dtype",
+        ),
+    )
+    return features
+
+
+def _validate_feature_control_resources(module, features: dict) -> dict:
+    """Validate optional feature subset and control lists against the matrix."""
+    all_columns = set(features["feature_names"])
+    resources = {}
+    for key, value, label in (
+        (
+            "feature_subset",
+            module.feature_subset_file,
+            "PoPS feature-subset file",
+        ),
+        (
+            "controls",
+            module.control_features_file,
+            "PoPS control-features file",
+        ),
     ):
-        if value is not None:
-            names = _read_names(_required_file(value, label), label)
-            unknown = sorted(set(names.tolist()) - set(all_columns))
-            if unknown:
-                raise PopsError(
-                    "%s contains features absent from the matrix: %s"
-                    % (label, ", ".join(unknown[:10]))
-                )
-    return {
-        "rows": rows,
-        "rows_path": rows_path,
-        "row_count": len(rows),
-        "feature_count": len(all_columns),
-        "chunks": chunk_metrics,
-    }
+        if value is None:
+            resources[key] = None
+            continue
+        path = _required_file(value, label)
+        names = read_unique_names(path, label, error_type=PopsError)
+        unknown = sorted(set(names.tolist()) - all_columns)
+        if unknown:
+            raise PopsError(
+                "%s contains features absent from the matrix: %s"
+                % (label, ", ".join(unknown[:10]))
+            )
+        resources[key] = {
+            "path": path,
+            "count": len(names),
+            "names": tuple(names.tolist()),
+        }
+    subset = resources["feature_subset"]
+    controls = resources["controls"]
+    if subset is not None and controls is not None:
+        excluded_controls = sorted(set(controls["names"]) - set(subset["names"]))
+        if excluded_controls:
+            raise PopsError(
+                "PoPS control-features file contains features excluded by the "
+                "feature-subset file: %s. Upstream PoPS applies the subset first, "
+                "so these controls would otherwise be silently discarded."
+                % ", ".join(excluded_controls[:10])
+            )
+        resources["controls_retained_by_subset"] = controls["count"]
+    else:
+        resources["controls_retained_by_subset"] = None
+    return resources
 
 
 def _validate_gene_annotation(module) -> dict:
     schema = module.input_schema
-    path = _required_file(module.gene_location_file, "PoPS gene-location file")
-    table = _read_table(path, schema.table_delimiter_pattern, "PoPS gene annotation")
-    required = [
-        schema.gene_annotation_id_column,
-        schema.gene_annotation_chromosome_column,
-        schema.gene_annotation_tss_column,
-    ]
-    _require_columns(table, required, "PoPS gene annotation")
-    identifiers = table[schema.gene_annotation_id_column].astype(str)
-    if identifiers.duplicated().any():
-        raise PopsError("PoPS gene annotation contains duplicate gene identifiers.")
-    chromosome = table[schema.gene_annotation_chromosome_column].astype(str)
-    if chromosome.str.strip().eq("").any():
-        raise PopsError("PoPS gene annotation contains empty chromosome labels.")
-    tss = pd.to_numeric(table[schema.gene_annotation_tss_column], errors="coerce")
-    if tss.isna().any() or not np.isfinite(tss.to_numpy()).all() or (tss < 0).any():
-        raise PopsError("PoPS gene annotation TSS values must be finite and non-negative.")
+    annotation = validate_gene_tss_annotation(
+        module.gene_location_file, delimiter=schema.table_delimiter_pattern,
+        id_column=schema.gene_annotation_id_column,
+        chromosome_column=schema.gene_annotation_chromosome_column,
+        tss_column=schema.gene_annotation_tss_column,
+        name_column=schema.gene_annotation_name_column,
+        require_names=False, require_nonempty_identifiers=False,
+        label="PoPS gene annotation", error_type=PopsError,
+    )
     configured_chromosomes = {
         value
         for values in (
@@ -291,24 +624,159 @@ def _validate_gene_annotation(module) -> dict:
         if values is not None
         for value in values
     }
-    unknown = sorted(configured_chromosomes - set(chromosome))
+    unknown = sorted(configured_chromosomes - set(annotation["chromosomes"]))
     if unknown:
         raise PopsError(
             "Configured PoPS chromosomes are absent from the gene annotation: %s"
             % ", ".join(unknown)
         )
-    names = identifiers
-    if schema.gene_annotation_name_column in table.columns:
-        configured_names = table[schema.gene_annotation_name_column].astype(str)
-        names = configured_names.where(configured_names.str.strip().ne(""), identifiers)
-    return {
-        "path": path,
-        "genes": set(identifiers),
-        "gene_count": len(identifiers),
-        "chromosomes": sorted(set(chromosome)),
-        "gene_names": dict(zip(identifiers, names)),
-        "gene_chromosomes": dict(zip(identifiers, chromosome)),
+    return annotation
+
+
+def _clean_table_value(value):
+    """Convert pandas/NumPy scalar values to JSON- and CSV-safe Python values."""
+    if pd.isna(value):
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _validate_annotated_magma_results(
+    module,
+    result_identifiers: list[str],
+    result_scores: pd.Series,
+    gene_chromosomes: dict[str, str],
+) -> dict | None:
+    """Validate an optional annotated MAGMA table against authoritative results."""
+    if module.magma_annotated_results_file is None:
+        return None
+    schema = module.input_schema.magma_annotated
+    path = _required_file(
+        module.magma_annotated_results_file,
+        "annotated MAGMA gene-results file",
+    )
+    table = read_pandas_table(path, schema.delimiter, "annotated MAGMA gene results", error_type=PopsError)
+    configured_columns = [
+        value
+        for name, value in schema.model_dump().items()
+        if name.endswith("_column")
+    ]
+    require_table_columns(table, configured_columns, "annotated MAGMA gene results", error_type=PopsError)
+    identifiers = table[schema.gene_id_column].astype(str)
+    if identifiers.duplicated().any():
+        raise PopsError(
+            "Annotated MAGMA gene results contain duplicate gene identifiers."
+        )
+    expected = set(result_identifiers)
+    observed = set(identifiers)
+    if observed != expected:
+        raise PopsError(
+            "Annotated MAGMA gene results must contain exactly the genes in "
+            ".genes.out (annotated=%d, .genes.out=%d, absent from annotated=%d, "
+            "absent from .genes.out=%d). Files: %s; %s"
+            % (
+                len(observed), len(expected), len(expected - observed),
+                len(observed - expected), path,
+                str(Path(module.magma_association_prefix).expanduser())
+                + module.input_schema.magma_genes_out_suffix,
+            )
+        )
+    indexed = table.assign(_gene_id=identifiers).set_index("_gene_id", drop=True)
+    zstats = pd.to_numeric(indexed[schema.zstat_column], errors="coerce")
+    if zstats.isna().any() or not np.isfinite(zstats.to_numpy()).all():
+        raise PopsError("Annotated MAGMA Z statistics must all be finite.")
+    expected_scores = pd.Series(
+        result_scores.to_numpy(), index=result_identifiers, dtype=float,
+    ).loc[zstats.index]
+    if not np.allclose(
+        zstats.to_numpy(), expected_scores.to_numpy(), rtol=1e-10, atol=1e-12,
+    ):
+        raise PopsError(
+            "Annotated MAGMA Z statistics do not match the authoritative "
+            ".genes.out values."
+        )
+    for column, label in (
+        (schema.pvalue_column, "MAGMA p-values"),
+        (schema.bonferroni_pvalue_column, "Bonferroni-adjusted MAGMA p-values"),
+        (schema.fdr_pvalue_column, "FDR-adjusted MAGMA p-values"),
+    ):
+        values = pd.to_numeric(indexed[column], errors="coerce")
+        if (
+            values.isna().any()
+            or not np.isfinite(values.to_numpy()).all()
+            or ((values < 0) | (values > 1)).any()
+        ):
+            raise PopsError("%s must be finite and between zero and one." % label)
+    numeric = {
+        column: pd.to_numeric(indexed[column], errors="coerce")
+        for column in (
+            schema.start_column,
+            schema.end_column,
+            schema.snp_count_column,
+            schema.parameter_count_column,
+            schema.sample_size_column,
+            schema.reference_start_column,
+            schema.reference_end_column,
+        )
     }
+    if any(
+        values.isna().any() or not np.isfinite(values.to_numpy()).all()
+        for values in numeric.values()
+    ):
+        raise PopsError(
+            "Annotated MAGMA positions, counts, and sample sizes must be finite "
+            "numeric values."
+        )
+    for column in (
+        schema.snp_count_column,
+        schema.parameter_count_column,
+        schema.sample_size_column,
+    ):
+        if (numeric[column] <= 0).any():
+            raise PopsError(
+                "Annotated MAGMA gene counts and sample sizes must be positive."
+            )
+    for start_column, end_column, label in (
+        (schema.start_column, schema.end_column, "MAGMA result"),
+        (
+            schema.reference_start_column,
+            schema.reference_end_column,
+            "MAGMA reference",
+        ),
+    ):
+        if (
+            (numeric[start_column] < 0).any()
+            or (numeric[end_column] < numeric[start_column]).any()
+        ):
+            raise PopsError(
+                "%s gene intervals must have non-negative starts and ends not "
+                "less than starts." % label
+            )
+    chromosomes = indexed[schema.chromosome_column].astype(str)
+    mismatches = [
+        gene
+        for gene, chromosome in chromosomes.items()
+        if chromosome != gene_chromosomes[gene]
+    ]
+    if mismatches:
+        raise PopsError(
+            "Annotated MAGMA chromosome values disagree with .genes.raw for %d "
+            "genes. Example genes: %s"
+            % (
+                len(mismatches),
+                _example_ids(mismatches, module.reporting.top_gene_count),
+            )
+        )
+    records = {
+        gene: {
+            column: _clean_table_value(value)
+            for column, value in row.items()
+            if column in configured_columns
+        }
+        for gene, row in indexed.iterrows()
+    }
+    return {"path": path, "records": records, "columns": configured_columns}
 
 
 def _validate_magma(module) -> dict:
@@ -323,12 +791,11 @@ def _validate_magma(module) -> dict:
         schema.magma_genes_raw_suffix,
         "MAGMA raw gene results",
     )
-    table = _read_table(output_path, schema.table_delimiter_pattern, "MAGMA gene results")
-    _require_columns(
+    table = read_pandas_table(output_path, schema.table_delimiter_pattern, "MAGMA gene results", error_type=PopsError)
+    require_table_columns(
         table,
         [schema.magma_gene_id_column, schema.magma_score_column],
-        "MAGMA gene results",
-    )
+        "MAGMA gene results", error_type=PopsError)
     identifiers = table[schema.magma_gene_id_column].astype(str)
     scores = pd.to_numeric(table[schema.magma_score_column], errors="coerce")
     if identifiers.duplicated().any():
@@ -337,6 +804,24 @@ def _validate_magma(module) -> dict:
         raise PopsError("MAGMA gene Z statistics must all be finite.")
     result_identifiers = identifiers.tolist()
     _, raw_records = _read_magma_raw_records(raw_path)
+    for row_number, record in enumerate(raw_records, 1):
+        for field_index, field_name in (
+            (4, "NSNPS"),
+            (5, "NPARAM"),
+            (7, "MAC"),
+        ):
+            try:
+                value = float(record[field_index])
+            except ValueError as exc:
+                raise PopsError(
+                    "MAGMA raw gene results row %d has a non-numeric %s value: %s"
+                    % (row_number, field_name, raw_path)
+                ) from exc
+            if not np.isfinite(value) or value <= 0:
+                raise PopsError(
+                    "MAGMA raw gene results row %d has a non-positive or "
+                    "non-finite %s value: %s" % (row_number, field_name, raw_path)
+                )
     raw_identifiers = [record[0] for record in raw_records]
     if raw_identifiers != result_identifiers:
         result_set = set(result_identifiers)
@@ -374,16 +859,38 @@ def _validate_magma(module) -> dict:
                 raw_identifiers[mismatch - 1], output_path, raw_path,
             )
         )
+    covariance_blocks = _magma_covariance_blocks(raw_path, result_identifiers)
+    gene_chromosomes = {record[0]: record[1] for record in raw_records}
+    annotated = _validate_annotated_magma_results(
+        module, result_identifiers, scores, gene_chromosomes,
+    )
+    result_records = {
+        gene: {
+            column: _clean_table_value(value)
+            for column, value in row.items()
+        }
+        for gene, row in table.assign(_gene_id=identifiers).set_index(
+            "_gene_id", drop=True,
+        ).iterrows()
+    }
     return {
         "genes": set(identifiers),
         "gene_ids": result_identifiers,
         "gene_count": len(identifiers),
+        "score_column": schema.magma_score_column,
+        "raw_chromosomes": sorted(set(record[1] for record in raw_records)),
+        "covariance_blocks": len(covariance_blocks),
         "label": "MAGMA",
         "output_path": output_path,
         "raw_path": raw_path,
-        "gene_chromosomes": {
-            record[0]: record[1] for record in raw_records
+        "gene_chromosomes": gene_chromosomes,
+        "target_scores": dict(zip(result_identifiers, scores)),
+        "target_rows": {
+            gene: row_number
+            for row_number, gene in enumerate(result_identifiers, 1)
         },
+        "result_records": result_records,
+        "annotated": annotated,
     }
 
 
@@ -438,39 +945,39 @@ def _example_ids(identifiers, limit: int) -> str:
 
 def _validate_target(module) -> dict:
     schema = module.input_schema
-    path = _required_file(module.target_score_file, "PoPS target-score file")
-    table = _read_table(
-        path, schema.target_table_delimiter, "PoPS target scores",
-    )
-    _require_columns(
+    path = _required_file(module.target_score_file, "PoPS custom gene-score file")
+    table = read_pandas_table(
+        path, schema.target_table_delimiter, "PoPS custom gene scores", error_type=PopsError)
+    require_table_columns(
         table,
         [schema.target_gene_id_column, schema.target_score_column],
-        "PoPS target scores",
-    )
+        "PoPS custom gene scores", error_type=PopsError)
     identifiers = table[schema.target_gene_id_column].astype(str)
     scores = pd.to_numeric(table[schema.target_score_column], errors="coerce")
     if identifiers.duplicated().any():
-        raise PopsError("PoPS target scores contain duplicate gene identifiers.")
+        raise PopsError("PoPS custom gene scores contain duplicate gene identifiers.")
     if scores.isna().any() or not np.isfinite(scores.to_numpy()).all():
-        raise PopsError("PoPS target scores must all be finite.")
+        raise PopsError("PoPS custom gene scores must all be finite.")
+    covariate_path = None
+    covariate_count = 0
     if module.target_covariates_file is not None:
         covariate_path = _required_file(
-            module.target_covariates_file, "PoPS target-covariates file",
+            module.target_covariates_file,
+            "PoPS custom gene-score covariates file",
         )
-        covariates = _read_table(
+        covariates = read_pandas_table(
             covariate_path,
             schema.target_table_delimiter,
-            "PoPS target covariates",
-        )
-        _require_columns(
+            "PoPS custom gene-score covariates", error_type=PopsError)
+        require_table_columns(
             covariates,
             [schema.target_gene_id_column],
-            "PoPS target covariates",
-        )
+            "PoPS custom gene-score covariates", error_type=PopsError)
         covariate_ids = covariates[schema.target_gene_id_column].astype(str)
         if covariate_ids.duplicated().any() or set(covariate_ids) != set(identifiers):
             raise PopsError(
-                "Target covariates must contain each target-score gene exactly once."
+                "Custom gene-score covariates must contain each scored gene "
+                "exactly once."
             )
         numeric = covariates.drop(columns=[schema.target_gene_id_column]).apply(
             pd.to_numeric, errors="coerce",
@@ -480,18 +987,47 @@ def _validate_target(module) -> dict:
             or numeric.isna().any().any()
             or not np.isfinite(numeric.to_numpy()).all()
         ):
-            raise PopsError("Target covariates must contain finite numeric columns.")
+            raise PopsError(
+                "Custom gene-score covariates must contain finite numeric columns."
+            )
+        covariate_count = numeric.shape[1]
     return {
         "genes": set(identifiers),
         "gene_ids": identifiers.tolist(),
         "gene_count": len(identifiers),
         "label": "Custom target",
         "path": path,
+        "score_column": schema.target_score_column,
+        "covariates_path": covariate_path,
+        "covariate_count": covariate_count,
+        "target_scores": dict(zip(identifiers, scores)),
+        "target_rows": {
+            gene: row_number
+            for row_number, gene in enumerate(identifiers, 1)
+        },
+        "result_records": {},
+        "annotated": None,
     }
 
 
+def _gene_compatibility_decision(
+    gene: str,
+    annotation_genes: set[str],
+    feature_genes: set[str],
+    retained_genes: set[str],
+) -> str:
+    """Return the shared retained/excluded decision for one input-score gene."""
+    if gene in retained_genes:
+        return "retained"
+    if gene not in annotation_genes and gene not in feature_genes:
+        return "missing_annotation_and_features"
+    if gene not in annotation_genes:
+        return "missing_annotation"
+    return "missing_features"
+
+
 def _validate_gene_universes(module, features: dict, annotation: dict, outcome) -> dict:
-    """Require target, annotation, and feature IDs to satisfy upstream indexing."""
+    """Require input-score, annotation, and feature IDs to satisfy indexing."""
     annotation_genes = annotation["genes"]
     feature_genes = set(features["rows"])
     feature_only = sorted(feature_genes - annotation_genes)
@@ -590,8 +1126,9 @@ def _validate_gene_universes(module, features: dict, annotation: dict, outcome) 
         incompatible and module.gene_universe_policy == "strict"
     ):
         outcome_path = outcome.get("output_path", outcome.get("path"))
+        score_description = _score_wording(outcome["label"])["plural"]
         policy_guidance = (
-            "Custom target intersection is not supported; provide target, "
+            "Custom gene-score intersection is not supported; provide gene-score, "
             "covariate, and covariance files already aligned to the PoPS gene "
             "universe."
             if unsupported_intersection
@@ -599,17 +1136,17 @@ def _validate_gene_universes(module, features: dict, annotation: dict, outcome) 
             "--gene-universe-policy intersect to derive aligned MAGMA inputs."
         )
         raise PopsError(
-            "PoPS input files are scientifically incompatible. %s genes=%d; "
+            "PoPS input files are scientifically incompatible. %s=%d; "
             "PoPS annotation genes=%d; PoPS feature-row genes=%d; shared genes=%d; "
-            "%s genes absent from annotation=%d; %s genes absent from feature "
+            "%s absent from annotation=%d; %s absent from feature "
             "rows=%d. Example genes absent from annotation: %s. Example genes "
             "absent from feature rows: %s. This usually indicates different gene "
             "annotation releases. %s Files: outcome=%s; annotation=%s; feature "
             "rows=%s"
             % (
-                outcome["label"], outcome["gene_count"], len(annotation_genes),
-                len(feature_genes), len(shared), outcome["label"],
-                len(missing_annotation), outcome["label"], len(missing_features),
+                score_description, outcome["gene_count"], len(annotation_genes),
+                len(feature_genes), len(shared), score_description,
+                len(missing_annotation), score_description, len(missing_features),
                 _example_ids(missing_annotation, example_count),
                 _example_ids(missing_features, example_count), policy_guidance,
                 outcome_path, annotation["path"], features["rows_path"],
@@ -751,11 +1288,10 @@ def _prepare_intersected_magma(
     compatibility = outcome["compatibility"]
     retained = set(compatibility["retained_gene_ids"])
     excluded = set(compatibility["excluded_gene_ids"])
-    output_table = _read_table(
+    output_table = read_pandas_table(
         outcome["output_path"],
         module.input_schema.table_delimiter_pattern,
-        "MAGMA gene results",
-    )
+        "MAGMA gene results", error_type=PopsError)
     gene_column = module.input_schema.magma_gene_id_column
     output_ids = output_table[gene_column].astype(str)
     if output_ids.tolist() != outcome["gene_ids"]:
@@ -803,14 +1339,9 @@ def _prepare_intersected_magma(
         in_annotation = gene in annotation_genes
         in_features = gene in feature_genes
         is_retained = gene in retained
-        if is_retained:
-            reason = "retained"
-        elif not in_annotation and not in_features:
-            reason = "missing_annotation_and_features"
-        elif not in_annotation:
-            reason = "missing_annotation"
-        else:
-            reason = "missing_features"
+        reason = _gene_compatibility_decision(
+            gene, annotation_genes, feature_genes, retained,
+        )
         audit_rows.append({
             "magma_row": row_number,
             "gene_id": gene,
@@ -836,11 +1367,12 @@ def _prepare_intersected_magma(
     }
     report.update({
         "decision": (
-            "MAGMA targets were restricted to genes present in both the PoPS "
-            "annotation and feature rows."
+            "MAGMA genes with Z-scores were restricted to genes present in both "
+            "the PoPS annotation and feature rows."
         ),
         "scientific_effect": (
-            "Feature selection and model fitting use the retained target genes; "
+            "Feature selection and model fitting use the retained MAGMA genes "
+            "with Z-scores; "
             "the resulting PoPS scores may differ from a run using a matched "
             "MAGMA gene annotation."
         ),
@@ -886,32 +1418,23 @@ def _load_target_covariance(path: Path, expected_size: int) -> tuple[np.ndarray,
             covariance = np.load(path, allow_pickle=False)
             converted = True
         except (OSError, TypeError, ValueError) as exc:
-            raise PopsError("Cannot read target covariance %s: %s" % (path, exc)) from exc
+            raise PopsError(
+                "Cannot read custom gene-error covariance %s: %s" % (path, exc)
+            ) from exc
     if covariance.shape != (expected_size, expected_size):
         raise PopsError(
-            "Target covariance has shape %s; expected (%d, %d)."
+            "Custom gene-error covariance has shape %s; expected (%d, %d)."
             % (covariance.shape, expected_size, expected_size)
         )
     if not np.isfinite(covariance).all() or not np.allclose(covariance, covariance.T):
-        raise PopsError("Target covariance must be finite and symmetric.")
+        raise PopsError("Custom gene-error covariance must be finite and symmetric.")
     try:
         np.linalg.cholesky(covariance)
     except np.linalg.LinAlgError as exc:
-        raise PopsError("Target covariance must be positive definite.") from exc
+        raise PopsError(
+            "Custom gene-error covariance must be positive definite."
+        ) from exc
     return covariance, converted
-
-
-def _resource_signature(module) -> tuple:
-    return (
-        module.feature_matrix_prefix,
-        module.feature_matrix_chunks,
-        module.gene_location_file,
-        module.feature_subset_file,
-        module.control_features_file,
-        tuple(module.covariate_projection_chromosomes or ()),
-        tuple(module.feature_selection_chromosomes or ()),
-        tuple(module.training_chromosomes or ()),
-    )
 
 
 def _validate_resolved_pops_configuration(
@@ -952,20 +1475,11 @@ def _validate_resolved_pops_configuration(
         alternatives=target_alternatives,
     )
     _require_pops_runtime()
-    signature = _resource_signature(module)
-    cached = getattr(args, "_pops_resource_preflight", None)
-    if cached is not None and cached[0] == signature:
-        features, annotation = cached[1], cached[2]
-    else:
-        features = _validate_feature_resources(module)
-        annotation = _validate_gene_annotation(module)
+    features = _validate_feature_resources(module)
+    annotation = _validate_gene_annotation(module)
+    controls = _validate_feature_control_resources(module, features)
+    features["control_resources"] = controls
     if pipeline:
-        magma_build = configuration.modules.magma.genome_build
-        if module.genome_build != magma_build:
-            raise PopsError(
-                "PoPS genome build %s does not match pipeline MAGMA genome build %s."
-                % (module.genome_build.value, magma_build.value)
-            )
         outcome = None
     elif module.magma_association_prefix is not None:
         outcome = _validate_magma(module)
@@ -973,13 +1487,15 @@ def _validate_resolved_pops_configuration(
         outcome = _validate_target(module)
     else:
         raise PopsError(
-            "Provide a MAGMA association prefix or a custom target-score file."
+            "Provide --magma-association-prefix PREFIX or --target-score-file "
+            "PATH (a custom gene-score table)."
         )
     _validate_gene_universes(module, features, annotation, outcome)
     if outcome is not None:
         if module.target_error_covariance_file is not None:
             covariance_path = _required_file(
-                module.target_error_covariance_file, "PoPS target covariance",
+                module.target_error_covariance_file,
+                "PoPS custom gene-error covariance",
             )
             _load_target_covariance(covariance_path, outcome["gene_count"])
     return configuration, features, annotation, outcome
@@ -992,15 +1508,23 @@ def validate_pops_configuration(args: argparse.Namespace, *, pipeline: bool = Fa
     )
 
 
-def preflight_pops_pipeline(args: argparse.Namespace) -> None:
+def preflight_pops_pipeline(
+    args: argparse.Namespace,
+    *,
+    preflight_evidence=None,
+) -> PipelinePreflightEvidence:
     """Fail before upstream pipeline steps if configured PoPS resources are invalid."""
-    if hasattr(args, "_pops_resource_preflight"):
-        del args._pops_resource_preflight
+    require_pipeline_input_vcf(preflight_evidence)
     configuration, features, annotation, _ = validate_pops_configuration(
         args, pipeline=True,
     )
-    args._pops_resource_preflight = (
-        _resource_signature(configuration.modules.pops), features, annotation,
+    return pipeline_preflight_evidence(
+        "pops",
+        preflight_evidence,
+        resources=(configuration, features, annotation, features["control_resources"]),
+        deferred_checks=(
+            "Validate the pipeline-generated MAGMA gene-association result.",
+        ),
     )
 
 
@@ -1116,6 +1640,8 @@ def _output_paths(output: Path, dataset: str, module) -> tuple[Path, dict[str, P
         "coefficients_file": layout.coefficients_suffix,
         "marginals_file": layout.marginals_suffix,
         "upstream_log_file": layout.upstream_log_suffix,
+        "integrated_results_file": layout.integrated_results_suffix,
+        "integrated_report_file": layout.integrated_report_suffix,
     }
     if module.save_matrix_files:
         suffixes["training_data_file"] = layout.training_data_suffix
@@ -1140,43 +1666,408 @@ def _result(output: Path, prefix: Path, paths: dict[str, Path]) -> dict:
     return {
         "status": "success",
         "pops_file": str(paths["pops_file"]),
+        "integrated_results_file": str(paths["integrated_results_file"]),
+        "integrated_report_file": str(paths["integrated_report_file"]),
         "output_dir": str(output),
         "out_prefix": str(prefix),
         "published_files": [str(path) for path in paths.values()],
     }
 
 
-def _true_count(values: pd.Series) -> int:
-    """Count upstream boolean values without treating the string 'False' as true."""
-    return int(values.astype(str).str.strip().str.lower().eq("true").sum())
+def _boolean_series(values: pd.Series, label: str) -> pd.Series:
+    """Validate and normalise an upstream Boolean output column."""
+    normalized = values.astype(str).str.strip().str.lower()
+    invalid = values.isna() | ~normalized.isin({"true", "false"})
+    if invalid.any():
+        examples = sorted(set(values.loc[invalid].astype(str)))[:5]
+        raise PopsError(
+            "%s must contain only true or false values. Invalid examples: %s"
+            % (label, ", ".join(examples))
+        )
+    return normalized.eq("true")
 
 
-def _summarise_outputs(
-    paths, module, annotation, outcome, features, *, published_paths=None,
-) -> dict:
-    """Validate published scientific results and build the terminal summary."""
+def _validated_predictions(paths, module, annotation, outcome, features) -> dict:
+    """Validate the official PoPS prediction table and its model-use flags."""
     schema = module.input_schema
-    predictions = _read_table(
-        paths["pops_file"], schema.target_table_delimiter, "PoPS predictions",
-    )
+    predictions = read_pandas_table(
+        paths["pops_file"], schema.target_table_delimiter, "PoPS predictions", error_type=PopsError)
     gene_column = schema.gene_annotation_id_column
     score_column = schema.prediction_score_column
-    _require_columns(predictions, [gene_column, score_column], "PoPS predictions")
+    required = [
+        gene_column,
+        score_column,
+        schema.prediction_target_column,
+        schema.prediction_feature_selection_column,
+        schema.prediction_training_column,
+    ]
+    require_table_columns(predictions, required, "PoPS predictions", error_type=PopsError)
     gene_ids = predictions[gene_column].astype(str)
     scores = pd.to_numeric(predictions[score_column], errors="coerce")
     if gene_ids.duplicated().any():
         raise PopsError("PoPS predictions contain duplicate gene identifiers.")
     if scores.isna().any() or not np.isfinite(scores.to_numpy()).all():
         raise PopsError("PoPS prediction scores must all be finite.")
-    missing_annotation = set(gene_ids) - annotation["genes"]
-    missing_features = set(gene_ids) - set(features["rows"])
-    if missing_annotation or missing_features:
+    feature_ids = [str(gene) for gene in features["rows"]]
+    if gene_ids.tolist() != feature_ids:
+        missing_predictions = set(feature_ids) - set(gene_ids)
+        unexpected_predictions = set(gene_ids) - set(feature_ids)
+        if missing_predictions or unexpected_predictions:
+            raise PopsError(
+                "PoPS predictions must contain every feature-row gene exactly "
+                "once (missing predictions=%d, unexpected predictions=%d)."
+                % (len(missing_predictions), len(unexpected_predictions))
+            )
         raise PopsError(
-            "Every PoPS prediction gene must occur in both annotation and features "
-            "(missing annotation=%d, missing features=%d)."
-            % (len(missing_annotation), len(missing_features))
+            "PoPS prediction gene order differs from the feature-row order."
+        )
+    missing_annotation = set(gene_ids) - annotation["genes"]
+    if missing_annotation:
+        raise PopsError(
+            "Every PoPS prediction gene must occur in the gene annotation "
+            "(missing annotation=%d)." % len(missing_annotation)
         )
 
+    targets = pd.to_numeric(
+        predictions[schema.prediction_target_column], errors="coerce",
+    )
+    invalid_targets = (
+        predictions[schema.prediction_target_column].notna() & targets.isna()
+    )
+    if invalid_targets.any() or not np.isfinite(targets.dropna().to_numpy()).all():
+        raise PopsError(
+            "Non-missing PoPS input gene scores must be finite numeric values."
+        )
+    retained_genes = set(outcome["compatibility"]["retained_gene_ids"])
+    target_gene_ids = set(gene_ids.loc[targets.notna()])
+    if target_gene_ids != retained_genes:
+        raise PopsError(
+            "Non-missing PoPS input gene scores do not match the validated "
+            "retained scored genes (prediction scores=%d, retained genes=%d)."
+            % (len(target_gene_ids), len(retained_genes))
+        )
+    if retained_genes:
+        target_by_gene = pd.Series(targets.to_numpy(), index=gene_ids)
+        observed = target_by_gene.loc[list(retained_genes)].astype(float)
+        expected = pd.Series(outcome["target_scores"]).loc[observed.index].astype(float)
+        if not np.allclose(
+            observed.to_numpy(), expected.to_numpy(), rtol=1e-10, atol=1e-12,
+        ):
+            raise PopsError(
+                "PoPS prediction input-score values do not match the validated "
+                "input gene scores."
+            )
+
+    covariate_projection = pd.Series(False, index=predictions.index)
+    if schema.prediction_covariate_projection_column in predictions.columns:
+        covariate_projection = _boolean_series(
+            predictions[schema.prediction_covariate_projection_column],
+            "PoPS covariate-projection gene flags",
+        )
+    flags = {
+        "covariate_projection": covariate_projection,
+        "feature_selection": _boolean_series(
+            predictions[schema.prediction_feature_selection_column],
+            "PoPS feature-selection gene flags",
+        ),
+        "model_fitting": _boolean_series(
+            predictions[schema.prediction_training_column],
+            "PoPS model-fitting gene flags",
+        ),
+    }
+    for label, values in flags.items():
+        invalid_genes = set(gene_ids.loc[values]) - retained_genes
+        if invalid_genes:
+            raise PopsError(
+                "PoPS %s flags include %d genes without retained input gene scores."
+                % (label.replace("_", "-"), len(invalid_genes))
+            )
+
+    projected = None
+    has_projected = schema.prediction_projected_target_column in predictions.columns
+    has_projection_flag = (
+        schema.prediction_covariate_projection_column in predictions.columns
+    )
+    if has_projected != has_projection_flag:
+        raise PopsError(
+            "PoPS predictions must contain both covariate-adjusted gene-score values "
+            "and covariate-projection gene flags, or neither."
+        )
+    if has_projected:
+        projected = pd.to_numeric(
+            predictions[schema.prediction_projected_target_column], errors="coerce",
+        )
+        invalid_projected = (
+            predictions[schema.prediction_projected_target_column].notna()
+            & projected.isna()
+        )
+        if (
+            invalid_projected.any()
+            or not np.isfinite(projected.dropna().to_numpy()).all()
+        ):
+            raise PopsError(
+                "Non-missing covariate-adjusted PoPS gene scores must be finite."
+            )
+        projected_gene_ids = set(gene_ids.loc[projected.notna()])
+        if projected_gene_ids != retained_genes:
+            raise PopsError(
+                "Non-missing covariate-adjusted PoPS gene scores do not match "
+                "the validated retained genes with input scores."
+            )
+    return {
+        "table": predictions,
+        "gene_ids": gene_ids,
+        "scores": scores,
+        "targets": targets,
+        "projected_targets": projected,
+        "flags": flags,
+    }
+
+
+def _magma_values(module, outcome, gene: str) -> dict[str, object]:
+    schema = module.input_schema.magma_annotated
+    if outcome["label"] != "MAGMA" or gene not in outcome["genes"]:
+        record = {}
+    elif outcome.get("annotated") is not None:
+        record = outcome["annotated"]["records"].get(gene, {})
+    else:
+        record = outcome["result_records"].get(gene, {})
+    return {
+        "gene_symbol": record.get(schema.gene_symbol_column),
+        "chromosome": record.get(schema.chromosome_column),
+        "start": record.get(schema.start_column),
+        "end": record.get(schema.end_column),
+        "snp_count": record.get(schema.snp_count_column),
+        "parameter_count": record.get(schema.parameter_count_column),
+        "sample_size": record.get(schema.sample_size_column),
+        "zstat": record.get(schema.zstat_column),
+        "pvalue": record.get(schema.pvalue_column),
+        "reference_chromosome": record.get(schema.reference_chromosome_column),
+        "reference_start": record.get(schema.reference_start_column),
+        "reference_end": record.get(schema.reference_end_column),
+        "reference_strand": record.get(schema.reference_strand_column),
+        "bonferroni_pvalue": record.get(schema.bonferroni_pvalue_column),
+        "fdr_pvalue": record.get(schema.fdr_pvalue_column),
+    }
+
+
+def _integrated_result_data(paths, module, annotation, outcome, features) -> dict:
+    """Build one full-union record per scored or input-target gene."""
+    validated = _validated_predictions(paths, module, annotation, outcome, features)
+    predictions = validated["table"]
+    gene_ids = validated["gene_ids"]
+    scores = validated["scores"]
+    targets = validated["targets"]
+    projected = validated["projected_targets"]
+    flags = validated["flags"]
+    score_order = np.argsort(-scores.to_numpy(), kind="stable")
+    ranked_prediction_indices = [int(index) for index in score_order]
+    rank_by_gene = {
+        str(gene_ids.iloc[index]): rank
+        for rank, index in enumerate(ranked_prediction_indices, 1)
+    }
+    prediction_index = {
+        str(gene): index for index, gene in enumerate(gene_ids)
+    }
+    prediction_genes = set(prediction_index)
+    ordered_genes = [str(gene_ids.iloc[index]) for index in ranked_prediction_indices]
+    ordered_genes.extend(
+        gene for gene in outcome["gene_ids"] if gene not in prediction_genes
+    )
+    feature_genes = set(str(gene) for gene in features["rows"])
+    retained_genes = set(outcome["compatibility"]["retained_gene_ids"])
+    columns = module.integrated_results.columns
+    statuses = module.integrated_results.status_labels
+    records = []
+    status_counts = {
+        statuses.scored_and_fitted: 0,
+        statuses.scored_with_target_not_fitted: 0,
+        statuses.scored_without_target: 0,
+        statuses.target_excluded_from_pops: 0,
+    }
+    for gene in ordered_genes:
+        index = prediction_index.get(gene)
+        scored = index is not None
+        target_available = gene in outcome["genes"]
+        fitted = bool(flags["model_fitting"].iloc[index]) if scored else None
+        if scored and fitted:
+            status = statuses.scored_and_fitted
+        elif scored and target_available:
+            status = statuses.scored_with_target_not_fitted
+        elif scored:
+            status = statuses.scored_without_target
+        else:
+            status = statuses.target_excluded_from_pops
+        status_counts[status] += 1
+        magma = _magma_values(module, outcome, gene)
+        gene_symbol = magma["gene_symbol"] or annotation["gene_names"].get(gene)
+        row = {
+            columns.gene_id: gene,
+            columns.gene_symbol: gene_symbol,
+            columns.pops_chromosome: annotation["gene_chromosomes"].get(gene),
+            columns.pops_tss: _clean_table_value(annotation["gene_tss"].get(gene)),
+            columns.target_source: outcome["label"] if target_available else None,
+            columns.target_row: outcome["target_rows"].get(gene),
+            columns.input_target_score_available: target_available,
+            columns.input_target_score: _clean_table_value(
+                outcome["target_scores"].get(gene)
+            ),
+            columns.present_in_pops_annotation: gene in annotation["genes"],
+            columns.present_in_feature_rows: gene in feature_genes,
+            columns.retained_as_pops_target: gene in retained_genes,
+            columns.compatibility_decision: (
+                _gene_compatibility_decision(
+                    gene,
+                    annotation["genes"],
+                    feature_genes,
+                    retained_genes,
+                )
+                if target_available else None
+            ),
+            columns.pops_score_available: scored,
+            columns.pops_score: _clean_table_value(scores.iloc[index]) if scored else None,
+            columns.pops_rank: rank_by_gene.get(gene),
+            columns.pops_target_score_available: (
+                bool(pd.notna(targets.iloc[index])) if scored else False
+            ),
+            columns.pops_target_score: (
+                _clean_table_value(targets.iloc[index]) if scored else None
+            ),
+            columns.pops_adjusted_target_score: (
+                _clean_table_value(projected.iloc[index])
+                if scored and projected is not None else None
+            ),
+            columns.used_for_covariate_projection: (
+                bool(flags["covariate_projection"].iloc[index]) if scored else None
+            ),
+            columns.used_for_feature_selection: (
+                bool(flags["feature_selection"].iloc[index]) if scored else None
+            ),
+            columns.used_for_model_fitting: fitted,
+            columns.gene_analysis_status: status,
+            columns.magma_result_available: (
+                outcome["label"] == "MAGMA" and target_available
+            ),
+            columns.magma_chromosome: magma["chromosome"],
+            columns.magma_start: magma["start"],
+            columns.magma_end: magma["end"],
+            columns.magma_snp_count: magma["snp_count"],
+            columns.magma_parameter_count: magma["parameter_count"],
+            columns.magma_sample_size: magma["sample_size"],
+            columns.magma_zstat: magma["zstat"],
+            columns.magma_pvalue: magma["pvalue"],
+            columns.magma_reference_chromosome: magma["reference_chromosome"],
+            columns.magma_reference_start: magma["reference_start"],
+            columns.magma_reference_end: magma["reference_end"],
+            columns.magma_reference_strand: magma["reference_strand"],
+            columns.magma_bonferroni_pvalue: magma["bonferroni_pvalue"],
+            columns.magma_fdr_pvalue: magma["fdr_pvalue"],
+        }
+        records.append(row)
+    return {
+        "predictions": validated,
+        "records": records,
+        "columns": list(columns.model_dump().values()),
+        "status_counts": status_counts,
+    }
+
+
+def _write_integrated_results(
+    paths, module, annotation, outcome, features, *, dataset: str,
+) -> dict:
+    integrated = _integrated_result_data(
+        paths, module, annotation, outcome, features,
+    )
+    settings = module.integrated_results
+    write_delimited_report(
+        integrated["records"],
+        paths["integrated_results_file"],
+        fieldnames=integrated["columns"],
+        delimiter=settings.delimiter,
+        null_value=settings.null_value,
+    )
+    display_counts = {
+        "Scored and used for model fitting": integrated["status_counts"][
+            settings.status_labels.scored_and_fitted
+        ],
+        "Scored with input gene score, not used for fitting": integrated[
+            "status_counts"
+        ][settings.status_labels.scored_with_target_not_fitted],
+        "Scored without an input gene score": integrated["status_counts"][
+            settings.status_labels.scored_without_target
+        ],
+        "Input-score gene excluded before PoPS": integrated["status_counts"][
+            settings.status_labels.target_excluded_from_pops
+        ],
+    }
+    write_integrated_gene_report(
+        integrated["records"],
+        integrated["columns"],
+        {"status_counts": display_counts},
+        dataset_id=dataset,
+        tsv_path=paths["integrated_results_file"],
+        report_path=paths["integrated_report_file"],
+        page_size=settings.html_page_size,
+        null_value=settings.null_value,
+    )
+    return integrated
+
+
+def _validate_integrated_results(
+    paths, module, annotation, outcome, features,
+) -> dict:
+    expected = _integrated_result_data(
+        paths, module, annotation, outcome, features,
+    )
+    settings = module.integrated_results
+    try:
+        observed = pd.read_csv(
+            paths["integrated_results_file"],
+            sep=settings.delimiter,
+            dtype=str,
+            keep_default_na=False,
+        )
+    except (OSError, ValueError, pd.errors.ParserError) as exc:
+        raise PopsError(
+            "Cannot read integrated PoPS gene results %s: %s"
+            % (paths["integrated_results_file"], exc)
+        ) from exc
+    require_table_columns(observed, expected["columns"], "integrated PoPS gene results", error_type=PopsError)
+    if observed.columns.tolist() != expected["columns"]:
+        raise PopsError(
+            "Integrated PoPS gene-result columns or column order changed."
+        )
+    for column in expected["columns"]:
+        expected_values = [
+            settings.null_value if record[column] is None else str(record[column])
+            for record in expected["records"]
+        ]
+        if observed[column].tolist() != expected_values:
+            raise PopsError(
+                "Integrated PoPS gene results do not match validated source "
+                "outputs in column %s." % column
+            )
+    if (
+        not paths["integrated_report_file"].is_file()
+        or paths["integrated_report_file"].stat().st_size <= 0
+    ):
+        raise PopsError("Integrated PoPS HTML report is missing or empty.")
+    return expected
+
+
+def _summarise_outputs(
+    paths, module, annotation, outcome, features, *, published_paths=None,
+    integrated=None,
+) -> dict:
+    """Validate published scientific results and build the terminal summary."""
+    schema = module.input_schema
+    integrated = integrated or _validate_integrated_results(
+        paths, module, annotation, outcome, features,
+    )
+    validated = integrated["predictions"]
+    predictions = validated["table"]
+    gene_ids = validated["gene_ids"]
+    scores = validated["scores"]
     ranked = predictions.assign(score_value=scores, gene_value=gene_ids).nlargest(
         module.reporting.top_gene_count, "score_value",
     )
@@ -1191,18 +2082,18 @@ def _summarise_outputs(
         }
         for rank, row in enumerate(ranked.itertuples(index=False), 1)
     ]
-    training_count = outcome["gene_count"]
-    if schema.prediction_training_column in predictions.columns:
-        training_count = _true_count(predictions[schema.prediction_training_column])
+    training_count = int(validated["flags"]["model_fitting"].sum())
     selected_features = None
-    marginals = _read_table(
-        paths["marginals_file"], schema.target_table_delimiter, "PoPS marginals",
-    )
+    marginals = read_pandas_table(
+        paths["marginals_file"], schema.target_table_delimiter, "PoPS marginals", error_type=PopsError)
     if schema.marginal_selected_column in marginals.columns:
-        selected_features = _true_count(marginals[schema.marginal_selected_column])
+        selected_features = int(_boolean_series(
+            marginals[schema.marginal_selected_column],
+            "PoPS marginal feature-selection flags",
+        ).sum())
 
-    reference_genes = annotation["genes"] & set(features["rows"])
-    target_genes = outcome["genes"] & reference_genes
+    reference_genes = set(str(gene) for gene in features["rows"])
+    target_genes = set(outcome["compatibility"]["retained_gene_ids"])
     missing_chromosomes = sorted(
         set(annotation["gene_chromosomes"].values())
         - {
@@ -1211,20 +2102,22 @@ def _summarise_outputs(
             if gene in annotation["gene_chromosomes"]
         }
     )
+    score_wording = _score_wording(outcome["label"])
     warnings = []
     if len(target_genes) < len(reference_genes):
         warnings.append(
-            "Target scores cover %d of %d compatible genes (%.1f%%); rankings "
+            "%s cover %d of %d compatible genes (%.1f%%); rankings "
             "were trained on incomplete genome-wide gene outcomes."
             % (
+                score_wording["plural"][0].upper() + score_wording["plural"][1:],
                 len(target_genes), len(reference_genes),
                 100 * len(target_genes) / len(reference_genes),
             )
         )
     if missing_chromosomes:
         warnings.append(
-            "No target-scored genes were available on chromosome(s): %s."
-            % ", ".join(missing_chromosomes)
+            "No genes with %s were available on chromosome(s): %s."
+            % (score_wording["plural"], ", ".join(missing_chromosomes))
         )
     compatibility = {
         key: value
@@ -1233,10 +2126,11 @@ def _summarise_outputs(
     }
     if compatibility.get("excluded_target_genes", 0):
         warnings.append(
-            "Gene-universe intersection excluded %d of %d MAGMA target genes "
+            "Gene-universe intersection excluded %d of %d MAGMA genes with "
+            "Z-scores "
             "(%.1f%% retained). Feature selection and fitting used the retained "
-            "target universe; review the compatibility audit before interpreting "
-            "rankings."
+            "MAGMA Z-score gene universe; review the compatibility audit before "
+            "interpreting rankings."
             % (
                 compatibility["excluded_target_genes"],
                 compatibility["original_target_genes"],
@@ -1251,14 +2145,30 @@ def _summarise_outputs(
         compatibility["compatible_genes_raw"] = str(reported["compatible_genes_raw"])
         compatibility["excluded_genes_out"] = str(reported["excluded_genes_out"])
         compatibility["excluded_genes_raw"] = str(reported["excluded_genes_raw"])
+    statuses = module.integrated_results.status_labels
+    status_counts = integrated["status_counts"]
+    reported = published_paths or paths
     return {
         "genes_scored": len(predictions),
+        "score_source": outcome["label"],
+        "genes_scored_with_target": int(validated["targets"].notna().sum()),
+        "genes_scored_without_target": status_counts[statuses.scored_without_target],
+        "genes_scored_with_target_not_fitted": status_counts[
+            statuses.scored_with_target_not_fitted
+        ],
+        "input_target_genes": outcome["gene_count"],
+        "input_target_genes_excluded": status_counts[
+            statuses.target_excluded_from_pops
+        ],
         "target_genes": len(target_genes),
         "compatible_genes": len(reference_genes),
         "training_genes": training_count,
         "selected_features": selected_features,
         "top_genes": top_genes,
         "gene_compatibility": compatibility,
+        "integrated_gene_count": len(integrated["records"]),
+        "integrated_results_file": str(reported["integrated_results_file"]),
+        "integrated_report_file": str(reported["integrated_report_file"]),
         "warnings": warnings,
     }
 
@@ -1269,6 +2179,7 @@ def _render_summary(
     width = label_width
     outer_width = width + 4
     status = "COMPLETED WITH SCIENTIFIC WARNINGS" if summary["warnings"] else "COMPLETED"
+    score_wording = _score_wording(summary["score_source"])
     lines = [
         "",
         screen_line("analysis", "PoPS gene-prioritisation summary", indent=2),
@@ -1278,20 +2189,35 @@ def _render_summary(
             "Analysis status", status, indent=6, label_width=outer_width,
         ),
         "",
-        screen_line("genetic", "Scientific findings", indent=6),
+        screen_line("genetic", "PoPS scoring coverage", indent=6),
         screen_field(
-            "count", "Genes assigned PoPS scores",
+            "count", "Genes receiving finite PoPS scores",
             f'{summary["genes_scored"]:,}', indent=10, label_width=width,
         ),
         screen_field(
-            "count", "Genes with target scores",
+            "count", "Scored genes with %s" % score_wording["coverage"],
             "%s of %s" % (
-                f'{summary["target_genes"]:,}', f'{summary["compatible_genes"]:,}',
+                f'{summary["genes_scored_with_target"]:,}',
+                f'{summary["genes_scored"]:,}',
             ),
             indent=10, label_width=width,
         ),
         screen_field(
-            "count", "Genes used for training", f'{summary["training_genes"]:,}',
+            "warning" if summary["genes_scored_without_target"] else "success",
+            "Scored genes without %s" % score_wording["coverage"],
+            f'{summary["genes_scored_without_target"]:,}',
+            indent=10, label_width=width,
+        ),
+        "",
+        screen_line("analysis", "PoPS model estimation", indent=6),
+        screen_field(
+            "count", "Genes used to fit the PoPS model",
+            f'{summary["training_genes"]:,}', indent=10, label_width=width,
+        ),
+        screen_field(
+            "count",
+            "Genes with %s not used for fitting" % score_wording["coverage"],
+            f'{summary["genes_scored_with_target_not_fitted"]:,}',
             indent=10, label_width=width,
         ),
     ]
@@ -1306,12 +2232,12 @@ def _render_summary(
             "",
             screen_line("warning", "MAGMA–PoPS gene compatibility", indent=6),
             screen_field(
-                "count", "Original MAGMA target genes",
+                "count", "Original MAGMA genes with Z-scores",
                 f'{compatibility["original_target_genes"]:,}',
                 indent=10, label_width=width,
             ),
             screen_field(
-                "success", "Retained target genes",
+                "success", "Retained MAGMA genes with Z-scores",
                 "%s (%.1f%%)" % (
                     f'{compatibility["retained_target_genes"]:,}',
                     compatibility["retained_percent"],
@@ -1319,7 +2245,7 @@ def _render_summary(
                 indent=10, label_width=width,
             ),
             screen_field(
-                "warning", "Excluded target genes",
+                "warning", "Excluded MAGMA genes with Z-scores",
                 "%s (%.1f%%)" % (
                     f'{compatibility["excluded_target_genes"]:,}',
                     compatibility["excluded_percent"],
@@ -1394,7 +2320,17 @@ def _render_summary(
     lines.extend([
         "",
         screen_field(
-            "success", "Complete PoPS results", paths["pops_file"],
+            "success", "Integrated gene-results table",
+            paths["integrated_results_file"], indent=6,
+            label_width=outer_width, break_long_values=True,
+        ),
+        screen_field(
+            "success", "Interactive gene-results report",
+            paths["integrated_report_file"], indent=6,
+            label_width=outer_width, break_long_values=True,
+        ),
+        screen_field(
+            "info", "Official PoPS predictions", paths["pops_file"],
             indent=6, label_width=outer_width, break_long_values=True,
         ),
         screen_field(
@@ -1418,60 +2354,30 @@ def _restore_root_logging(handlers: list[logging.Handler], level: int) -> None:
 
 def run_pops_direct(args: argparse.Namespace, ctx=None):
     """Validate inputs, run upstream PoPS in isolation, and publish complete outputs."""
-    progress = None
-    active_progress_step = 0
     try:
         configuration = _resolved_configuration(args)
-        progress = StageProgress(
-            "PoPS analysis progress",
-            enabled=configuration.logging.show_progress,
-            outcome_label_width=configuration.logging.terminal_label_width,
+        module = configuration.modules.pops
+        output = Path(configuration.run.output_directory).expanduser().resolve()
+        dataset = validate_filename_component(
+            configuration.run.dataset_id,
+            "dataset_id",
+            error_type=PopsError,
         )
-        active_progress_step = 1
-        progress.start_step(
-            active_progress_step,
-            len(_POPS_PROGRESS_STAGES),
-            _POPS_PROGRESS_STAGES[active_progress_step - 1],
+        output.mkdir(parents=True, exist_ok=True)
+        prefix, final_paths = _output_paths(output, dataset, module)
+        completion_manifest = configured_output_path(
+            output,
+            module.output_layout.completion_manifest,
+            error_type=PopsError,
+            dataset_id=dataset,
         )
-        configuration, features, annotation, outcome = (
-            _validate_resolved_pops_configuration(args, configuration)
-        )
-        compatible_target_genes = len(
-            outcome["genes"] & annotation["genes"] & set(features["rows"])
-        )
-        progress.complete_step(
-            active_progress_step,
-            len(_POPS_PROGRESS_STAGES),
-            _POPS_PROGRESS_STAGES[active_progress_step - 1],
-            outcome_fields=[
-                ("genetic", "Declared genome build", configuration.modules.pops.genome_build.value),
-                (
-                    "decision", "Gene-universe policy",
-                    configuration.modules.pops.gene_universe_policy,
-                ),
-                ("count", "Annotation genes", annotation["gene_count"]),
-                ("count", "Feature-matrix genes", features["row_count"]),
-                ("count", "Available features", features["feature_count"]),
-                (
-                    "count", "Original target genes",
-                    outcome["compatibility"]["original_target_genes"],
-                ),
-                ("success", "Compatible target genes", compatible_target_genes),
-                (
-                    "warning" if outcome["compatibility"]["excluded_target_genes"]
-                    else "success",
-                    "Excluded target genes",
-                    outcome["compatibility"]["excluded_target_genes"],
-                ),
-            ],
+        log_path = configured_output_path(
+            output,
+            module.output_layout.service_log_file,
+            error_type=PopsError,
+            dataset_id=dataset,
         )
     except BaseException as exc:
-        if progress is not None and active_progress_step:
-            progress.fail_step(
-                active_progress_step,
-                len(_POPS_PROGRESS_STAGES),
-                _POPS_PROGRESS_STAGES[active_progress_step - 1],
-            )
         fallback = load_configuration()
         output = Path(
             getattr(args, "output_directory", None) or fallback.run.output_directory
@@ -1497,23 +2403,9 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
             screen_level=fallback.logging.console_level,
         )
         raise
-    module = configuration.modules.pops
-    output = Path(configuration.run.output_directory).expanduser().resolve()
-    dataset = configuration.run.dataset_id
-    output.mkdir(parents=True, exist_ok=True)
-    prefix, final_paths = _output_paths(output, dataset, module)
-    completion_manifest = configured_output_path(
-        output,
-        module.output_layout.completion_manifest,
-        error_type=PopsError,
-        dataset_id=dataset,
-    )
-    log_path = configured_output_path(
-        output,
-        module.output_layout.service_log_file,
-        error_type=PopsError,
-        dataset_id=dataset,
-    )
+
+    pipeline_progress = getattr(args, "_pipeline_stage_progress", None)
+    pipeline_stage_numbers = pops_pipeline_stage_numbers(args)
     logger = PipelineLogger(
         dataset,
         "run",
@@ -1521,31 +2413,311 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
         level=configuration.logging.file_level,
         screen_level=configuration.logging.console_level,
         log_path=str(log_path),
+        stage_progress=StageProgress(
+            "PoPS analysis progress",
+            enabled=pipeline_progress is None or pipeline_stage_numbers is None,
+            outcome_label_width=configuration.logging.terminal_label_width,
+        ),
     )
 
+    def start_pipeline_stage(key: str) -> None:
+        if pipeline_progress is not None and pipeline_stage_numbers is not None:
+            pipeline_progress.start(int(pipeline_stage_numbers[key]))
+
+    def complete_pipeline_stage(key: str, fields, *, defer: bool = False) -> None:
+        if pipeline_progress is None or pipeline_stage_numbers is None:
+            return
+        if defer:
+            args._pipeline_stage_completion = {"outcome_fields": fields}
+        else:
+            pipeline_progress.complete(
+                int(pipeline_stage_numbers[key]), outcome_fields=fields,
+            )
+
+    active_upstream_manager = None
+    active_upstream_step = None
+    upstream_stage_index = 0
+
+    def open_upstream_stage() -> None:
+        nonlocal active_upstream_manager, active_upstream_step
+        key = _POPS_UPSTREAM_PROGRESS_ORDER[upstream_stage_index]
+        local_number = 6 + upstream_stage_index
+        start_pipeline_stage(key)
+        active_upstream_manager = logger.step(
+            local_number,
+            len(POPS_STAGES),
+            POPS_STAGES[local_number - 1],
+            "pops_%s" % key,
+        )
+        active_upstream_step = active_upstream_manager.__enter__()
+
     def record_upstream_progress(stage: str, metrics: dict) -> None:
-        nonlocal active_progress_step
-        expected_stage = _POPS_UPSTREAM_PROGRESS_ORDER[active_progress_step - 2]
+        nonlocal active_upstream_manager, active_upstream_step, upstream_stage_index
+        expected_stage = _POPS_UPSTREAM_PROGRESS_ORDER[upstream_stage_index]
         if stage != expected_stage:
             raise PopsError(
                 "PoPS progress stages are out of order: expected %s, received %s"
                 % (expected_stage, stage)
             )
-        logger.record("OBSERVED", "pops_%s" % stage, **metrics)
-        progress.complete_step(
-            active_progress_step,
-            len(_POPS_PROGRESS_STAGES),
-            _POPS_PROGRESS_STAGES[active_progress_step - 1],
-            outcome_fields=_progress_outcome_fields(stage, metrics),
+        if active_upstream_manager is None or active_upstream_step is None:
+            raise PopsError("PoPS reported a progress stage before it was started.")
+        fields = _progress_outcome_fields(
+            stage, metrics, score_source=outcome["label"],
         )
-        active_progress_step += 1
-        progress.start_step(
-            active_progress_step,
-            len(_POPS_PROGRESS_STAGES),
-            _POPS_PROGRESS_STAGES[active_progress_step - 1],
+        active_upstream_step.observed("pops_%s" % stage, **metrics)
+        active_upstream_step.outcome(
+            "PoPS %s completed with validated metrics." % stage.replace("_", " "),
+            fields=fields,
+            **metrics,
         )
+        active_upstream_manager.__exit__(None, None, None)
+        active_upstream_manager = None
+        active_upstream_step = None
+        complete_pipeline_stage(stage, fields)
+        upstream_stage_index += 1
+        if upstream_stage_index < len(_POPS_UPSTREAM_PROGRESS_ORDER):
+            open_upstream_stage()
 
     try:
+        target_alternatives = (
+            RequiredAlternative((
+                RequiredArgument(
+                    "--magma-association-prefix",
+                    "modules.pops.magma_association_prefix",
+                    module.magma_association_prefix,
+                ),
+                RequiredArgument(
+                    "--target-score-file",
+                    "modules.pops.target_score_file",
+                    module.target_score_file,
+                ),
+            )),
+        )
+        start_pipeline_stage("target_inputs")
+        with logger.step(
+            1,
+            len(POPS_STAGES),
+            POPS_STAGES[0],
+            "validate_pops_target_inputs",
+        ) as step:
+            require_resolved_arguments(
+                (
+                    RequiredArgument(
+                        "--genome-build",
+                        "modules.pops.genome_build",
+                        module.genome_build,
+                    ),
+                    RequiredArgument(
+                        "--feature-matrix-prefix",
+                        "modules.pops.feature_matrix_prefix",
+                        module.feature_matrix_prefix,
+                    ),
+                    RequiredArgument(
+                        "--pops-gene-location-file",
+                        "modules.pops.gene_location_file",
+                        module.gene_location_file,
+                    ),
+                ),
+                alternatives=target_alternatives,
+            )
+            _require_pops_runtime()
+            if module.magma_association_prefix is not None:
+                outcome = _validate_magma(module)
+            elif module.target_score_file is not None:
+                outcome = _validate_target(module)
+            else:
+                raise PopsError(
+                    "Provide --magma-association-prefix PREFIX or "
+                    "--target-score-file PATH (a custom gene-score table)."
+                )
+            if module.target_error_covariance_file is not None:
+                covariance_path = _required_file(
+                    module.target_error_covariance_file,
+                    "PoPS custom gene-error covariance",
+                )
+                _, converted = _load_target_covariance(
+                    covariance_path, outcome["gene_count"],
+                )
+                outcome["covariance"] = {
+                    "path": covariance_path,
+                    "dimension": outcome["gene_count"],
+                    "representation": (
+                        "NumPy dense array; converted for PoPS"
+                        if converted else "SciPy sparse NPZ"
+                    ),
+                }
+            target_fields = _target_validation_fields(module, outcome)
+            step.outcome(
+                "Gene-score inputs and optional companions are valid.",
+                fields=target_fields,
+                target_source=outcome["label"],
+                target_genes=outcome["gene_count"],
+                target_score_file=str(
+                    outcome.get("output_path", outcome.get("path"))
+                ),
+                magma_annotated_results_file=(
+                    str(outcome["annotated"]["path"])
+                    if outcome.get("annotated") is not None else None
+                ),
+                magma_covariance_file=(
+                    str(outcome["raw_path"])
+                    if outcome.get("raw_path") is not None else None
+                ),
+                target_covariates_file=(
+                    str(outcome["covariates_path"])
+                    if outcome.get("covariates_path") is not None else None
+                ),
+                target_error_covariance_file=(
+                    str(outcome["covariance"]["path"])
+                    if outcome.get("covariance") is not None else None
+                ),
+                target_error_covariance_dimension=(
+                    outcome["covariance"]["dimension"]
+                    if outcome.get("covariance") is not None else None
+                ),
+                structural_validation="passed",
+            )
+        complete_pipeline_stage("target_inputs", target_fields)
+
+        start_pipeline_stage("gene_annotation")
+        with logger.step(
+            2,
+            len(POPS_STAGES),
+            POPS_STAGES[1],
+            "validate_pops_gene_annotation",
+        ) as step:
+            annotation = _validate_gene_annotation(module)
+            annotation_fields = _annotation_validation_fields(module, annotation)
+            step.outcome(
+                "PoPS gene-location annotation is structurally valid.",
+                fields=annotation_fields,
+                gene_annotation_file=str(annotation["path"]),
+                genome_build=module.genome_build.value,
+                annotated_genes=annotation["gene_count"],
+                chromosomes=annotation["chromosomes"],
+                gene_id_column=module.input_schema.gene_annotation_id_column,
+                chromosome_column=(
+                    module.input_schema.gene_annotation_chromosome_column
+                ),
+                transcription_start_site_column=(
+                    module.input_schema.gene_annotation_tss_column
+                ),
+                tss_minimum=annotation["tss_minimum"],
+                tss_maximum=annotation["tss_maximum"],
+                structural_validation="passed",
+            )
+        complete_pipeline_stage("gene_annotation", annotation_fields)
+
+        start_pipeline_stage("feature_matrix")
+        with logger.step(
+            3,
+            len(POPS_STAGES),
+            POPS_STAGES[2],
+            "validate_pops_feature_matrices",
+        ) as step:
+            features = _validate_feature_resources(module)
+            feature_fields = _feature_validation_fields(module, features)
+            for metrics in features["chunks"]:
+                step.observed(
+                    "pops_feature_matrix_chunk",
+                    chunk=metrics["chunk"],
+                    columns_file=str(metrics["columns_path"]),
+                    matrix_file=str(metrics["matrix_path"]),
+                    rows=metrics["rows"],
+                    columns=metrics["columns"],
+                    dtype=metrics["dtype"],
+                    finite_numeric_values=True,
+                )
+            step.outcome(
+                "All PoPS feature-matrix companions, dimensions, and values are valid.",
+                fields=feature_fields,
+                feature_genes=features["row_count"],
+                feature_count=features["feature_count"],
+                chunks=len(features["chunks"]),
+                feature_rows_file=str(features["rows_path"]),
+                structural_validation="passed",
+                finite_numeric_values=True,
+            )
+        complete_pipeline_stage("feature_matrix", feature_fields)
+
+        start_pipeline_stage("feature_controls")
+        with logger.step(
+            4,
+            len(POPS_STAGES),
+            POPS_STAGES[3],
+            "validate_pops_feature_controls",
+        ) as step:
+            controls = _validate_feature_control_resources(module, features)
+            features["control_resources"] = controls
+            control_fields = _feature_control_validation_fields(controls)
+            step.outcome(
+                "Optional PoPS feature-control resources are valid.",
+                fields=control_fields,
+                feature_subset_count=(
+                    controls["feature_subset"]["count"]
+                    if controls["feature_subset"] is not None else 0
+                ),
+                control_feature_count=(
+                    controls["controls"]["count"]
+                    if controls["controls"] is not None else 0
+                ),
+                feature_subset_file=(
+                    str(controls["feature_subset"]["path"])
+                    if controls["feature_subset"] is not None else None
+                ),
+                control_features_file=(
+                    str(controls["controls"]["path"])
+                    if controls["controls"] is not None else None
+                ),
+                matrix_feature_compatibility="passed",
+                controls_retained_by_feature_subset=(
+                    controls["controls_retained_by_subset"]
+                ),
+            )
+        complete_pipeline_stage("feature_controls", control_fields)
+
+        start_pipeline_stage("gene_compatibility")
+        with logger.step(
+            5,
+            len(POPS_STAGES),
+            POPS_STAGES[4],
+            "validate_pops_gene_universes",
+        ) as step:
+            if pipeline_progress is not None and pipeline_stage_numbers is not None:
+                vcf_evidence = getattr(args, "_pipeline_vcf_header_evidence", {})
+                magma_build = (
+                    vcf_evidence.get("genome_build")
+                    or getattr(args, "genome_build", None)
+                    or configuration.modules.magma.genome_build
+                )
+                magma_build_value = getattr(magma_build, "value", str(magma_build))
+                if module.genome_build.value != magma_build_value:
+                    raise PopsError(
+                        "PoPS genome build %s does not match pipeline MAGMA "
+                        "genome build %s."
+                        % (module.genome_build.value, magma_build_value)
+                    )
+                outcome["pipeline_genome_build"] = magma_build_value
+            _validate_gene_universes(module, features, annotation, outcome)
+            compatibility_fields = _gene_compatibility_fields(
+                module, features, annotation, outcome,
+            )
+            step.outcome(
+                "Input-score, annotation, and feature gene identifiers are "
+                "compatible.",
+                fields=compatibility_fields,
+                **{
+                    key: value
+                    for key, value in outcome["compatibility"].items()
+                    if not key.endswith("_gene_ids")
+                },
+                annotation_genes=annotation["gene_count"],
+                feature_genes=features["row_count"],
+                declared_genome_build=module.genome_build.value,
+                chromosome_consistency="passed",
+            )
+        complete_pipeline_stage("gene_compatibility", compatibility_fields)
+
         logger.record(
             "PARAM", "pops_run",
             genome_build=module.genome_build.value,
@@ -1602,28 +2774,50 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
             )
             result["summary"] = summary
             logger.record("SKIP", "pops_run", reason="validated_complete_outputs")
-            active_progress_step = len(_POPS_PROGRESS_STAGES)
-            progress.start_step(
-                active_progress_step,
-                len(_POPS_PROGRESS_STAGES),
-                _POPS_PROGRESS_STAGES[active_progress_step - 1],
-            )
-            progress.complete_step(
-                active_progress_step,
-                len(_POPS_PROGRESS_STAGES),
-                _POPS_PROGRESS_STAGES[active_progress_step - 1],
-                outcome_fields=[
+            for index, key in enumerate(_POPS_UPSTREAM_PROGRESS_ORDER, 6):
+                start_pipeline_stage(key)
+                with logger.step(
+                    index,
+                    len(POPS_STAGES),
+                    POPS_STAGES[index - 1],
+                    "resume_validated_pops_stage",
+                ) as step:
+                    resumed_fields = [
+                        ("success", "Resume decision", "reused validated complete outputs"),
+                    ]
+                    step.outcome(
+                        "Reused completed PoPS analysis stage.",
+                        fields=resumed_fields,
+                        resume_mode="validated_complete_outputs",
+                    )
+                complete_pipeline_stage(key, resumed_fields)
+            start_pipeline_stage("results")
+            with logger.step(
+                11,
+                len(POPS_STAGES),
+                POPS_STAGES[10],
+                "validate_resumed_pops_results",
+            ) as step:
+                result_fields = [
                     ("success", "Resume decision", "reused validated complete outputs"),
-                    ("count", "Genes assigned PoPS scores", summary["genes_scored"]),
+                    ("count", "Genes receiving PoPS scores", summary["genes_scored"]),
+                    ("count", "Integrated gene rows", summary["integrated_gene_count"]),
                     ("count", "Published result files", len(final_paths)),
-                ],
-            )
+                ]
+                step.outcome(
+                    "Existing PoPS outputs were validated and reused.",
+                    fields=result_fields,
+                    genes_scored=summary["genes_scored"],
+                )
+            complete_pipeline_stage("results", result_fields, defer=True)
             print(_render_summary(
                 summary, dataset, module, final_paths, log_path,
                 configuration.logging.terminal_label_width,
             ))
             if ctx is not None:
                 ctx["pops_output"] = result["pops_file"]
+                ctx["pops_integrated_results"] = result["integrated_results_file"]
+                ctx["pops_integrated_report"] = result["integrated_report_file"]
             return result
         existing = [path for path in final_paths.values() if path.exists()]
         if existing and not configuration.run.overwrite:
@@ -1674,7 +2868,8 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
                 if compatibility_report["excluded_target_genes"]:
                     logger.warning(
                         "PoPS gene-universe intersection retained %d of %d MAGMA "
-                        "target genes (%.1f%%) and excluded %d; originals were "
+                        "genes with Z-scores (%.1f%%) and excluded %d; originals "
+                        "were "
                         "not modified."
                         % (
                             compatibility_report["retained_target_genes"],
@@ -1686,7 +2881,8 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
             covariance_path = None
             if module.target_error_covariance_file is not None:
                 source = _required_file(
-                    module.target_error_covariance_file, "PoPS target covariance",
+                    module.target_error_covariance_file,
+                    "PoPS custom gene-error covariance",
                 )
                 covariance, converted = _load_target_covariance(source, outcome["gene_count"])
                 if converted:
@@ -1707,125 +2903,161 @@ def run_pops_direct(args: argparse.Namespace, ctx=None):
             upstream_level = logging.getLogger().level
             try:
                 get_pops_args, pops_main = _load_upstream_entrypoints()
-                active_progress_step = 2
-                progress.start_step(
-                    active_progress_step,
-                    len(_POPS_PROGRESS_STAGES),
-                    _POPS_PROGRESS_STAGES[active_progress_step - 1],
-                )
+                open_upstream_stage()
                 pops_main(
                     vars(get_pops_args(upstream_arguments)),
                     progress_callback=record_upstream_progress,
                 )
+                if upstream_stage_index != len(_POPS_UPSTREAM_PROGRESS_ORDER):
+                    raise PopsError(
+                        "Upstream PoPS did not report every required progress stage."
+                    )
             except SystemExit as exc:
                 raise PopsError("Upstream PoPS exited before completion.") from exc
             finally:
                 _restore_root_logging(upstream_handlers, upstream_level)
 
-            missing = [
-                path for path in staged_paths.values()
-                if not path.is_file() or path.stat().st_size <= 0
-            ]
-            if missing:
-                raise PopsError(
-                    "PoPS staging did not create required non-empty outputs: %s"
-                    % ", ".join(str(path) for path in missing)
+            start_pipeline_stage("results")
+            with logger.step(
+                11,
+                len(POPS_STAGES),
+                POPS_STAGES[10],
+                "validate_and_publish_pops_results",
+            ) as step:
+                derived_names = {
+                    "integrated_results_file", "integrated_report_file",
+                }
+                missing = [
+                    path for name, path in staged_paths.items()
+                    if name not in derived_names
+                    if not path.is_file() or path.stat().st_size <= 0
+                ]
+                if missing:
+                    raise PopsError(
+                        "PoPS staging did not create required non-empty outputs: %s"
+                        % ", ".join(str(path) for path in missing)
+                    )
+                integrated = _write_integrated_results(
+                    staged_paths,
+                    module,
+                    annotation,
+                    outcome,
+                    features,
+                    dataset=dataset,
                 )
-            summary = _summarise_outputs(
-                staged_paths, module, annotation, outcome, features,
-                published_paths=final_paths,
-            )
-            all_known_suffixes = {
-                module.output_layout.predictions_suffix,
-                module.output_layout.coefficients_suffix,
-                module.output_layout.marginals_suffix,
-                module.output_layout.upstream_log_suffix,
-                module.output_layout.training_data_suffix,
-                module.output_layout.matrix_data_suffix,
-                module.output_layout.compatible_genes_out_suffix,
-                module.output_layout.compatible_genes_raw_suffix,
-                module.output_layout.excluded_genes_out_suffix,
-                module.output_layout.excluded_genes_raw_suffix,
-                module.output_layout.gene_compatibility_table_suffix,
-                module.output_layout.gene_compatibility_report_suffix,
-            }
-            if configuration.run.overwrite:
-                completion_manifest.unlink(missing_ok=True)
-                for suffix in all_known_suffixes:
-                    Path(str(prefix) + suffix).unlink(missing_ok=True)
-            for name, source in staged_paths.items():
-                destination = final_paths[name]
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                source.replace(destination)
+                if not _complete_outputs(staged_paths):
+                    raise PopsError(
+                        "PoPS staging did not create every required non-empty output."
+                    )
+                summary = _summarise_outputs(
+                    staged_paths, module, annotation, outcome, features,
+                    published_paths=final_paths,
+                    integrated=integrated,
+                )
+                all_known_suffixes = {
+                    module.output_layout.predictions_suffix,
+                    module.output_layout.coefficients_suffix,
+                    module.output_layout.marginals_suffix,
+                    module.output_layout.upstream_log_suffix,
+                    module.output_layout.training_data_suffix,
+                    module.output_layout.matrix_data_suffix,
+                    module.output_layout.compatible_genes_out_suffix,
+                    module.output_layout.compatible_genes_raw_suffix,
+                    module.output_layout.excluded_genes_out_suffix,
+                    module.output_layout.excluded_genes_raw_suffix,
+                    module.output_layout.gene_compatibility_table_suffix,
+                    module.output_layout.gene_compatibility_report_suffix,
+                    module.output_layout.integrated_results_suffix,
+                    module.output_layout.integrated_report_suffix,
+                }
+                if configuration.run.overwrite:
+                    completion_manifest.unlink(missing_ok=True)
+                    for suffix in all_known_suffixes:
+                        Path(str(prefix) + suffix).unlink(missing_ok=True)
+                for name, source in staged_paths.items():
+                    destination = final_paths[name]
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    source.replace(destination)
+                result = _result(output, prefix, final_paths)
+                result["summary"] = summary
+                write_yaml_report(
+                    {
+                        "status": "COMPLETED",
+                        "dataset_id": dataset,
+                        "genome_build": module.genome_build.value,
+                        "method": module.method,
+                        "summary": summary,
+                        "files": result["published_files"],
+                    },
+                    completion_manifest,
+                )
+                result["completion_manifest"] = str(completion_manifest)
+                logger.record(
+                    "OUTPUT", "pops_outputs", files=result["published_files"],
+                )
+                logger.record(
+                    "OUTPUT", "pops_integrated_gene_results",
+                    table=result["integrated_results_file"],
+                    html=result["integrated_report_file"],
+                    full_union_genes=summary["integrated_gene_count"],
+                    genes_scored=summary["genes_scored"],
+                    genes_scored_without_input_target=(
+                        summary["genes_scored_without_target"]
+                    ),
+                    input_target_genes_excluded=(
+                        summary["input_target_genes_excluded"]
+                    ),
+                )
+                logger.record("OBSERVED", "pops_summary", **{
+                    key: value
+                    for key, value in summary.items()
+                    if key != "top_genes"
+                })
+                for warning in summary["warnings"]:
+                    logger.warning(warning)
+                result_fields = [
+                    ("success", "Output validation", "all required files are non-empty"),
+                    ("count", "Genes receiving PoPS scores", summary["genes_scored"]),
+                    ("count", "Integrated gene rows", summary["integrated_gene_count"]),
+                    (
+                        "count",
+                        "Selected features",
+                        summary["selected_features"]
+                        if summary["selected_features"] is not None
+                        else "not recorded",
+                    ),
+                    (
+                        "warning" if summary["warnings"] else "success",
+                        "Scientific warnings",
+                        len(summary["warnings"]),
+                    ),
+                    ("count", "Published result files", len(final_paths)),
+                ]
+                step.outcome(
+                    "PoPS results were validated and published.",
+                    fields=result_fields,
+                    genes_scored=summary["genes_scored"],
+                    published_files=len(final_paths),
+                )
+            complete_pipeline_stage("results", result_fields, defer=True)
 
-        result = _result(output, prefix, final_paths)
-        result["summary"] = summary
-        write_yaml_report(
-            {
-                "status": "COMPLETED",
-                "dataset_id": dataset,
-                "genome_build": module.genome_build.value,
-                "method": module.method,
-                "summary": summary,
-                "files": result["published_files"],
-            },
-            completion_manifest,
-        )
-        result["completion_manifest"] = str(completion_manifest)
-        logger.record("OUTPUT", "pops_outputs", files=result["published_files"])
-        logger.record("OBSERVED", "pops_summary", **{
-            key: value for key, value in summary.items() if key != "top_genes"
-        })
-        for warning in summary["warnings"]:
-            logger.warning(warning)
         logger.record("STATUS", "pops_run", status="COMPLETED")
         if ctx is not None:
             ctx["pops_output"] = result["pops_file"]
-        progress.complete_step(
-            active_progress_step,
-            len(_POPS_PROGRESS_STAGES),
-            _POPS_PROGRESS_STAGES[active_progress_step - 1],
-            outcome_fields=[
-                (
-                    "success", "Output validation",
-                    "all required files are non-empty",
-                ),
-                (
-                    "count", "Genes assigned PoPS scores",
-                    summary["genes_scored"],
-                ),
-                (
-                    "count", "Selected features",
-                    summary["selected_features"]
-                    if summary["selected_features"] is not None
-                    else "not recorded",
-                ),
-                (
-                    "warning" if summary["warnings"] else "success",
-                    "Scientific warnings", len(summary["warnings"]),
-                ),
-                ("count", "Published result files", len(final_paths)),
-            ],
-        )
-        active_progress_step = 0
+            ctx["pops_integrated_results"] = result["integrated_results_file"]
+            ctx["pops_integrated_report"] = result["integrated_report_file"]
         print(_render_summary(
             summary, dataset, module, final_paths, log_path,
             configuration.logging.terminal_label_width,
         ))
         return result
     except BaseException as exc:
-        if progress is not None and active_progress_step:
-            progress.fail_step(
-                active_progress_step,
-                len(_POPS_PROGRESS_STAGES),
-                _POPS_PROGRESS_STAGES[active_progress_step - 1],
-            )
+        if active_upstream_manager is not None:
+            active_upstream_manager.__exit__(type(exc), exc, exc.__traceback__)
         if not logger.summary()["failed"]:
             logger.error("PoPS analysis failed: %s: %s" % (type(exc).__name__, exc))
         raise
     finally:
-        if progress is not None:
-            progress.close()
         logger.close()
 
 

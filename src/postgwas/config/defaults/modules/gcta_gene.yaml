@@ -9,10 +9,14 @@ reference:
   bim_columns: [chromosome, variant_id, genetic_distance, position, allele1, allele2]
   table_delimiter_pattern: '\s+'
 variant_harmonisation:
-  coordinate_fallback: true
   chromosome_label_policy: strip_chr_prefix
   minimum_overlap_fraction: 0.50
   allow_strand_complement: false
+mhc:
+  policy: exclude_both
+  region_override: null
+chromosomes:
+  exclude: [Y, MT]
 gene_annotation:
   file: null
   columns: [chromosome, start, end, gene]
@@ -30,6 +34,7 @@ set_annotation:
     chromosome_label_policy: exact
     duplicate_gene_policy: deduplicate
     unmapped_gene_policy: report
+    minimum_gene_id_overlap_fraction: 0.50
     empty_pathway_policy: omit
     parallelism:
       worker_memory_multiplier: 8.0
@@ -76,6 +81,13 @@ reporting:
     fastbat_segment: Chr
     fastbat_set: null
     mbat_combo: Chr
+html_report:
+  page_size: 50
+  columns:
+    fastbat_gene: [Gene, Chr, Start, End, No.SNPs, SNP_start, SNP_end, Chisq(Obs), Pvalue, TopSNP.Pvalue, TopSNP, significant_nominal, P_bonferroni, significant_bonferroni, P_fdr_bh, significant_fdr_bh]
+    fastbat_segment: [Chr, Start, End, No.SNPs, SNP_start, SNP_end, Chisq(Obs), Pvalue, TopSNP.Pvalue, TopSNP, significant_nominal, P_bonferroni, significant_bonferroni, P_fdr_bh, significant_fdr_bh]
+    fastbat_set: [Set, No.SNPs, SNP_start, SNP_end, Chisq(Obs), Pvalue, TopSNP.Pvalue, TopSNP, significant_nominal, P_bonferroni, significant_bonferroni, P_fdr_bh, significant_fdr_bh]
+    mbat_combo: [Gene, Chr, Start, End, No.SNPs, SNP_start, SNP_end, TopSNP, TopSNP_Pvalue, No.Eigenvalues, Chisq_mBAT, P_mBATcombo, P_mBAT, Chisq_fastBAT, P_fastBAT, significant_nominal, P_bonferroni, significant_bonferroni, P_fdr_bh, significant_fdr_bh]
 minimum_gcta_version: 1.94.1
 version_arguments: [--version]
 version_pattern: '(?i)(?:gcta[^0-9]*)?v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
@@ -90,13 +102,16 @@ output_layout:
   staging_directory: '.partial/{dataset_id}_{method}'
   prepared_set_directory: 'prepared_sets/{dataset_id}'
   analysis_set_list: 'prepared_sets/{dataset_id}/analysis.fastbat.set'
-  harmonised_input: 'prepared_inputs/{dataset_id}_{method}_gcta_reference_ids.tsv'
+  variant_exclusion_list: 'analysis_inputs/{dataset_id}_{method}_excluded_variants.snplist'
+  scoped_gene_list: 'analysis_inputs/{dataset_id}_{method}_scoped_genes.txt'
+  excluded_gene_list: 'analysis_inputs/{dataset_id}_{method}_excluded_genes.txt'
   primary_results:
     fastbat_gene: 'raw/{dataset_id}.gene.fastbat'
     fastbat_segment: 'raw/{dataset_id}.seg.fastbat'
     fastbat_set: 'raw/{dataset_id}.fastbat'
     mbat_combo: 'raw/{dataset_id}.gene.assoc.mbat'
   normalized_result: 'results/{dataset_id}_{method}_results.tsv'
+  html_report: 'reports/{dataset_id}_{method}_gcta_gene_report.html'
   frequency_qc_result: 'raw/{dataset_id}.freq.badsnps'
   mbat_snpset_result: 'raw/{dataset_id}.gene.snpset.mbat'
 results:
@@ -112,24 +127,28 @@ results:
   schemas:
     fastbat_gene:
       required_columns: [Gene, Chr, Start, End, No.SNPs, Pvalue]
+      reportable_columns: [Gene, Chr, Start, End, No.SNPs, SNP_start, SNP_end, Chisq(Obs), Pvalue, TopSNP.Pvalue, TopSNP]
       p_value_column: Pvalue
       identifier_columns: [Gene]
       component_p_value_columns: []
       unit_label: genes
     fastbat_segment:
       required_columns: [Chr, Start, End, No.SNPs, Pvalue]
+      reportable_columns: [Chr, Start, End, No.SNPs, SNP_start, SNP_end, Chisq(Obs), Pvalue, TopSNP.Pvalue, TopSNP]
       p_value_column: Pvalue
       identifier_columns: [Chr, Start, End]
       component_p_value_columns: []
       unit_label: segments
     fastbat_set:
       required_columns: [Set, No.SNPs, Pvalue]
+      reportable_columns: [Set, No.SNPs, SNP_start, SNP_end, Chisq(Obs), Pvalue, TopSNP.Pvalue, TopSNP]
       p_value_column: Pvalue
       identifier_columns: [Set]
       component_p_value_columns: []
       unit_label: sets
     mbat_combo:
       required_columns: [Gene, Chr, Start, End, No.SNPs, P_mBATcombo]
+      reportable_columns: [Gene, Chr, Start, End, No.SNPs, SNP_start, SNP_end, TopSNP, TopSNP_Pvalue, No.Eigenvalues, Chisq_mBAT, P_mBATcombo, P_mBAT, Chisq_fastBAT, P_fastBAT]
       p_value_column: P_mBATcombo
       identifier_columns: [Gene]
       component_p_value_columns: [P_mBAT, P_fastBAT]

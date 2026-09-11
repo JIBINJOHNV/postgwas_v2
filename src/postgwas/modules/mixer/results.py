@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence, Type
 
 from postgwas.core.io.delimiters import open_text
 from postgwas.core.io.reports import write_delimited_report, write_yaml_report
+from postgwas.core.reference_resources import validate_table_header
 from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.core.values import (
     format_count,
@@ -438,23 +439,12 @@ def _float_or_none(value: Any) -> float | None:
 
 
 def validate_gsa_go_file(path: str | Path, settings, error_type=RuntimeError) -> None:
-    """Validate the configured ontology-table contract without loading the file."""
-    try:
-        with open_text(path) as handle:
-            reader = csv.DictReader(handle, delimiter=settings.go_file_delimiter)
-            header = reader.fieldnames or []
-            missing = [name for name in settings.go_file_required_columns if name not in header]
-            if missing:
-                raise error_type(
-                    "GSA-MiXeR ontology file is missing configured columns: %s"
-                    % ", ".join(missing)
-                )
-            if next(reader, None) is None:
-                raise error_type("GSA-MiXeR ontology file contains no records: %s" % path)
-    except error_type:
-        raise
-    except (OSError, UnicodeError, csv.Error) as exc:
-        raise error_type("Cannot read GSA-MiXeR ontology file %s: %s" % (path, exc)) from exc
+    """Check ontology header and first-record presence through the shared reader."""
+    validate_table_header(
+        path, delimiter=settings.go_file_delimiter,
+        required_columns=settings.go_file_required_columns,
+        label="GSA-MiXeR ontology file", error_type=error_type,
+    )
 
 
 def _gsa_test_identifiers(path: str | Path, settings, error_type) -> set[str]:

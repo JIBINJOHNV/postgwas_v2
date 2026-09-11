@@ -2,11 +2,53 @@ from argparse import Namespace
 from io import StringIO
 import logging
 
+import pytest
+from rich.cells import cell_len
 from rich.console import Console
 
 from postgwas.modules.fine_mapping.logging_utils import detailed_file_logging
 from postgwas.modules.fine_mapping.presentation import FineMappingScreen
 from postgwas.pipeline import runners
+
+
+@pytest.mark.parametrize("width", [80, 120])
+def test_final_summary_paths_keep_value_alignment_at_console_width(tmp_path, width):
+    stream = StringIO()
+    screen = FineMappingScreen(
+        "FINEMAP", show_progress=False, label_width=42,
+        console=Console(file=stream, force_terminal=False, color_system=None, width=width),
+    )
+    root = tmp_path / "long_parent_directory" / "study_with_a_long_reproducible_name"
+    paths = {
+        "Scientific HTML report": ("html_report", "results/study_fine_mapping_report.html"),
+        "Final combined result": ("final_combined_credible_sets", "results/combined_results/final_combined_credible_sets.tsv"),
+        "FLAMES input": ("flames_input", "downstream_inputs/flames"),
+        "Input and resource QC": ("preflight_validation", "quality_control/input_and_resource_validation.tsv"),
+        "Locus QC": ("locus_status", "quality_control/finemap_locus_status.tsv"),
+        "QC summary": ("overlap_resolution_summary", "quality_control/overlap_resolution_summary.tsv"),
+    }
+    screen.print_final_summary(
+        {"status": "success", "output_dir": root, "n_attempted": 8, "n_successful": 8,
+         "n_final_credible_sets": 14, "n_warnings": 8,
+         "warning_reason_counts": {"nef_relative_range_exceeds_threshold;ld_z_mismatch_warning": 8},
+         **{key: root / relative for key, relative in paths.values()}},
+        root / "run_metadata/pipeline_summary.log",
+    )
+    lines = stream.getvalue().splitlines()
+    assert all(cell_len(line) <= width for line in lines)
+    expected_paths = {label: relative for label, (_, relative) in paths.items()}
+    expected_paths.update({"Output directory": str(root), "Full detailed log": "run_metadata/pipeline_summary.log"})
+    for label, expected in expected_paths.items():
+        index = next(index for index, line in enumerate(lines) if label in line)
+        prefix, first = lines[index].split(" : ", 1)
+        assert first
+        indentation = " " * cell_len(prefix + " : ")
+        fragments = [first]
+        for continuation in lines[index + 1:]:
+            if not continuation.startswith(indentation):
+                break
+            fragments.append(continuation[len(indentation):])
+        assert "".join(fragments) == expected
 
 
 def test_fine_mapping_screen_is_concise_and_decision_focused(tmp_path):
@@ -40,8 +82,10 @@ def test_fine_mapping_screen_is_concise_and_decision_focused(tmp_path):
             "n_overlap_groups": 0,
             "n_final_credible_sets": 4,
             "output_dir": tmp_path,
+            "html_report": tmp_path / "report.html",
             "final_combined_credible_sets": tmp_path / "final.tsv",
             "flames_input": tmp_path / "flames",
+            "preflight_validation": tmp_path / "preflight.tsv",
             "locus_status": tmp_path / "locus_qc.tsv",
             "overlap_resolution_summary": tmp_path / "overlap_qc.tsv",
         },
@@ -63,6 +107,8 @@ def test_fine_mapping_screen_is_concise_and_decision_focused(tmp_path):
     assert "finemap timeout (1 locus)" in normalized_text
     assert "final.tsv" in text
     assert "pipeline_summary.log" in text
+    assert "preflight.tsv" in text
+    assert "report.html" in text
     assert "Full detailed log" in text
     assert "[STAGE]" not in text
     assert "[PROGRESS]" not in text
@@ -122,7 +168,7 @@ def test_pipeline_runners_do_not_print_raw_fine_mapping_objects(
     }
     monkeypatch.setattr(
         "postgwas.modules.fine_mapping.service.run_fine_mapping",
-        lambda _args: result,
+        lambda _args, **_kwargs: result,
     )
     assert runners.run_finemap_runner(args, context) == result
 
@@ -133,3 +179,61 @@ def test_pipeline_runners_do_not_print_raw_fine_mapping_objects(
     assert str(ld_result) not in terminal
     assert str(result) not in terminal
     assert str(tmp_path / "loci.tsv") not in terminal
+
+
+def test_ld_clumping_runner_passes_current_vcf_evidence_to_the_service(
+    monkeypatch, tmp_path,
+):
+    from postgwas.core.contracts import RunContext
+
+    indexed = object()
+    captured = {}
+    args = Namespace(
+        output_directory=str(tmp_path),
+        vcf="study.vcf.gz",
+        _step_num=1,
+    )
+    context = RunContext()
+    monkeypatch.setattr(
+        runners,
+        "_validate_current_pipeline_vcf",
+        lambda *_args: {"indexed": indexed},
+    )
+
+    def run(_args, **kwargs):
+        captured.update(kwargs)
+        return {"ld_clump_standard": {"ldpruned_sig_file": "loci.tsv"}}
+
+    monkeypatch.setattr(
+        "postgwas.modules.ld_clumping.service.run_ld_clump_direct",
+        run,
+    )
+
+    runners.run_ld_clump_runner(args, context)
+
+    assert captured["cached_vcf"] is indexed
+    assert captured["pipeline"] is True
+
+
+@pytest.mark.parametrize("engine,input_key", [("susie", "susie_input"), ("finemap", "finemap_input")])
+def test_finemap_runner_forwards_prior_reports_for_both_engines(tmp_path, monkeypatch, engine, input_key):
+    from postgwas.core.contracts import RunContext
+
+    context = RunContext({
+        "ld_clump": {"ld_clump_standard": {"ldpruned_sig_file": "loci.tsv"},
+                     "html_report": "clumping.html"},
+        "formatter": {engine: {input_key: "summary.tsv", "html_report": "formatting.html"}},
+        "finemap": {"html_report": "previous_finemap.html"},
+    })
+    captured = {}
+
+    def run(_args, **kwargs):
+        captured.update(kwargs)
+        return {"status": "success"}
+
+    monkeypatch.setattr("postgwas.modules.fine_mapping.service.run_fine_mapping", run)
+    args = Namespace(output_directory=str(tmp_path), finemap_method=engine, _step_num=3)
+    runners.run_finemap_runner(args, context)
+    assert set(captured["upstream_results"]) == {"ld_clump", "formatter"}
+    assert captured["upstream_results"]["ld_clump"]["html_report"] == "clumping.html"
+    assert args.output_directory == str(tmp_path)

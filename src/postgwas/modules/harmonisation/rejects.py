@@ -56,6 +56,7 @@ __all__ = [
     "ReconciliationError",
     "concat_reject_files",
     "reconcile",
+    "resolved_reject_output_path",
     "REJECT_COLUMNS",
 ]
 
@@ -66,15 +67,18 @@ __all__ = [
 
 _REASONS = {
     # -- step 01, reading -----------------------------------------------------
-    "missing_required_columns":
-        "A column the variant needs was empty or could not be parsed as its "
-        "configured numeric type, so the variant could not be used.",
+    "missing_read_mandatory_value":
+        "A read-stage mandatory value was empty after configured missing-token "
+        "parsing, or every value in a mandatory alternative group was empty.",
 
     # -- step 02, coordinates and alleles -------------------------------------
     "invalid_chromosome":
-        "The chromosome is not one of the chromosomes being kept.",
+        "The chromosome value is missing or cannot be interpreted.",
     "invalid_position":
         "The position is missing, is not a positive number, or could not be read.",
+    "unsupported_chromosome":
+        "The chromosome is outside the configured analysis scope. PostGWAS "
+        "retains autosomes and chromosome X in the packaged configuration.",
     "non_standard_allele":
         "An allele is not written as plain A, C, G or T letters - insertions and "
         "deletions coded as I, D or - land here.",
@@ -87,23 +91,38 @@ _REASONS = {
     "conflicting_duplicate":
         "Rows share the configured duplicate key but disagree on one or more "
         "scientific values, so no row in the group can be selected safely.",
+    "swapped_orientation_duplicate":
+        "Rows describe the same chromosome, position and unordered allele pair "
+        "with opposite effect/other-allele order, so their effect and frequency "
+        "values cannot be reconciled safely before reference orientation.",
 
     # -- step 03, effect allele frequency -------------------------------------
     "eaf_out_of_range":
-        "The frequency is below 0 or above 1 by more than rounding error.",
+        "The frequency is non-finite or is outside the valid interval from 0 to 1.",
     "eaf_degenerate":
-        "The frequency is exactly 0 or exactly 1, which makes the standard-error "
-        "formula divide by zero.",
+        "The frequency is exactly 0 or exactly 1; such endpoints are unusable for "
+        "effect reconstruction from Z because its denominator becomes zero.",
     "eaf_null":
         "The frequency is missing and could not be recovered from any reference.",
     "eaf_unmatched_external":
         "The variant is not in the external frequency reference.",
     "palindromic_ambiguous":
-        "The variant is palindromic (A/T or C/G) and its frequency sits inside the "
-        "band where both strand orientations are equally plausible.",
+        "The variant is palindromic (A/T or C/G), and its internal study frequency "
+        "is near 0.5 or does not uniquely identify one reference orientation.",
+    "palindromic_orientation_unavailable":
+        "The variant is palindromic (A/T or C/G), and automatic mode has neither "
+        "a strong study-wide strand consensus nor usable internal study frequency "
+        "evidence for orienting it.",
+    "palindromic_frequency_discordant":
+        "The variant is palindromic (A/T or C/G), and both study-frequency "
+        "orientations differ from the ancestry-matched reference by more than "
+        "the configured maximum.",
+    "palindromic_frequency_conflict":
+        "Study-wide strand consensus and decisive internal effect-allele-frequency "
+        "evidence select different orientations for this palindromic variant.",
     "af_discordant":
-        "The frequency disagrees with the reference panel under both orientations, "
-        "so it cannot be trusted either way.",
+        "The final effect-allele frequency differs from the already aligned "
+        "ancestry-matched reference AF by more than the configured tolerance.",
     "reference_unmatched":
         "No REF/ALT allele orientation at this coordinate matches the configured "
         "chromosome reference.",
@@ -124,6 +143,16 @@ _REASONS = {
     # -- step 06, Z score ------------------------------------------------------
     "z_invalid":
         "The Z score is missing or is not a finite number.",
+    "beta_z_sign_discordant":
+        "The effect size and signed Z score have incompatible directions while "
+        "the standard error is missing, so no positive standard error can satisfy "
+        "Z = BETA / SE.",
+    "effect_from_z_low_effective_variance":
+        "The effective genotype-variance proxy 2*EAF*(1-EAF)*Neff is below "
+        "the configured minimum for reconstructing BETA and SE from Z.",
+    "effect_from_z_invalid_denominator":
+        "The denominator required to reconstruct BETA and SE from Z is missing, "
+        "non-finite or not positive.",
 
     # -- step 07, p-value ------------------------------------------------------
     "pval_out_of_range":
@@ -194,18 +223,23 @@ _REASONS = {
 }
 
 _REASON_STEPS = {
-    "missing_required_columns": "01",
+    "missing_read_mandatory_value": "01",
     "invalid_chromosome": "02",
     "invalid_position": "02",
+    "unsupported_chromosome": "02",
     "non_standard_allele": "02",
     "null_allele": "02",
     "duplicate_variant": "02",
     "conflicting_duplicate": "02",
+    "swapped_orientation_duplicate": "02",
     "eaf_out_of_range": "03",
     "eaf_degenerate": "03",
     "eaf_null": "03",
     "eaf_unmatched_external": "03",
     "palindromic_ambiguous": "03",
+    "palindromic_orientation_unavailable": "03",
+    "palindromic_frequency_discordant": "03",
+    "palindromic_frequency_conflict": "03",
     "af_discordant": "03",
     "reference_unmatched": "03",
     "reference_ambiguous": "03",
@@ -213,6 +247,9 @@ _REASON_STEPS = {
     "sample_size_invalid": "04",
     "effect_non_positive_or": "05",
     "z_invalid": "06",
+    "beta_z_sign_discordant": "06",
+    "effect_from_z_low_effective_variance": "06",
+    "effect_from_z_invalid_denominator": "06",
     "pval_out_of_range": "07",
     "pval_null": "07",
     "zero_p_missing_se": "08",
@@ -304,8 +341,11 @@ class RejectCollector(object):
                     % self._source_path
                 )
             try:
+                source_scan = pl.scan_parquet(self._source_path)
+                collect_schema = getattr(source_scan, "collect_schema", None)
                 source_schema = dict(
-                    pl.scan_parquet(self._source_path).collect_schema()
+                    collect_schema() if callable(collect_schema)
+                    else source_scan.schema
                 )
             except Exception as exc:
                 raise RejectOutputError(
@@ -350,10 +390,7 @@ class RejectCollector(object):
         if len(self.delimiter) != 1:
             raise ValueError("Reject-file delimiter must be exactly one character")
 
-        path = str(out_path)
-        if self.compress and not path.endswith(".gz"):
-            path += ".gz"
-        self.out_path = path
+        self.out_path = resolved_reject_output_path(out_path, self.compress)
 
         self.columns = self.original_columns + list(REJECT_COLUMNS)
         self._frames = []          # type: List[pl.DataFrame]
@@ -408,12 +445,11 @@ class RejectCollector(object):
                 pl.col(_MASK_COLUMN).cast(pl.Boolean, strict=False).fill_null(True)
             )
 
-        partitions = tagged.partition_by(
-            _MASK_COLUMN, as_dict=True, maintain_order=True,
-        )
-        empty = tagged.head(0)
-        rejected = partitions.get((True,), empty).drop(_MASK_COLUMN)
-        survivors = partitions.get((False,), empty).drop(_MASK_COLUMN)
+        # The materialised Boolean column makes these exact complements while
+        # avoiding version-dependent ``partition_by(..., as_dict=True)`` key
+        # types (Boolean in Polars 0.20, one-element tuple in newer Polars).
+        rejected = tagged.filter(pl.col(_MASK_COLUMN)).drop(_MASK_COLUMN)
+        survivors = tagged.filter(~pl.col(_MASK_COLUMN)).drop(_MASK_COLUMN)
         after = survivors.height
 
         if rejected.height:
@@ -552,6 +588,7 @@ class RejectCollector(object):
             source_rows,
             on=self.source_row_column,
             how="left",
+            coalesce=True,
         )
         if joined.get_column(self._source_found_column).null_count():
             raise RejectOutputError(
@@ -616,6 +653,14 @@ class RejectCollector(object):
 # =============================================================================
 
 
+def resolved_reject_output_path(path, compress):
+    """Return the exact collector path for the configured compression mode."""
+    resolved = str(path)
+    if bool(compress) and not resolved.endswith(".gz"):
+        resolved += ".gz"
+    return resolved
+
+
 def _write_table(frame, path, compress, delimiter):
     if compress:
         with gzip.open(path, "wb") as handle:
@@ -624,19 +669,225 @@ def _write_table(frame, path, compress, delimiter):
         frame.write_csv(path, separator=delimiter)
 
 
-def _read_table(path, delimiter):
-    """Read a reject file with every column as text, so the schemas always match."""
-    return pl.read_csv(
-        path,
+def _open_reject_text(path):
+    """Open one reject table for lightweight CSV-aware header inspection."""
+    opener = gzip.open if str(path).endswith(".gz") else open
+    return opener(path, "rt", encoding="utf-8", newline="")
+
+
+def _read_reject_header(path, delimiter):
+    """Return and validate one source header without materialising its rows."""
+    try:
+        with _open_reject_text(path) as handle:
+            reader = csv.reader(handle, delimiter=delimiter)
+            try:
+                header = next(reader)
+            except StopIteration as exc:
+                raise RejectOutputError(
+                    "Required rejected-variants file is empty and has no header: %s"
+                    % path
+                ) from exc
+    except RejectOutputError:
+        raise
+    except Exception as exc:
+        raise RejectOutputError(
+            "Required rejected-variants file could not be read at %s "
+            "(%s: %s)." % (path, type(exc).__name__, exc)
+        ) from exc
+
+    if len(set(header)) != len(header):
+        duplicates = sorted(
+            set(column for column in header if header.count(column) > 1)
+        )
+        raise RejectOutputError(
+            "Required rejected-variants file %s contains duplicate column "
+            "name(s): %s." % (path, ", ".join(duplicates))
+        )
+    missing = [column for column in REJECT_COLUMNS if column not in header]
+    if missing:
+        raise RejectOutputError(
+            "Required rejected-variants file %s is missing required column(s): %s."
+            % (path, ", ".join(missing))
+        )
+    return header
+
+
+def _normalise_reject_batch(frame, columns):
+    """Project one source batch onto the ordered diagonal-union schema."""
+    expressions = []
+    present = set(frame.columns)
+    for column in columns:
+        if column in present:
+            expressions.append(
+                pl.col(column).cast(pl.Utf8, strict=False).alias(column)
+            )
+        else:
+            expressions.append(pl.lit(None, dtype=pl.Utf8).alias(column))
+    return frame.select(expressions)
+
+
+def _logical_csv_records(handle, source):
+    """Yield raw logical CSV records, including quoted embedded newlines."""
+    fragments = []
+    inside_quotes = False
+    for line in handle:
+        fragments.append(line)
+        if line.count(b'"') % 2:
+            inside_quotes = not inside_quotes
+        if not inside_quotes:
+            yield b"".join(fragments)
+            fragments = []
+    if fragments:
+        raise RejectOutputError(
+            "Required rejected-variants file %s ends inside a quoted CSV field."
+            % source
+        )
+
+
+def _read_compressed_reject_batches(source, delimiter, batch_rows):
+    """Work around the Polars 0.20 multiline-gzip batched-reader defect."""
+    with gzip.open(source, "rb") as handle:
+        records = _logical_csv_records(handle, source)
+        try:
+            header = next(records)
+        except StopIteration as exc:
+            raise RejectOutputError(
+                "Required rejected-variants file is empty and has no header: %s"
+                % source
+            ) from exc
+        batch = []
+        for record in records:
+            batch.append(record)
+            if len(batch) == batch_rows:
+                yield pl.read_csv(
+                    header + b"".join(batch),
+                    separator=delimiter,
+                    infer_schema_length=0,
+                    has_header=True,
+                    truncate_ragged_lines=False,
+                )
+                batch = []
+        if batch:
+            yield pl.read_csv(
+                header + b"".join(batch),
+                separator=delimiter,
+                infer_schema_length=0,
+                has_header=True,
+                truncate_ragged_lines=False,
+            )
+
+
+def _iter_reject_batches(source, delimiter, batch_rows, multiline_safe):
+    """Yield text-typed Polars frames from one source table."""
+    if multiline_safe and str(source).endswith(".gz"):
+        for frame in _read_compressed_reject_batches(
+            source, delimiter, batch_rows,
+        ):
+            yield frame
+        return
+
+    reader = pl.read_csv_batched(
+        source,
         separator=delimiter,
         infer_schema_length=0,
         has_header=True,
         truncate_ragged_lines=False,
+        batch_size=batch_rows,
     )
+    while True:
+        batches = reader.next_batches(1)
+        if not batches:
+            break
+        for frame in batches:
+            yield frame
+
+
+def _write_reject_batch_stream(
+    paths, path, columns, delimiter, compressed, batch_rows, multiline_safe,
+):
+    """Write one attempt and return exact per-source rows and reasons."""
+    opener = gzip.open if compressed else open
+    rows_written = 0
+    rows_by_source = {}
+    reasons_by_source = {}
+    wrote_header = False
+    with opener(path, "wb") as handle:
+        for source in paths:
+            source = str(source)
+            source_rows = 0
+            source_reasons = {}
+            for frame in _iter_reject_batches(
+                source, delimiter, batch_rows, multiline_safe,
+            ):
+                frame = _normalise_reject_batch(frame, columns)
+                reason_counts = frame.group_by("reject_reason").len()
+                for reason, count in reason_counts.iter_rows():
+                    if reason is None:
+                        raise RejectOutputError(
+                            "Required rejected-variants file %s contains %d "
+                            "row(s) without a reject_reason."
+                            % (source, int(count))
+                        )
+                    reason = str(reason)
+                    if reason not in REASONS:
+                        raise RejectOutputError(
+                            "Required rejected-variants file %s contains the "
+                            "unregistered reject_reason %r."
+                            % (source, reason)
+                        )
+                    source_reasons[reason] = (
+                        source_reasons.get(reason, 0) + int(count)
+                    )
+                frame.write_csv(
+                    handle,
+                    separator=delimiter,
+                    include_header=not wrote_header,
+                )
+                rows_written += frame.height
+                source_rows += frame.height
+                wrote_header = True
+            rows_by_source[source] = int(source_rows)
+            reasons_by_source[source] = source_reasons
+        if not wrote_header:
+            pl.DataFrame(
+                dict(
+                    (column, pl.Series(column, [], dtype=pl.Utf8))
+                    for column in columns
+                )
+            ).write_csv(handle, separator=delimiter)
+    return rows_written, rows_by_source, reasons_by_source
+
+
+def _write_reject_batches(
+    paths, path, columns, delimiter, compressed, batch_rows,
+):
+    """Write bounded batches, retrying a pinned Polars multiline-gzip defect."""
+    try:
+        return _write_reject_batch_stream(
+            paths,
+            path,
+            columns,
+            delimiter,
+            compressed,
+            batch_rows,
+            multiline_safe=False,
+        )
+    except pl.exceptions.ComputeError:
+        if not any(str(source).endswith(".gz") for source in paths):
+            raise
+        return _write_reject_batch_stream(
+            paths,
+            path,
+            columns,
+            delimiter,
+            compressed,
+            batch_rows,
+            multiline_safe=True,
+        )
 
 
 def _validate_reject_output(path, delimiter, expected_rows, compressed):
-    """Validate one written reject table without loading it back into memory."""
+    """Validate the header and empty/non-empty state after counted batch writes."""
     opener = gzip.open if compressed else open
     try:
         with opener(
@@ -656,7 +907,7 @@ def _validate_reject_output(path, delimiter, expected_rows, compressed):
                     "Combined rejected-variants output %s is missing required "
                     "column(s): %s." % (path, ", ".join(missing))
                 )
-            observed_rows = sum(1 for _row in reader)
+            first_row = next(reader, None)
     except RejectOutputError:
         raise
     except Exception as exc:
@@ -664,18 +915,25 @@ def _validate_reject_output(path, delimiter, expected_rows, compressed):
             "Combined rejected-variants output could not be validated at %s "
             "(%s: %s)." % (path, type(exc).__name__, exc)
         ) from exc
-    if observed_rows != int(expected_rows):
+    expected_rows = int(expected_rows)
+    if expected_rows > 0 and first_row is None:
         raise RejectOutputError(
-            "Combined rejected-variants output %s contains %d row(s), but %d "
-            "were written from the source rejection files. Source files were "
-            "not removed."
-            % (path, observed_rows, int(expected_rows))
+            "Combined rejected-variants output %s has no data rows, but %d row(s) "
+            "were passed to the writer. Source files were not removed."
+            % (path, expected_rows)
         )
-    return observed_rows
+    if expected_rows == 0 and first_row is not None:
+        raise RejectOutputError(
+            "Combined rejected-variants output %s contains data even though no "
+            "source rows were passed to the writer. Source files were not removed."
+            % path
+        )
+    return expected_rows
 
 
 def concat_reject_files(
-    paths, out_path, delimiter, logger=None, compress=None, remove_sources=False,
+    paths, out_path, delimiter, batch_rows, logger=None, compress=None,
+    remove_sources=False,
 ):
     """Merge the per-chromosome reject files into the one dataset file.
 
@@ -683,12 +941,22 @@ def concat_reject_files(
     an expected stage left no auditable record. Header-only files contribute
     nothing but confirm that the stage ran and rejected no variants. When
     ``remove_sources`` is true, source shards are removed only after an atomic
-    write has passed required-column and exact-row-count validation.
+    write has passed required-column validation. The exact row count is
+    accumulated while each bounded batch is written, so finalisation does not
+    need a third full pass over the combined output.
     """
     delimiter = str(delimiter)
     if len(delimiter) != 1:
         raise RejectOutputError(
             "Reject-file delimiter must be exactly one character."
+        )
+    if (
+        isinstance(batch_rows, bool)
+        or not isinstance(batch_rows, int)
+        or batch_rows < 1
+    ):
+        raise RejectOutputError(
+            "Reject-file concatenation batch_rows must be a positive integer."
         )
     if compress is None:
         compress = str(out_path).endswith(".gz")
@@ -696,18 +964,21 @@ def concat_reject_files(
         out_path = str(out_path) + ".gz"
     out_path = str(out_path)
 
-    frames = []      # type: List[pl.DataFrame]
     used = []        # type: List[str]
     missing = []     # type: List[str]
+    failure_details = []  # type: List[str]
+    original_columns = []  # type: List[str]
     for path in paths:
         path = str(path)
         if not os.path.exists(path) or os.path.getsize(path) == 0:
             missing.append(path)
+            failure_details.append("%s (file is missing or empty)" % path)
             continue
         try:
-            frame = _read_table(path, delimiter)
+            header = _read_reject_header(path, delimiter)
         except Exception as exc:
             missing.append(path)
+            failure_details.append("%s (%s)" % (path, exc))
             if logger is not None:
                 logger.error(
                     "The required reject file %s could not be read (%s: %s)."
@@ -715,41 +986,44 @@ def concat_reject_files(
                 )
             continue
         used.append(path)
-        if frame.height:
-            frames.append(frame)
+        for column in header:
+            if column not in REJECT_COLUMNS and column not in original_columns:
+                original_columns.append(column)
 
     if missing:
         raise RejectOutputError(
-            "%d required rejected-variant file%s %s missing or unreadable: %s"
+            "%d required rejected-variant file%s %s missing or unreadable: %s. "
+            "Details: %s"
             % (
                 len(missing),
                 "" if len(missing) == 1 else "s",
                 "is" if len(missing) == 1 else "are",
                 ", ".join(missing),
+                "; ".join(failure_details),
             )
         )
 
-    if frames:
-        merged = pl.concat(frames, how="diagonal")
-    elif used:
-        merged = _read_table(used[0], delimiter).head(0)
-    else:
-        merged = pl.DataFrame(
-            dict((name, pl.Series(name, [], dtype=pl.Utf8)) for name in REJECT_COLUMNS)
-        )
-
-    ordered = [c for c in merged.columns if c not in REJECT_COLUMNS]
-    ordered += [c for c in REJECT_COLUMNS if c in merged.columns]
-    merged = merged.select(ordered)
+    ordered = original_columns + list(REJECT_COLUMNS)
 
     directory = os.path.dirname(os.path.abspath(out_path))
     temporary = out_path + ".part%d" % os.getpid()
     try:
         if directory:
             os.makedirs(directory, exist_ok=True)
-        _write_table(merged, temporary, compress, delimiter)
+        (
+            rows_written,
+            rows_by_source,
+            reject_counts_by_source,
+        ) = _write_reject_batches(
+            used,
+            temporary,
+            ordered,
+            delimiter,
+            compress,
+            batch_rows,
+        )
         _validate_reject_output(
-            temporary, delimiter, merged.height, compressed=compress,
+            temporary, delimiter, rows_written, compressed=compress,
         )
         os.replace(temporary, out_path)
     except RejectOutputError:
@@ -796,7 +1070,10 @@ def concat_reject_files(
 
     result = {
         "path": out_path,
-        "rows": merged.height,
+        "rows": rows_written,
+        "rows_by_source": rows_by_source,
+        "reject_counts_by_source": reject_counts_by_source,
+        "batch_rows": batch_rows,
         "files_used": used,
         "files_missing": missing,
         "source_files_removed": removed_sources,
@@ -806,7 +1083,7 @@ def concat_reject_files(
         logger.info(
             "Combined %d reject file%s into %s: %s variants in total."
             % (len(used), "" if len(used) == 1 else "s", out_path,
-               "{:,}".format(merged.height))
+               "{:,}".format(rows_written))
         )
         if remove_sources:
             logger.info(

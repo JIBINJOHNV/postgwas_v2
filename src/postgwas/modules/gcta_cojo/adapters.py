@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
+from postgwas.config.models.modules.gcta_cojo import (
+    validate_gcta_cojo_mode_inputs,
+)
 from postgwas.core.gcta import require_supported_gcta as _require_supported_gcta
 from postgwas.core.processes import run_checked_command
 from postgwas.modules.gcta_cojo.errors import GctaCojoError
@@ -29,10 +32,14 @@ def build_cojo_command(
     output_prefix: str | Path,
     threads: int,
     module,
+    *,
+    exclude_snps: str | Path | None = None,
+    chromosome: int | None = None,
 ) -> list[str]:
     """Build one GCTA-COJO command from the resolved canonical configuration."""
     analysis = module.analysis
     inputs = module.inputs
+    validate_gcta_cojo_mode_inputs(module.mode, inputs)
     command = [
         executable,
         "--bfile", str(reference_prefix),
@@ -44,11 +51,15 @@ def build_cojo_command(
         "--thread-num", str(threads),
         "--out", str(output_prefix),
     ]
-    if analysis.chromosome is not None:
-        command.extend(["--chr", analysis.chromosome])
-    if inputs.exclude_snps is not None:
+    effective_chromosome = (
+        chromosome if chromosome is not None else analysis.chromosome
+    )
+    if effective_chromosome is not None:
+        command.extend(["--chr", str(effective_chromosome)])
+    effective_exclude = exclude_snps or inputs.exclude_snps
+    if effective_exclude is not None:
         command.extend([
-            "--exclude", str(Path(inputs.exclude_snps).expanduser().resolve()),
+            "--exclude", str(Path(effective_exclude).expanduser().resolve()),
         ])
     if inputs.extract_snps is not None:
         command.extend([
@@ -77,20 +88,25 @@ def build_cojo_command(
 
 def run_cojo_command(
     command: Sequence[str],
-    expected_result: Path,
     configuration,
     logger,
     *,
     dry_run: bool,
+    purpose: str | None = None,
+    resource_metrics: dict[str, int] | None = None,
+    resource_poll_seconds: float | None = None,
 ) -> None:
     run_checked_command(
         command,
-        "GCTA-COJO %s analysis" % configuration.modules.gcta_cojo.mode,
+        purpose or (
+            "GCTA-COJO %s analysis" % configuration.modules.gcta_cojo.mode
+        ),
         logger=logger,
         error_type=GctaCojoError,
         timeout_seconds=configuration.execution.timeout_seconds,
-        expected_outputs=[expected_result],
         dry_run=dry_run,
+        resource_metrics=resource_metrics,
+        resource_poll_seconds=resource_poll_seconds,
     )
 
 

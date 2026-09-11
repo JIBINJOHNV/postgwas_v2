@@ -1,1 +1,0 @@
-"""Packaged FLAMES model assets."""

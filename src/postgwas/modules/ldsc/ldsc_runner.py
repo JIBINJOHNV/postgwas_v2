@@ -4,16 +4,29 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import re
 from typing import Any
 
 from postgwas.core.paths import require_nonempty_file
 from postgwas.core.processes import run_checked_command
+from postgwas.core.reference_resources import require_file_inventory
+from postgwas.core.validation_reporting import register_file_availability_bundle
 
 
 class LDSCError(RuntimeError):
     """Raised when an LDSC input, command, or required result is invalid."""
+
+
+@dataclass(frozen=True)
+class LDSCReferenceValidation:
+    """Exact external files consumed by one resolved LDSC analysis."""
+
+    merge_alleles: Path | None
+    reference_directory: Path
+    weights_directory: Path
+    required_files: tuple[Path, ...]
 
 
 _ESTIMATE_WITH_SE = re.compile(
@@ -168,29 +181,93 @@ def validate_reference_files(
     configuration,
 ) -> tuple[Path, Path]:
     """Require every chromosome-split file consumed by the pinned LDSC reader."""
+    validated = validate_ldsc_reference_resources(
+        None,
+        reference_directory,
+        weights_directory,
+        configuration,
+    )
+    return validated.reference_directory, validated.weights_directory
+
+
+def validate_ldsc_reference_resources(
+    merge_alleles: str | Path | None,
+    reference_directory: str | Path,
+    weights_directory: str | Path,
+    configuration,
+) -> LDSCReferenceValidation:
+    """Validate and enumerate the resolved external LDSC resource contract."""
     reference = _required_directory(reference_directory, "Reference LD-score")
     weights = _required_directory(weights_directory, "Regression-weight LD-score")
     layout = configuration.reference_layout
     m_suffix = layout.m_5_50_suffix if configuration.use_m_5_50 else layout.m_suffix
-    missing: list[Path] = []
+    required_files: list[Path] = []
+    reference_ld_files: list[Path] = []
+    reference_snp_count_files: list[Path] = []
+    weight_ld_files: list[Path] = []
     for chromosome in range(1, configuration.chromosomes + 1):
-        required = [
-            reference / (str(chromosome) + layout.ld_score_suffix),
-            reference / (str(chromosome) + m_suffix),
-            weights / (str(chromosome) + layout.ld_score_suffix),
-        ]
-        missing.extend(
-            path for path in required
-            if not path.is_file() or path.stat().st_size <= 0
+        reference_ld_files.append(
+            reference / (str(chromosome) + layout.ld_score_suffix)
         )
-    if missing:
-        preview = ", ".join(str(path) for path in missing[:5])
-        suffix = " (and %d more)" % (len(missing) - 5) if len(missing) > 5 else ""
-        raise LDSCError(
-            "LDSC chromosome-split reference files are missing or empty: %s%s"
-            % (preview, suffix)
+        reference_snp_count_files.append(
+            reference / (str(chromosome) + m_suffix)
         )
-    return reference, weights
+        weight_ld_files.append(
+            weights / (str(chromosome) + layout.ld_score_suffix)
+        )
+        required_files.extend((
+            reference_ld_files[-1],
+            reference_snp_count_files[-1],
+            weight_ld_files[-1],
+        ))
+    require_file_inventory(
+        required_files, "LDSC chromosome-split reference",
+        missing_message="LDSC chromosome-split reference files are missing or empty",
+        error_type=LDSCError,
+    )
+    directory_fields = (
+        (("info", "ldsc_shared_reference_directory", reference, True),)
+        if reference == weights
+        else (
+            ("info", "ldsc_reference_directory", reference, True),
+            ("info", "ldsc_weight_directory", weights, True),
+        )
+    )
+    register_file_availability_bundle(
+        required_files,
+        "LDSC chromosome reference bundle",
+        (
+            ("count", "chromosomes", [
+                str(chromosome)
+                for chromosome in range(1, configuration.chromosomes + 1)
+            ]),
+            ("success", "ldsc_reference_ld_files", "%d / %d" % (
+                len(reference_ld_files), configuration.chromosomes,
+            )),
+            ("success", "ldsc_reference_snp_count_files", "%d / %d" % (
+                len(reference_snp_count_files), configuration.chromosomes,
+            )),
+            ("success", "ldsc_weight_ld_files", "%d / %d" % (
+                len(weight_ld_files), configuration.chromosomes,
+            )),
+            ("info", "ldsc_snp_count_suffix", m_suffix),
+            ("count", "ldsc_unique_bundle_files", len(set(required_files))),
+            *directory_fields,
+        ),
+    )
+    merge_file = (
+        None
+        if merge_alleles is None
+        else require_nonempty_file(
+            merge_alleles, "LDSC merge-alleles file", error_type=LDSCError,
+        )
+    )
+    return LDSCReferenceValidation(
+        merge_alleles=merge_file,
+        reference_directory=reference,
+        weights_directory=weights,
+        required_files=tuple(required_files),
+    )
 
 
 def extract_ldsc_metrics(log_file: str | Path) -> dict[str, str]:
@@ -241,6 +318,84 @@ def extract_ldsc_metrics(log_file: str | Path) -> dict[str, str]:
     }
 
 
+def _validate_liability_conversion_invariant(
+    observed_metrics: dict[str, str],
+    liability_metrics: dict[str, str],
+    *,
+    observed_log: Path,
+    liability_log: Path,
+    logger=None,
+) -> None:
+    """Require prevalence to leave the fitted LDSC regression unchanged.
+
+    The pinned CBIIT LDSC implementation passes prevalence only to the summary
+    conversion after fitting the regression. It may therefore rescale h² and
+    its standard error, but the intercept and attenuation ratio must be shared
+    by the observed- and liability-scale reports.
+    """
+    shared_metrics = ("intercept", "ratio")
+    mismatches = [
+        name for name in shared_metrics
+        if observed_metrics[name] != liability_metrics[name]
+    ]
+    differences = "; ".join(
+        "%s (observed=%r, liability=%r)"
+        % (name, observed_metrics[name], liability_metrics[name])
+        for name in mismatches
+    )
+    unverifiable_ratio_scales = [
+        scale
+        for scale, metrics in (
+            ("observed", observed_metrics),
+            ("liability", liability_metrics),
+        )
+        if (
+            metrics["ratio"] == "N/A"
+            and not metrics["intercept"].startswith("constrained to ")
+        )
+    ]
+    problems = []
+    if mismatches:
+        problems.append(
+            "the prevalence run changed shared regression metric(s): %s"
+            % differences
+        )
+    if unverifiable_ratio_scales:
+        problems.append(
+            "the attenuation ratio is missing despite an unconstrained "
+            "intercept in the %s log(s)"
+            % ", ".join(unverifiable_ratio_scales)
+        )
+    if problems:
+        validation_problem = "; ".join(problems)
+        if logger is not None and hasattr(logger, "record"):
+            logger.record(
+                "FAILED", "ldsc_liability_conversion_invariant",
+                mismatched_metrics=mismatches,
+                unverifiable_ratio_scales=unverifiable_ratio_scales,
+                observed_log=str(observed_log),
+                liability_log=str(liability_log),
+                problem=validation_problem,
+            )
+        raise LDSCError(
+            "LDSC liability-scale validation failed because %s. In the "
+            "pinned CBIIT LDSC implementation, --samp-prev and --pop-prev "
+            "may rescale only h² and its standard error. PostGWAS compared "
+            "observed log %s with liability log %s and stopped before "
+            "publication."
+            % (validation_problem, observed_log, liability_log)
+        )
+    if logger is not None and hasattr(logger, "record"):
+        logger.record(
+            "PASS", "ldsc_liability_conversion_invariant",
+            result="intercept_and_ratio_unchanged",
+            shared_intercept=observed_metrics["intercept"],
+            shared_ratio=observed_metrics["ratio"],
+            observed_log=str(observed_log),
+            liability_log=str(liability_log),
+        )
+
+
 def _analysis_outputs(
     prefix: Path, configuration, *, include_all_optional: bool = False,
 ) -> list[Path]:
@@ -254,6 +409,62 @@ def _analysis_outputs(
             Path(str(prefix) + layout.partitioned_delete_values_suffix),
         ])
     return outputs
+
+
+def _run_h2_analysis(
+    command: list[str],
+    purpose: str,
+    outputs: list[Path],
+    *,
+    logger=None,
+) -> dict[str, str]:
+    """Run one h² command and validate its durable scientific report.
+
+    The pinned CBIIT logger sends each report line to both stdout and ``.log``.
+    On affected executions its unclosed buffered file can remain zero bytes
+    despite a complete zero-exit stdout report. In that one condition, preserve
+    the exact captured stdout as the staged log and apply the normal strict
+    scientific parser before accepting the run.
+    """
+    log_path = outputs[0]
+    stdout = run_checked_command(
+        command,
+        purpose,
+        logger=logger,
+        error_type=LDSCError,
+        expected_outputs=outputs[1:],
+    )
+    if log_path.is_file() and log_path.stat().st_size > 0:
+        return extract_ldsc_metrics(log_path)
+    if not stdout:
+        raise LDSCError(
+            "%s returned success but expected output is missing or empty: %s. "
+            "Captured stdout was also empty, so no scientific result can be "
+            "validated."
+            % (purpose, log_path)
+        )
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(stdout, encoding="utf-8")
+        metrics = extract_ldsc_metrics(log_path)
+    except (OSError, LDSCError) as exc:
+        log_path.unlink(missing_ok=True)
+        raise LDSCError(
+            "%s returned success but expected output is missing or empty: %s. "
+            "Captured stdout was not a complete, parseable LDSC heritability "
+            "report: %s"
+            % (purpose, log_path, exc)
+        ) from exc
+    if logger is not None and hasattr(logger, "record"):
+        logger.record(
+            "WARNING", "ldsc_log_recovered_from_stdout",
+            purpose=purpose,
+            path=str(log_path),
+            captured_stdout_bytes=len(stdout.encode("utf-8")),
+            reason="upstream_log_missing_or_empty_after_zero_exit",
+            validation="required_heritability_metrics_parsed",
+        )
+    return metrics
 
 
 def ldsc_owned_output_paths(
@@ -288,17 +499,30 @@ def run_ldsc(
     ldsc_executable: str,
     configuration,
     logger=None,
+    reference_validation: LDSCReferenceValidation | None = None,
 ) -> dict[str, Any]:
     """Munge formatter output and run validated observed/liability h² analyses."""
     sumstats = require_nonempty_file(
         sumstats_tsv, "LDSC formatter input", error_type=LDSCError,
     )
-    merge_file = require_nonempty_file(
-        merge_alleles, "LDSC merge-alleles file", error_type=LDSCError,
+    validated_reference = reference_validation or validate_ldsc_reference_resources(
+        merge_alleles,
+        reference_ld_directory,
+        weights_ld_directory,
+        configuration,
     )
-    reference, weights = validate_reference_files(
-        reference_ld_directory, weights_ld_directory, configuration,
-    )
+    merge_file = validated_reference.merge_alleles
+    if (
+        merge_file is None
+        or not merge_file.is_file()
+        or merge_file.stat().st_size <= 0
+    ):
+        raise LDSCError(
+            "Prevalidated LDSC merge-alleles file is missing or empty: %s"
+            % merge_file
+        )
+    reference = validated_reference.reference_directory
+    weights = validated_reference.weights_directory
     if logger is not None and hasattr(logger, "record"):
         logger.record(
             "INPUT", "ldsc_inputs",
@@ -342,7 +566,7 @@ def run_ldsc(
 
     observed_prefix = Path(str(prefix) + layout.observed_prefix_suffix)
     observed_outputs = _analysis_outputs(observed_prefix, configuration)
-    run_checked_command(
+    observed_metrics = _run_h2_analysis(
         build_h2_command(
             ldsc_executable,
             sumstats=munged_sumstats,
@@ -359,11 +583,9 @@ def run_ldsc(
         ),
         "LDSC observed-scale heritability",
         logger=logger,
-        error_type=LDSCError,
-        expected_outputs=observed_outputs,
+        outputs=observed_outputs,
     )
     observed_log = observed_outputs[0]
-    observed_metrics = extract_ldsc_metrics(observed_log)
 
     result: dict[str, Any] = {
         "munged_sumstats": str(munged_sumstats),
@@ -378,7 +600,7 @@ def run_ldsc(
     if configuration.population_prevalence is not None:
         liability_prefix = Path(str(prefix) + layout.liability_prefix_suffix)
         liability_outputs = _analysis_outputs(liability_prefix, configuration)
-        run_checked_command(
+        liability_metrics = _run_h2_analysis(
             build_h2_command(
                 ldsc_executable,
                 sumstats=munged_sumstats,
@@ -397,13 +619,21 @@ def run_ldsc(
             ),
             "LDSC liability-scale heritability",
             logger=logger,
-            error_type=LDSCError,
-            expected_outputs=liability_outputs,
+            outputs=liability_outputs,
         )
         liability_log = liability_outputs[0]
-        result["h2_liability"] = str(liability_log)
-        result["liability_outputs"] = [str(path) for path in liability_outputs]
-        result["liability_metrics"] = extract_ldsc_metrics(liability_log)
+        _validate_liability_conversion_invariant(
+            observed_metrics,
+            liability_metrics,
+            observed_log=observed_log,
+            liability_log=liability_log,
+            logger=logger,
+        )
+        result.update({
+            "h2_liability": str(liability_log),
+            "liability_outputs": [str(path) for path in liability_outputs],
+            "liability_metrics": liability_metrics,
+        })
     elif logger is not None and hasattr(logger, "record"):
         logger.record(
             "SKIP", "ldsc_liability_scale",
@@ -413,7 +643,8 @@ def run_ldsc(
 
 
 __all__ = [
-    "LDSCError", "build_h2_command", "build_h2_cts_command",
+    "LDSCError", "LDSCReferenceValidation", "build_h2_command", "build_h2_cts_command",
     "build_munge_sumstats_command", "extract_ldsc_metrics", "run_ldsc",
-    "ldsc_owned_output_paths", "validate_reference_files",
+    "ldsc_owned_output_paths", "validate_ldsc_reference_resources",
+    "validate_reference_files",
 ]

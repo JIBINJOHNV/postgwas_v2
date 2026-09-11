@@ -35,6 +35,7 @@ The same formatter is used for run, dataset, chromosome, and concordance logs.
 
 import datetime
 import os
+import re
 import sys
 import textwrap
 import threading
@@ -43,7 +44,11 @@ import traceback
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from postgwas.core.ui.screen import SYMBOLS, screen_field, screen_line
+from postgwas.core.ui.screen import (
+    normalize_stage_outcome_fields,
+    screen_field,
+    screen_line,
+)
 from postgwas.core.values import format_count as _count
 
 __all__ = [
@@ -361,7 +366,7 @@ class StepContext(object):
     __slots__ = (
         "number", "total", "title", "func_name",
         "rows_in", "rows_out", "removed", "extra",
-        "outcome_fields", "failure_hint", "_logger", "started",
+        "outcome_fields", "failure_hint", "_logger", "started", "logged_outcome",
     )
 
     def __init__(self, logger, number, total, title, func_name, rows_in):
@@ -374,6 +379,7 @@ class StepContext(object):
         self.removed = None     # type: Optional[int]
         self.extra = {}         # type: Dict[str, Any]
         self.outcome_fields = None
+        self.logged_outcome = None
         self.failure_hint = None  # type: Optional[str]
         self.started = time.time()
         self._logger = logger
@@ -415,6 +421,8 @@ class StepContext(object):
             self.removed = removed
 
     def outcome(self, message, fields=None, **values):
+        from postgwas.core.validation_reporting import consolidate_validation_fields
+
         text = str(message).strip()
         if not text:
             raise ValueError("A completed-stage outcome must not be empty")
@@ -424,21 +432,12 @@ class StepContext(object):
                 "Stage outcome details use reserved names: %s"
                 % ", ".join(sorted(reserved))
             )
-        normalized_fields = []
-        for field in fields or ():
-            if len(field) != 3:
-                raise ValueError(
-                    "Each stage outcome field must contain kind, label and value"
-                )
-            kind, label, value = field
-            kind, label = str(kind).strip(), str(label).strip()
-            if kind not in SYMBOLS or not label:
-                raise ValueError(
-                    "Stage outcome fields require a known symbol kind and label"
-                )
-            normalized_fields.append((kind, label, value))
         self.extra["outcome"] = {"message": text, **values}
-        self.outcome_fields = tuple(normalized_fields)
+        log_values = dict(values)
+        self.outcome_fields = normalize_stage_outcome_fields(consolidate_validation_fields(
+            normalize_stage_outcome_fields(fields), log_details=log_values,
+        ))
+        self.logged_outcome = {"message": text, **log_values}
 
     @property
     def label(self):
@@ -570,6 +569,29 @@ class PipelineLogger(object):
                 error="%s: %s" % (type(exc).__name__, exc),
             )
 
+    def set_stage_progress(self, stage_progress):
+        """Replace the live stage observer at a validated phase boundary.
+
+        A logger may contain several independently numbered stage groups. The
+        previous observer is closed before the next one is installed so a
+        completed live region cannot remain active or receive events from a
+        later group whose numbering starts again at one.
+        """
+        previous = self._stage_progress
+        if previous is stage_progress:
+            return
+        self._stage_progress = None
+        if previous is not None:
+            try:
+                previous.close()
+            except Exception as exc:
+                self.record(
+                    "WARNING",
+                    "terminal_progress_close_failed",
+                    error="%s: %s" % (type(exc).__name__, exc),
+                )
+        self._stage_progress = stage_progress
+
     # -- the one and only line formatter ----------------------------------
     def log(self, marker, message, indent=0, level=None, wrap=True, screen=True):
         # type: (str, Any, int, Optional[str], bool, bool) -> None
@@ -649,6 +671,11 @@ class PipelineLogger(object):
 
     def record(self, marker, subject, **values):
         """Write one compact structured audit record."""
+        from postgwas.core.validation_reporting import consolidate_validation_log
+
+        values = consolidate_validation_log(marker, subject, values)
+        if values is None:
+            return
         detail = _fields(**values)
         message = str(subject) if not detail else "%s %s" % (subject, detail)
         self.log(marker, message)
@@ -844,7 +871,7 @@ class PipelineLogger(object):
 
             outcome = ctx.extra.get("outcome")
             if outcome:
-                self.record("RESULT", "stage_outcome", step=label, **outcome)
+                self.record("RESULT", "stage_outcome", step=label, **(ctx.logged_outcome or outcome))
 
             self.record(
                 "STATUS", label, status="OK", rows_in=ctx.rows_in,
@@ -959,306 +986,227 @@ def _analysis_line(label, detail, width, kind="analysis"):
     ).splitlines()
 
 
+def _chromosome_section(title, fields, width, kind="analysis"):
+    """Render recorded stage metrics without parsing prose or scanning data."""
+    lines = ["", screen_line(kind, title, indent=8)]
+    for label, value in fields:
+        lines.extend(screen_field(
+            "info", label, str(value), width=width, indent=12, label_width=26,
+        ).splitlines())
+    return lines
+
+
 def _chromosome_analysis_lines(summary, width):
-    # type: (Dict[str, Any], int) -> List[str]
-    """Scientific stage outcomes, using public language rather than functions."""
+    """Show recorded chromosome stages in execution order."""
     stages = summary.get("stage_qc") or {}
-    lines = []  # type: List[str]
+    lines = []
+
+    def section(title, fields, kind="analysis"):
+        lines.extend(_chromosome_section(title, fields, width, kind))
+
+    def value(record, key):
+        return record.get(key) if record.get(key) is not None else "not recorded"
+
+    def count(record, key):
+        return _count(record[key]) if record.get(key) is not None else "not recorded"
+
+    effect = stages.get("beta_or_oddsratio_qc") or {}
+    if effect:
+        is_or = effect.get("effect_type") == "odds_ratio"
+        section("Effect-scale conversion", [
+            ("Input column", value(effect, "effect_col")),
+            ("Input effect type", value(effect, "effect_type")),
+            ("Decision source", value(effect, "effect_decision_source")),
+            ("Transformation", "No input effect supplied; derivation occurs later" if effect.get("status") == "skipped_no_input_effect_column"
+             else "BETA = log(OR)" if is_or else "BETA used directly"),
+            ("Rows processed", count(effect, "initial_variants")),
+            ("Standard error", "Converted from OR scale to log-odds" if effect.get("se_rescaled_by_or")
+             else "%s scale; unchanged" % value(effect, "se_input_scale")),
+            ("Non-positive OR detected", count(effect, "or_non_positive_count") if is_or else "Not applicable"),
+            ("Non-positive OR action", value(effect, "or_non_positive_action") if is_or else "Not applicable"),
+            ("Retained at this step", count(effect, "final_total")),
+        ])
 
     eaf = stages.get("eaf_qc") or {}
     strand = eaf.get("strand_orientation") or {}
     if strand:
-        if strand.get("status") == "disabled":
-            detail = "disabled by policy."
-        else:
-            actions = strand.get("actions") or {}
-            matched = sum(_integer(value) for value in actions.values())
-            detail = (
-                "reference %s, AF column %s; study consensus %s; %s matched "
-                "(forward %s, forward-swapped %s, reverse-complement %s, "
-                "reverse-complement-swapped %s); %s unmatched, %s palindromic "
-                "ambiguous and %s reference ambiguous removed."
-                % (
-                    os.path.basename(str(strand.get("reference_file") or "not recorded")),
-                    strand.get("reference_population_column") or "not recorded",
-                    strand.get("study_strand_consensus") or "not recorded",
-                    _count(matched),
-                    _count(_integer(actions.get("forward"))),
-                    _count(_integer(actions.get("forward_swapped"))),
-                    _count(_integer(actions.get("reverse_complement"))),
-                    _count(_integer(actions.get("reverse_complement_swapped"))),
-                    _count(_integer(strand.get("reference_unmatched"))),
-                    _count(_integer(strand.get("palindromic_ambiguous"))),
-                    _count(_integer(strand.get("reference_ambiguous"))),
-                )
-            )
-        lines.extend(_analysis_line("Strand orientation", detail, width, "genetic"))
+        actions = strand.get("actions") or {}
+        section("Strand and allele alignment", [
+            ("Reference", os.path.basename(str(strand.get("reference_file") or "not recorded"))),
+            ("Reference population", value(strand, "reference_population_column")),
+            ("Mode / consensus", "%s / %s" % (value(strand, "strand_mode"), value(strand, "study_strand_consensus"))),
+            ("Matched", _count(sum(_integer(v) for v in actions.values()))
+             + (" / %s" % _count(strand["initial_variants"]) if strand.get("initial_variants") is not None else "")),
+            ("Alleles unchanged", _count(_integer(actions.get("forward")))),
+            ("Alleles swapped", _count(_integer(actions.get("forward_swapped")))),
+            ("Reverse-complement", _count(_integer(actions.get("reverse_complement")))),
+            ("Complement + swap", _count(_integer(actions.get("reverse_complement_swapped")))),
+            ("Unmatched removed", count(strand, "reference_unmatched")),
+            ("Unmatched retained", count(strand, "reference_unmatched_retained")),
+            ("Palindromic conflicts", "%s removed; study-wide strand and allele-frequency evidence supported opposite orientations" % _count(_integer(strand.get("palindromic_frequency_conflict")))),
+            ("Orientation unavailable", _count(_integer(strand.get("palindromic_orientation_unavailable")))),
+            ("Palindromic AF failures", _count(_integer(strand.get("palindromic_frequency_discordant")))),
+            ("Palindromic ambiguous", count(strand, "palindromic_ambiguous")),
+            ("Reference ambiguous", count(strand, "reference_ambiguous")),
+            ("Retained", count(strand, "final_variants")),
+        ], "genetic")
 
     if eaf:
-        removed = _integer(eaf.get("variants_removed"))
-        if str(eaf.get("decision_source") or "").startswith("external"):
-            direct = _integer(eaf.get("external_merge_direct_match_rows"))
-            flipped = _integer(eaf.get("external_merge_flip_match_rows"))
-            unmatched = _integer(eaf.get("external_merge_unmatched_rows"))
-            detail = (
-                "external file %s, column %s; %s direct matches, %s allele-swapped matches, "
-                "%s unmatched; %s removed"
-                % (
-                    eaf.get("external_eaf_file") or "not recorded",
-                    eaf.get("external_eaf_column") or "not recorded",
-                    _count(direct), _count(flipped), _count(unmatched), _count(removed),
-                )
-            )
+        external = str(eaf.get("decision_source") or "").startswith("external")
+        interpretation = "EAF" if external or eaf.get("maf_reference_decision") == "eaf" or eaf.get("study_decision_eaf_is_maf") is False else "MAF suspected / unresolved"
+        fields = [
+            ("Source", eaf.get("external_eaf_file") if external else "Study column %s" % value(eaf, "final_eaf_col")),
+            ("Frequency interpretation", interpretation),
+        ]
+        if external:
+            fields += [
+                ("Reference column", value(eaf, "external_eaf_column")),
+                ("Direct matches", count(eaf, "external_merge_direct_match_rows")),
+                ("Swapped matches", count(eaf, "external_merge_flip_match_rows")),
+                ("Unmatched", count(eaf, "external_merge_unmatched_rows")),
+            ]
         else:
-            used = _integer(
-                eaf.get("internal_af_initial_non_null_rows")
-                or eaf.get("final_eaf_non_null_rows")
-            )
-            interpretation = (
-                "MAF" if eaf.get("study_decision_eaf_is_maf") is True else "EAF"
-            )
-            corrected = _integer(
-                eaf.get("internal_af_outside_unit_interval_count")
-                or eaf.get("internal_af_out_of_range_count")
-            )
-            strand_actions = strand.get("actions") or {}
-            swapped = (
-                _integer(strand_actions.get("forward_swapped"))
-                + _integer(strand_actions.get("reverse_complement_swapped"))
-            )
-            frequency_aligned = (
-                eaf.get("study_decision_eaf_is_maf") is False
-                or eaf.get("maf_reference_decision") == "eaf"
-            )
-            if swapped and frequency_aligned:
-                orientation = "%s allele-swapped frequencies inverted" % _count(swapped)
-            elif swapped:
-                orientation = "%s allele-swapped rows retained without EAF inversion" % _count(swapped)
-            else:
-                orientation = "frequency inversion not required"
-            detail = (
-                "internal column %s interpreted as %s; %s read directly; "
-                "%s; %s corrected, %s removed"
-                % (
-                    eaf.get("final_eaf_col") or "not recorded",
-                    interpretation,
-                    _count(used), orientation, _count(corrected), _count(removed),
-                )
-            )
-        lines.extend(_analysis_line("Allele frequency", detail + ".", width, "genetic"))
+            actions = strand.get("actions") or {}
+            swapped = _integer(actions.get("forward_swapped")) + _integer(actions.get("reverse_complement_swapped"))
+            fields.append(("Transformation", "%s allele-swapped frequencies inverted using 1 − EAF" % _count(swapped)
+                           if interpretation == "EAF" else "No EAF inversion asserted while frequency type is unresolved"))
+            outside = eaf.get("internal_af_outside_unit_interval_count", eaf.get("internal_af_out_of_range_count"))
+            fields.append(("Out-of-range detected", _count(outside) if outside is not None else "not recorded"))
+        if eaf.get("strand_af_tolerance") is not None:
+            fields.append(("Reference AF tolerance", "|aligned study EAF − reference AF| ≤ %s" % eaf["strand_af_tolerance"]))
+        for label, prefix, action_key in [
+            ("Non-palindromic AF", "strand_non_palindromic_af", "strand_af_discordance_action"),
+            ("Palindromic AF", "strand_palindromic_af", "strand_palindromic_af_discordance_action"),
+        ]:
+            if eaf.get(prefix + "_discordant") is not None:
+                action = eaf.get(action_key)
+                handling = {"warn": "retained with warning; no frequencies changed by this check",
+                            "reject": "removed", "fail": "stop on disagreement"}.get(action, "action %s" % action)
+                fields.append((label, "%s / %s comparable variants disagree; %s" % (
+                    count(eaf, prefix + "_discordant"), count(eaf, prefix + "_comparable"), handling)))
+        fields += [
+            ("Total strand/EAF removals", count(eaf, "variants_removed")),
+            ("Retained", count(eaf, "final_variants")),
+        ]
+        if strand.get("final_variants") is not None and eaf.get("final_variants") is not None:
+            fields.insert(-1, ("Additional AF removals", _count(strand["final_variants"] - eaf["final_variants"])))
+        section("Allele frequency", fields, "genetic")
 
     size = stages.get("sample_size_qc") or {}
     if size:
-        neff = str(size.get("Neff_status") or "not computed")
+        neff = str(size.get("Neff_status") or "not recorded")
         if neff == "calculated_from_case_control":
             neff = "NEFF = 4 / (1/Ncase + 1/Ncontrol)"
         elif neff.startswith("fallback_ncontrol_only"):
-            neff = "control count used as total sample size"
+            neff = "Control-count input used as total sample size"
         elif neff.startswith("fallback_ncase_only"):
-            neff = "case count used as total sample size"
-        removed = _sum_mapping(size.get("removed_by_reason"))
-        detail = "cases from %s; controls from %s; %s; minimum count %s; %s removed." % (
-            _source_name(size.get("ncase_source")),
-            _source_name(size.get("ncontrol_source")),
-            neff,
-            size.get("min_value") if size.get("min_value") is not None else "not set",
-            _count(removed),
-        )
-        lines.extend(_analysis_line("Sample size", detail, width, "count"))
+            neff = "Case-count input used as total sample size"
+        section("Sample size", [
+            ("Cases", _source_name(size.get("ncase_source"))),
+            ("Controls / total N", _source_name(size.get("ncontrol_source"))),
+            ("Calculation", neff), ("Minimum count", value(size, "min_value")),
+            ("Removed", _count(_sum_mapping(size.get("removed_by_reason")))),
+        ], "count")
 
     inputs = stages.get("effect_from_z_qc") or {}
     if inputs:
-        beta_column = inputs.get("effect_column") or "the supplied effect column"
-        se_column = inputs.get("se_column") or "the supplied SE column"
-        z_column = inputs.get("z_column") or "the supplied Z column"
-        if inputs.get("has_beta") and inputs.get("has_se"):
-            detail = "effect from column %s and SE from column %s; nothing derived from Z" % (
-                beta_column, se_column,
-            )
-        elif inputs.get("beta_computed") and inputs.get("se_computed"):
-            estimate = (
-                "standardized BETA estimate and SE"
-                if inputs.get("effect_estimate_scale") == "standardized_effect_estimate"
-                else "BETA and SE"
-            )
-            detail = "%s derived from %s, EAF and NEFF" % (estimate, z_column)
+        if inputs.get("beta_computed") and inputs.get("se_computed"):
+            handling = "standardized BETA estimate and SE derived from Z, EAF and NEFF"
             if inputs.get("effect_estimate_citation"):
-                detail += " using %s" % inputs["effect_estimate_citation"]
+                handling += "; " + inputs["effect_estimate_citation"]
         elif inputs.get("beta_computed"):
-            detail = "BETA derived as Z × SE from columns %s and %s" % (
-                z_column, se_column,
-            )
-        elif inputs.get("se_computed"):
-            detail = "SE derived as BETA / Z from columns %s and %s" % (
-                beta_column, z_column,
-            )
-        elif inputs.get("has_beta"):
-            detail = "effect from column %s; SE deferred to the p-value stage" % beta_column
+            handling = "BETA derived as Z × SE"
+        elif inputs.get("se_computed") or inputs.get("se_recovered_from_z"):
+            handling = "positive SE derived as abs(BETA / Z) after signed agreement"
+        elif inputs.get("has_beta") and inputs.get("has_se"):
+            handling = "Using available BETA and SE; nothing derived from Z"
         else:
-            detail = "no effect value was produced"
-        detail += "; %s removed." % _count(inputs.get("variants_removed_total"))
-        lines.extend(_analysis_line("Effect inputs", detail, width))
-
-    effect = stages.get("beta_or_oddsratio_qc") or {}
-    if effect:
-        effect_type = str(effect.get("effect_type") or "not decided")
-        changed = _integer(effect.get("initial_variants"))
-        non_positive = _integer(effect.get("or_non_positive_count"))
-        source = str(effect.get("effect_decision_source") or "not recorded")
-        se_scale = str(effect.get("se_input_scale") or "not recorded").replace("_", "-")
-        se_result = (
-            "converted from the supplied OR scale to log-odds"
-            if effect.get("se_rescaled_by_or")
-            else "declared %s and left unchanged" % se_scale
-        )
-        detail = (
-            "odds ratio (%s); %s rows processed—positive OR converted with BETA = log(OR); %s non-positive OR "
-            "handled by policy '%s'; SE %s; %s variants remain."
-            % (
-                source,
-                _count(changed),
-                _count(non_positive),
-                effect.get("or_non_positive_action") or "not recorded",
-                se_result,
-                _count(effect.get("final_total")),
-            )
-            if effect_type == "odds_ratio"
-            else "BETA (%s) used directly; %s variants remain."
-            % (source, _count(effect.get("final_total")))
-        )
-        lines.extend(_analysis_line("Effect scale", detail, width))
+            handling = "SE deferred to the p-value stage"
+        section("Effect inputs", [
+            ("Effect estimate", "%s%s" % (value(inputs, "effect_column"),
+             " (BETA already converted from odds ratios)" if effect.get("effect_type") == "odds_ratio" else "")),
+            ("Standard error column", value(inputs, "se_column")),
+            ("Handling", handling),
+            ("SE recovered from Z", count(inputs, "se_recovered_from_z")),
+            ("BETA/Z sign mismatches", count(inputs, "beta_z_sign_mismatches")),
+            ("Sign mismatch action", value(inputs, "beta_z_sign_mismatch_action")),
+            ("Removed", count(inputs, "variants_removed_total")),
+        ])
 
     pvalue = stages.get("pval_detection_and_conversion_qc") or {}
     if pvalue:
-        clipped = (
-            _integer(pvalue.get("variants_with_pvalues_clipped_low"))
-            + _integer(pvalue.get("variants_with_pvalues_clipped_high"))
-        )
-        removed = (
-            _integer(pvalue.get("initial_total_variants_with_pvalues"))
-            - _integer(pvalue.get("after_filter_variants_with_pvalues"))
-        )
-        bounds = ""
-        if pvalue.get("pvalue_clip_low") is not None:
-            bounds = " to ".join(
-                str(value) for value in (
-                    pvalue.get("pvalue_clip_low"), pvalue.get("pvalue_clip_high")
-                )
-            )
-        detail = "column %s; %s scale (%s); accepted range %s; %s clipped (policy '%s'); %s removed." % (
-            pvalue.get("pvalue_column") or "not recorded",
-            pvalue.get("detected_scale") or "not decided",
-            pvalue.get("pvalue_decision_source") or "not recorded",
-            bounds or "not recorded",
-            _count(clipped),
-            pvalue.get("pvalue_out_of_range_action") or "not recorded",
-            _count(max(0, removed)),
-        )
-        lines.extend(_analysis_line("P-values", detail, width))
+        section("P-values", [
+            ("Input column / scale", "%s / %s" % (value(pvalue, "pvalue_column"), value(pvalue, "detected_scale"))),
+            ("Decision source", value(pvalue, "pvalue_decision_source")),
+            ("Accepted range", "%s to %s" % (value(pvalue, "pvalue_clip_low"), value(pvalue, "pvalue_clip_high"))),
+            ("Outside-range action", value(pvalue, "pvalue_out_of_range_action")),
+            ("Clipped", _count(_integer(pvalue.get("variants_with_pvalues_clipped_low")) + _integer(pvalue.get("variants_with_pvalues_clipped_high")))),
+            ("Removed", _count(max(0, _integer(pvalue.get("initial_total_variants_with_pvalues")) - _integer(pvalue.get("after_filter_variants_with_pvalues"))))),
+        ])
 
     se = stages.get("se_from_beta_pvalue_qc") or {}
     if se:
-        removed = max(
-            0,
-            _integer(se.get("initial_variants")) - _integer(se.get("total_variants")),
-        )
-        status = str(se.get("status") or "status not recorded")
-        if status == "SE already present":
-            status = "supplied SE used directly"
-        elif status == "SE calculated":
-            tail = _integer(se.get("se_tail"))
-            status = "calculated from BETA and %s-sided p-values" % tail
-        detail = "%s; %s undefined; %s removed." % (
-            status,
-            _count(se.get("se_undefined")),
-            _count(removed),
-        )
-        lines.extend(_analysis_line("Standard error", detail, width))
-
-    zscore = stages.get("z_from_beta_se_qc") or {}
-    if zscore:
-        source = _source_name(zscore.get("z_source"))
-        zero = _integer(zscore.get("variants_with_zero_beta"))
-        removed = _integer(zscore.get("variants_removed_invalid_beta_se"))
-        zero_action = zscore.get("beta_zero_action") or "not recorded"
-        zero_outcome = "kept" if zero_action == "keep" else "handled"
-        detail = "%s; %s exact zero effects %s (policy '%s'); %s removed." % (
-            source,
-            _count(zero),
-            zero_outcome,
-            zero_action,
-            _count(removed),
-        )
-        lines.extend(_analysis_line("Z score", detail, width))
+        status = se.get("status")
+        handling = "supplied SE used directly" if status == "SE already present" else (
+            "Calculated from BETA and %s-sided p-values" % value(se, "se_tail") if status == "SE calculated" else status or "not recorded")
+        section("Standard error", [
+            ("Handling", handling), ("Undefined", count(se, "se_undefined")),
+            ("Removed", _count(max(0, _integer(se.get("initial_variants")) - _integer(se.get("total_variants"))))),
+        ])
 
     validation = stages.get("effect_statistics_validation_qc") or {}
+    zscore = stages.get("z_from_beta_se_qc") or {}
+    if zscore:
+        section("Z score", [
+            ("Calculation / source", _source_name(zscore.get("z_source"))),
+            ("Exact zero effects", count(validation, "variants_with_zero_beta")),
+            ("Zero-effect action", value(validation, "beta_zero_action")),
+            ("Invalid BETA/SE removed", count(validation, "variants_removed_invalid_beta_se")),
+        ])
     if validation:
         concordance = validation.get("z_pval_concordance") or {}
-        removed = _integer(validation.get("removed_total"))
-        reasons = ", ".join(
-            "%s %s" % (key.replace("_", " "), _count(value))
-            for key, value in (validation.get("removed_by_reason") or {}).items()
-            if value
-        )
-        action = concordance.get("action") or "not recorded"
-        detail = "BETA, SE and Z checked; Z/P concordance policy '%s'; %s removed%s." % (
-            action,
-            _count(removed),
-            " (%s)" % reasons if reasons else "",
-        )
-        lines.extend(_analysis_line("Effect QC", detail, width))
+        section("Effect-statistic QC", [
+            ("Checked", "BETA, SE and Z"), ("Z/P disagreement action", value(concordance, "action")),
+            ("Z/P comparable", count(concordance, "checked")),
+            ("Z/P disagreements", count(concordance, "discordant")),
+            ("Removed", count(validation, "removed_total")),
+        ])
 
     info = stages.get("info_qc") or {}
     if info:
-        changed = _integer(info.get("rescaled_within_tolerance"))
-        if info.get("info_out_of_range_action") in ("clip", "null"):
-            changed += _integer(info.get("out_of_range"))
-        removed = (
-            _integer(info.get("rejected_out_of_range"))
-            + _integer(info.get("rejected_missing"))
-        )
-        detail = (
-            "%s%s; accepted range %g–%g, rounding tolerance to %g; policy '%s'; "
-            "%s corrected; %s missing (policy '%s'); %s removed."
-            % (
-                _source_name(info.get("source")),
-                (", column %s" % info.get("info_column"))
-                if info.get("info_column") and str(info.get("source") or "").startswith("external")
-                else "",
-                float(info.get("info_clip_min") or 0),
-                float(info.get("info_clip_max") or 1),
-                float(info.get("info_clip_tolerance") or 1),
-                info.get("info_out_of_range_action") or "not recorded",
-                _count(changed),
-                _count(info.get("missing_info_after")),
-                info.get("info_on_missing_action") or "not recorded",
-                _count(removed),
-            )
-        )
-        lines.extend(_analysis_line("Imputation quality", detail, width))
+        mach = info.get("info_score_type") == "mach_rsq"
+        section("Imputation quality", [
+            ("Source", _source_name(info.get("source"))),
+            ("Input column", value(info, "info_column")),
+            ("Score type", value(info, "info_score_type")),
+            ("Accepted range", "%s–%s" % (value(info, "info_clip_min"), value(info, "info_mach_rsq_max" if mach else "info_clip_max"))),
+            ("Tolerance corrections", "Not applied to MaCH Rsq" if mach else "%s values above %s and ≤%s set to %s" % (
+                count(info, "rescaled_within_tolerance"), value(info, "info_clip_max"),
+                value(info, "info_clip_tolerance"), value(info, "info_clip_max"))),
+            ("Outside-range action", value(info, "info_out_of_range_action")),
+            ("Outside-range detected", count(info, "out_of_range")),
+            ("Missing / action", "%s / %s" % (count(info, "missing_info_after"), value(info, "info_on_missing_action"))),
+            ("Removed", _count(_integer(info.get("rejected_out_of_range")) + _integer(info.get("rejected_missing")))),
+        ])
 
     identifiers = _step_extra(summary, 12)
     if identifiers:
-        detail = "%s; %s separators rewritten; %s missing IDs filled; none removed." % (
-            _source_name(identifiers.get("source")),
-            _count(identifiers.get("identifiers_rewritten")),
-            _count(identifiers.get("identifiers_filled")),
-        )
-        lines.extend(_analysis_line("Variant IDs", detail, width, "genetic"))
-
+        filled = identifiers.get("identifiers_filled")
+        if filled is None and identifiers.get("missing_identifiers") == 0:
+            filled = 0
+        section("Variant IDs", [
+            ("Source", _source_name(identifiers.get("source"))),
+            ("Separators rewritten", count(identifiers, "identifiers_rewritten")),
+            ("Missing IDs filled", _count(filled) if filled is not None else "not recorded"),
+        ], "genetic")
     final = stages.get("final_completeness_qc") or {}
     if final:
-        missing = _sum_mapping(final.get("missing_by_field"))
-        required = final.get("required_fields") or []
-        detail = "%s required fields checked (%s; policy '%s'); %s missing-field observations; %s removed." % (
-            _count(len(final.get("required_fields") or [])),
-            ", ".join(required) if required else "none recorded",
-            final.get("on_missing") or "not recorded",
-            _count(missing),
-            _count(final.get("removed_total")),
-        )
-        lines.extend(_analysis_line("Completeness", detail, width))
-
+        section("Final completeness", [
+            ("Required fields", ", ".join(final.get("required_fields") or [])),
+            ("Missing observations", _count(_sum_mapping(final.get("missing_by_field")))),
+            ("Missing-value action", value(final, "on_missing")),
+            ("Removed", count(final, "removed_total")),
+        ])
     return lines
 
 
@@ -1340,42 +1288,31 @@ def print_chromosome_summary(
         lines.extend(stage_lines)
 
     if rows_out is not None and rejected is not None:
-        result = "%s harmonised" % _count(rows_out)
-        if int(rejected):
-            reasons = summary.get("reject_counts") or {}
-            detail = ", ".join(
-                "%s %s" % (reason.replace("_", " "), _count(count))
-                for reason, count in sorted(
-                    reasons.items(), key=lambda item: (-item[1], item[0])
-                )
-                if count
-            )
-            result += "; %s removed" % _count(rejected)
-            if detail:
-                result += " (%s)" % detail
-        else:
-            result += "; none removed"
-        lines.append("")
-        lines.extend(_analysis_line(
-            "Final result", result + ".", screen_width,
-            "loss" if int(rejected) else "info",
-        ))
+        fields = [("Input", _count(rows_in)), ("Total removed", _count(rejected))]
+        fields.extend((reason.replace("_", " "), _count(count))
+                      for reason, count in (summary.get("reject_counts") or {}).items() if count)
+        fields.append(("Harmonised", _count(rows_out)))
+        lines.extend(_chromosome_section("Harmonisation accounting", fields, screen_width, "count"))
 
     lifted_in, lifted_out = _liftover_counts(summary)
-    if lifted_in is not None:
-        vcf = "created and annotated; %s of %s retained after liftover" % (
-            _count(lifted_out), _count(lifted_in),
-        )
-        if lifted_out < lifted_in:
-            vcf += " (%s not lifted)" % _count(lifted_in - lifted_out)
-        lines.extend(_analysis_line(
-            "VCF and liftover", vcf + ".", screen_width,
-            "loss" if lifted_out < lifted_in else "genetic",
-        ))
+    accounting = (_step_extra(summary, 16) or {}).get("liftover_accounting") or {}
+    if lifted_in is not None or accounting:
+        fields = [("Sent for conversion", _count(rows_out)),
+                  ("Target VCF retained", _count(accounting.get("final", lifted_out)))]
+        if accounting:
+            fields.extend([
+                ("Liftover input", _count(accounting.get("input"))),
+                ("Liftover rejected", _count(accounting.get("rejected"))),
+                ("Excluded after liftover", "%s successfully lifted variants with swapped alleles" % _count(accounting.get("swap_excluded"))),
+                ("Exclusion policy", "vcf.liftover_swap = %s" % accounting.get("swap_policy")),
+            ])
+        elif lifted_in is not None:
+            fields.append(("Net reduction", "%s; cause breakdown not recorded" % _count(lifted_in - lifted_out)))
+        lines.extend(_chromosome_section("VCF creation and liftover", fields, screen_width, "genetic"))
     elif _target_vcf(summary):
-        lines.extend(_analysis_line(
-            "VCF and liftover", "created and annotated.", screen_width, "genetic",
-        ))
+        lines.extend(_chromosome_section("VCF creation and liftover", [
+            ("Result", "Created and annotated; count breakdown not recorded"),
+        ], screen_width, "genetic"))
 
     warnings = int(summary.get("warnings") or 0)
     errors = int(summary.get("errors") or 0)
@@ -1387,7 +1324,17 @@ def print_chromosome_summary(
             _count(warnings), "" if warnings == 1 else "s",
             _count(errors), "" if errors == 1 else "s",
         ), screen_width, "error" if errors else "warning"))
+        af_counter_continuation = False
         for message in _screen_messages(screen_text):
+            # These retained-AF warnings have a complete labelled breakdown
+            # above. Do not repeat the generic logger counters as prose.
+            if not failed and (summary.get("stage_qc") or {}).get("eaf_qc"):
+                if "study/reference frequency concordance" in message:
+                    af_counter_continuation = True
+                    continue
+                if af_counter_continuation and re.fullmatch(r"(?:affected|removed|changed|matched)=\d+(?:\s+(?:affected|removed|changed|matched)=\d+)*", message):
+                    continue
+            af_counter_continuation = False
             lines.extend(_analysis_line(
                 "Reason", message, screen_width,
                 "error" if errors else "warning",
@@ -1400,14 +1347,10 @@ def print_chromosome_summary(
     target = _target_vcf(summary)
     file_names = []
     if target:
-        file_names.append(os.path.basename(target))
+        file_names.append(("Target VCF", os.path.basename(target)))
     log_path = summary.get("log_path")
-    file_names.append(
-        "%s (detailed log)" % (os.path.basename(log_path) if log_path else "log not recorded")
-    )
-    lines.extend(_analysis_line(
-        "Files", "; ".join(file_names) + ".", screen_width, "info",
-    ))
+    file_names.append(("Detailed log", os.path.basename(log_path) if log_path else "not recorded"))
+    lines.extend(_chromosome_section("Files", file_names, screen_width, "info"))
 
     text = "\n".join(lines)
     stream.write("\n" + text + "\n\n")

@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass, replace
-import math
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
 
 from postgwas.core.completion import (
     apply_completion_restart,
@@ -27,6 +24,14 @@ from postgwas.core.paths import (
     validate_filename_component,
 )
 from postgwas.core.processes import run_checked_command
+from postgwas.core.single_cell_validation import (
+    H5adValidationPolicy,
+    normalize_gene_identifier,
+    read_cell_covariates,
+    read_gene_identifier_crosswalk,
+    read_scdrs_gene_sets,
+    validate_h5ad_expression,
+)
 from postgwas.modules.single_cell.errors import SingleCellError
 
 
@@ -64,449 +69,79 @@ class ScdrsExecution:
     resumed: bool
 
 
-def _load_anndata(path: Path):
-    try:
-        import anndata
-    except ImportError as exc:
-        raise SingleCellError(
-            "scDRS H5AD validation requires the optional single-cell "
-            "dependencies; install PostGWAS with the 'single-cell' extra"
-        ) from exc
-    try:
-        return anndata.read_h5ad(path, backed="r")
-    except Exception as exc:
-        raise SingleCellError(
-            "Cannot open the scDRS H5AD input %s: %s" % (path, exc)
-        ) from exc
-
-
-def _matrix_values(chunk):
-    if sparse.issparse(chunk):
-        return np.asarray(chunk.data)
-    return np.asarray(chunk)
-
-
-def _expressed_counts(chunk) -> tuple[np.ndarray, np.ndarray]:
-    if sparse.issparse(chunk):
-        expressed = chunk > 0
-        return (
-            np.asarray(expressed.sum(axis=1)).ravel(),
-            np.asarray(expressed.sum(axis=0)).ravel(),
-        )
-    values = np.asarray(chunk)
-    return (
-        np.count_nonzero(values > 0, axis=1),
-        np.count_nonzero(values > 0, axis=0),
-    )
-
-
-def _group_count_summary(obs, names: list[str]) -> dict[str, list[dict]]:
-    summary = {}
-    for name in names:
-        counts = obs[name].value_counts(dropna=False)
-        summary[name] = [
-            {
-                "value": None if pd.isna(value) else str(value),
-                "cells": int(count),
-            }
-            for value, count in counts.items()
-        ]
-    return summary
-
-
-def _continuous_annotation_summary(
-    obs,
-    names: list[str],
-    *,
-    context: str,
-) -> dict[str, dict]:
-    summary = {}
-    for name in names:
-        try:
-            values = np.asarray(obs[name], dtype=float)
-        except (TypeError, ValueError) as exc:
-            raise SingleCellError(
-                "scDRS correlation annotation %r must be numeric" % name
-            ) from exc
-        if np.isinf(values).any():
-            raise SingleCellError(
-                "scDRS correlation annotation %r contains infinite values" % name
-            )
-        observed = values[np.isfinite(values)]
-        if observed.size < 2 or np.ptp(observed) <= 0:
-            raise SingleCellError(
-                "scDRS correlation annotation %r requires at least two "
-                "finite, nonconstant values %s" % (name, context)
-            )
-        summary[name] = {
-            "observed_cells": int(observed.size),
-            "minimum": float(np.min(observed)),
-            "maximum": float(np.max(observed)),
-        }
-    return summary
-
-
-def _requested_annotation_names(method) -> tuple[list[str], list[str]]:
-    categorical = list(method.downstream.group_analysis)
-    if method.adjust_proportion_column is not None:
-        categorical.append(method.adjust_proportion_column)
-    continuous = list(method.downstream.correlation_analysis)
-    return categorical, continuous
-
-
-def _validate_annotation_values(adata, method) -> dict[str, Any]:
-    categorical, continuous = _requested_annotation_names(method)
-    requested = categorical + continuous
-    missing_columns = [name for name in requested if name not in adata.obs.columns]
-    if missing_columns:
-        raise SingleCellError(
-            "scDRS annotations are absent from adata.obs: %s"
-            % ", ".join(missing_columns)
-        )
-
-    missing_counts: dict[str, int] = {}
-    for name in requested:
-        missing = int(adata.obs[name].isna().sum())
-        missing_counts[name] = missing
-        if missing and name == method.adjust_proportion_column:
-            raise SingleCellError(
-                "scDRS proportion-adjustment annotation %r contains %d missing "
-                "values; the upstream cell-weight lookup requires every cell "
-                "to have a group" % (name, missing)
-            )
-        if missing and not method.validation.allow_missing_annotation_values:
-            raise SingleCellError(
-                "scDRS annotation %r contains %d missing values; either curate "
-                "the H5AD file or explicitly permit missing annotation values"
-                % (name, missing)
-            )
-    return {
-        "missing_values": missing_counts,
-        "input_group_counts": _group_count_summary(adata.obs, categorical),
-        "input_continuous_summaries": _continuous_annotation_summary(
-            adata.obs,
-            continuous,
-            context="in the input H5AD",
-        ),
-    }
-
-
 def validate_scdrs_h5ad(path: str | Path, method) -> dict[str, Any]:
-    """Validate AnnData structure and the exact expression matrix scDRS reads."""
-    h5ad_file = require_nonempty_file(
-        path, "scDRS H5AD file", error_type=SingleCellError,
+    """Apply the configured scDRS contract through the shared H5AD validator."""
+    policy = H5adValidationPolicy(
+        matrix_state=method.matrix_state,
+        filter_data=method.filter_data,
+        minimum_genes_per_cell=method.minimum_genes_per_cell,
+        minimum_cells_per_gene=method.minimum_cells_per_gene,
+        matrix_chunk_rows=method.validation.matrix_chunk_rows,
+        raw_count_integer_tolerance=method.validation.raw_count_integer_tolerance,
+        group_analysis=tuple(method.downstream.group_analysis),
+        correlation_analysis=tuple(method.downstream.correlation_analysis),
+        adjust_proportion_column=method.adjust_proportion_column,
+        allow_missing_annotation_values=method.validation.allow_missing_annotation_values,
     )
-    adata = _load_anndata(h5ad_file)
-    try:
-        if int(adata.n_obs) <= 0 or int(adata.n_vars) <= 0:
-            raise SingleCellError("scDRS H5AD must contain cells and genes")
-        if not adata.obs_names.is_unique:
-            raise SingleCellError("scDRS H5AD cell identifiers must be unique")
-        if not adata.var_names.is_unique:
-            raise SingleCellError("scDRS H5AD gene identifiers must be unique")
-        if adata.X is None:
-            raise SingleCellError(
-                "scDRS reads adata.X, but this H5AD file has no X matrix"
-            )
-
-        annotation_summary = _validate_annotation_values(adata, method)
-        gene_cell_counts = np.zeros(int(adata.n_vars), dtype=np.int64)
-        passing_cell_mask = np.zeros(int(adata.n_obs), dtype=bool)
-        passing_cells = 0
-        maximum_fractional_part = 0.0
-        chunk_rows = method.validation.matrix_chunk_rows
-        for start in range(0, int(adata.n_obs), chunk_rows):
-            stop = min(start + chunk_rows, int(adata.n_obs))
-            chunk = adata.X[start:stop]
-            values = _matrix_values(chunk)
-            if values.size and not np.isfinite(values).all():
-                raise SingleCellError(
-                    "scDRS H5AD adata.X contains NaN or infinite expression values"
-                )
-            if values.size and np.any(values < 0):
-                raise SingleCellError(
-                    "scDRS H5AD adata.X contains negative expression values"
-                )
-            if method.matrix_state == "raw_counts" and values.size:
-                deviation = float(np.max(np.abs(values - np.rint(values))))
-                maximum_fractional_part = max(
-                    maximum_fractional_part, deviation,
-                )
-                if deviation > method.validation.raw_count_integer_tolerance:
-                    raise SingleCellError(
-                        "scDRS matrix_state is raw_counts, but adata.X contains "
-                        "non-integer values beyond the configured tolerance"
-                    )
-
-            cell_gene_counts, _ = _expressed_counts(chunk)
-            if method.filter_data:
-                passing = cell_gene_counts >= method.minimum_genes_per_cell
-            else:
-                passing = np.ones(stop - start, dtype=bool)
-            passing_cell_mask[start:stop] = passing
-            passing_cells += int(np.sum(passing))
-            if np.any(passing):
-                _, filtered_gene_counts = _expressed_counts(chunk[passing])
-                gene_cell_counts += filtered_gene_counts.astype(np.int64)
-
-        if passing_cells <= 0:
-            raise SingleCellError(
-                "No H5AD cells pass the configured scDRS minimum_genes_per_cell"
-            )
-        if method.filter_data:
-            passing_genes = gene_cell_counts >= method.minimum_cells_per_gene
-        else:
-            passing_genes = np.ones(int(adata.n_vars), dtype=bool)
-        filtered_genes = int(np.sum(passing_genes))
-        if filtered_genes <= 0:
-            raise SingleCellError(
-                "No H5AD genes pass the configured scDRS minimum_cells_per_gene"
-            )
-        categorical, continuous = _requested_annotation_names(method)
-        analysis_obs = adata.obs.iloc[np.flatnonzero(passing_cell_mask)]
-        if method.adjust_proportion_column is not None:
-            # scDRS 1.0.3 enforces fewer than one group per ten analyzed cells
-            # before it computes inverse group-size weights.
-            group_count = int(
-                analysis_obs[method.adjust_proportion_column].nunique()
-            )
-            if group_count >= 0.1 * passing_cells:
-                raise SingleCellError(
-                    "scDRS proportion adjustment has %d groups among %d "
-                    "post-filter cells; the supported upstream algorithm "
-                    "requires fewer than one group per ten cells"
-                    % (group_count, passing_cells)
-                )
-        annotation_summary["analysis_group_counts"] = _group_count_summary(
-            analysis_obs, categorical,
-        )
-        annotation_summary["analysis_continuous_summaries"] = (
-            _continuous_annotation_summary(
-                analysis_obs,
-                continuous,
-                context="after configured scDRS cell filtering",
-            )
-        )
-        gene_universe = tuple(
-            str(value)
-            for value in adata.var_names[np.asarray(passing_genes, dtype=bool)]
-        )
-        cell_names = tuple(str(value) for value in adata.obs_names)
-        return {
-            "cells": int(adata.n_obs),
-            "genes": int(adata.n_vars),
-            "cells_after_configured_filter": passing_cells,
-            "genes_after_configured_filter": filtered_genes,
-            "gene_universe": gene_universe,
-            "cell_names": cell_names,
-            "matrix_source": "X",
-            "matrix_state": method.matrix_state,
-            "maximum_raw_count_fractional_part": maximum_fractional_part,
-            "annotation_validation": annotation_summary,
-        }
-    finally:
-        file_manager = getattr(adata, "file", None)
-        if file_manager is not None:
-            file_manager.close()
-
-
-def _parse_gene_token(token: str, format_config) -> tuple[str, float | None]:
-    cleaned = token.strip()
-    if not cleaned:
-        raise SingleCellError("scDRS gene sets must not contain empty gene entries")
-    separator = format_config.weight_separator
-    if separator not in cleaned:
-        return cleaned, None
-    gene, raw_weight = cleaned.rsplit(separator, 1)
-    gene = gene.strip()
-    if not gene or not raw_weight.strip():
-        raise SingleCellError("Invalid scDRS gene-weight entry: %r" % cleaned)
-    try:
-        weight = float(raw_weight)
-    except ValueError as exc:
-        raise SingleCellError(
-            "Invalid scDRS gene weight in entry %r" % cleaned
-        ) from exc
-    if not math.isfinite(weight):
-        raise SingleCellError(
-            "scDRS gene weights must be finite: %r" % cleaned
-        )
-    return gene, weight
+    return validate_h5ad_expression(path, policy=policy, error_type=SingleCellError)
 
 
 def validate_scdrs_gene_sets(
-    path: str | Path,
-    method,
-    *,
-    gene_universe: tuple[str, ...],
+    path: str | Path, method, *, gene_universe: tuple[str, ...],
 ) -> dict[str, Any]:
-    """Validate native .gs syntax and effective overlap after H5AD filtering."""
-    gene_set_file = require_nonempty_file(
-        path, "scDRS .gs gene-set file", error_type=SingleCellError,
+    """Check effective gene-set overlap after the shared native file parser."""
+    parsed = read_scdrs_gene_sets(
+        path, **method.gene_set_format.model_dump(), error_type=SingleCellError,
     )
-    format_config = method.gene_set_format
     universe = set(gene_universe)
-    records: list[dict[str, Any]] = []
-    observed_traits: set[str] = set()
-    try:
-        handle = gene_set_file.open("r", encoding="utf-8", newline="")
-    except OSError as exc:
-        raise SingleCellError(
-            "Cannot read scDRS gene-set file %s: %s" % (gene_set_file, exc)
-        ) from exc
-    with handle:
-        reader = csv.DictReader(handle, delimiter=format_config.delimiter)
-        expected_header = [
-            format_config.trait_column, format_config.gene_set_column,
-        ]
-        if reader.fieldnames != expected_header:
+    records = []
+    for row in parsed:
+        trait, genes, weighted_genes = row.trait, row.genes, row.weighted_genes
+        effective = set(genes).intersection(universe)
+        effective_count = len(effective)
+        effective_fraction = effective_count / len(universe)
+        validation = method.validation
+        if effective_count < validation.minimum_effective_genes:
             raise SingleCellError(
-                "scDRS .gs header must be exactly %s"
-                % format_config.delimiter.join(expected_header)
+                "scDRS trait %s has %d genes in the filtered H5AD universe; "
+                "the configured minimum is %d"
+                % (
+                    trait, effective_count,
+                    validation.minimum_effective_genes,
+                )
             )
-        for line_number, row in enumerate(reader, start=2):
-            trait = validate_filename_component(
-                row.get(format_config.trait_column, ""),
-                "scDRS trait on line %d" % line_number,
-                error_type=SingleCellError,
+        if effective_fraction >= validation.maximum_effective_gene_fraction:
+            raise SingleCellError(
+                "scDRS trait %s covers %.6g of the filtered H5AD gene "
+                "universe; it must be below the configured maximum %.6g"
+                % (
+                    trait, effective_fraction,
+                    validation.maximum_effective_gene_fraction,
+                )
             )
-            if "@" in trait:
-                raise SingleCellError(
-                    "scDRS trait %r contains '@', which is reserved by the "
-                    "upstream multi-score filename pattern" % trait
-                )
-            if trait in observed_traits:
-                raise SingleCellError("Duplicate scDRS trait: %s" % trait)
-            observed_traits.add(trait)
-            raw_gene_set = (row.get(format_config.gene_set_column) or "").strip()
-            tokens = raw_gene_set.split(format_config.gene_separator)
-            parsed = [_parse_gene_token(token, format_config) for token in tokens]
-            genes = [gene for gene, _ in parsed]
-            weighted_genes = sum(weight is not None for _, weight in parsed)
-            if weighted_genes not in {0, len(parsed)}:
-                raise SingleCellError(
-                    "scDRS trait %s mixes weighted and unweighted genes; all "
-                    "entries must use the same native .gs representation" % trait
-                )
-            if len(genes) != len(set(genes)):
-                raise SingleCellError(
-                    "scDRS trait %s contains duplicate genes" % trait
-                )
-            effective = set(genes).intersection(universe)
-            effective_count = len(effective)
-            effective_fraction = effective_count / len(universe)
-            validation = method.validation
-            if effective_count < validation.minimum_effective_genes:
-                raise SingleCellError(
-                    "scDRS trait %s has %d genes in the filtered H5AD universe; "
-                    "the configured minimum is %d"
-                    % (
-                        trait, effective_count,
-                        validation.minimum_effective_genes,
-                    )
-                )
-            if effective_fraction >= validation.maximum_effective_gene_fraction:
-                raise SingleCellError(
-                    "scDRS trait %s covers %.6g of the filtered H5AD gene "
-                    "universe; it must be below the configured maximum %.6g"
-                    % (
-                        trait, effective_fraction,
-                        validation.maximum_effective_gene_fraction,
-                    )
-                )
-            records.append({
-                "trait": trait,
-                "input_genes": len(genes),
-                "weighted_genes": weighted_genes,
-                "effective_genes": effective_count,
-                "effective_gene_fraction": effective_fraction,
-            })
-    if not records:
-        raise SingleCellError("scDRS .gs file must contain at least one trait")
+        records.append({
+            "trait": trait,
+            "input_genes": len(genes),
+            "weighted_genes": weighted_genes,
+            "effective_genes": effective_count,
+            "effective_gene_fraction": effective_fraction,
+        })
     return {"traits": records, "trait_count": len(records)}
 
 
 def validate_scdrs_covariates(
-    path: str | Path,
-    method,
-    *,
-    cell_names: tuple[str, ...],
+    path: str | Path, method, *, cell_names: tuple[str, ...],
 ) -> dict[str, Any]:
-    """Validate numeric scDRS covariates against AnnData cell identifiers."""
-    covariate_file = require_nonempty_file(
-        path, "scDRS covariate file", error_type=SingleCellError,
-    )
+    """Match the shared parsed covariate evidence to this exact H5AD cell set."""
     configured = method.covariate_format
-    cells: set[str] = set()
-    row_count = 0
-    maximum_constant_deviation = 0.0
-    try:
-        handle = covariate_file.open("r", encoding="utf-8", newline="")
-    except OSError as exc:
-        raise SingleCellError(
-            "Cannot read scDRS covariate file %s: %s" % (covariate_file, exc)
-        ) from exc
-    with handle:
-        reader = csv.reader(handle, delimiter=configured.delimiter)
-        header = next(reader, None)
-        if header is None or len(header) < 2 or any(not value.strip() for value in header):
-            raise SingleCellError(
-                "scDRS covariate file requires a cell-ID column and at least "
-                "one named numeric covariate"
-            )
-        if len(header) != len(set(header)):
-            raise SingleCellError("scDRS covariate column names must be unique")
-        constant_index = None
-        if configured.constant_column is not None:
-            if configured.constant_column not in header[1:]:
-                raise SingleCellError(
-                    "scDRS covariates require the configured constant column %r"
-                    % configured.constant_column
-                )
-            constant_index = header.index(configured.constant_column)
-        for line_number, row in enumerate(reader, start=2):
-            if len(row) != len(header):
-                raise SingleCellError(
-                    "scDRS covariate line %d has %d fields; expected %d"
-                    % (line_number, len(row), len(header))
-                )
-            cell = row[0].strip()
-            if not cell:
-                raise SingleCellError(
-                    "scDRS covariate line %d has an empty cell identifier"
-                    % line_number
-                )
-            if cell in cells:
-                raise SingleCellError(
-                    "Duplicate scDRS covariate cell identifier: %s" % cell
-                )
-            cells.add(cell)
-            for column, raw_value in zip(header[1:], row[1:]):
-                try:
-                    value = float(raw_value)
-                except ValueError as exc:
-                    raise SingleCellError(
-                        "scDRS covariate %r is non-numeric on line %d"
-                        % (column, line_number)
-                    ) from exc
-                if not math.isfinite(value):
-                    raise SingleCellError(
-                        "scDRS covariate %r is not finite on line %d"
-                        % (column, line_number)
-                    )
-            if constant_index is not None:
-                constant_value = float(row[constant_index])
-                deviation = abs(constant_value - 1.0)
-                maximum_constant_deviation = max(
-                    maximum_constant_deviation, deviation,
-                )
-                if deviation > configured.constant_tolerance:
-                    raise SingleCellError(
-                        "scDRS covariate constant column %r differs from one "
-                        "beyond the configured tolerance on line %d"
-                        % (configured.constant_column, line_number)
-                    )
-            row_count += 1
+    evidence = read_cell_covariates(
+        path,
+        delimiter=configured.delimiter,
+        constant_column=configured.constant_column,
+        constant_tolerance=configured.constant_tolerance,
+        error_type=SingleCellError,
+    )
+    cells = evidence.cells
     h5ad_cells = set(cell_names)
     missing = h5ad_cells - cells
     unexpected = cells - h5ad_cells
@@ -531,14 +166,14 @@ def validate_scdrs_covariates(
             )
         )
     return {
-        "rows": row_count,
-        "covariates": header[1:],
+        "rows": evidence.rows,
+        "covariates": list(evidence.columns),
         "overlapping_cells": overlap,
         "overlap_fraction": overlap_fraction,
         "missing_h5ad_cells": len(missing),
         "unexpected_covariate_cells": len(unexpected),
         "constant_column": configured.constant_column,
-        "maximum_constant_deviation": maximum_constant_deviation,
+        "maximum_constant_deviation": evidence.maximum_constant_deviation,
     }
 
 
@@ -614,6 +249,7 @@ def preflight_scdrs(
                 "scDRS gene-identifier crosswalk",
                 error_type=SingleCellError,
             )
+            _read_identifier_crosswalk(gene_identifier_map_file, construction)
         gene_set_summary = {
             "source": "magma",
             "status": (
@@ -656,15 +292,6 @@ def preflight_scdrs(
     )
 
 
-def _normalize_gene_identifier(value: object) -> str | None:
-    if value is None or pd.isna(value):
-        return None
-    if isinstance(value, (float, np.floating)) and float(value).is_integer():
-        return str(int(value))
-    cleaned = str(value).strip()
-    return cleaned or None
-
-
 def _read_magma_gene_statistics(path: Path, construction) -> pd.DataFrame:
     try:
         frame = pd.read_csv(
@@ -685,7 +312,7 @@ def _read_magma_gene_statistics(path: Path, construction) -> pd.DataFrame:
             "MAGMA gene statistics are empty or missing columns: %s"
             % ", ".join(missing or sorted(required))
         )
-    genes = frame[construction.gene_id_column].map(_normalize_gene_identifier)
+    genes = frame[construction.gene_id_column].map(normalize_gene_identifier)
     if genes.isna().any():
         raise SingleCellError(
             "MAGMA gene statistics contain missing or empty gene identifiers"
@@ -703,53 +330,13 @@ def _read_magma_gene_statistics(path: Path, construction) -> pd.DataFrame:
 
 
 def _read_identifier_crosswalk(path: Path, construction) -> tuple[dict[str, str], dict]:
-    try:
-        frame = pd.read_csv(
-            path,
-            sep=construction.mapping_delimiter,
-            dtype=str,
-            keep_default_na=False,
-        )
-    except (OSError, ValueError, pd.errors.ParserError) as exc:
-        raise SingleCellError(
-            "Cannot read scDRS gene-identifier crosswalk %s: %s" % (path, exc)
-        ) from exc
-    required = {
-        construction.mapping_source_column,
-        construction.mapping_target_column,
-    }
-    missing = sorted(required - set(frame.columns))
-    if missing or frame.empty:
-        raise SingleCellError(
-            "scDRS gene-identifier crosswalk is empty or missing columns: %s"
-            % ", ".join(missing or sorted(required))
-        )
-    source = frame[construction.mapping_source_column].map(
-        _normalize_gene_identifier
+    return read_gene_identifier_crosswalk(
+        path,
+        delimiter=construction.mapping_delimiter,
+        source_column=construction.mapping_source_column,
+        target_column=construction.mapping_target_column,
+        error_type=SingleCellError,
     )
-    target = frame[construction.mapping_target_column].map(
-        _normalize_gene_identifier
-    )
-    if source.isna().any() or target.isna().any():
-        raise SingleCellError(
-            "scDRS gene-identifier crosswalk contains empty source or target IDs"
-        )
-    pairs = pd.DataFrame({"source": source, "target": target})
-    duplicate_sources = pairs["source"].duplicated(keep=False)
-    duplicate_targets = pairs["target"].duplicated(keep=False)
-    if duplicate_sources.any() or duplicate_targets.any():
-        raise SingleCellError(
-            "scDRS gene-identifier crosswalk is not one-to-one "
-            "(repeated_source_rows=%d, repeated_target_rows=%d); ambiguous "
-            "identifier mappings require manual curation"
-            % (int(duplicate_sources.sum()), int(duplicate_targets.sum()))
-        )
-    mapping = dict(zip(pairs["source"], pairs["target"]))
-    return mapping, {
-        "crosswalk_rows": len(pairs),
-        "repeated_source_rows": 0,
-        "repeated_target_rows": 0,
-    }
 
 
 def prepare_scdrs_gene_set(

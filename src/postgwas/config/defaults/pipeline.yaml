@@ -1,3 +1,6 @@
 modules: []
 fail_fast: true
 stop_after: null
+validation:
+  # Full, atomic startup audit; generated-input checks are explicitly deferred.
+  report_file: run_metadata/input_validation.yaml
