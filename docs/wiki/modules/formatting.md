@@ -49,7 +49,6 @@ provenance but does not require it to equal `--dataset-id`. The requested
 dataset ID controls output naming only. The VCF must contain exactly one sample
 column. A lone sample ID that differs from the run dataset ID is used with a
 warning; zero-sample and multi-sample VCFs fail before extraction.
-Dataset-identity validation is deferred in `urgent_attention_needed.md`.
 
 ## Command
 

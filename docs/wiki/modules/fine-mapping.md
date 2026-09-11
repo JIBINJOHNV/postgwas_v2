@@ -53,7 +53,7 @@ resulting loci. LD-block annotation and its BED resources are added only when
 `region` is selected. When `cojo-slct` is selected, formatter runs before LD
 clumping because the COJO analysis consumes its GCTA table.
 
-## Locus boundaries
+### Locus boundaries
 
 The canonical boundary flank is 500 kb on each side. In `point` mode, a locus
 at `POS` therefore spans `POS - 500 kb` through `POS + 500 kb` by default. In

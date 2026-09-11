@@ -45,8 +45,9 @@ schema; all method defaults remain in the canonical `single_cell.yaml`.
 
 ## What the analysis does
 
-The pipeline reuses PostGWAS MAGMA to convert variant-level GWAS evidence into
-calibrated gene-association results. It then reuses the MAGMAcovar service to
+For `magma_celltype`, the pipeline reuses PostGWAS MAGMA to convert
+variant-level GWAS evidence into calibrated gene-association results. It then
+reuses the MAGMAcovar service to
 regress the MAGMA gene statistic on each cell-type average-expression property
 while conditioning on the configured across-cell-type average-expression
 property. The alternative hypothesis is prespecified as a positive association.
@@ -210,6 +211,49 @@ validated on `PATH` before analysis.
 
 ## Full example
 
+### Direct mode: scDRS from an existing gene set
+
+This example assumes human gene symbols in the `.gs` and H5AD, raw counts in
+`adata.X`, and a `cell_type` annotation in `adata.obs`. Declare the actual matrix
+state with `--scdrs-matrix-state`; do not label log-normalized values as counts.
+
+```console
+postgwas single_cell \
+  --tools scdrs \
+  --scdrs-h5ad-file brain_atlas.h5ad \
+  --scdrs-gene-set-file STUDY.gs \
+  --scdrs-matrix-state raw_counts \
+  --scdrs-group-analysis cell_type \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Direct mode: LDSC cell typing from munged statistics
+
+Use a matched GRCh37/EUR reference release for this example. The direct input
+is already munged; a formatter table is not interchangeable with it.
+
+```console
+postgwas single_cell \
+  --tools ldsc_celltype \
+  --ldsc-celltype-sumstats-file STUDY.sumstats.gz \
+  --ldsc-celltype-ldcts-file reference/brain.ldcts \
+  --ldsc-celltype-baseline-prefix reference/baselineLD. \
+  --ldsc-celltype-weights-prefix reference/weights. \
+  --ldsc-celltype-genome-build GRCh37 \
+  --ldsc-celltype-population EUR \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Pipeline mode: MAGMA cell typing
+
+This example uses the packaged GRCh37/EUR MAGMA settings and NCBI/Entrez gene
+locations. The expression matrix must use matching Entrez IDs. For an Ensembl
+atlas, supply compatible Ensembl gene locations and their
+[primary-ID and source declarations](magma.md#gene-identifiers-and-source-declarations);
+changing an identifier label does not convert either file.
+
 ```console
 postgwas pipeline \
   --modules single_cell \
@@ -230,6 +274,8 @@ creates MAGMA SNP and p-value tables from the GWAS-VCF; MAGMA produces one
 validated primary `.genes.raw`; and the single-cell stage runs and normalizes
 the cell-type gene-property analysis.
 
+### Pipeline mode: scDRS
+
 For pipeline scDRS, the same stages are used, but the final stage consumes
 MAGMA's headered gene output and creates a weighted disease gene set first:
 
@@ -240,6 +286,7 @@ postgwas pipeline \
   --vcf study.gwas.vcf.gz \
   --scdrs-h5ad-file brain_atlas.h5ad \
   --scdrs-gene-id-map entrez_to_symbol.tsv \
+  --scdrs-matrix-state raw_counts \
   --scdrs-group-analysis cell_type \
   --magma-ld-reference reference/g1000_eur \
   --gene-location-file reference/NCBI37.3.gene.loc \
@@ -247,10 +294,15 @@ postgwas pipeline \
   --output-directory results
 ```
 
-The packaged crosswalk schema expects `ENTREZID` and `SYMBOL`. Override the
-columns and the declared source/target identifier types in YAML when using a
-different pinned namespace. Set `scdrs.magma_gene_set.mapping_mode: exact` only
+The packaged crosswalk schema expects `ENTREZID` and `SYMBOL`; the H5AD example
+assumes raw counts in `adata.X` and gene symbols in `adata.var_names`. The
+namespace declarations can be overridden with `--scdrs-source-gene-id-type` and
+`--scdrs-target-gene-id-type`, but mapping-column names and mapping policy are
+configured in YAML under `modules.single_cell.scdrs.magma_gene_set`. Keep these
+settings consistent with the actual crosswalk. Set `mapping_mode: exact` only
 when MAGMA and `adata.var_names` genuinely use the same identifiers.
+
+### Pipeline mode: LDSC cell typing
 
 For LDSC cell typing, pipeline mode schedules `formatter` and `single_cell`
 without MAGMA. It creates the LDSC input from the harmonised GWAS-VCF, mungs it,
@@ -265,6 +317,8 @@ postgwas pipeline \
   --ldsc-celltype-baseline-prefix reference/baselineLD. \
   --ldsc-celltype-weights-prefix reference/weights. \
   --ldsc-celltype-merge-alleles-file reference/w_hm3.snplist \
+  --ldsc-celltype-genome-build GRCh37 \
+  --ldsc-celltype-population EUR \
   --ldsc /path/to/ldsc.py \
   --munge-sumstats /path/to/munge_sumstats.py \
   --dataset-id STUDY \
@@ -297,6 +351,8 @@ remaining MAGMAcovar missingness, overlap, executable, staging, and validation
 settings continue to be owned and logged by the reused MAGMAcovar service.
 
 ## Processing steps
+
+The `magma_celltype` path performs these steps:
 
 1. Resolve and schema-validate single-cell, MAGMA, and MAGMAcovar settings.
 2. Validate the covariate matrix, exact `Average` property, cell-type columns,
@@ -350,9 +406,10 @@ The LDSC cell-type path performs these steps:
 
 ## Outputs
 
-The primary output is the configured `results/<dataset>_magma_celltype.tsv`
-table. It contains the dataset identifier, cell type, MAGMA gene count,
-coefficient, standardized coefficient, standard error, raw p-value, adjusted
+For `magma_celltype`, the primary output is the configured
+`results/<dataset>_magma_celltype.tsv` table. It contains the dataset identifier,
+cell type, MAGMA gene count, coefficient, standardized coefficient, standard
+error, raw p-value, adjusted
 p-values, and significance flags. The native MAGMAcovar result and log are
 retained below the configured engine directory. The module also writes its
 canonical log, resolved configuration, and completion manifest.
@@ -413,8 +470,8 @@ tool-specific completion manifest.
 
 ## Interpretation
 
-A positive result indicates that genes with higher expression in a cell type
-have stronger gene-level GWAS association after adjustment for average
+For `magma_celltype`, a positive result indicates that genes with higher
+expression in a cell type have stronger gene-level GWAS association after adjustment for average
 expression and MAGMA's technical covariates. It does not establish that the cell
 type is causal, that the associated genes act only in that cell type, or that
 the result is independent of correlated cell-type expression profiles.
@@ -501,8 +558,11 @@ or an identifier mapping. Pin the exact files used by the study:
 | Cell-type `.ldcts` plus LD scores | A versioned [official LDSC-SEG release](https://github.com/bulik/ldsc/wiki/Cell-type-specific-analyses), or LD scores created from a documented annotation and ancestry-matched reference panel | The first prefix is the tested annotation, later prefixes are controls, chromosomes 1–22 are complete, `.l2.M_5_50` files match the LD scores, and annotation/build/population provenance is retained. |
 | Baseline LD scores, weights, and HapMap3 list | The matching release linked by the [official LDSC cell-type tutorial](https://github.com/bulik/ldsc/wiki/Cell-type-specific-analyses) | All resources belong to the same reference population/build/release and use the SNP universe expected by the selected LDSC implementation. Do not mix baseline, weights, and cell-type releases. |
 
-Install the pinned implementation and compatible scientific stack with
-`pip install -e '.[analysis,single-cell]'` when using a source checkout.
+For the complete software setup, follow the
+[installation guide](../getting-started/installation.md). In a source checkout,
+`pip install -e '.[analysis,single-cell]'` installs the declared Python extras;
+it does not by itself install the MAGMA/LDSC executables or download the atlases,
+crosswalks, and LD-score reference panels described above.
 
 ## Scientific references
 

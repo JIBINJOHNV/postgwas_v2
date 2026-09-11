@@ -1,122 +1,128 @@
 # PostGWAS user guide
 
-PostGWAS is a command-line toolkit for preparing GWAS summary statistics and
-running post-GWAS analyses through standalone commands or a validated pipeline.
+This is the complete documentation index for PostGWAS. The repository README
+provides installation, the analysis catalogue and a short introduction; use the
+pages below for input contracts, method-specific commands and interpretation.
+All guides remain available as ordinary repository Markdown without a separate
+GitHub Wiki deployment.
 
-## Start here
+## Start with your input
 
-- [Installation](getting-started/installation.md) explains the supported local
-  and container setup paths and their limitations.
-- [Quick Start](getting-started/quick-start.md) shows the two-stage journey:
-  harmonise raw summary statistics, then run downstream analyses.
-- [Input Data](reference/input-data.md) describes the raw-summary-statistics
-  sample sheet and the harmonised GWAS-VCF boundary.
-- [Reference Resources](reference/reference-resources.md) explains why genome
-  build and ancestry must agree across the study and every reference panel.
-- [Resource Setup](getting-started/resource-setup.md) gives the current
-  harmonisation resource tree and validation checklist.
+| What you have | Where to go |
+|---|---|
+| Raw summary statistics | [Quick start](getting-started/quick-start.md), then [sample-sheet preparation](harmonisation/sample-sheet.md) and [harmonisation](harmonisation/overview.md) |
+| A PostGWAS-harmonised VCF | [Pipeline workflow](core/pipeline-workflow.md) or a VCF-consuming module in the index below |
+| Compatible tool-specific results | [Running modules independently](core/running-modules-independently.md), then the selected module's input requirements |
+| No installation or reference data yet | [Installation](getting-started/installation.md) and [resource setup](getting-started/resource-setup.md) |
 
-## Understand the workflow
+Pipeline entry requires an indexed, single-sample PostGWAS-harmonised VCF with
+provenance, not an arbitrary VCF. Direct commands accept their documented file
+types; some can use compatible inputs prepared outside PostGWAS. Harmonisation
+and pathway enrichment are standalone-only; the direct QC command is
+`postgwas qc`, while its pipeline target is `qc_summary`.
 
-- [Configuration](core/configuration.md) explains configuration precedence,
-  validation, inspection, and export.
-- [Pipeline Workflow](core/pipeline-workflow.md) explains target selection,
-  dependency planning, and execution order.
-- [Input and Output Contracts](core/input-output-contracts.md) explains the
-  scientific metadata and file boundaries between stages.
-- [Logging and Reproducibility](core/logging-and-reproducibility.md) explains
-  the run information needed to audit and reproduce an analysis.
-- [Scientific Considerations](core/scientific-considerations.md) summarizes
-  the compatibility decisions that must be made before analysis.
-- [Running Modules Independently](core/running-modules-independently.md)
-  explains the boundary between standalone commands and pipeline execution.
+## How analysis branches connect
 
-## How the modules connect
-
-All workflows begin by converting raw GWAS summary statistics into a
-harmonised GWAS-VCF. The downstream pipeline then adds the preparation steps
-required by the final analysis you select.
+The following example shows two branches leading to gene prioritisation. It
+is not a request to run every module and does not show external references,
+which remain user inputs. Start at the VCF when it already exists.
 
 ```mermaid
-flowchart LR
-    RAW["Raw GWAS summary statistics"] --> HARM["Harmonisation"]
-    HARM --> VCF["Harmonised GWAS-VCF"]
-
-    VCF -. optional .-> FILTER["Filtering"]
-    VCF -. optional .-> IMPUTE["Formatting for imputation → Imputation"]
-    FILTER -. when filtering and imputation are combined .-> IMPUTE
-    FILTER --> PREP["Analysis input"]
-    IMPUTE --> PREP
-    IMPUTE -. optional .-> POSTFILTER["Post-imputation filtering"]
-    POSTFILTER --> PREP
-    VCF --> PREP
-
-    PREP --> QC["QC Summary"]
-    PREP --> PLOT["Manhattan and QQ plots"]
-    PREP --> LDANN["LD Annotation"]
-    LDANN --> CLUMP["LD Clumping"]
-    CLUMP --> FINEMAP["Fine Mapping"]
-
-    PREP --> FORMAT["Formatting for downstream tools"]
-    FORMAT --> FINEMAP
-    FORMAT --> LDSC["LDSC Heritability"]
-    FORMAT --> GCTA["GCTA Gene Analysis"]
-    FORMAT --> MIXER["MiXeR"]
-    FORMAT --> MAGMA["MAGMA"]
-    MAGMA --> MAGMACOVAR["MAGMAcovar"]
+flowchart TD
+    RAW["Raw summary statistics + sample sheet"] --> HARM["Standalone harmonisation"]
+    HARM --> VCF["PostGWAS-harmonised VCF + QC"]
+    VCF --> FMAG["Formatter: MAGMA inputs"]
+    FMAG --> MAGMA["MAGMA"]
     MAGMA --> POPS["PoPS"]
     MAGMA --> KPOPS["K-POPS"]
-
-    FINEMAP --> CALDERA["CALDERA"]
+    MAGMA --> COVAR["MAGMAcovar"]
+    VCF --> CLUMP["Standard clumping"]
+    CLUMP --> FFINE["Formatter: fine-mapping inputs"]
+    FFINE --> FINE["SuSiE-RSS or FINEMAP"]
+    FINE --> CALDERA["CALDERA"]
     POPS --> CALDERA
-    FINEMAP --> FLAMES["FLAMES"]
-    MAGMACOVAR --> FLAMES
-    POPS --> FLAMES
 ```
 
-Filtering, imputation, Manhattan plots, and LDSC heritability can be added to a
-pipeline with workflow switches. Solid arrows between analysis modules show
-required pipeline dependencies; dotted arrows show optional preparation paths.
-The diagram does not mean that every branch runs in every analysis. See
-[Pipeline Workflow](core/pipeline-workflow.md) before selecting targets.
+This diagram explicitly selects standard clumping. Region clumping adds
+LD-block annotation; COJO selection adds formatting and a PLINK reference.
+MAGMA cell typing and scDRS use the MAGMA branch in pipeline mode, whereas LDSC
+cell typing uses formatter/LDSC inputs without MAGMA. CALDERA consumes PoPS,
+not K-POPS. The [pipeline guide](core/pipeline-workflow.md) explains the remaining
+branches, conditional dependencies and current limitations.
 
-## Choose an analysis
+## Find the right level of detail
 
-Select the result you want. In pipeline mode, PostGWAS plans the required
-preceding modules automatically.
+- For a first run, use the [connected tutorial](getting-started/quick-start.md).
+- To understand harmonisation decisions, read the [processing walkthrough](harmonisation/processing-order.md), then the [complete policy reference](harmonisation/policies.md).
+- For an analysis, open its module guide: required inputs and resources come
+  before commands; outputs and interpretation follow them.
+- To investigate a result, start with [output structure](reference/output-structure.md), [validation](reference/validation.md) and [troubleshooting](help/troubleshooting.md).
 
-| Research task | User guide | Pipeline selection |
-|---|---|---|
-| Prepare raw summary statistics | [Harmonisation](harmonisation/overview.md) | Standalone first stage |
-| Apply variant-level QC rules | [Filtering](modules/filtering.md) | `--modules sumstat_filter` or `--apply-filter` |
-| Create external-tool input files | [Formatting](modules/formatting.md) | `--modules formatter` or planned automatically |
-| Summarise GWAS-VCF quality | [QC Summary](modules/qc-summary.md) | `--modules qc_summary` |
-| Draw Manhattan and QQ plots | [Manhattan Plots](modules/manhattan.md) | `--modules manhattan` or `--apply-manhattan` |
-| Impute missing summary statistics | [Imputation](modules/imputation.md) | `--modules imputation` or `--apply-imputation` |
-| Assign variants to LD blocks | [LD Annotation](modules/ld-annotation.md) | `--modules annot_ldblock` |
-| Identify independent loci | [LD Clumping](modules/ld-clumping.md) | `--modules ld_clump` |
-| Estimate SNP heritability | [LDSC Heritability](modules/ldsc.md) | `--modules heritability` or `--heritability` |
-| Fine-map association signals | [Fine Mapping](modules/fine-mapping.md) | `--modules finemap` |
-| Test gene and gene-set association | [MAGMA](modules/magma.md) | `--modules magma` |
-| Run GCTA gene, segment, or set tests | [GCTA Gene Analysis](modules/gcta-gene.md) | `--modules gcta_gene` |
-| Run GCTA-COJO conditional or joint analysis | `docs/modules/gcta_cojo/README.md` in the repository | `--modules gcta_cojo` |
-| Test gene properties with MAGMA | [MAGMAcovar](modules/magmacovar.md) | `--modules magmacovar` |
-| Identify GWAS-associated cell types | [Single-Cell Integration](modules/single-cell.md) | `--modules single_cell` |
-| Prioritise genes with PoPS | [PoPS](modules/pops.md) | `--modules pops` |
-| Prioritise genes with K-POPS | [K-POPS](../modules/kpops.md) | `--modules kpops` |
-| Combine PoPS with credible sets | [CALDERA](../modules/caldera.md) | `--modules caldera` |
-| Integrate fine-mapping and gene evidence | [FLAMES](modules/flames.md) | `--modules flames` |
-| Model polygenic architecture or run MiXeR GSA | [MiXeR](modules/mixer.md) | `--modules mixer` |
-| Run pathway and interaction enrichment | [Pathway Enrichment](modules/pathway-enrichment.md) | Standalone terminal analysis |
+## Complete documentation index
 
-## Command discovery
+- [Home](home.md)
 
-Use the live command help together with this guide. The help output reflects the
-installed checkout, while the Wiki explains inputs, workflow context, outputs,
-and interpretation.
+### Getting Started
 
-```console
-postgwas --help
-postgwas harmonisation --help
-postgwas pipeline --help
-```
+- [Installation](getting-started/installation.md)
+- [Quick Start](getting-started/quick-start.md)
+- [Resource Setup](getting-started/resource-setup.md)
+
+### Core Concepts
+
+- [Configuration](core/configuration.md)
+- [Pipeline Workflow](core/pipeline-workflow.md)
+- [Pipeline Input Validation](core/pipeline-input-validation.md)
+- [Input and Output Contracts](core/input-output-contracts.md)
+- [Logging and Reproducibility](core/logging-and-reproducibility.md)
+- [Method and Data Considerations](core/scientific-considerations.md)
+- [Running Modules Independently](core/running-modules-independently.md)
+
+### Harmonisation
+
+- [Harmonisation Overview](harmonisation/overview.md)
+- [Harmonisation Sample Sheet](harmonisation/sample-sheet.md)
+- [Harmonisation Configuration](../modules/harmonisation/configuration.md)
+- [Harmonisation Workflow and Policy Reference](harmonisation/policies.md)
+- [How Harmonisation Processes Your Data](harmonisation/processing-order.md)
+- [Harmonisation Outputs and QC](harmonisation/outputs-and-qc.md)
+
+### Analysis Modules
+
+- [Filtering](modules/filtering.md)
+- [Formatting](modules/formatting.md)
+- [QC Summary](modules/qc-summary.md)
+- [Manhattan Plots](modules/manhattan.md)
+- [Imputation](modules/imputation.md)
+- [LD Annotation](modules/ld-annotation.md)
+- [LD Clumping](modules/ld-clumping.md)
+- [LDSC Heritability](modules/ldsc.md)
+- [Fine Mapping](modules/fine-mapping.md)
+- [MAGMA](modules/magma.md)
+- [GCTA Gene Analysis](modules/gcta-gene.md)
+- [GCTA-COJO](../modules/gcta_cojo/README.md)
+- [MAGMAcovar](modules/magmacovar.md)
+- [Single-Cell Integration](modules/single-cell.md)
+- [PoPS](modules/pops.md)
+- [K-POPS](../modules/kpops.md)
+- [CALDERA](../modules/caldera.md)
+- [FLAMES](modules/flames.md)
+- [MiXeR](modules/mixer.md)
+- [Pathway Enrichment](modules/pathway-enrichment.md)
+
+### Reference
+
+- [Input Data](reference/input-data.md)
+- [Reference Resources](reference/reference-resources.md)
+- [Configuration Defaults](reference/configuration-defaults.md)
+- [Output Structure](reference/output-structure.md)
+- [Command Reference](reference/command-reference.md)
+- [Validation Reference](reference/validation.md)
+- [Method References](reference/scientific-references.md)
+- [scDRS Evidence Review](reference/scdrs-evidence-review.md)
+
+### Help
+
+- [Troubleshooting](help/troubleshooting.md)
+- [Frequently Asked Questions](help/faq.md)
+- [Error Messages](help/error-messages.md)

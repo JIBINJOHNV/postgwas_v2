@@ -111,6 +111,7 @@ For a standard MAGMA-backed PoPS run, supply:
 
 ```console
 postgwas pops --magma-association-prefix PREFIX [options]
+postgwas pipeline --modules pops --help
 ```
 
 ## Minimal example
@@ -130,6 +131,8 @@ postgwas pops \
 
 ## Full example
 
+### Direct mode: existing MAGMA results
+
 ```console
 postgwas pops \
   --magma-association-prefix magma/STUDY \
@@ -148,6 +151,40 @@ postgwas pops \
   --dataset-id STUDY \
   --output-directory results
 ```
+
+### Pipeline mode: GWAS-VCF to MAGMA and PoPS
+
+Use a strand-aware MAGMA gene-location file from the same Ensembl gene universe
+as the PoPS annotation and feature rows. An NCBI/Entrez location file is not an
+alternative for an Ensembl feature bundle. The following GRCh37/EUR example
+assumes a 116-chunk feature bundle. Replace the file paths, chunk count, and the
+uppercase source-metadata placeholders with the exact values from your resource
+manifest; the source URL must be HTTPS. Metadata declarations do not remap IDs.
+
+```console
+postgwas pipeline \
+  --modules pops \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/pops/PoPS_GRCh37_strand_aware.loc \
+  --magma-positional-gene-id-type ensembl \
+  --magma-positional-source-name GENE_LOCATION_SOURCE \
+  --magma-positional-source-version SOURCE_RELEASE \
+  --magma-positional-source-url https://example.org/GENE_LOCATION_SOURCE_RECORD \
+  --magma-positional-context GENE_LOCATION_CONTEXT \
+  --feature-matrix-prefix reference/pops/features_munged/pops_features \
+  --feature-matrix-chunks 116 \
+  --pops-gene-location-file reference/pops/GRCh37_gene_annot.tsv \
+  --pops-genome-build GRCh37 \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+The pipeline supplies MAGMA's validated `.genes.out`/`.genes.raw` pair; do not
+provide `--magma-association-prefix` in pipeline mode. The direct build option
+is `--genome-build`; the PoPS-specific pipeline option is `--pops-genome-build`.
+For non-default MAGMA builds or mappings, also provide compatible MAGMA settings
+as described in the [MAGMA guide](magma.md#gene-identifiers-and-source-declarations).
 
 ### Optional MAGMA gene-universe intersection
 

@@ -1,8 +1,27 @@
 # Configuration
 
-PostGWAS uses YAML configuration files for analysis settings, reference
-resources, output behavior, and compute limits. Start from an exported template
-instead of writing a configuration file from memory.
+PostGWAS keeps its defaults in schema-validated YAML. For a simple run, use the
+public CLI options for your chosen module or pipeline. Use a run configuration
+when you want to reuse settings, specify advanced policies, or provide values
+that have no public CLI override. Export a template rather than writing one from
+memory; the existence of a configuration key does not mean every command exposes
+it on the CLI.
+
+## Which configuration file do I need?
+
+| File or interface | Purpose | What it does not do |
+|---|---|---|
+| Harmonisation sample sheet | Identifies each raw dataset and maps its actual columns | Does not replace the analysis/resource YAML |
+| Module run configuration | Supplies supported settings and input/reference paths for one direct analysis | Does not cause the global planner to create missing upstream analyses |
+| Pipeline run configuration | Supplies settings for the selected targets and their prerequisites | Does not download references or execute simply because it was exported |
+| CLI overrides | Changes the corresponding supported setting for this invocation | Does not make an incompatible file or undeclared method valid |
+
+Most direct commands accept `--run-config`. Direct `manhattan` and
+`pathway_enrichment` currently do not; pipeline Manhattan does. Enrichment's
+registered `providers` setting is not an implemented provider-selection
+interface. Follow the exact command's help rather than assuming that an exported
+YAML can drive every direct command. The pipeline requires target selection
+through `--modules` or the documented workflow switches.
 
 ## Create a configuration file
 
@@ -50,9 +69,9 @@ When the same setting is supplied more than once, PostGWAS applies this order:
 2. Values in your YAML file, including any files it pulls in with `include:`.
 3. Explicit command-line overrides.
 
-The command-line value therefore has the highest priority. Hardware-dependent
-values such as `threads: auto` and `memory_gb: auto` are resolved for the
-machine running the analysis.
+The corresponding supported command-line value therefore has the highest
+priority. Hardware-dependent values such as `threads: auto` and
+`memory_gb: auto` are resolved for the machine running the analysis.
 
 ## Validate before analysis
 
@@ -67,7 +86,7 @@ include cycles are rejected. Correct these errors before launching a long run.
 
 ## Inspect the effective settings
 
-Show the values that will be used after defaults and overrides are combined:
+Inspect the packaged defaults combined with the supplied YAML:
 
 ```console
 postgwas config show --config analysis.yaml
@@ -89,8 +108,10 @@ postgwas config show \
   --output results/run_metadata/resolved_config.yaml
 ```
 
-Keep this resolved file with the command, logs, input versions, and reference
-resource versions needed to reproduce the analysis.
+This inspection command does not replay extra analysis CLI overrides from a
+different command. Keep the actual run's resolved configuration and exact
+command with the logs, input versions, and reference versions; those record
+the settings consumed during execution.
 
 ## Screen display and transcript
 
@@ -100,8 +121,8 @@ always appends the complete standard-output and standard-error stream to the
 relative `logging.screen_log_file` under `run.output_directory`; its packaged
 location is `run_metadata/screen.log`. `--hide-screen` suppresses the terminal
 copy only, so the transcript and canonical module logs are still written. Set
-`logging.show_screen: true` in YAML to enable display when a run configuration
-has disabled it.
+`logging.show_screen: true` in a supported run configuration to enable display
+when that configuration has disabled it.
 
 `logging.progress_refresh_seconds` controls how often PostGWAS samples
 append-only native outputs when an external tool exposes measurable work units.
@@ -158,3 +179,10 @@ changes to content-determining parameters, inputs, resources, software, or
 upstream checkpoints still invalidate reuse.
 
 Do not manually combine outputs from different configurations or studies.
+
+## Related pages
+
+- [Quick Start](../getting-started/quick-start.md)
+- [Running Modules Independently](running-modules-independently.md)
+- [Pipeline Workflow](pipeline-workflow.md)
+- [Input and Output Contracts](input-output-contracts.md)

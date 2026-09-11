@@ -7,8 +7,8 @@ interaction providers for one list of human gene symbols.
 
 ## What the analysis does
 
-It reads unique symbols from the first column, switches to a dedicated
-`enricher` micromamba environment, and independently attempts OmniPath,
+It reads unique symbols from the first column, dispatches automatically to the
+managed isolated pathway-enrichment runtime, and independently attempts OmniPath,
 DSigDB/WebGestaltR, BioGRID, DAVID, DGIdb, Enrichr, g:Profiler, ToppGene, and
 STRINGdb.
 
@@ -20,11 +20,22 @@ and background independently of results and acknowledge selection/multiplicity.
 ## Input requirements
 
 A delimited file with a header and gene symbols in the first column; BioGRID
-API key; DAVID-registered email; optional DSigDB GMT; network access; an
-`enricher` micromamba environment with Python/R dependencies; dataset ID and
-output directory.
+API key; DAVID-registered email; optional DSigDB GMT; network access; the managed
+runtime's Python/R dependencies; dataset ID and output directory.
+
+The [all-tools installer](../getting-started/installation.md) installs this
+runtime below the main environment. Activate the main PostGWAS environment and
+use the ordinary command; do not manually activate an environment named
+`enricher`. The launcher locates
+`share/postgwas/environments/enrichment/bin/python` under the active environment,
+or uses an explicitly configured `POSTGWAS_ENRICHMENT_PYTHON` override. A missing
+or unusable runtime fails before provider requests begin.
 
 ## Command
+
+This is a standalone command, not a selectable pipeline target. It consumes a
+gene-symbol list, not a GWAS-VCF or the complete output table of another module.
+Select and document the intended genes before exporting the one-column input.
 
 ```console
 postgwas pathway_enrichment --gene-input-file PATH [options]
@@ -90,13 +101,18 @@ searches increase multiplicity.
 ## Common problems
 
 Invalid credentials, missing DSigDB GMT, rate limits, API changes, missing
-environment, unmapped symbols, or one provider failing while others continue.
+runtime, unmapped symbols, or one provider failing while others continue.
 
 ## Limitations
 
-The workflow is fixed, failure-tolerant, online, and lacks a unified manifest.
-YAML provider selection is not implemented. Confirm that each required provider
-returned results before treating the run as complete.
+The provider sequence is fixed and failure-tolerant. The
+`modules.enrichment.providers` configuration field does not select providers in
+the current dispatcher. Provider exceptions are caught independently, so a
+zero process exit or top-level completion does not certify that every provider
+succeeded. Inspect each provider's diagnostics and output; distinguish a valid
+empty result from a failed request. There is no unified provider-success
+manifest. Installation cannot guarantee remote service availability or valid
+credentials.
 
 ## Scientific references
 

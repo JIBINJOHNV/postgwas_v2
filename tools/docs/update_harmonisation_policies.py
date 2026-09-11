@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synchronize the README harmonisation policy table with canonical YAML."""
+"""Synchronize the detailed harmonisation policy guide with canonical YAML."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-README = REPOSITORY_ROOT / "README.md"
+POLICY_GUIDE = (
+    REPOSITORY_ROOT / "docs" / "wiki" / "harmonisation" / "policies.md"
+)
 POLICIES_YAML = (
     REPOSITORY_ROOT
     / "src"
@@ -188,10 +190,10 @@ def render_reference() -> str:
     return "\n".join(sections)
 
 
-def synchronized_readme() -> str:
-    current = README.read_text(encoding="utf-8")
+def synchronized_guide() -> str:
+    current = POLICY_GUIDE.read_text(encoding="utf-8")
     if current.count(START) != 1 or current.count(END) != 1:
-        raise ValueError("README must contain exactly one policy-reference marker pair")
+        raise ValueError("Policy guide must contain exactly one policy-reference marker pair")
     before, remainder = current.split(START, 1)
     _old, after = remainder.split(END, 1)
     return before + render_reference() + after
@@ -199,26 +201,26 @@ def synchronized_readme() -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Synchronize README harmonisation policies with canonical YAML."
+        description="Synchronize the harmonisation policy guide with canonical YAML."
     )
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Return non-zero when README is not synchronized; do not write it.",
+        help="Return non-zero when the policy guide is not synchronized; do not write it.",
     )
     args = parser.parse_args()
 
-    current = README.read_text(encoding="utf-8")
-    expected = synchronized_readme()
+    current = POLICY_GUIDE.read_text(encoding="utf-8")
+    expected = synchronized_guide()
     if args.check:
         if current != expected:
-            print("README harmonisation policy reference is out of date.", file=sys.stderr)
+            print("Harmonisation policy reference is out of date.", file=sys.stderr)
             return 1
-        print("README harmonisation policy reference is synchronized.")
+        print("Harmonisation policy reference is synchronized.")
         return 0
 
-    README.write_text(expected, encoding="utf-8")
-    print("Updated README harmonisation policy reference.")
+    POLICY_GUIDE.write_text(expected, encoding="utf-8")
+    print("Updated harmonisation policy reference.")
     return 0
 
 

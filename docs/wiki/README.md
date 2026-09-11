@@ -1,14 +1,15 @@
 # Documentation maintenance
 
 The PostGWAS user guide is maintained as canonical Markdown in the main
-repository. The root [`README.md`](../../README.md) links every published page,
-so the complete guide can be browsed directly in a private repository without
-GitHub Wiki access.
+repository. The root [`README.md`](../../README.md) introduces installation,
+available analyses and the first workflow. The [user-guide home](home.md)
+contains the complete manifest-ordered documentation index, so all pages can
+be browsed directly without GitHub Wiki access.
 
 ## Source contract
 
 [`docs/wiki.yml`](../wiki.yml) is the documentation manifest. Its page order is
-the order used by the root README and optional generated navigation, and each
+the order used by the user-guide index and optional generated navigation, and each
 entry defines:
 
 - the user-facing page title;
@@ -65,12 +66,12 @@ replacement of a Wiki clone or another user-owned directory.
 
 GitHub Wiki publication is not configured for this private repository. Users
 browse the canonical pages through the complete documentation index in the
-root README. The workflow validates the Markdown, generated navigation, links,
+user-guide home. The workflow validates the Markdown, generated navigation, links,
 and documented commands, but does not attempt to push a `.wiki.git` repository.
 
 If Wiki access is enabled in the future, the optional generated tree can be
 reviewed and published as a separate change. The canonical Markdown and the
-root README index must remain the source of truth.
+user-guide index must remain the source of truth.
 
 ## Add a page
 
@@ -78,7 +79,9 @@ root README index must remain the source of truth.
 2. Start the page with one level-one heading.
 3. Add the page to `docs/wiki.yml` with a stable, unique slug.
 4. Use relative links between canonical Markdown sources.
-5. Add its canonical source link to the root README in manifest order.
+5. Add its canonical source link to the complete index in `docs/wiki/home.md`
+   in manifest order. Add or update its README catalogue entry when introducing
+   a public analysis command.
 6. Run the documentation validation tests.
 7. Inspect the source page and optional generated navigation.
 
@@ -86,3 +89,20 @@ For module documentation, begin with
 [`docs/templates/module-page.md`](../templates/module-page.md). Configuration and
 pipeline sections marked as generated must not be filled by copying defaults or
 dependencies manually.
+
+## Maintain the harmonisation policy reference
+
+The detailed source/step contract and generated policy tables live in
+[`docs/wiki/harmonisation/policies.md`](harmonisation/policies.md), not the
+landing README. The generated block is derived from canonical YAML and schema
+constraints; do not edit its rows by hand.
+
+```console
+python tools/docs/update_harmonisation_policies.py --check
+```
+
+After an intentional change to policy documentation or schema, run the same
+command without `--check`, review the generated diff, and run the documentation
+tests. The tests retain complete sample-sheet field coverage and the seven-stage,
+29-step processing-order contract in the detailed guide while checking the
+README's introductory navigation separately.

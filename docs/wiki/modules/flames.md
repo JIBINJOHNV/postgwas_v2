@@ -111,21 +111,32 @@ postgwas flames \
 ### Pipeline mode
 
 The pipeline creates the fine-mapping, MAGMA, gene-property, and PoPS inputs
-consumed by FLAMES. The `--ld-folder` must use the version-2 manifest, dual
+consumed by FLAMES. This GRCh37/EUR example explicitly selects standard
+clumping; it does not require LD-block BED files. The `--ld-folder` must use
+the version-2 manifest, dual
 tabix-indexed pair tables, and allele-aware inventory layout documented in the
-[LD-clumping reference guide](ld-clumping.md#preparing-the-standard-ld-reference):
+[LD-clumping reference guide](ld-clumping.md#preparing-the-standard-ld-reference).
+The gene-location file, tissue table, and PoPS feature annotation must use
+compatible Ensembl identifiers. Replace the paths, feature-chunk count, and
+uppercase source-metadata placeholders with the values for your actual reference
+release; the source URL must be its HTTPS provenance record. These declarations
+record the gene-location source and do not convert its identifiers.
 
 ```console
 postgwas pipeline \
   --modules flames \
   --vcf study_GRCh37.vcf.gz \
   --genome-build GRCh37 \
-  --ld-region-dir reference/ld_blocks \
-  --ld-block-populations EUR \
+  --clumping-methods standard \
   --ld-folder reference/pairwise_ld \
   --population EUR \
   --magma-ld-reference reference/1000G_EUR \
   --gene-location-file reference/FUMA/ENSGv102.coding.genes.txt \
+  --magma-positional-gene-id-type ensembl \
+  --magma-positional-source-name GENE_LOCATION_SOURCE \
+  --magma-positional-source-version SOURCE_RELEASE \
+  --magma-positional-source-url https://example.org/GENE_LOCATION_SOURCE_RECORD \
+  --magma-positional-context GENE_LOCATION_CONTEXT \
   --covariates reference/GTEx/gtex_v8_ts_avg_log2TPM.txt \
   --feature-matrix-prefix reference/FLAMES/pops_features_full_FUMA_compatible/features_munged/pops_features \
   --feature-matrix-chunks 116 \

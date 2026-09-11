@@ -50,10 +50,17 @@ Formatter SNP-location and P-value tables; PLINK BED/BIM/FAM LD-reference
 prefix; MAGMA gene-location file; optional GMT/native gene-set file;
 MAGMA 1.10 or newer; dataset ID and output directory.
 
+Those are direct-mode inputs for positional MAGMA. Pipeline mode starts from a
+harmonised GWAS-VCF and runs the formatter automatically; it still requires the
+LD reference and gene annotations. Functional mappings additionally require the
+resources declared by their selected mapping definitions. A filename does not
+establish a resource's build, gene identifier system, or release.
+
 ## Command
 
 ```console
 postgwas magma --snp-location-file PATH --p-value-file PATH [options]
+postgwas pipeline --modules magma --help
 ```
 
 ## Minimal example
@@ -69,6 +76,8 @@ postgwas magma \
 ```
 
 ## Full example
+
+### Direct mode: gene and gene-set association
 
 ```console
 postgwas magma \
@@ -90,6 +99,34 @@ postgwas magma \
   --output-directory results
 ```
 
+### Pipeline mode: start from GWAS-VCF
+
+This positional example uses GRCh37/EUR resources and the packaged NCBI37.3
+gene-location declaration. The gene-set identifiers must match a supported
+identifier column in the gene-location file; review the reported compatibility
+decision rather than assuming that every GMT is compatible.
+
+```console
+postgwas pipeline \
+  --modules magma \
+  --vcf STUDY_GRCh37_merged.vcf.gz \
+  --magma-ld-reference reference/1000G_EUR \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --gene-set-file reference/pathways.gmt \
+  --dataset-id STUDY \
+  --output-directory results
+```
+
+### Functional mapping analyses
+
+Prepare the [functional-mapping resources](../getting-started/resource-setup.md)
+and use their generated configuration with `--run-config`. Select its definition
+names with `--magma-mapping` and choose the downstream handoff with
+`--primary-magma-mapping`. These definitions carry annotation paths, build,
+population, identifier system, tissue/context, and source provenance; selecting
+a method name alone does not supply those resources. Downstream consumers that
+require calibrated gene statistics reject a chromMAGMA primary result.
+
 ## Parameters
 
 See the generated [Configuration Defaults](../reference/configuration-defaults.md)
@@ -101,6 +138,20 @@ behavior. Export the YAML before creating study-specific overrides.
 budget and overrides `modules.magma.batching.memory_per_process_gb`. The number
 of concurrent MAGMA gene-analysis workers is bounded by both `--threads` and
 the total `--memory-gb` budget. It does not enforce a process-level memory cap.
+
+### Gene identifiers and source declarations
+
+For a positional reference other than the packaged NCBI37.3/Entrez example,
+declare the actual first-column identifier system with
+`--magma-positional-gene-id-type` and record its source with
+`--magma-positional-source-name`, `--magma-positional-source-version`,
+`--magma-positional-source-url`, and `--magma-positional-context`. These options
+are available in direct and pipeline mode and override the corresponding
+`modules.magma.mapping.definitions.positional` keys. They record metadata; they
+do not convert Entrez IDs to Ensembl IDs or make incompatible references match.
+`--gene-location-alternate-id-type` describes the optional alternate-ID column,
+not the primary identifiers. Build and population must also agree with the
+resolved MAGMA configuration and all selected mapping definitions.
 
 ## Processing steps
 

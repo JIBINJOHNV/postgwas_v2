@@ -12,6 +12,8 @@ from typing import Iterable
 
 import yaml
 
+from postgwas.core.ui import cli_option_values
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = REPOSITORY_ROOT / "docs" / "wiki.yml"
@@ -21,6 +23,16 @@ INLINE_COMMAND_PATTERN = re.compile(r"`(postgwas(?:\s+[^`\n]+)?)`")
 LONG_OPTION_PATTERN = re.compile(r"(?<![A-Za-z0-9-])(--[A-Za-z][A-Za-z0-9-]*)")
 TABLE_COMMAND_PATTERN = re.compile(r"^\s*│\s*([a-z][a-z0-9_-]*)\s*│", re.MULTILINE)
 CONFIG_ACTION_PATTERN = re.compile(r"\{([a-z]+(?:,[a-z]+)+)\}")
+# These are help-routing inputs, not analysis defaults. Keep the documented
+# selections when asking the live CLI which workflow's options are available.
+# GCTA's set source is selected by option presence; help does not read the file.
+PIPELINE_CONTEXT_OPTIONS = (
+    "--modules", "--clumping-methods", "--finemap-method", "--tools",
+    "--method", "--analysis", "--cojo-mode", "--gmt", "--fastbat-set-list",
+)
+PIPELINE_CONTEXT_FLAGS = (
+    "--apply-filter", "--apply-imputation", "--apply-manhattan", "--heritability",
+)
 
 
 class CliDocumentationError(ValueError):
@@ -118,15 +130,25 @@ def _clean_option(token: str) -> str | None:
 
 
 def _pipeline_help_arguments(tokens: list[str]) -> list[str]:
-    if "--modules" not in tokens:
-        return ["pipeline", "--help"]
-    start = tokens.index("--modules")
-    modules = []
-    for token in tokens[start + 1 :]:
-        if token.startswith("-") or token.startswith("["):
-            break
-        modules.append(token.strip("[],{}"))
-    return ["pipeline", "--modules", *modules, "--help"] if modules else ["pipeline", "--help"]
+    arguments = ["pipeline"]
+    for option in PIPELINE_CONTEXT_OPTIONS:
+        values = []
+        for value in cli_option_values(tokens, option):
+            if value.startswith("["):
+                break  # Prose such as [pipeline options], not a CLI value.
+            values.append(value)
+        if values:
+            arguments.extend((option, *values))
+        elif option != "--modules" and any(
+            token == option or token.startswith(option + "=") for token in tokens
+        ):
+            raise CliDocumentationError(
+                f"Documented pipeline selector {option} has no value"
+            )
+    arguments.extend(flag for flag in PIPELINE_CONTEXT_FLAGS if flag in tokens)
+    # Example configuration paths need not exist. Do not load --run-config or
+    # pass analysis inputs: the CLI is inspected, never an analysis executed.
+    return [*arguments, "--help"]
 
 
 def _choice_options(help_text: str) -> dict[str, set[str]]:
@@ -134,12 +156,19 @@ def _choice_options(help_text: str) -> dict[str, set[str]]:
     choices: dict[str, set[str]] = {}
     current_options: tuple[str, ...] = ()
     block_lines: list[str] = []
+    lines = help_text.splitlines()
+    option_indent = min(
+        (len(line) - len(line.lstrip()) for line in lines
+         if line.lstrip().startswith("--")),
+        default=0,
+    )
 
     def finish_block() -> None:
         if not current_options:
             return
         block = " ".join(block_lines)
-        match = re.search(r"\{([^{}]+)\}", block_lines[0])
+        invocation = re.split(r"\s{2,}", block_lines[0].lstrip(), maxsplit=1)[0]
+        match = re.search(r"\{([^{}]+)\}", invocation)
         if not match:
             match = re.search(
                 r"(?:choices?|accepted values?)\s*:?\s*\{([^{}]+)\}",
@@ -147,14 +176,23 @@ def _choice_options(help_text: str) -> dict[str, set[str]]:
                 re.IGNORECASE,
             )
         if not match:
+            match = re.search(
+                r"Available options:\s*(.+?)(?:\.(?:\s|$)|$)",
+                block,
+            )
+        if not match:
             return
         values = {value.strip() for value in match.group(1).split(",") if value.strip()}
         for option in current_options:
             choices[option] = values
 
-    for line in help_text.splitlines():
-        options = tuple(LONG_OPTION_PATTERN.findall(line))
-        if options and line.lstrip().startswith("--"):
+    for line in lines:
+        invocation = re.split(r"\s{2,}", line.lstrip(), maxsplit=1)[0]
+        options = tuple(LONG_OPTION_PATTERN.findall(invocation))
+        if (
+            options and line.lstrip().startswith("--")
+            and len(line) - len(line.lstrip()) == option_indent
+        ):
             finish_block()
             current_options = options
             block_lines = [line]
@@ -173,7 +211,10 @@ def _documented_choice_errors(
         if option not in choices:
             continue
         values = []
-        for value in tokens[index + 1 :]:
+        following = tokens[index + 1 :]
+        if "=" in token:
+            following = [token.partition("=")[2], *following]
+        for value in following:
             if value.startswith("-") or any(marker in value for marker in "[]{}|"):
                 break
             if value.isupper():

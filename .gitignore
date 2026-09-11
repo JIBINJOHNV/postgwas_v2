@@ -1,6 +1,9 @@
-# Local hand-off and assistant backup files
+# Local hand-off, review notes and assistant backup files
 .claude_transfer/
 /AGENTS.md
+/agents.md
+/urgent_attention_needed.md
+/HARMONISATION_REVIEW.md
 
 # PostGWAS runtime output and local scientific data
 /cache/

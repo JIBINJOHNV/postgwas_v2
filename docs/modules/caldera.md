@@ -41,19 +41,30 @@ For GRCh38, include `c_gene` or `rsid` in the credible-set table. Column names a
 
 ## Pipeline mode
 
-```console
-postgwas config export --pipeline caldera --style full --output caldera_pipeline.yaml
+This GRCh37/EUR example uses standard LD clumping and SuSiE. It requires a
+standard [PostGWAS LD reference bundle](../wiki/modules/ld-clumping.md#preparing-the-standard-ld-reference),
+a PLINK panel, and compatible Ensembl MAGMA/PoPS resources. The MAGMA location
+file must use compatible gene identifiers and coordinates; PoPS validates the
+gene overlap before fitting. An NCBI/Entrez file cannot replace an Ensembl
+reference. Replace the paths, exact feature-chunk count,
+and uppercase source-metadata placeholders with values from the resource
+manifest. The source URL must be the actual HTTPS gene-location source record.
 
+```console
 postgwas pipeline \
   --modules caldera \
   --vcf study_GRCh37.vcf.gz \
   --genome-build GRCh37 \
-  --ld-region-dir reference/ld_blocks \
-  --ld-block-populations EUR \
+  --clumping-methods standard \
   --ld-folder reference/ld \
   --population EUR \
   --magma-ld-reference reference/1000G_EUR \
-  --gene-location-file reference/NCBI37.3.gene.loc \
+  --gene-location-file reference/pops/PoPS_GRCh37_strand_aware.loc \
+  --magma-positional-gene-id-type ensembl \
+  --magma-positional-source-name GENE_LOCATION_SOURCE \
+  --magma-positional-source-version SOURCE_RELEASE \
+  --magma-positional-source-url https://example.org/GENE_LOCATION_SOURCE_RECORD \
+  --magma-positional-context GENE_LOCATION_CONTEXT \
   --feature-matrix-prefix reference/pops/features_munged/pops_features \
   --feature-matrix-chunks 116 \
   --pops-gene-location-file reference/pops/GRCh37_gene_annot.tsv \
@@ -62,9 +73,14 @@ postgwas pipeline \
   --finemap-ld-reference reference/1000G_EUR \
   --caldera-genome-build GRCh37 \
   --dataset-id STUDY \
-  --output-directory results \
-  --run-config caldera_pipeline.yaml
+  --output-directory results
 ```
+
+No run YAML is required for this example. For reusable settings, export
+`postgwas config export --pipeline caldera --style full --output caldera_pipeline.yaml`,
+fill in its inputs and resource declarations, and use `--run-config`. Standard
+clumping alone does not require LD-block BED resources; those are needed only
+when the additional `region` clumping method is selected.
 
 The plan runs MAGMA and PoPS plus fine-mapping prerequisites. MAGMA output is
 consumed by PoPS; CALDERA itself never reads a MAGMA result file. The pinned

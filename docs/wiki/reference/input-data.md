@@ -1,8 +1,15 @@
 # Input Data
 
-PostGWAS accepts two broad forms of input: raw summary-statistics tables for
-harmonisation, and harmonised GWAS-VCF or module-specific derivatives for
-downstream analysis.
+Choose the entry point from the file you actually have:
+
+| Starting input | Entry point | Important boundary |
+|---|---|---|
+| Raw GWAS summary-statistics table | Standalone harmonisation with a version-2 sample sheet | Map the real study columns and provide compatible references |
+| PostGWAS-harmonised GWAS-VCF | A VCF-consuming direct command or the downstream pipeline | Required PostGWAS provenance, build, sample, index, and field checks must pass |
+| Prepared analysis artifacts or a gene list | The direct module that documents that input | A file prepared for one tool is not automatically suitable for another |
+
+The pipeline does not accept raw tables or arbitrary third-party VCFs. Start
+with [Quick Start](../getting-started/quick-start.md) for a connected example.
 
 ## Raw summary statistics
 
@@ -73,8 +80,8 @@ Use the sample-sheet column names shown below. Do not add unsupported columns.
 | `control_count` | At least one control/N source is required | Positive whole-number constant used as total analyzed N for quantitative traits or control N for case-control traits. Use this when the count is the same for all variants. |
 | `case_count_column` | Required for case-control traits unless constant supplied | Input column containing case N. Use this for per-variant counts. Quantitative traits must not provide case-count fields. |
 | `case_count` | Required for case-control traits unless column supplied | Positive whole-number constant case N. Use this when the count is the same for all variants. Quantitative traits must not provide case-count fields. |
-| `imputation_info_column` | Internal INFO takes priority | Input column containing study imputation quality. When an external source is also listed it is ignored, and the run reports that it was ignored. |
-| `external_info_file` | Used when no internal INFO column is mapped | External study-INFO file. It must be paired with `external_info_column`. |
+| `imputation_info_column` | Optional mapping; internal INFO takes priority | Input column containing study imputation quality. When an external source is also listed it is ignored, and the run reports that it was ignored. |
+| `external_info_file` | Optional mapping, used when no internal INFO column is mapped | External INFO file. It must be paired with `external_info_column`; inspect the declared source and interpretation rather than assuming it is study-measured INFO. |
 | `external_info_column` | Required with external INFO file | Name of the INFO value column in `external_info_file`. |
 | `delimiter` | Optional/inferred | `tab`, `comma`, `semicolon`, `space`, `whitespace`, or `auto`. Aliases include `\\t`, `csv`, and `comma-separated`. |
 
@@ -101,9 +108,19 @@ Do not encode scientific missingness as a plausible numeric sentinel.
 
 ## Harmonised GWAS-VCF
 
-The GWAS-VCF carries coordinates, alleles, study statistics, and metadata in a
-form understood by downstream modules. Keep its index beside it where one is
-created. Do not hand-edit VCF fields or headers between stages.
+The PostGWAS GWAS-VCF carries coordinates, alleles, study statistics, and metadata
+under the downstream input contract. Public study-VCF commands require unique,
+non-empty PostGWAS version, dataset-ID, and status declarations in addition to
+their own content checks. Missing declarations are not repaired by manually
+adding headers: regenerate the file through harmonisation from the source
+statistics. These declarations record provenance; they are not a signature or
+proof that every variant is valid.
+
+Keep the VCF index beside the data and retain the original harmonisation
+reports. The main pipeline input is a single-study VCF, not a multi-sample
+genotype VCF. See the [PostGWAS-origin contract](../core/input-output-contracts.md#postgwas-origin-check-for-study-vcfs)
+for exact configured header names and the exemptions for reference panels and
+direct table inputs. Do not hand-edit VCF fields or headers between stages.
 
 ## Module-specific inputs
 
@@ -111,6 +128,12 @@ Formatting creates tool-specific tables for consumers such as LDSC, MAGMA,
 GCTA gene analysis, fine-mapping, PRED-LD summary-statistic imputation, and
 MiXeR. A table formatted for one consumer is not automatically valid for
 another. Follow the producing and consuming module pages together.
+
+Direct commands may consume native upstream files such as MAGMA `.genes.raw`,
+PoPS scores, or fine-mapping credible sets; pathway enrichment starts from gene
+symbols. These are different interfaces from the pipeline VCF entry point.
+Use [Running Modules Independently](../core/running-modules-independently.md)
+to decide who prepares each artifact.
 
 See [Input and Output Contracts](../core/input-output-contracts.md) for the
 metadata that must remain consistent across these boundaries.

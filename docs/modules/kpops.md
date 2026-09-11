@@ -82,21 +82,33 @@ postgwas kpops \
 
 ## Pipeline mode
 
-```console
-postgwas config export --pipeline kpops --style full --output kpops_pipeline.yaml
+The following command needs no run YAML. Replace paths and uppercase
+source-metadata placeholders with the exact reference manifest values; the
+source URL must identify the actual gene-location resource over HTTPS. The
+Ensembl declaration describes column one; it does not convert identifiers.
 
+```console
 postgwas pipeline \
   --modules kpops \
   --vcf study_GRCh37.vcf.gz \
   --magma-ld-reference /path/to/postgwas-resources/magma/functional_mapping/base/ld_reference/g1000_eur/g1000_eur \
   --gene-location-file reference/PoPS_GRCh37_strand_aware.loc \
+  --magma-positional-gene-id-type ensembl \
+  --magma-positional-source-name GENE_LOCATION_SOURCE \
+  --magma-positional-source-version SOURCE_RELEASE \
+  --magma-positional-source-url https://example.org/GENE_LOCATION_SOURCE_RECORD \
+  --magma-positional-context GENE_LOCATION_CONTEXT \
   --kpops-gene-annotation-file /path/to/postgwas-resources/pops/GRCh37_gene_annot_jun10.txt \
   --kernel-matrix-prefix /path/to/postgwas-resources/kpops/kernels/GRCh37/pops_features_standardized_linear \
   --kpops-genome-build GRCh37 \
   --dataset-id STUDY \
-  --output-directory results \
-  --run-config kpops_pipeline.yaml
+  --output-directory results
 ```
+
+To keep the same settings in YAML instead, export
+`postgwas config export --pipeline kpops --style full --output kpops_pipeline.yaml`,
+edit the required inputs and positional mapping declarations, and provide it
+with `--run-config`. An unedited export does not supply study-specific resources.
 
 Pipeline mode runs formatter and MAGMA first, then supplies the validated MAGMA prefix to K-POPS. The prepared gene-location reference must use the same GRCh37 Ensembl gene universe as the K-POPS annotation, with columns `gene_id chromosome start end strand` and an optional symbol. PostGWAS requires strand to be `+` or `-`; the upstream K-POPS `Ensembl.hg19.gene.loc` instead contains a numeric TSS in column five and is not directly compatible. An explicitly audited preparation may derive `+` when the source TSS equals START and `-` when it equals END, but must reject ambiguous or non-endpoint TSS values and preserve all source genes and coordinates. An NCBI/Entrez location file is not compatible with this kernel. Installation provides the pinned `k-pops.py` command. The annotation, kernel prefix, and declared build must be supplied explicitly through the corresponding CLI options or a run configuration; PostGWAS has no machine-specific data-resource defaults.
 

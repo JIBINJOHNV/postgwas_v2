@@ -7,22 +7,28 @@ identity, schema, and effect-allele convention as well as the filename.
 ## Input boundary
 
 Harmonisation accepts raw GWAS summary statistics together with an explicit
-sample sheet, run configuration, resources, and output location. Column roles,
+sample sheet, reference resources, and output location; a supplied run
+configuration is optional when the packaged choices are appropriate. Column roles,
 study design, sample-size information, and permitted transformations must be
 declared and validated rather than inferred silently.
 
 Downstream commands commonly require:
 
-- a harmonised GWAS-VCF;
+- a PostGWAS-harmonised GWAS-VCF or the module's documented upstream artifact;
 - a stable dataset identifier;
 - an output directory;
-- a resolved run configuration;
+- resolved settings, from packaged defaults plus supported YAML/CLI overrides;
 - module-specific reference data compatible with the input genome build and
   population requirements.
 
 Use standalone command help to identify inputs that must be supplied directly.
 Pipeline help hides artifacts created by preceding steps and continues to show
 external resources that the workflow cannot create.
+
+Not every direct command accepts a `--run-config` file. In particular,
+standalone Manhattan and pathway enrichment currently expose no such option.
+This does not remove their validation requirements; use their documented CLI
+inputs and see [Configuration](configuration.md) for the supported boundaries.
 
 ### PostGWAS-origin check for study VCFs
 
@@ -114,9 +120,17 @@ Before reusing an output, verify:
 
 ## Standalone and pipeline consistency
 
-For standalone commands, provide every required input explicitly. In pipeline
-mode, PostGWAS supplies files created by preceding stages; external references
-and study-specific inputs must still be configured by the user.
+For standalone commands, supply every required artifact through the interface
+that command supports. In pipeline mode, PostGWAS supplies files created by the
+selected preceding stages; external references and study-specific inputs must
+still be configured by the user. Both modes apply module-specific validation.
+Pipeline orchestration does not turn an incompatible upstream result into a
+compatible one.
+
+The producing method matters. For example, the single-cell LDSC route uses
+formatted LDSC input rather than MAGMA results, and fine-mapping has different
+SuSiE/FINEMAP tables. Follow the [method-dependent plan](pipeline-workflow.md#how-the-execution-order-is-decided)
+instead of treating every module as a consecutive link in one chain.
 
 ## Related pages
 

@@ -2,8 +2,13 @@
 
 PostGWAS supports both standalone module commands and a pipeline command. Use a
 standalone command when you already have that module's required input artifacts.
-Use the pipeline when PostGWAS should run the required preceding steps for one
-or more final analyses.
+Use the pipeline when PostGWAS should run the registered preceding steps for one
+or more final analyses. Pipeline mode is an orchestration choice, not a different
+statistical method or an instruction to run every module.
+
+For a complete connected example, start with [Quick Start](../getting-started/quick-start.md).
+For the same MAGMA analysis with manually supplied intermediates, see the
+[direct-mode comparison](running-modules-independently.md#example-magma-with-and-without-pipeline-orchestration).
 
 ## Harmonisation comes first
 
@@ -13,9 +18,15 @@ Raw summary statistics are prepared with the standalone harmonisation command:
 postgwas harmonisation --help
 ```
 
-Harmonisation is not currently a pipeline-selectable step. Complete it first,
-validate the resulting GWAS-VCF, and then provide that VCF to downstream
-standalone commands or to `postgwas pipeline`.
+Harmonisation is not currently a pipeline-selectable step. Complete it first
+when starting from raw data, then provide its validated study VCF to downstream
+commands. An existing compatible PostGWAS-harmonised VCF can be used directly;
+an arbitrary GWAS-VCF cannot. The entry check requires PostGWAS provenance,
+the supported build declaration, one sample, an index, and the configured field
+contract. Read [Input and Output Contracts](input-output-contracts.md).
+
+Pathway enrichment is also standalone-only: it starts from a gene list, not the
+pipeline study-VCF interface.
 
 ## Select final analyses
 
@@ -23,7 +34,11 @@ Pipeline targets describe the results you want, not every prerequisite you
 expect to run. For example:
 
 ```console
-postgwas pipeline --modules finemap --help
+postgwas pipeline \
+  --modules finemap \
+  --clumping-methods standard \
+  --finemap-method susie \
+  --help
 ```
 
 PostGWAS validates the selected targets and shows their execution order. Shared
@@ -31,28 +46,54 @@ preceding steps normally run once. Formatting before imputation and formatting
 the resulting VCF for downstream analysis are separate steps because they use
 different data.
 
-The contextual help page shows the actual steps and options for the selected
-target. Inspect it before starting a run.
+The contextual help page shows the steps and options for the selected methods.
+Fine-mapping first asks for workflow choices when they are not explicit; include
+both clumping and fine-mapping method choices to inspect that concrete plan.
+Help inspects the interface and plan, not the contents of your study or references.
+
+You supply the PostGWAS study VCF, dataset ID, output directory, external
+references, and study-specific choices. The pipeline supplies intermediate
+artifacts created by its selected upstream stages and hides those input options
+from contextual help. It does not download missing reference panels or silently
+replace them with a different build or ancestry.
 
 ## How the execution order is decided
 
-Each target's registered dependencies are expanded recursively and cycles are
-rejected. The resulting steps are then emitted in a fixed order:
+The planner resolves method-dependent prerequisites, expands them recursively,
+rejects unavailable targets or cycles, and produces a deterministic execution
+order. There is no mandatory all-module chain. Examples without optional
+workflow switches are:
 
-1. filtering;
-2. formatting and imputation, followed by an internal post-imputation filtering
-   step when filtering and imputation are both active;
-3. LD-block annotation;
-4. formatting for downstream tools;
-5. the analysis modules;
-6. Manhattan plotting;
-7. the GWAS-VCF QC summary.
+| Requested result | Relevant plan |
+|---|---|
+| `magma` | `formatter → magma` |
+| `pops` | `formatter → magma → pops` |
+| `heritability` or `mixer` | `formatter → selected target` |
+| `ld_clump` with `standard` only | `ld_clump`; no LD-block annotation |
+| `ld_clump` with `region` | `annot_ldblock → ld_clump` |
+| `ld_clump` with `cojo-slct` | `formatter → ld_clump` |
+| `single_cell` with `magma_celltype` or `scdrs` | `formatter → magma → single_cell` |
+| `single_cell` with `ldsc_celltype` only | `formatter → single_cell` |
 
-Step directories are numbered by their position in the plan, so the same module
-can appear more than once with different numbers, and a different target set
-produces different numbers. For `--modules flames` the plan is
-`annot_ldblock`, `formatter`, `ld_clump`, `magma`, `magmacovar`, `pops`,
-`finemap`, `flames`.
+Combined clumping methods combine their prerequisites. Fine-mapping requires
+standard clumping for its pipeline locus artifact and an engine-specific
+formatter input. Selecting region pruning adds LD-block annotation; selecting
+COJO clumping changes where its formatter input is needed. Do not use a fixed
+diagram to infer the order of every fine-mapping combination.
+
+Filtering, imputation, plotting, and QC appear only when the selected targets or
+switches request them. The planner can repeat formatting around imputation
+because the post-imputation data need new downstream inputs. Shared prerequisites
+are otherwise scheduled once where compatible.
+
+Imputation also re-harmonises its generated statistics internally, so selecting
+it requires the full harmonisation resources as well as the PRED-LD reference.
+The fact that public `harmonisation` is not a selectable pipeline target does
+not remove those internal requirements.
+
+Step directories are numbered by position in this resolved plan, not by a
+permanent module number. A different target or method selection can therefore
+change both directory numbers and required references.
 
 ## Optional workflow stages
 
@@ -75,11 +116,14 @@ before imputation and a distinct post-imputation filtering stage. Always inspect
 the displayed plan rather than assuming that a command-line option maps to only
 one physical step.
 
-`--apply-filter` cannot currently be combined with a target whose plan also
-defines a genome-build option — this includes `finemap`, `ld_clump`,
-`qc_summary`, `caldera`, `flames`, `mixer`, `gcta_cojo`, and `gcta_gene`. Run
-`postgwas sumstat_filter` as a separate step and pass the filtered VCF to the
-pipeline instead.
+There is a current CLI-composition limitation: adding `--apply-filter` to
+`ld_clump`, or to `finemap` including explicit standard/SuSiE selection, can
+fail before analysis with an argparse conflict for `--remove-mhc` /
+`--no-remove-mhc`. This is not a general prohibition on combining filtering
+with any module that has a genome-build setting; the `gcta_cojo` and `qc_summary`
+help combinations do construct successfully. For the affected routes, run
+`postgwas sumstat_filter` separately and pass its validated filtered VCF to the
+pipeline. This documentation workaround does not fix the parser defect.
 
 ## Export the matching configuration
 
@@ -92,8 +136,10 @@ postgwas config export \
   --output finemap_pipeline.yaml
 ```
 
-Review the exported module order and complete all required resource paths before
-running the analysis.
+Review the exported method selections and complete all required resource paths
+before running the analysis. Continue to name the requested targets with
+`--modules`; exporting settings is not a run, a resource download, or proof of
+input readiness.
 
 ## Common input and resource validation
 
@@ -121,11 +167,17 @@ a startup pass as evidence of scientific compatibility.
 
 ## Execute the plan
 
-A typical configured downstream run has the following shape:
+A configured fine-mapping run has the following shape after the exported YAML
+has been edited with all required references. This example explicitly selects
+standard clumping and SuSiE, so the configuration must supply the prepared
+pairwise-LD reference for standard clumping and a matching PLINK reference for
+SuSiE, together with the compatible build/population settings:
 
 ```console
 postgwas pipeline \
   --modules finemap \
+  --clumping-methods standard \
+  --finemap-method susie \
   --vcf study.vcf.gz \
   --dataset-id STUDY \
   --output-directory results \

@@ -1,70 +1,165 @@
 # Quick Start
 
-PostGWAS has two distinct entry points. Raw GWAS summary statistics first go
-through the standalone `harmonisation` command. The downstream `pipeline`
-starts from the resulting harmonised GWAS-VCF; it does not ingest the original
-table directly.
+This walkthrough takes one study from raw summary statistics to a QC assessment
+and positional MAGMA gene-association results. It uses the same dataset name and
+output paths throughout; no example data or references are downloaded by these
+analysis commands.
 
-## 1. Inspect the current interfaces
-
-```console
-postgwas harmonisation --help
-postgwas pipeline --help
-postgwas config --help
+```text
+Raw summary statistics + studies.csv
+  → harmonisation → PostGWAS GWAS-VCF
+                      ├─ qc → report-only assessment
+                      └─ pipeline --modules magma → formatter → MAGMA
 ```
 
-Do this with the exact checkout or installed version you will run.
+The example downstream analysis uses GRCh37, a European LD reference, and the
+NCBI37.3 Entrez gene-location file, matching the packaged positional MAGMA
+configuration. Use it only when these choices are appropriate for the study.
+Other builds, ancestries, and gene annotations need their matching references
+and configuration; do not relabel a reference to make it fit the example.
 
-## 2. Prepare a harmonisation sample sheet
+## 1. Install and prepare the inputs
 
-Create one row per dataset. At minimum, map the input file, dataset identifier,
-coordinates, effect and non-effect alleles, effect statistic, P value, allele
-frequency, imputation quality, sample-size information, and trait type. Some
-fields can be supplied as constants or external lookup files; the accepted
-combinations are described in [Input Data](../reference/input-data.md).
+Complete [Installation](installation.md) and activate the installed environment.
+Before running this example, replace the following paths with your real inputs:
 
-Repository examples are available at:
+| Example path | What must be present |
+|---|---|
+| `studies.csv` | A reviewed version-2 sample sheet containing a row whose `dataset_id` is `STUDY` and whose input path points to the real study file |
+| `reference/harmonisation/` | The configured build-check, FASTA, dbSNP, frequency, annotation, and chain resources for the input and output builds |
+| `reference/GRCh37_EUR_reference` | A compatible PLINK prefix with `.bed`, `.bim`, and `.fam` companions; the BIM identifiers must match the formatter's selected identifier convention |
+| `reference/NCBI37.3.gene.loc` | The NCBI37.3 MAGMA gene-location annotation with Entrez gene IDs |
+
+The [resource setup guide](resource-setup.md) explains what the software installer
+does not provide. These are placeholders, not a bundled demonstration dataset.
+
+## 2. Prepare the sample sheet
+
+Use one row per study and map the actual source columns. Declare the coordinate
+and allele columns, effect estimate or Z score, P-value representation, exactly
+one study-frequency source, and the real sample-size sources. Quantitative and
+case-control studies have different sample-size requirements. Do not invent
+case counts, control counts, allele frequencies, or imputation-quality values.
+
+Repository templates are available at:
 
 ```text
 examples/configs/harmonisation/sample_sheet_quantitative.csv
 examples/configs/harmonisation/sample_sheet_case_control.csv
-examples/configs/harmonisation/run_config.yaml
 ```
 
-Copy an example into your project and replace all study-specific values. Do not
-run an example unchanged against unrelated data.
+Copy the appropriate template into `studies.csv`, change its dataset ID to
+`STUDY`, and replace all example values. Relative input paths are resolved from
+the sample sheet's directory. Follow the [sample-sheet contract](../harmonisation/sample-sheet.md)
+for INFO-source choices, external sources, missing statistics, and accepted
+column combinations. The templates map study INFO; if your study has no internal
+or external INFO source, the command requires an explicit `--fixed-info` choice,
+recorded as user-assigned rather than measured quality. Do not leave an INFO
+column mapped when it does not exist. A sample sheet is not a YAML run configuration.
 
-## 3. Validate, then harmonise
-
-Use the exact syntax printed by `postgwas harmonisation --help`. The
-harmonisation configuration and sample sheet are separate inputs. Resolve all
-validation errors before starting a large run, then inspect the dataset-level
-QC and rejection reports before using the GWAS-VCF downstream.
-
-## 4. Configure downstream analyses
-
-The pipeline configuration selects targets and supplies module settings. Check
-the resolved configuration before execution:
+## 3. Harmonise the study
 
 ```console
-postgwas config validate --config /absolute/path/to/pipeline.yaml
-postgwas config show --module filtering
+postgwas harmonisation \
+  --sample-sheet studies.csv \
+  --dataset-id STUDY \
+  --resource-directory reference/harmonisation \
+  --output-directory results/harmonisation \
+  --validate
 ```
 
-The planner expands requested targets into their registered prerequisites. For
-example, fine-mapping requires formatted inputs and LD clumping; the plan may
-therefore contain stages that were not named directly.
+Harmonisation is a standalone preparation command, not a pipeline target. It
+validates and prepares each dataset, processes chromosomes, then merges and
+assesses the results. It can reject variants; it does not promise to preserve
+every input row. Build conversion may also lose records that cannot be lifted.
+`--dataset-id STUDY` selects that sample-sheet row; omit it to process all rows.
+The optional `--validate` used here compares the original study with its
+same-build final VCF and records concordance evidence after harmonisation.
 
-## 5. Run from the harmonised GWAS-VCF
+After a successful run, inspect:
 
-Follow the live `postgwas pipeline --help` interface to supply the harmonised
-VCF, dataset identifier, output directory, resources, configuration, and target
-modules. Before launching, verify genome build, ancestry, allele convention,
-sample-size definition, and external-tool availability.
+- `results/harmonisation/STUDY/harmonisation/STUDY_harmonisation_report.html`;
+- the dataset's `rejected/` records and `qc_summary/STUDY_reject_reasons.tsv`;
+- the run-level summary and HTML report under
+  `results/harmonisation/run_metadata/`.
 
-## 6. Review the run as a scientific record
+With the packaged output layout, the GRCh37 VCF for the next steps is:
 
-Do not interpret only the final association table or plot. Retain the resolved
-configuration, canonical log, commands, tool versions, stage summaries,
-exclusion counts, and failure reports. See [Logging and Reproducibility](../core/logging-and-reproducibility.md)
-and [Output Structure](../reference/output-structure.md).
+```text
+results/harmonisation/STUDY/harmonisation/STUDY_GRCh37_merged.vcf.gz
+```
+
+Keep its index beside it. Only continue after the required outputs and
+completion state validate. Downstream study-VCF commands require the PostGWAS
+provenance declarations; an arbitrary GWAS-VCF is not interchangeable. Do not
+add headers manually to bypass that boundary. See [input and output contracts](../core/input-output-contracts.md).
+
+## 4. Review QC without changing the VCF
+
+```console
+postgwas qc \
+  --vcf results/harmonisation/STUDY/harmonisation/STUDY_GRCh37_merged.vcf.gz \
+  --dataset-id STUDY \
+  --output-directory results/qc
+```
+
+Open `results/qc/reports/STUDY_GRCh37_qc_report.html` and review
+the assessed input, rule counts, missing values, and frequency/INFO provenance.
+QC reports which records satisfy the configured rules but **does not filter the
+input VCF**. This example therefore passes the same VCF to MAGMA below.
+
+If your analysis requires exclusion rules, run [sumstat filtering](../modules/filtering.md)
+explicitly, inspect its retention evidence, and use its validated filtered VCF
+instead. Do not choose thresholds only to make a later analysis succeed.
+
+## 5. Run MAGMA in pipeline mode
+
+Inspect the selected plan first:
+
+```console
+postgwas pipeline --modules magma --help
+```
+
+For this target the plan is `formatter → magma`. PostGWAS generates and passes
+the SNP-location and P-value/sample-size tables; you still supply both external
+references:
+
+```console
+postgwas pipeline \
+  --modules magma \
+  --vcf results/harmonisation/STUDY/harmonisation/STUDY_GRCh37_merged.vcf.gz \
+  --magma-ld-reference reference/GRCh37_EUR_reference \
+  --gene-location-file reference/NCBI37.3.gene.loc \
+  --resolve-variants-to-reference \
+  --dataset-id STUDY \
+  --output-directory results/magma_pipeline
+```
+
+Here `--resolve-variants-to-reference` explicitly checks formatter IDs against
+the BIM identifier field and retains exact matches under the configured overlap
+policy. It is not a coordinate liftover or a substitute for compatible alleles,
+build, and ancestry. Review the reported overlap and exclusions before
+interpreting the gene results.
+
+The pipeline writes numbered step directories. Consult the MAGMA
+[outputs and interpretation](../modules/magma.md#outputs) for the primary gene
+table, native results, report, and exclusions. A gene-set file is not needed for
+this gene-only example; competitive gene-set analysis is a separate option with
+its own gene-ID compatibility requirements.
+
+## 6. Choose the next analysis or a different execution mode
+
+- To run exactly the same MAGMA steps yourself, use the
+  [paired direct-mode recipe](../core/running-modules-independently.md#example-magma-with-and-without-pipeline-orchestration).
+- To combine targets or select other engines, read
+  [Pipeline Workflow](../core/pipeline-workflow.md). Dependencies depend on the
+  selected method, not only the module name.
+- For reusable settings, read [Configuration](../core/configuration.md). A run
+  YAML can hold analysis choices and reference paths where the command supports
+  it; the sample sheet still describes the raw study.
+- Before archiving or rerunning, review [Output Structure](../reference/output-structure.md)
+  and [Logging and Reproducibility](../core/logging-and-reproducibility.md).
+
+If a step fails, stop at the first error and follow
+[Troubleshooting](../help/troubleshooting.md). File existence alone is not a
+successful or resumable analysis.

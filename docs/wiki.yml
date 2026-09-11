@@ -57,6 +57,10 @@ wiki:
       slug: Harmonisation-Configuration
       source: docs/modules/harmonisation/configuration.md
       section: Harmonisation
+    - title: Harmonisation Workflow and Policy Reference
+      slug: Harmonisation-Policies
+      source: docs/wiki/harmonisation/policies.md
+      section: Harmonisation
     - title: How Harmonisation Processes Your Data
       slug: Harmonisation-Processing-Order
       source: docs/wiki/harmonisation/processing-order.md
@@ -108,6 +112,10 @@ wiki:
     - title: GCTA Gene Analysis
       slug: GCTA-Gene-Analysis
       source: docs/wiki/modules/gcta-gene.md
+      section: Analysis Modules
+    - title: GCTA-COJO
+      slug: GCTA-COJO
+      source: docs/modules/gcta_cojo/README.md
       section: Analysis Modules
     - title: MAGMAcovar
       slug: MAGMAcovar

@@ -6,7 +6,8 @@ PostGWAS has three separate readiness layers:
 2. third-party command-line programs used by selected modules; and
 3. genome-build-, population-, and method-specific scientific resources.
 
-The complete Mamba installer completes and verifies the first two layers.
+The complete Mamba installer installs and checks the first two layers. A
+successful installation is not a test of every analysis on your study data.
 Scientific resources remain explicit inputs because build, ancestry, release,
 allele convention, credentials, and licensing differ by analysis. A module is
 ready only after every item in its row of the
@@ -46,10 +47,12 @@ Python 3.12 or later.
 
 ## Install the complete software stack
 
-Clone the repository and run this same command from its root on Apple-silicon
-macOS or glibc Linux x86-64:
+After installing and initialising Miniforge with Mamba, clone the repository
+and run the installer on Apple-silicon macOS or glibc Linux x86-64:
 
 ```console
+git clone https://github.com/JIBINJOHNV/postgwas_v2.git
+cd postgwas_v2
 bash tools/setup/install_postgwas.sh \
   --all-tools \
   --name postgwas
@@ -123,8 +126,9 @@ installer places these runtimes under `$CONDA_PREFIX/share/postgwas/environments
   in the main environment and dispatch through Rosetta automatically.
 
 Combining these dependency sets with the main single-cell and numerical stack
-would make the environment inconsistent. Isolation is an installation detail,
-not a second user activation step.
+would make the environment inconsistent. This is one user-facing activation,
+not one dependency environment. Isolation is an installation detail, not a
+second user activation step.
 
 Each created environment clears inherited `PYTHONPATH` and disables per-user
 Python site packages. The installation verifier confirms that PostGWAS,
@@ -229,16 +233,19 @@ population must agree with the study.
 
 | Module or engine | Software status after `--all-tools` | Scientific resources or access |
 |---|---|---|
-| `harmonisation` | bcftools, tabix, and the liftover plugin installed | Reference FASTA/index, dbSNP and frequency VCFs/indexes, chain files, and configured build-check files |
+| `harmonisation` | bcftools, tabix, and the liftover plugin installed | Reference FASTA/index, dbSNP and frequency resources/indexes, GFF annotation, chain files, and configured build-check files |
 | `sumstat_filter`, `formatter`, `qc` | Installed | Harmonised GWAS-VCF; formatter targets may require downstream metadata |
 | `annot_ldblock` | Installed | Build- and population-matched LD-block BED files |
-| `ld_clump` | Installed | Indexed population-specific pairwise-LD tables and LD blocks |
-| `imputation` (`pred_ld`) | Installed | PRED-LD reference panel matching build and ancestry |
+| `ld_clump` (`standard`) | Installed | Prepared manifest-validated, indexed pairwise-LD reference and variant inventories |
+| `ld_clump` (`region`) | Installed | Population-specific LD-block annotation in the VCF, or BED files for pipeline preparation |
+| `ld_clump` (`cojo-slct`) | GCTA installed | Matching PLINK BED/BIM/FAM reference; see the method-specific clumping guide |
+| `imputation` (`pred_ld`) | Installed | Matching PRED-LD reference plus the full harmonisation resource tree, because imputed output is re-harmonised |
 | `manhattan` | R and plotting packages installed | Harmonised GWAS-VCF |
-| `finemap` (`susie`) | PLINK 1.9, R, and `susieR` installed | Matching PLINK genotype reference |
-| `finemap` (`finemap`) | PLINK 2, BGENIX, LDstore 2, and FINEMAP 1.4.2 installed | Matching PLINK genotype reference |
+| `finemap` (`susie`) | PLINK 1.9, R, and `susieR` installed | Matching PLINK genotypes; pipeline mode also needs the standard-clumping pairwise-LD bundle |
+| `finemap` (`finemap`) | PLINK 2, BGENIX, LDstore 2, and FINEMAP 1.4.2 installed | Matching PLINK genotypes; pipeline mode also needs the standard-clumping pairwise-LD bundle |
 | `magma`, `magmacovar`, single-cell MAGMA | MAGMA 1.10 installed | PLINK LD reference, gene locations, and analysis-specific gene sets/covariates |
-| `gcta_cojo`, `gcta_gene` | GCTA installed | Matching PLINK reference, gene list, and selected GMT/set files |
+| `gcta_cojo` | GCTA installed | Matching PLINK reference and method-specific SNP lists when required |
+| `gcta_gene` | GCTA installed | Matching PLINK reference; gene coordinates for gene tests or GMT conversion, a native set list or GMT for set tests, and no gene list for fixed-segment tests |
 | `heritability`, single-cell LDSC | Isolated CBIIT LDSC installed | Matching LD scores, regression weights, HapMap3 alleles, and optional `.ldcts` resources |
 | `pops` | Packaged module and dependencies installed | PoPS feature chunks, row/column files, and gene annotation |
 | `kpops` | Pinned `k-pops.py` installed | K-POPS kernel and gene annotation matching the MAGMA/PoPS build |
@@ -332,3 +339,10 @@ are true:
 Configuration validation alone is not an end-to-end installation test. Never
 interpret a result until the module's required outputs, QC, log, and completion
 status all confirm success.
+
+## Next steps
+
+1. [Prepare the references required by your selected analyses](resource-setup.md).
+2. [Follow the connected harmonisation, QC, and MAGMA tutorial](quick-start.md).
+3. If a check fails, use [Troubleshooting](../help/troubleshooting.md) before
+   starting a full analysis.

@@ -3452,9 +3452,12 @@ policies:
       help: |-
         What it does: Chooses whether the p-value is read as one-sided or two-sided when a
           standard error is worked back out of it.
-        When it applies: chromosome step 09 (standard error from effect size and p-value), and
-          only when the study supplies no standard-error column; if one is present the step
-          derives nothing.
+        When it applies: chromosome step 08 (standard error from effect size and p-value),
+          after exact recovery from supplied Z has been attempted. It is used when no SE
+          column exists, or for unresolved null cells in an existing SE column when
+          pvalue.derive_partial_missing_se is true. Populated study-supplied and Z-derived
+          SE values are preserved. Explicit approximation for a literal p=0 follows
+          pvalue.zero_missing_se separately, including when partial-SE recovery is disabled.
         Values:
           2 - two-sided: the Z score is the normal tail quantile of p/2. Correct for GWAS, where
             the p-value covers effects in either direction.
