@@ -1,6 +1,6 @@
-# Scientific Considerations
+# Analysis assumptions and limitations
 
-PostGWAS coordinates methods with different scientific assumptions. A command
+PostGWAS coordinates methods with different assumptions. A command
 that completes successfully is not sufficient evidence that its inputs and
 reference data were compatible.
 
@@ -38,13 +38,13 @@ specific method and record them with the run.
 Beta coefficients, odds ratios, Z scores, standard errors, raw P values,
 `-log10(P)`, and `-ln(P)` are distinct representations. Declare the input type;
 do not rely on magnitude-based guessing. Treat transformations and reconstructed
-statistics as scientific decisions that must appear in QC and provenance.
+statistics as analysis decisions that must appear in QC and provenance.
 
 ## Filtering and missingness
 
 MAF, INFO, P-value, MHC, indel, palindromic-variant, and allele-frequency
-discordance filters can change the scientific population represented by the
-data. Use the resolved YAML values, inspect removal counts by reason, and do not
+discordance filters can change the set of variants retained for analysis.
+Use the resolved YAML values, inspect removal counts by reason, and do not
 describe a virtual QC subset as a newly filtered file.
 
 ## Interpreting downstream results
@@ -54,4 +54,3 @@ Fine-mapping posterior probabilities depend on the locus, LD matrix, model, and
 variant set. Gene and pathway results depend on gene mapping, covariates, gene
 sets, LD reference, and multiple-testing procedure. Cross-trait estimates can
 be unstable when heritability, overlap assumptions, or trait metadata are weak.
-

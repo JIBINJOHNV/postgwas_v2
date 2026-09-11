@@ -1,4 +1,4 @@
-# Scientific References
+# Method references
 
 Module pages contain method-specific references and interpretation cautions.
 Core primary sources include:

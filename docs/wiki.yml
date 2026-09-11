@@ -37,7 +37,7 @@ wiki:
       slug: Logging-and-Reproducibility
       source: docs/wiki/core/logging-and-reproducibility.md
       section: Core Concepts
-    - title: Scientific Considerations
+    - title: Analysis Assumptions and Limitations
       slug: Scientific-Considerations
       source: docs/wiki/core/scientific-considerations.md
       section: Core Concepts
@@ -173,7 +173,7 @@ wiki:
       slug: Validation-Reference
       source: docs/wiki/reference/validation.md
       section: Reference
-    - title: Scientific References
+    - title: Method References
       slug: Scientific-References
       source: docs/wiki/reference/scientific-references.md
       section: Reference

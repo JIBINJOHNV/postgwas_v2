@@ -75,7 +75,7 @@ branches, conditional dependencies and current limitations.
 - [Pipeline Input Validation](core/pipeline-input-validation.md)
 - [Input and Output Contracts](core/input-output-contracts.md)
 - [Logging and Reproducibility](core/logging-and-reproducibility.md)
-- [Method and Data Considerations](core/scientific-considerations.md)
+- [Analysis Assumptions and Limitations](core/scientific-considerations.md)
 - [Running Modules Independently](core/running-modules-independently.md)
 
 ### Harmonisation

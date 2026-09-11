@@ -406,7 +406,7 @@ commands, outputs, assumptions and limitations.
 Cite the methods, software and reference datasets used in your analysis.
 
 [Method references](docs/wiki/reference/scientific-references.md) ·
-[Method and data considerations](docs/wiki/core/scientific-considerations.md)
+[Analysis assumptions and limitations](docs/wiki/core/scientific-considerations.md)
 
 ## Development and licensing
 
