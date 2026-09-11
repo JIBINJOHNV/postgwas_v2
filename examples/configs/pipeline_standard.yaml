@@ -30,6 +30,8 @@ modules:
     info_min: 0.8
   ld_annotation:
     enabled: true
+    inputs:
+      ld_region_dir: /path/to/build_and_population_ld_blocks
   ld_clumping:
     enabled: true
   fine_mapping:

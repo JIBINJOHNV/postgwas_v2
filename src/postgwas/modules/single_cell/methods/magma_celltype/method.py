@@ -142,7 +142,7 @@ class MagmaCelltypeMethod:
     def prepare_pipeline_args(self, args: argparse.Namespace) -> None:
         return None
 
-    def preflight_pipeline(self, args: argparse.Namespace, configuration) -> None:
+    def preflight_pipeline(self, args: argparse.Namespace, configuration) -> dict:
         module = configuration.modules.single_cell
         method = module.magma_celltype
         covariates = require_nonempty_file(
@@ -154,7 +154,7 @@ class MagmaCelltypeMethod:
             module,
             configuration.modules.magmacovar,
         )
-        validate_magma_celltype_covariates(
+        validated = validate_magma_celltype_covariates(
             covariates,
             average_property=method.average_property,
             magmacovar_config=configuration.modules.magmacovar,
@@ -164,6 +164,7 @@ class MagmaCelltypeMethod:
             "MAGMA executable",
             error_type=SingleCellError,
         )
+        return validated
 
     def preflight_direct(
         self,
@@ -227,11 +228,12 @@ class MagmaCelltypeMethod:
             engine_directory=paths["engine_directory"],
             use_case=preflight.use_case,
         )
+        magmacovar_result = run_magma_covar_direct(
+            engine_args,
+            configuration=engine_configuration,
+        )
         gene_property_results = Path(
-            run_magma_covar_direct(
-                engine_args,
-                configuration=engine_configuration,
-            )
+            magmacovar_result["raw_results"]
         ).expanduser().resolve()
         digest = configuration_digest(
             _completion_configuration(configuration, engine_configuration)

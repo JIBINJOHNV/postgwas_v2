@@ -10,7 +10,14 @@ from pydantic import ValidationError
 import yaml
 
 from postgwas.config import load_configuration
+from postgwas.cli.common import get_ldsc_common_parser
 from postgwas.core.errors import ConfigurationError
+from postgwas.core.contracts import RunContext
+from postgwas.core.input_validation import InputValidationSession
+from postgwas.core.validation_reporting import (
+    FileValidationDisplay,
+    write_validation_audit,
+)
 from postgwas.modules.ldsc.cli import build_parser, main as ldsc_main
 from postgwas.modules.ldsc.ldsc_runner import (
     LDSCError,
@@ -18,11 +25,16 @@ from postgwas.modules.ldsc.ldsc_runner import (
     build_munge_sumstats_command,
     extract_ldsc_metrics,
     run_ldsc,
+    validate_reference_files,
 )
 from postgwas.modules.ldsc.service import (
+    LDSCPipelineResources,
+    preflight_ldsc_pipeline,
     resolve_ldsc_configuration,
     run_ldsc_direct,
 )
+from postgwas.pipeline.resource_validation import record_pipeline_resource_validation
+from preflight_support import pipeline_input_vcf_evidence
 
 
 def _write_inputs(root: Path) -> tuple[Path, Path, Path, Path]:
@@ -74,6 +86,90 @@ def _service_args(root: Path, **values) -> Namespace:
     return Namespace(**supplied)
 
 
+def test_pipeline_preflight_validates_exact_ldsc_resources(tmp_path):
+    args = _service_args(tmp_path)
+
+    evidence = preflight_ldsc_pipeline(
+        args,
+        preflight_evidence=pipeline_input_vcf_evidence(),
+    )
+
+    resources = evidence.resources
+    assert isinstance(resources, LDSCPipelineResources)
+    assert resources.reference.merge_alleles == Path(args.merge_alleles).resolve()
+    assert resources.reference.reference_directory == Path(args.ref_ld_chr).resolve()
+    assert resources.reference.weights_directory == Path(args.w_ld_chr).resolve()
+    assert len(resources.reference.required_files) == (
+        resources.configuration.modules.ldsc.chromosomes * 3
+    )
+    identity_paths = {identity.path for identity in resources.file_identities}
+    assert Path(args.merge_alleles).resolve() in identity_paths
+    assert Path(sys.executable).resolve() in identity_paths
+    assert set(resources.reference.required_files).issubset(identity_paths)
+
+
+def test_ldsc_reference_inventory_is_compact_on_screen_and_complete_in_audit(
+    tmp_path, capsys,
+):
+    args = _service_args(tmp_path)
+    configuration = load_configuration()
+    destination = tmp_path / "input_validation.yaml"
+    with InputValidationSession() as session:
+        display = FileValidationDisplay(session, configuration)
+        with session.scope("heritability"):
+            evidence = preflight_ldsc_pipeline(
+                args,
+                preflight_evidence=pipeline_input_vcf_evidence(),
+            )
+            record_pipeline_resource_validation("heritability", evidence)
+        display.flush(report_path=destination)
+        write_validation_audit(
+            {"report_kind": "test", "status": "passed"},
+            session.records,
+            destination,
+        )
+
+    screen = capsys.readouterr().out
+    module = evidence.resources.configuration.modules.ldsc
+    assert "LDSC chromosome reference resources — AVAILABLE — availability only" in screen
+    for label in (
+        "Reference LD-score files",
+        "Reference SNP-count files",
+        "Weight LD-score files",
+        "SNP-count file type",
+        "Physical files checked",
+    ):
+        assert label in screen
+    assert "%d / %d" % (module.chromosomes, module.chromosomes) in screen
+    assert module.reference_layout.m_5_50_suffix in screen
+    unwrapped_screen = "".join(screen.split())
+    assert str(Path(args.ref_ld_chr).resolve()) in unwrapped_screen
+    assert str(Path(args.w_ld_chr).resolve()) in unwrapped_screen
+    assert "Additional files" not in screen
+    assert "1.l2.ldscore.gz" not in screen
+    assert "1.l2.M_5_50" not in screen
+    audit = yaml.safe_load(destination.read_text())
+    audited_paths = {Path(row["path"]) for row in audit["files"]}
+    assert set(evidence.resources.reference.required_files).issubset(audited_paths)
+
+
+def test_pipeline_ldsc_rejects_reference_changed_after_preflight(tmp_path):
+    args = _service_args(tmp_path)
+    evidence = preflight_ldsc_pipeline(
+        args,
+        preflight_evidence=pipeline_input_vcf_evidence(),
+    )
+    Path(args.merge_alleles).write_text(
+        "SNP\tA1\tA2\nrs2\tC\tT\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LDSCError, match="changed after pipeline preflight"):
+        run_ldsc_direct(args, pipeline_resources=evidence.resources)
+
+    assert not Path(args.output_directory).exists()
+
+
 def _fake_ldsc_result(**kwargs):
     prefix = Path(kwargs["output_prefix"])
     module = kwargs["configuration"]
@@ -103,7 +199,9 @@ def _fake_ldsc_result(**kwargs):
         "h2_observed": str(observed),
         "observed_outputs": [str(observed)],
         "observed_metrics": {
-            "h2": "0.20 (0.03)", "intercept": "1.01", "ratio": "0.1",
+            "h2": "0.20 (0.03)",
+            "intercept": "1.01 (0.01)",
+            "ratio": "0.1 (0.02)",
         },
         "h2_liability": None if liability is None else str(liability),
         "liability_outputs": liability_outputs,
@@ -112,11 +210,58 @@ def _fake_ldsc_result(**kwargs):
             if liability is None
             else {
                 "h2": "0.35 (0.05)",
-                "intercept": "1.02 (0.01)",
-                "ratio": "0.2 (0.1)",
+                "intercept": "1.01 (0.01)",
+                "ratio": "0.1 (0.02)",
             }
         ),
     }
+
+
+def _fake_ldsc_subprocess(
+    layout,
+    *,
+    observed_intercept: str = "1.01 (0.01)",
+    liability_intercept: str = "1.01 (0.01)",
+    observed_ratio_line: str | None = "Ratio: 0.10 (0.02)",
+    liability_ratio_line: str | None = "Ratio: 0.10 (0.02)",
+):
+    """Return a deterministic subprocess fake for observed/liability tests."""
+    def fake_subprocess_run(command, **_kwargs):
+        output_prefix = Path(command[command.index("--out") + 1])
+        if "--sumstats" in command:
+            Path(str(output_prefix) + layout.munged_sumstats_suffix).write_text(
+                "sumstats\n", encoding="utf-8",
+            )
+            Path(str(output_prefix) + layout.upstream_log_suffix).write_text(
+                "munge complete\n", encoding="utf-8",
+            )
+            return Namespace(returncode=0, stdout="", stderr="")
+
+        liability = output_prefix.name.endswith(
+            layout.liability_prefix_suffix
+        )
+        intercept = (
+            liability_intercept if liability else observed_intercept
+        )
+        ratio_line = (
+            liability_ratio_line if liability else observed_ratio_line
+        )
+        lines = [
+            "Total %s scale h2: %s"
+            % (
+                "Liability" if liability else "Observed",
+                "0.35 (0.05)" if liability else "0.20 (0.03)",
+            ),
+            "Intercept: %s" % intercept,
+        ]
+        if ratio_line is not None:
+            lines.append(ratio_line)
+        Path(str(output_prefix) + layout.upstream_log_suffix).write_text(
+            "\n".join(lines) + "\n", encoding="utf-8",
+        )
+        return Namespace(returncode=0, stdout="", stderr="")
+
+    return fake_subprocess_run
 
 
 def test_packaged_defaults_match_pinned_upstream_ldsc():
@@ -135,6 +280,10 @@ def test_packaged_defaults_match_pinned_upstream_ldsc():
     assert module.print_delete_values is False
     assert module.sample_prevalence is None
     assert module.population_prevalence is None
+    assert (
+        module.sample_prevalence_comparison.warning_absolute_difference
+        == 0.01
+    )
     assert module.population is None
     assert module.genome_build is None
     assert module.chromosomes == 22
@@ -161,16 +310,27 @@ def test_ldsc_configurable_cli_actions_do_not_own_defaults():
         assert "unset" in action.help
 
 
-def test_use_m_5_50_help_displays_canonical_default_in_green():
+def test_not_m_5_50_is_the_only_cli_switch_and_is_off_by_default():
     parser = build_parser()
     action = next(
         item for item in parser._actions
         if item.dest == "ldsc_use_m_5_50"
     )
 
+    assert action.option_strings == ["--not-M-5-50"]
+    assert action.default == argparse.SUPPRESS
     assert "[bold green]Default:[/bold green]" in action.help
-    assert "[green]true[/green]" in action.help
-    assert "Default: true" in parser.format_help()
+    assert "[green]false[/green]" in action.help
+    assert "not used by default" in action.help
+    help_text = parser.format_help()
+    assert "--use-M-5-50" not in help_text
+    assert "--not-M-5-50" in help_text
+    assert "Default: false" in help_text
+    shared_parser = get_ldsc_common_parser()
+    assert vars(shared_parser.parse_args([])) == {}
+    assert shared_parser.parse_args([
+        "--not-M-5-50",
+    ]).ldsc_use_m_5_50 is False
 
 
 def test_direct_cli_requires_every_runtime_input_and_complete_examples(tmp_path):
@@ -191,9 +351,13 @@ def test_direct_cli_requires_every_runtime_input_and_complete_examples(tmp_path)
             "--w-ld-chr", str(weights),
         ])
 
-    assert parser.format_help().count(
-        "--merge-alleles reference/w_hm3.snplist"
-    ) == 2
+    help_text = parser.format_help()
+    assert "Create the LDSC input first:" in help_text
+    assert "Run observed-scale LDSC heritability:" in help_text
+    assert "Run observed- and liability-scale LDSC heritability:" in help_text
+    assert "Export reusable LDSC settings:" in help_text
+    assert "formatted/STUDY_ldsc_input.tsv" in help_text
+    assert "formatted/STUDY_ldsc_input.tsv.gz" not in help_text
 
 
 def test_direct_cli_renders_existing_outputs_as_an_actionable_error(
@@ -238,20 +402,25 @@ def test_direct_cli_renders_existing_outputs_as_an_actionable_error(
 def test_explicit_cli_overrides_module_yaml(tmp_path):
     run_config = tmp_path / "ldsc.yaml"
     run_config.write_text(
-        "minimum_info: 0.8\nn_blocks: 80\nuse_m_5_50: false\n",
+        "minimum_info: 0.8\nn_blocks: 80\nuse_m_5_50: true\n",
         encoding="utf-8",
     )
     configuration = resolve_ldsc_configuration(Namespace(
         run_config=str(run_config),
         ldsc_minimum_info=0.95,
         ldsc_n_blocks=120,
-        ldsc_use_m_5_50=True,
+        ldsc_use_m_5_50=False,
+        ldsc_sample_prevalence_warning_threshold=0.02,
     ))
     module = configuration.modules.ldsc
     assert module.minimum_info == 0.95
     assert module.n_blocks == 120
-    assert module.use_m_5_50 is True
+    assert module.use_m_5_50 is False
     assert module.minimum_maf == 0.01
+    assert (
+        module.sample_prevalence_comparison.warning_absolute_difference
+        == 0.02
+    )
 
 
 def test_direct_cli_values_override_upstream_defaults(tmp_path):
@@ -376,6 +545,38 @@ def test_default_commands_preserve_upstream_data_dependent_options(tmp_path):
         assert option not in h2
 
 
+@pytest.mark.parametrize("use_m_5_50", [True, False])
+def test_reference_validation_requires_selected_m_only_for_reference(
+    tmp_path, use_m_5_50,
+):
+    _, _, reference, weights = _write_inputs(tmp_path)
+    module = load_configuration().modules.ldsc.model_copy(update={
+        "use_m_5_50": use_m_5_50,
+    })
+    layout = module.reference_layout
+    selected_suffix = (
+        layout.m_5_50_suffix if use_m_5_50 else layout.m_suffix
+    )
+    unselected_suffix = (
+        layout.m_suffix if use_m_5_50 else layout.m_5_50_suffix
+    )
+
+    for chromosome in range(1, module.chromosomes + 1):
+        (reference / (str(chromosome) + unselected_suffix)).unlink()
+        assert not (weights / (str(chromosome) + selected_suffix)).exists()
+        assert not (weights / (str(chromosome) + unselected_suffix)).exists()
+
+    assert validate_reference_files(reference, weights, module) == (
+        reference.resolve(), weights.resolve(),
+    )
+
+    missing = reference / ("1" + selected_suffix)
+    missing.unlink()
+    with pytest.raises(LDSCError) as error:
+        validate_reference_files(reference, weights, module)
+    assert str(missing) in str(error.value)
+
+
 def test_service_uses_formatter_returned_sample_prevalence(
     tmp_path, monkeypatch, capsys,
 ):
@@ -394,7 +595,8 @@ def test_service_uses_formatter_returned_sample_prevalence(
 
     assert captured["sample_prevalence"] == 0.25
     assert result["sample_prevalence"] == 0.25
-    assert result["sample_prevalence_source"] == "formatter_return_value"
+    assert result["sample_prevalence_source"] == "gwas_vcf_case_fraction"
+    assert result["sample_prevalence_comparison"] is None
     assert Path(result["h2_observed"]).is_file()
     assert Path(result["h2_liability"]).is_file()
     assert ctx["heritability"] == result
@@ -405,6 +607,9 @@ def test_service_uses_formatter_returned_sample_prevalence(
     assert resolved["modules"]["ldsc"]["population_prevalence"] == 0.01
     assert resolved["modules"]["ldsc"]["population"] is None
     assert resolved["modules"]["ldsc"]["genome_build"] is None
+    assert resolved["modules"]["ldsc"]["sample_prevalence_comparison"] == {
+        "warning_absolute_difference": 0.01,
+    }
 
     screen = capsys.readouterr().out
     for finding in (
@@ -417,7 +622,7 @@ def test_service_uses_formatter_returned_sample_prevalence(
         "Liability-scale h²",
         "0.35 (0.05)",
         "Sample prevalence",
-        "0.25 (formatter-returned value)",
+        "0.25 (GWAS-VCF case fraction)",
         "Population prevalence",
         "Full PostGWAS log",
     ):
@@ -429,9 +634,8 @@ def test_service_uses_formatter_returned_sample_prevalence(
         "Observed-scale h²",
         "Observed intercept",
         "Observed ratio",
-        "Liability-scale h²",
-        "Liability intercept",
-        "Liability ratio",
+        "Liability-scale h² (converted)",
+        "Conversion check",
         "Sample prevalence",
         "Population prevalence",
     )
@@ -441,24 +645,200 @@ def test_service_uses_formatter_returned_sample_prevalence(
     }
     assert len({line.index(":") for line in finding_lines.values()}) == 1
     observed_ratio_index = summary_lines.index(finding_lines["Observed ratio"])
-    liability_ratio_index = summary_lines.index(finding_lines["Liability ratio"])
+    conversion_index = summary_lines.index(finding_lines["Conversion check"])
     assert summary_lines[observed_ratio_index + 1] == ""
-    assert summary_lines[liability_ratio_index + 1] == ""
+    assert summary_lines[conversion_index + 1] == ""
+    assert "Liability intercept" not in screen
+    assert "Liability ratio" not in screen
+    assert "PASS — intercept and ratio unchanged" in screen
     service_log = Path(result["service_log"]).read_text(encoding="utf-8")
     assert "RESULT   ldsc_observed_scale" in service_log
     assert "RESULT   ldsc_liability_scale" in service_log
+    service_lines = service_log.splitlines()
+    liability_index = next(
+        index for index, line in enumerate(service_lines)
+        if "RESULT   ldsc_liability_scale" in line
+    )
+    liability_record = "\n".join(
+        service_lines[liability_index:liability_index + 3]
+    )
+    assert "conversion_of=ldsc_observed_scale.h2" in liability_record
+    assert " intercept=" not in liability_record
+    assert " ratio=" not in liability_record
 
 
-def test_explicit_sample_prevalence_overrides_formatter_return(tmp_path, monkeypatch):
-    args = _service_args(tmp_path, samp_prev=0.3, pop_prev=0.01)
+@pytest.mark.parametrize("override_source", ["cli", "yaml"])
+def test_explicit_sample_prevalence_mismatch_warns_but_retains_override(
+    tmp_path, monkeypatch, capsys, override_source,
+):
+    values = {"samp_prev": 0.5, "pop_prev": 0.01}
+    if override_source == "yaml":
+        run_config = tmp_path / "ldsc.yaml"
+        run_config.write_text("sample_prevalence: 0.5\n", encoding="utf-8")
+        values = {"run_config": str(run_config), "pop_prev": 0.01}
+    args = _service_args(tmp_path, **values)
     monkeypatch.setattr(
         "postgwas.modules.ldsc.service.run_ldsc", _fake_ldsc_result,
     )
     result = run_ldsc_direct(args, {
-        "formatter": {"ldsc": {"sample_prev": 0.25, "trait_type": "binary"}},
+        "formatter": {"ldsc": {
+            "sample_prev": 0.11,
+            "sample_prevalence_aggregation": "median",
+            "sample_prevalence_variants": 1234,
+            "sample_prevalence_minimum": 0.10,
+            "sample_prevalence_maximum": 0.12,
+            "sample_prevalence_case_count_minimum": 1050,
+            "sample_prevalence_case_count_maximum": 1100,
+            "sample_prevalence_control_count_minimum": 8900,
+            "sample_prevalence_control_count_maximum": 8950,
+            "trait_type": "binary",
+        }},
     })
-    assert result["sample_prevalence"] == 0.3
+    assert result["sample_prevalence"] == 0.5
     assert result["sample_prevalence_source"] == "configuration_or_cli"
+    assert result["sample_prevalence_comparison"] == {
+        "matches": False,
+        "exceeds_warning_threshold": True,
+        "provided_sample_prevalence": 0.5,
+        "gwas_vcf_case_fraction": 0.11,
+        "absolute_difference": pytest.approx(0.39),
+        "warning_absolute_difference": 0.01,
+        "liability_scale_requested": True,
+        "gwas_vcf_aggregation": "median",
+        "gwas_vcf_variant_count": 1234,
+        "gwas_vcf_case_fraction_minimum": 0.10,
+        "gwas_vcf_case_fraction_maximum": 0.12,
+        "gwas_vcf_case_count_minimum": 1050,
+        "gwas_vcf_case_count_maximum": 1100,
+        "gwas_vcf_control_count_minimum": 8900,
+        "gwas_vcf_control_count_maximum": 8950,
+    }
+
+    screen = capsys.readouterr().out
+    normalized_screen = " ".join(screen.split())
+    for warning_text in (
+        "COMPLETED WITH SCIENTIFIC WARNINGS",
+        "Sample prevalence warning",
+        "Provided sample prevalence",
+        "0.5",
+        "GWAS-VCF case fraction",
+        "0.11 (median aggregation, 1234 variants)",
+        "Absolute difference",
+        "0.39",
+        "Warning threshold",
+        "0.01",
+        "WARNING — difference is above the configured threshold",
+        "GWAS-VCF case-fraction range",
+        "0.1 to 0.12",
+        "GWAS-VCF case-count range",
+        "1050 to 1100",
+        "GWAS-VCF control-count range",
+        "8900 to 8950",
+        "LDSC WILL USE 0.5 (the provided sample prevalence), NOT 0.11",
+        "If this is intentional, allow the run to continue.",
+        "ensure the YAML sample_prevalence setting is absent or null",
+    ):
+        assert warning_text in normalized_screen
+    assert normalized_screen.count("Sample prevalence warning") == 1
+    assert screen.count("🚨  Important — value selected") == 1
+    assert "LDSC USED 0.5" not in normalized_screen
+    assert "🧠  Action" not in screen
+    service_log = Path(result["service_log"]).read_text(encoding="utf-8")
+    assert "WARNING  ldsc_sample_prevalence_comparison" in service_log
+    assert "provided_sample_prevalence=0.5" in service_log
+    assert "gwas_vcf_case_fraction=0.11" in service_log
+    assert "absolute_difference=0.39" in service_log
+    assert "warning_absolute_difference=0.01" in service_log
+    assert "result=warning_threshold_exceeded" in service_log
+    assert "action='explicit_cli_or_yaml_value_retained;" in service_log
+
+
+@pytest.mark.parametrize(
+    "selected_value,expected_difference,expected_match",
+    (
+        (0.11, 0.0, True),
+        (0.115, 0.005, False),
+        (0.12, 0.01, False),
+    ),
+)
+def test_explicit_sample_prevalence_at_or_below_threshold_is_informational(
+    tmp_path, monkeypatch, capsys,
+    selected_value, expected_difference, expected_match,
+):
+    args = _service_args(
+        tmp_path, samp_prev=selected_value, pop_prev=0.01,
+    )
+    monkeypatch.setattr(
+        "postgwas.modules.ldsc.service.run_ldsc", _fake_ldsc_result,
+    )
+    result = run_ldsc_direct(args, {
+        "formatter": {"ldsc": {
+            "sample_prev": 0.11,
+            "sample_prevalence_aggregation": "median",
+            "trait_type": "binary",
+        }},
+    })
+
+    comparison = result["sample_prevalence_comparison"]
+    assert result["sample_prevalence"] == selected_value
+    assert comparison["matches"] is expected_match
+    assert comparison["absolute_difference"] == pytest.approx(
+        expected_difference
+    )
+    assert comparison["exceeds_warning_threshold"] is False
+    screen = " ".join(capsys.readouterr().out.split())
+    assert screen.count("Sample prevalence comparison") == 1
+    assert "Provided sample prevalence" in screen
+    assert "GWAS-VCF case fraction" in screen
+    assert "difference is at or below the configured threshold" in screen
+    assert "COMPLETED WITH SCIENTIFIC WARNINGS" not in screen
+    service_log = Path(result["service_log"]).read_text(encoding="utf-8")
+    assert "PASS     ldsc_sample_prevalence_comparison" in service_log
+    assert "WARNING  ldsc_sample_prevalence_comparison" not in service_log
+    assert "result=within_warning_threshold" in service_log
+
+
+def test_pipeline_compares_explicit_sample_prevalence_without_liability_run(
+    tmp_path, monkeypatch, capsys,
+):
+    args = _service_args(tmp_path, samp_prev=0.5)
+    monkeypatch.setattr(
+        "postgwas.modules.ldsc.service.run_ldsc", _fake_ldsc_result,
+    )
+
+    result = run_ldsc_direct(args, {
+        "formatter": {"ldsc": {
+            "sample_prev": 0.11,
+            "sample_prevalence_aggregation": "median",
+            "trait_type": "binary",
+        }},
+    })
+
+    comparison = result["sample_prevalence_comparison"]
+    assert comparison["exceeds_warning_threshold"] is True
+    assert comparison["liability_scale_requested"] is False
+    assert result["h2_liability"] is None
+    screen = capsys.readouterr().out
+    assert "Sample prevalence warning" in screen
+    normalized_screen = " ".join(screen.split())
+    assert (
+        "Liability-scale h² WILL NOT RUN because population prevalence "
+        "was not provided"
+    ) in normalized_screen
+
+
+def test_direct_liability_run_has_no_formatter_comparison(
+    tmp_path, monkeypatch, capsys,
+):
+    args = _service_args(tmp_path, samp_prev=0.2, pop_prev=0.01)
+    monkeypatch.setattr(
+        "postgwas.modules.ldsc.service.run_ldsc", _fake_ldsc_result,
+    )
+
+    result = run_ldsc_direct(args)
+
+    assert result["sample_prevalence_comparison"] is None
+    assert "Sample prevalence comparison" not in capsys.readouterr().out
 
 
 def test_pipeline_runner_passes_formatter_result_without_calculating_prevalence(
@@ -468,33 +848,38 @@ def test_pipeline_runner_passes_formatter_result_without_calculating_prevalence(
 
     captured = {}
 
-    def fake_service(args, ctx):
+    def fake_service(args, ctx, **kwargs):
         captured["ctx"] = ctx
+        captured["pipeline_resources"] = kwargs["pipeline_resources"]
         captured["has_sample_override"] = hasattr(args, "samp_prev")
         captured["input"] = args.ldsc_input
-        return {"sample_prevalence_source": "formatter_return_value"}
+        return {"sample_prevalence_source": "gwas_vcf_case_fraction"}
 
     monkeypatch.setattr(
         "postgwas.modules.ldsc.service.run_ldsc_direct", fake_service,
     )
-    args = Namespace(
-        output_directory=str(tmp_path), dataset_id="STUDY", _step_num="04",
+    args = _service_args(tmp_path)
+    args._step_num = "04"
+    evidence = preflight_ldsc_pipeline(
+        args, preflight_evidence=pipeline_input_vcf_evidence(),
     )
-    ctx = {"formatter": {"ldsc": {
-        "ldsc_file": "formatter-returned.tsv", "sample_prev": 0.25,
-    }}}
+    ctx = RunContext(
+        {"formatter": {"ldsc": {
+            "ldsc_file": "formatter-returned.tsv", "sample_prev": 0.25,
+        }}},
+        validations={"heritability": evidence},
+    )
     result = run_heritability_runner(args, ctx)
 
-    assert result == {"sample_prevalence_source": "formatter_return_value"}
-    assert captured == {
-        "ctx": ctx,
-        "has_sample_override": False,
-        "input": "formatter-returned.tsv",
-    }
-    assert args.output_directory == str(tmp_path)
+    assert result == {"sample_prevalence_source": "gwas_vcf_case_fraction"}
+    assert captured["ctx"] is ctx
+    assert captured["has_sample_override"] is False
+    assert captured["input"] == "formatter-returned.tsv"
+    assert captured["pipeline_resources"] is evidence.resources
+    assert args.output_directory == str(tmp_path / "output")
 
 
-def test_population_prevalence_without_formatter_value_fails(tmp_path):
+def test_population_prevalence_without_gwas_vcf_case_fraction_fails(tmp_path):
     args = _service_args(tmp_path, pop_prev=0.01)
     with pytest.raises(LDSCError, match="formatter returned no sample prevalence"):
         run_ldsc_direct(args, {
@@ -545,6 +930,20 @@ def test_constrained_intercept_rejects_two_step_estimator():
 def test_prevalence_must_be_strictly_between_zero_and_one(name, value):
     with pytest.raises(ConfigurationError, match="prevalence"):
         resolve_ldsc_configuration(Namespace(**{name: value}))
+
+
+def test_sample_prevalence_warning_threshold_is_schema_validated(tmp_path):
+    run_config = tmp_path / "invalid_ldsc.yaml"
+    run_config.write_text(
+        "sample_prevalence_comparison:\n"
+        "  warning_absolute_difference: -0.01\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ConfigurationError, match="warning_absolute_difference",
+    ):
+        resolve_ldsc_configuration(Namespace(run_config=str(run_config)))
 
 
 def test_success_without_required_outputs_is_rejected(tmp_path):
@@ -621,6 +1020,139 @@ def test_runner_skips_liability_without_population_prevalence(
     }) in events
 
 
+@pytest.mark.parametrize(
+    "intercept,ratio_line,expected_ratio",
+    (
+        ("1.01 (0.01)", "Ratio: 0.10 (0.02)", "0.10 (0.02)"),
+        (
+            "1.01 (0.01)",
+            "Ratio: NA (mean chi^2 < 1)",
+            "NA (mean chi^2 < 1)",
+        ),
+        ("constrained to 1", None, "N/A"),
+        (
+            "0.99 (0.01)",
+            "Ratio < 0 (usually indicates GC correction).",
+            "Ratio < 0 (usually indicates GC correction).",
+        ),
+    ),
+)
+def test_liability_conversion_preserves_shared_regression_metrics(
+    tmp_path, monkeypatch, intercept, ratio_line, expected_ratio,
+):
+    sumstats, merge, reference, weights = _write_inputs(tmp_path)
+    module = load_configuration().modules.ldsc.model_copy(update={
+        "sample_prevalence": 0.2,
+        "population_prevalence": 0.01,
+    })
+    events = []
+
+    class RecordingLogger:
+        def record(self, *values, **details):
+            events.append((values, details))
+
+    monkeypatch.setattr(
+        "postgwas.core.processes.subprocess.run",
+        _fake_ldsc_subprocess(
+            module.output_layout,
+            observed_intercept=intercept,
+            liability_intercept=intercept,
+            observed_ratio_line=ratio_line,
+            liability_ratio_line=ratio_line,
+        ),
+    )
+    result = run_ldsc(
+        sumstats_tsv=sumstats,
+        output_prefix=tmp_path / "result",
+        merge_alleles=merge,
+        reference_ld_directory=reference,
+        weights_ld_directory=weights,
+        munge_executable="munge_sumstats.py",
+        ldsc_executable="ldsc.py",
+        configuration=module,
+        logger=RecordingLogger(),
+    )
+
+    assert result["observed_metrics"]["h2"] == "0.20 (0.03)"
+    assert result["liability_metrics"]["h2"] == "0.35 (0.05)"
+    assert result["observed_metrics"]["intercept"] == intercept
+    assert result["liability_metrics"]["intercept"] == intercept
+    assert result["observed_metrics"]["ratio"] == expected_ratio
+    assert result["liability_metrics"]["ratio"] == expected_ratio
+    invariant_events = [
+        details for values, details in events
+        if values == ("PASS", "ldsc_liability_conversion_invariant")
+    ]
+    assert invariant_events == [{
+        "result": "intercept_and_ratio_unchanged",
+        "shared_intercept": intercept,
+        "shared_ratio": expected_ratio,
+        "observed_log": result["h2_observed"],
+        "liability_log": result["h2_liability"],
+    }]
+
+
+@pytest.mark.parametrize(
+    "failure_mode", ["intercept", "ratio", "missing_ratios"],
+)
+def test_liability_regression_invariant_failure_stops_before_publication(
+    tmp_path, monkeypatch, failure_mode,
+):
+    args = _service_args(
+        tmp_path, samp_prev=0.2, pop_prev=0.01,
+    )
+    module = load_configuration().modules.ldsc
+    observed_ratio_line = (
+        None
+        if failure_mode == "missing_ratios"
+        else "Ratio: 0.10 (0.02)"
+    )
+    liability_ratio_line = {
+        "ratio": "Ratio: 0.20 (0.02)",
+        "missing_ratios": None,
+    }.get(failure_mode, "Ratio: 0.10 (0.02)")
+    fake_process = _fake_ldsc_subprocess(
+        module.output_layout,
+        liability_intercept=(
+            "1.02 (0.01)" if failure_mode == "intercept" else "1.01 (0.01)"
+        ),
+        observed_ratio_line=observed_ratio_line,
+        liability_ratio_line=liability_ratio_line,
+    )
+    monkeypatch.setattr(
+        "postgwas.core.processes.subprocess.run", fake_process,
+    )
+
+    with pytest.raises(LDSCError) as error:
+        run_ldsc_direct(args)
+
+    message = str(error.value)
+    assert "liability-scale validation failed" in message
+    if failure_mode == "missing_ratios":
+        assert "attenuation ratio is missing" in message
+        assert "unconstrained intercept" in message
+    else:
+        assert "changed shared regression metric" in message
+        assert failure_mode in message
+    assert "may rescale only h² and its standard error" in message
+
+    output = Path(args.output_directory)
+    final_prefix = output / args.dataset_id
+    for suffix in (
+        module.output_layout.munged_sumstats_suffix,
+        module.output_layout.upstream_log_suffix,
+        module.output_layout.observed_prefix_suffix
+        + module.output_layout.upstream_log_suffix,
+        module.output_layout.liability_prefix_suffix
+        + module.output_layout.upstream_log_suffix,
+    ):
+        assert not Path(str(final_prefix) + suffix).exists()
+    service_log = output / "logs" / "STUDY_ldsc_service.log"
+    log_text = service_log.read_text(encoding="utf-8")
+    assert "FAILED   ldsc_liability_conversion_invariant" in log_text
+    assert "FAILED   ldsc_run" in log_text
+
+
 @pytest.mark.parametrize("missing_stage", ["observed", "liability"])
 def test_zero_exit_missing_heritability_log_is_rejected(
     tmp_path, monkeypatch, missing_stage,
@@ -676,6 +1208,131 @@ def test_zero_exit_missing_heritability_log_is_rejected(
         )
 
 
+def test_zero_byte_h2_logs_are_recovered_from_validated_stdout(
+    tmp_path, monkeypatch,
+):
+    sumstats, merge, reference, weights = _write_inputs(tmp_path)
+    module = load_configuration().modules.ldsc.model_copy(update={
+        "sample_prevalence": 0.2,
+        "population_prevalence": 0.01,
+    })
+    layout = module.output_layout
+    events = []
+
+    class RecordingLogger:
+        def record(self, *values, **details):
+            events.append((values, details))
+
+        def info(self, *_args, **_kwargs):
+            pass
+
+    def fake_subprocess_run(command, **_kwargs):
+        output_prefix = Path(command[command.index("--out") + 1])
+        if "--sumstats" in command:
+            Path(str(output_prefix) + layout.munged_sumstats_suffix).write_text(
+                "sumstats\n", encoding="utf-8",
+            )
+            Path(str(output_prefix) + layout.upstream_log_suffix).write_text(
+                "munge complete\n", encoding="utf-8",
+            )
+            return Namespace(returncode=0, stdout="", stderr="")
+
+        liability = output_prefix.name.endswith(
+            layout.liability_prefix_suffix
+        )
+        Path(str(output_prefix) + layout.upstream_log_suffix).write_text(
+            "", encoding="utf-8",
+        )
+        stdout = (
+            "Total %s scale h2: %s\n"
+            "Intercept: 1.01 (0.01)\n"
+            "Ratio: 0.10 (0.02)\n"
+            % (
+                "Liability" if liability else "Observed",
+                "0.35 (0.05)" if liability else "0.20 (0.03)",
+            )
+        )
+        return Namespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(
+        "postgwas.core.processes.subprocess.run", fake_subprocess_run,
+    )
+    result = run_ldsc(
+        sumstats_tsv=sumstats,
+        output_prefix=tmp_path / "result",
+        merge_alleles=merge,
+        reference_ld_directory=reference,
+        weights_ld_directory=weights,
+        munge_executable="munge_sumstats.py",
+        ldsc_executable="ldsc.py",
+        configuration=module,
+        logger=RecordingLogger(),
+    )
+
+    assert result["observed_metrics"]["h2"] == "0.20 (0.03)"
+    assert result["liability_metrics"]["h2"] == "0.35 (0.05)"
+    assert Path(result["h2_observed"]).read_text(encoding="utf-8").startswith(
+        "Total Observed scale h2:"
+    )
+    assert Path(result["h2_liability"]).read_text(encoding="utf-8").startswith(
+        "Total Liability scale h2:"
+    )
+    recovery_events = [
+        details for values, details in events
+        if values == ("WARNING", "ldsc_log_recovered_from_stdout")
+    ]
+    assert [event["purpose"] for event in recovery_events] == [
+        "LDSC observed-scale heritability",
+        "LDSC liability-scale heritability",
+    ]
+    assert all(
+        event["reason"] == "upstream_log_missing_or_empty_after_zero_exit"
+        and event["validation"] == "required_heritability_metrics_parsed"
+        and event["captured_stdout_bytes"] > 0
+        for event in recovery_events
+    )
+
+
+def test_missing_h2_log_is_not_recovered_from_unparseable_stdout(
+    tmp_path, monkeypatch,
+):
+    sumstats, merge, reference, weights = _write_inputs(tmp_path)
+    module = load_configuration().modules.ldsc
+    layout = module.output_layout
+
+    def fake_subprocess_run(command, **_kwargs):
+        output_prefix = Path(command[command.index("--out") + 1])
+        if "--sumstats" in command:
+            Path(str(output_prefix) + layout.munged_sumstats_suffix).write_text(
+                "sumstats\n", encoding="utf-8",
+            )
+            Path(str(output_prefix) + layout.upstream_log_suffix).write_text(
+                "munge complete\n", encoding="utf-8",
+            )
+            return Namespace(returncode=0, stdout="", stderr="")
+        return Namespace(
+            returncode=0, stdout="LDSC finished without metrics\n", stderr="",
+        )
+
+    monkeypatch.setattr(
+        "postgwas.core.processes.subprocess.run", fake_subprocess_run,
+    )
+    with pytest.raises(
+        LDSCError, match="not a complete, parseable LDSC heritability report",
+    ):
+        run_ldsc(
+            sumstats_tsv=sumstats,
+            output_prefix=tmp_path / "result",
+            merge_alleles=merge,
+            reference_ld_directory=reference,
+            weights_ld_directory=weights,
+            munge_executable="munge_sumstats.py",
+            ldsc_executable="ldsc.py",
+            configuration=module,
+        )
+    assert not (tmp_path / "result_h2.log").exists()
+
+
 def test_metrics_parser_requires_scientific_results(tmp_path):
     log = tmp_path / "result.log"
     log.write_text("LDSC completed\n", encoding="utf-8")
@@ -729,13 +1386,17 @@ def test_metrics_parser_rejects_nonfinite_scientific_result(tmp_path):
         extract_ldsc_metrics(log)
 
 
-def test_dockerfile_uses_cbiit_ldsc_in_postgwas_environment():
+def test_dockerfile_uses_cbiit_ldsc_in_isolated_compatible_environment():
     dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(
         encoding="utf-8",
     )
     assert "https://github.com/CBIIT/ldsc.git" in dockerfile
     assert "LDSC_COMMIT=6c673952cee74bd5c57aef1555a03b1c015399a0" in dockerfile
+    assert "micromamba create -y -n ldsc" in dockerfile
+    assert "micromamba run -n ldsc" in dockerfile
     assert "pip install --no-deps --no-cache-dir /opt/ldsc" in dockerfile
+    assert "micromamba run -n ldsc python -m pip check" in dockerfile
+    assert "/usr/local/bin/ldsc.py" in dockerfile
+    assert "/usr/local/bin/munge_sumstats.py" in dockerfile
     assert "python=2.7" not in dockerfile
-    assert "micromamba create -y -n ldsc" not in dockerfile
     assert "github.com/bulik/ldsc" not in dockerfile

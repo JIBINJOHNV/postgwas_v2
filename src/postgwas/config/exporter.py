@@ -11,6 +11,7 @@ from postgwas.config.loader import (
     canonical_module_name,
     load_configuration,
     load_module_configuration,
+    load_run_configuration_for_module,
     select_configuration_values,
 )
 from postgwas.config.models.modules.single_cell import (
@@ -19,11 +20,19 @@ from postgwas.config.models.modules.single_cell import (
     single_cell_supporting_configurations,
 )
 from postgwas.core.errors import ConfigurationError
-from postgwas.pipeline.planner import build_pipeline_plan
+from postgwas.config.export_layout import (
+    changed_configuration_paths,
+    load_export_layout,
+)
+from postgwas.pipeline.planner import (
+    build_pipeline_plan,
+    resolve_pipeline_dependency_overrides,
+)
 from postgwas.modules.formatting.contracts import required_formats
 
 
 EXPORT_STYLES = ("full", "minimal", "values")
+EXPORT_SCOPES = ("all", "common")
 
 
 class _CompactDumper(yaml.SafeDumper):
@@ -54,19 +63,83 @@ def _indent(text: str, spaces: int) -> str:
     return "\n".join(prefix + line if line else "" for line in text.splitlines())
 
 
-def _render_harmonisation(module_config, style: str) -> str:
-    from postgwas.modules.harmonisation.policies import as_yaml_template, load_policies
+def _render_harmonisation(module_config, style: str, *, common: bool = False) -> str:
+    from postgwas.modules.harmonisation.policies import PolicyError, as_yaml_template, load_policies
 
     values = module_config.model_dump(mode="json")
-    overrides = values.pop("policies", {})
-    policies = load_policies(overrides)
+    layout = load_export_layout("harmonisation", values)
+    overrides = values["policies"]
+    try:
+        policies = load_policies(overrides)
+    except PolicyError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    if common:
+        defaults = load_module_configuration("harmonisation").model_dump(mode="json")
+        paths = [*layout.common_fields, *changed_configuration_paths(
+            {key: value for key, value in values.items() if key != "policies"},
+            defaults,
+        )]
+        values = select_configuration_values(values, paths)
     policy_text = as_yaml_template(
         policies=policies,
         style=style,
         include_header=False,
         include_required_inputs=False,
+        common_only=common,
+        include_changed=common,
+        group_notes=layout.policy_summaries,
     )
-    return _dump_values(values).rstrip() + "\n" + policy_text
+    output = []
+    if style != "values":
+        output.extend("# " + line for line in layout.introduction)
+    for section in layout.sections:
+        fields = [key for key in section.fields if key in values or key == "policies"]
+        if not fields:
+            continue
+        if style != "values":
+            output.extend(("", "# " + section.title))
+        for field in fields:
+            output.append(
+                policy_text.rstrip() if field == "policies"
+                else _render_commented({field: values[field]}, style, layout.comments).rstrip()
+            )
+    return "\n".join(output) + "\n"
+
+
+def _render_common_harmonisation_run(config_file, style: str) -> str:
+    """Export a short run file plus any supplied non-default advanced values."""
+    config = load_run_configuration_for_module("harmonisation", config_file)
+    defaults = load_configuration()
+    values = config.model_dump(mode="json")
+    baseline = defaults.model_dump(mode="json")
+    # Policies have their own canonical registry; compare them there rather
+    # than treating a resolved policy block as a change from the empty overlay.
+    values["modules"].pop("harmonisation")
+    baseline["modules"].pop("harmonisation")
+    layout = load_export_layout(
+        "harmonisation", config.modules.harmonisation.model_dump(mode="json"),
+    )
+    select_configuration_values(values, layout.run_comments)
+    selected = select_configuration_values(values, [
+        *layout.common_run_fields,
+        *changed_configuration_paths(values, baseline),
+    ])
+    supporting = selected.pop("modules", {})
+    intro = (
+        "\n".join("# " + line for line in layout.common_introduction) + "\n\n"
+        if style != "values" else ""
+    )
+    output = intro + _render_commented(selected, style, layout.run_comments)
+    output += "modules:\n  harmonisation:\n"
+    output += _indent(_render_harmonisation(config.modules.harmonisation, style, common=True).rstrip(), 4) + "\n"
+    if supporting:
+        comments = {
+            path.removeprefix("modules."): lines
+            for path, lines in layout.run_comments.items()
+            if path.startswith("modules.")
+        }
+        output += _indent(_render_commented(supporting, style, comments).rstrip(), 2) + "\n"
+    return output
 
 
 _FORMATTING_COMMENTS = {
@@ -92,6 +165,10 @@ _FORMATTING_COMMENTS = {
         "Smallest raw p-value written when 10^(-LP) would underflow.",
         "Every bounded value is counted in the formatter audit log.",
     ),
+    "input_contract": (
+        "PostGWAS GWAS-VCF build, provenance, chromosome, and allele contract.",
+        "The formatter validates this contract and does not re-harmonise values.",
+    ),
     "vcf_fields": (
         "Canonical formatter-table column -> bcftools query expression.",
         "This is the single source of truth for structural and FORMAT-field extraction.",
@@ -109,13 +186,13 @@ _FORMATTING_COMMENTS = {
         "Per-target explanation of how the saved sample-size values are consumed.",
     ),
     "chromosome_labels": (
-        "Normalization applied to chromosome labels before any target is exported.",
+        "Normalization used only when formatter inspects external reference IDs.",
     ),
     "chromosome_labels.prefix_pattern": (
-        "Configured leading chromosome prefix removed from VCF chromosome labels.",
+        "Leading chromosome prefix removed while inspecting external reference IDs.",
     ),
     "chromosome_labels.aliases": (
-        "Optional exact chromosome-label replacements applied after prefix removal.",
+        "Optional exact aliases applied while inspecting external reference IDs.",
     ),
     "variant_identifiers": (
         "General variant-ID policy applied independently to each formatter target.",
@@ -389,13 +466,32 @@ _MAGMA_COMMENTS = {
         "Minimum exact BIM-ID overlap required only when reference intersection is enabled.",
     ),
     "snp_harmonisation.duplicate_policy": (
-        "Retain the lowest valid p-value when several rows resolve to one reference SNP.",
+        "Handle repeated SNP IDs after optional reference filtering: err stops, "
+        "lowest_p retains the lowest valid p-value, and remove excludes the "
+        "complete duplicated-ID group.",
+    ),
+    "mhc": (
+        "MAGMA-local MHC policy and optional complete region override.",
+        "The build-specific default interval comes from resources.genomes.<build>.regions.mhc.",
+    ),
+    "mhc.policy": (
+        "Include MHC, exclude its SNPs, exclude overlapping annotated units, or both.",
+    ),
+    "chromosomes.exclude": (
+        "Chromosomes removed from both SNP and annotation-unit analysis; X is retained by default.",
+    ),
+    "exclusion_reporting": (
+        "Configuration-driven column names for MAGMA exclusion audit tables.",
     ),
     "gene_sets": (
         "Gene-set input format and gene-ID compatibility required before testing.",
     ),
     "gene_sets.input_format": (
         "Accept standard GMT, native MAGMA set annotations, or detect either format.",
+    ),
+    "gene_sets.identifier_mismatch_action": (
+        "Skip only competitive gene-set analysis or fail the complete MAGMA "
+        "run when identifiers are incompatible.",
     ),
     "annotation_validation": (
         "Structural and exact BIM-ID checks applied to supplied functional annotations.",
@@ -435,20 +531,45 @@ _MAGMA_COMMENTS = {
     "multiple_testing.reporting_significance_threshold": (
         "Threshold used only to count and report nominal and adjusted significant results.",
     ),
+    "multiple_testing.primary_method": (
+        "Primary global gene-set correction used for significance declarations.",
+        "Other global and named-family corrections remain secondary result columns.",
+    ),
     "multiple_testing.reporting_method_labels": (
         "User-facing labels for configured correction methods in stage outcomes.",
     ),
     "multiple_testing.gene_methods": (
         "Corrections applied across all valid gene p-values in one MAGMA result.",
     ),
+    "multiple_testing.global_methods": (
+        "Corrections applied across all tested gene sets within each mapping analysis.",
+    ),
     "result_schema": (
         "MAGMA result-column roles and PostGWAS report names and serialization.",
+    ),
+    "screen_summary": (
+        "Limits for p-value-ranked gene and pathway associations shown after analysis.",
+    ),
+    "screen_summary.top_gene_rows": (
+        "Number of genes shown on screen, ranked by unadjusted MAGMA gene p-value.",
+    ),
+    "screen_summary.top_pathway_rows": (
+        "Number of pathways shown on screen, ranked by unadjusted competitive-test p-value.",
     ),
     "result_schema.report_gene_set_description_column": (
         "Output column containing the GMT description; null for native MAGMA input.",
     ),
     "result_schema.report_input_genes_column": (
         "Output column containing the gene IDs supplied for each tested set.",
+    ),
+    "result_schema.primary_correction_method_column": (
+        "Machine-readable method selected as the primary gene-set correction.",
+    ),
+    "result_schema.primary_adjusted_p_value_column": (
+        "Primary global adjusted p-value copied from the selected method column.",
+    ),
+    "result_schema.primary_significant_column": (
+        "Boolean primary decision at the configured reporting threshold.",
     ),
     "minimum_magma_version": ("Oldest MAGMA version accepted by the runner.",),
     "version_arguments": ("Arguments used only to obtain MAGMA's version output.",),
@@ -464,21 +585,94 @@ def _render_magma(module_config, style: str) -> str:
     return _render_commented(module_config, style, _MAGMA_COMMENTS)
 
 
+_MAGMACOVAR_COMMENTS = {
+    "enabled": ("Enable MAGMAcovar when this module is selected in a pipeline.",),
+    "model": (
+        "MAGMA --model modifiers applied to the configured gene properties.",
+    ),
+    "direction": ("Alternative-hypothesis direction for gene-property tests.",),
+    "minimum_genes": (
+        "Minimum analyzed genes required for each reported gene property.",
+    ),
+    "input": (
+        "Native MAGMA gene results, gene-property table, and missingness policy.",
+    ),
+    "multiple_testing": (
+        "Global corrections across all valid COVAR rows from this MAGMA run.",
+        "The native .gsa.out remains unchanged as the validated source result.",
+    ),
+    "multiple_testing.primary_method": (
+        "Correction used for the primary significance declaration.",
+        "Bonferroni matches the 461-cell-property screen in Duncan et al. (2025).",
+    ),
+    "multiple_testing.significance_threshold": (
+        "Inclusive adjusted-p threshold used for primary significance calls.",
+    ),
+    "multiple_testing.methods": (
+        "Ordered global correction methods written to the corrected report.",
+    ),
+    "multiple_testing.reporting_method_labels": (
+        "User-facing labels for configured correction methods.",
+    ),
+    "result_schema": (
+        "Configured columns and serialization for the separate corrected TSV.",
+    ),
+    "result_schema.adjusted_p_value_column_pattern": (
+        "Output-column pattern containing the literal {method} placeholder.",
+    ),
+    "reporting": (
+        "Top-property count and numeric precision used in the main findings.",
+    ),
+    "reporting.highlight_method": (
+        "Configured secondary correction highlighted beside the primary method.",
+    ),
+    "reporting.top_property_count": (
+        "Number of properties ranked by the lowest native MAGMA P value.",
+    ),
+    "reporting.p_value_significant_digits": (
+        "Significant digits used for raw and highlighted adjusted P values.",
+    ),
+    "reporting.effect_significant_digits": (
+        "Significant digits used for standardized property coefficients.",
+    ),
+    "output_layout": (
+        "Relative native, corrected, logging, checkpoint, and staging paths.",
+    ),
+    "output_layout.results_file": (
+        "Unmodified native MAGMA .gsa.out retained for validation and provenance.",
+    ),
+    "output_layout.corrected_results_file": (
+        "PostGWAS report containing raw statistics and global adjusted p-values.",
+    ),
+}
+
+
+def _render_magmacovar(module_config, style: str) -> str:
+    return _render_commented(module_config, style, _MAGMACOVAR_COMMENTS)
+
+
 def render_module_configuration(
     module: str,
     *,
     config_file: str | Path | None = None,
     style: str = "minimal",
     formats: list[str] | tuple[str, ...] | None = None,
+    scope: str = "all",
 ) -> str:
-    """Render one complete module configuration as reloadable YAML."""
+    """Render complete module YAML, or a curated harmonisation run file."""
     if style not in EXPORT_STYLES:
         raise ConfigurationError("Unknown export style: %s" % style)
     name = canonical_module_name(module)
+    if scope not in EXPORT_SCOPES:
+        raise ConfigurationError("Unknown export scope: %s" % scope)
     if formats is not None and name != "formatting":
         raise ConfigurationError(
             "--format can be used only with --module formatting"
         )
+    if scope == "common":
+        if name != "harmonisation":
+            raise ConfigurationError("--scope common requires --module harmonisation")
+        return _render_common_harmonisation_run(config_file, style)
     config = load_module_configuration(name, config_file)
     if name == "harmonisation":
         return _render_harmonisation(config, style)
@@ -493,6 +687,8 @@ def render_module_configuration(
         return _render_mixer(config, style)
     if name == "magma":
         return _render_magma(config, style)
+    if name == "magmacovar":
+        return _render_magmacovar(config, style)
     return _dump_values(config.model_dump(mode="json"))
 
 
@@ -509,16 +705,13 @@ def render_pipeline_configuration(
     single_cell_tools = (
         config.modules.single_cell.tools if "single_cell" in targets else []
     )
-    dependency_overrides = (
-        {
-            "single_cell": single_cell_pipeline_dependencies(
-                single_cell_tools
-            )
-        }
-        if single_cell_tools else None
-    )
+    dependency_overrides = resolve_pipeline_dependency_overrides((), config)
+    if single_cell_tools:
+        dependency_overrides["single_cell"] = single_cell_pipeline_dependencies(
+            single_cell_tools
+        )
     plan = build_pipeline_plan(
-        targets, dependency_overrides=dependency_overrides,
+        targets, dependency_overrides=dependency_overrides or None,
     )
     selected = list(
         dict.fromkeys(canonical_module_name(step) for step in plan.steps)
@@ -557,6 +750,8 @@ def render_pipeline_configuration(
             rendered = _render_mixer(all_modules[name], style)
         elif name == "magma":
             rendered = _render_magma(all_modules[name], style)
+        elif name == "magmacovar":
+            rendered = _render_magmacovar(all_modules[name], style)
         else:
             rendered = _dump_values(all_modules[name])
         output += _indent(rendered.rstrip(), 4) + "\n"

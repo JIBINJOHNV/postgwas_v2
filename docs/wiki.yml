@@ -25,6 +25,10 @@ wiki:
       slug: Pipeline-Workflow
       source: docs/wiki/core/pipeline-workflow.md
       section: Core Concepts
+    - title: Pipeline Input Validation
+      slug: Pipeline-Input-Validation
+      source: docs/wiki/core/pipeline-input-validation.md
+      section: Core Concepts
     - title: Input and Output Contracts
       slug: Input-and-Output-Contracts
       source: docs/wiki/core/input-output-contracts.md

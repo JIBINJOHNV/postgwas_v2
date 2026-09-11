@@ -7,7 +7,12 @@ from typing import get_args, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from postgwas.config.models.common import DelimitedTableReadConfig, StrictModel
+from postgwas.config.models.common import (
+    ChromosomeAnalysisScopeConfig,
+    DelimitedTableReadConfig,
+    MHCAnalysisScopeConfig,
+    StrictModel,
+)
 from postgwas.config.models.gcta import GctaBackedModuleConfig, GctaReferenceConfig
 
 
@@ -35,7 +40,6 @@ def _validate_output_filenames(model: StrictModel, label: str) -> None:
 
 
 class GctaVariantHarmonisationConfig(StrictModel):
-    coordinate_fallback: bool
     chromosome_label_policy: GctaChromosomeLabelPolicy
     minimum_overlap_fraction: float = Field(
         gt=0, le=1, allow_inf_nan=False,
@@ -121,6 +125,9 @@ class GctaPathwayConversionConfig(StrictModel):
     chromosome_label_policy: GctaChromosomeLabelPolicy
     duplicate_gene_policy: GctaDuplicateGenePolicy
     unmapped_gene_policy: GctaUnmappedGenePolicy
+    minimum_gene_id_overlap_fraction: float = Field(
+        gt=0, le=1, allow_inf_nan=False,
+    )
     empty_pathway_policy: GctaEmptyPathwayPolicy
     parallelism: GctaPathwayParallelismConfig
     audit: GctaPathwayAuditConfig
@@ -166,17 +173,21 @@ class GctaGeneOutputLayout(StrictModel):
     staging_directory: str
     prepared_set_directory: str
     analysis_set_list: str
-    harmonised_input: str
+    variant_exclusion_list: str
+    scoped_gene_list: str
+    excluded_gene_list: str
     primary_results: dict[GctaGeneMethod, str]
     normalized_result: str
+    html_report: str
     frequency_qc_result: str
     mbat_snpset_result: str
 
     @field_validator(
         "log_file", "resolved_config_file", "completion_manifest", "output_prefix",
         "staging_directory", "prepared_set_directory", "analysis_set_list",
-        "harmonised_input",
-        "normalized_result", "frequency_qc_result", "mbat_snpset_result",
+        "variant_exclusion_list", "scoped_gene_list", "excluded_gene_list",
+        "normalized_result", "html_report", "frequency_qc_result",
+        "mbat_snpset_result",
     )
     @classmethod
     def safe_relative_pattern(cls, value: str) -> str:
@@ -197,8 +208,11 @@ class GctaGeneOutputLayout(StrictModel):
             "staging_directory": ("{dataset_id}", "{method}"),
             "prepared_set_directory": ("{dataset_id}",),
             "analysis_set_list": ("{dataset_id}",),
-            "harmonised_input": ("{dataset_id}", "{method}"),
+            "variant_exclusion_list": ("{dataset_id}", "{method}"),
+            "scoped_gene_list": ("{dataset_id}", "{method}"),
+            "excluded_gene_list": ("{dataset_id}", "{method}"),
             "normalized_result": ("{dataset_id}", "{method}"),
+            "html_report": ("{dataset_id}", "{method}"),
             "frequency_qc_result": ("{dataset_id}",),
             "mbat_snpset_result": ("{dataset_id}",),
         }
@@ -221,18 +235,22 @@ class GctaGeneOutputLayout(StrictModel):
                 raise ValueError(
                     "primary_results.%s must contain {dataset_id}" % method
                 )
+        if not self.html_report.lower().endswith(".html"):
+            raise ValueError("html_report must end with .html")
         return self
 
 
 class GctaResultSchema(StrictModel):
     required_columns: list[str]
+    reportable_columns: list[str]
     p_value_column: str
     identifier_columns: list[str]
     component_p_value_columns: list[str]
     unit_label: str
 
     @field_validator(
-        "required_columns", "identifier_columns", "component_p_value_columns",
+        "required_columns", "reportable_columns", "identifier_columns",
+        "component_p_value_columns",
     )
     @classmethod
     def unique_columns(cls, values: list[str]) -> list[str]:
@@ -243,12 +261,17 @@ class GctaResultSchema(StrictModel):
     @model_validator(mode="after")
     def referenced_columns_are_required(self):
         required = set(self.required_columns)
+        reportable = set(self.reportable_columns)
+        if not required.issubset(reportable):
+            raise ValueError("required_columns must all be reportable")
         if self.p_value_column not in required:
             raise ValueError("p_value_column must be required")
         if not self.identifier_columns or not set(self.identifier_columns).issubset(required):
             raise ValueError("identifier_columns must be nonempty required columns")
         if required & set(self.component_p_value_columns):
             raise ValueError("component p-value columns must not duplicate required columns")
+        if not set(self.component_p_value_columns).issubset(reportable):
+            raise ValueError("component p-value columns must all be reportable")
         if not self.unit_label.strip():
             raise ValueError("unit_label must not be empty")
         return self
@@ -336,12 +359,41 @@ class GctaReportingConfig(StrictModel):
         return self
 
 
+class GctaHtmlReportConfig(StrictModel):
+    """Presentation settings for complete method-specific GCTA result tables."""
+
+    page_size: int = Field(gt=0)
+    columns: dict[GctaGeneMethod, list[str]]
+
+    @model_validator(mode="after")
+    def every_method_has_unique_columns(self):
+        expected = set(get_args(GctaGeneMethod))
+        if set(self.columns) != expected:
+            raise ValueError(
+                "columns must contain every method exactly once: %s"
+                % ", ".join(sorted(expected))
+            )
+        for method, columns in self.columns.items():
+            if not columns or len(columns) != len(set(columns)):
+                raise ValueError(
+                    "columns.%s must contain one or more unique column names"
+                    % method
+                )
+            if any(not str(column).strip() for column in columns):
+                raise ValueError(
+                    "columns.%s must not contain empty column names" % method
+                )
+        return self
+
+
 class GctaGeneConfig(GctaBackedModuleConfig):
     method: GctaGeneMethod
     input_file: str | None = None
     genome_build: str | None = None
     reference: GctaReferenceConfig
     variant_harmonisation: GctaVariantHarmonisationConfig
+    mhc: MHCAnalysisScopeConfig
+    chromosomes: ChromosomeAnalysisScopeConfig
     gene_annotation: GctaGeneAnnotationConfig
     set_annotation: GctaSetAnnotationConfig
     gene_window_kb: int = Field(ge=0)
@@ -353,6 +405,7 @@ class GctaGeneConfig(GctaBackedModuleConfig):
     print_component_p_values: bool
     write_snpset: bool
     reporting: GctaReportingConfig
+    html_report: GctaHtmlReportConfig
     output_layout: GctaGeneOutputLayout
     results: GctaGeneResultConfig
 
@@ -391,6 +444,34 @@ class GctaGeneConfig(GctaBackedModuleConfig):
                 raise ValueError(
                     "reporting chromosome column for %s must be required by its "
                     "result schema" % method
+                )
+        correction_order = list(
+            self.reporting.correction_columns.model_dump().values()
+        )
+        for method, columns in self.html_report.columns.items():
+            schema = self.results.schemas[method]
+            available = set(
+                schema.reportable_columns
+                + correction_order
+            )
+            unknown = [column for column in columns if column not in available]
+            if unknown:
+                raise ValueError(
+                    "html_report.columns.%s contains columns not guaranteed by "
+                    "the normalized result schema: %s"
+                    % (method, ", ".join(unknown))
+                )
+            required = [
+                *schema.identifier_columns,
+                schema.p_value_column,
+                *correction_order,
+            ]
+            missing = [column for column in required if column not in columns]
+            if missing:
+                raise ValueError(
+                    "html_report.columns.%s must contain identifier, primary "
+                    "p-value, and correction columns: %s"
+                    % (method, ", ".join(missing))
                 )
         return self
 

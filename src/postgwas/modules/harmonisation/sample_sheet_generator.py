@@ -48,8 +48,16 @@ class SampleSheetDatasetStatus:
 
 
 @dataclass(frozen=True)
+class SampleSheetFileRejection:
+    input_file: Path
+    reason: str
+
+
+@dataclass(frozen=True)
 class SampleSheetGenerationResult:
     output_file: Path
+    rejection_report_file: Path
+    candidate_count: int
     dataset_count: int
     trait_type: str
     effect_type: str
@@ -57,6 +65,7 @@ class SampleSheetGenerationResult:
     warnings: tuple[str, ...]
     requires_completion: bool
     datasets: tuple[SampleSheetDatasetStatus, ...]
+    rejected_files: tuple[SampleSheetFileRejection, ...]
 
 
 def _normalise_column_name(value: str) -> str:
@@ -66,7 +75,7 @@ def _normalise_column_name(value: str) -> str:
 
 def _candidate_files(
     input_directory: Path,
-    output_file: Path,
+    excluded_files: Sequence[Path],
     suffixes: Sequence[str],
 ) -> list[Path]:
     if not input_directory.is_dir():
@@ -74,13 +83,16 @@ def _candidate_files(
             "Summary-statistics input directory does not exist: %s"
             % input_directory
         )
-    resolved_output = output_file.resolve(strict=False)
+    excluded = {
+        path.resolve(strict=False)
+        for path in excluded_files
+    }
     candidates = [
         path.resolve()
         for path in input_directory.iterdir()
         if path.is_file()
         and not path.name.startswith(".")
-        and path.resolve() != resolved_output
+        and path.resolve() not in excluded
         and any(path.name.lower().endswith(suffix) for suffix in suffixes)
     ]
     candidates.sort(key=lambda path: (path.name.casefold(), str(path)))
@@ -511,6 +523,37 @@ def _write_sample_sheet(
         temporary.unlink(missing_ok=True)
 
 
+def _write_rejection_report(
+    rejected_files: Sequence[SampleSheetFileRejection],
+    output_file: Path,
+) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".%s." % output_file.name,
+        suffix=".tmp",
+        dir=output_file.parent,
+        text=True,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                delimiter="\t",
+                fieldnames=("input_file", "reason"),
+            )
+            writer.writeheader()
+            for rejection in rejected_files:
+                writer.writerow({
+                    "input_file": str(rejection.input_file),
+                    "reason": rejection.reason,
+                })
+        os.replace(temporary, output_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def generate_sample_sheet(
     input_directory: str | Path,
     output_file: str | Path,
@@ -523,16 +566,19 @@ def generate_sample_sheet(
     policies = load_policies(module_config.policies)
     source_directory = Path(input_directory).expanduser().resolve()
     destination = Path(output_file).expanduser().resolve()
+    rejection_report = destination.with_name(
+        destination.name + generator_config.rejection_report_suffix
+    )
     files = _candidate_files(
         source_directory,
-        destination,
+        (destination, rejection_report),
         generator_config.supported_suffixes,
     )
 
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
     dataset_statuses: list[SampleSheetDatasetStatus] = []
-    problems: list[str] = []
+    rejected_files: list[SampleSheetFileRejection] = []
     for path in files:
         try:
             row, row_warnings = _row_for_file(path, generator_config, policies)
@@ -547,11 +593,32 @@ def generate_sample_sheet(
                 warnings=tuple(row_warnings),
             ))
         except (ConfigurationError, OSError, ValueError, csv.Error) as exc:
-            problems.append("%s: %s" % (path.name, exc))
-    if problems:
+            rejected_files.append(SampleSheetFileRejection(
+                input_file=path,
+                reason=str(exc),
+            ))
+    if rejected_files and generator_config.failure_policy == "fail_all":
         raise ConfigurationError(
             "Sample-sheet generation failed for %d file(s); no output was written:\n- %s"
-            % (len(problems), "\n- ".join(problems))
+            % (
+                len(rejected_files),
+                "\n- ".join(
+                    "%s: %s" % (item.input_file.name, item.reason)
+                    for item in rejected_files
+                ),
+            )
+        )
+    if not rows:
+        raise ConfigurationError(
+            "Sample-sheet generation failed because none of the %d candidate "
+            "file(s) could be mapped; no output was written:\n- %s"
+            % (
+                len(rejected_files),
+                "\n- ".join(
+                    "%s: %s" % (item.input_file.name, item.reason)
+                    for item in rejected_files
+                ),
+            )
         )
 
     dataset_ids: dict[str, str] = {}
@@ -569,13 +636,12 @@ def generate_sample_sheet(
         not _has_sample_size(row) or not _has_eaf(row)
         for row in rows
     )
-    _write_sample_sheet(
-        rows,
-        destination,
-        allow_incomplete=requires_completion,
-    )
+    _write_rejection_report(rejected_files, rejection_report)
+    _write_sample_sheet(rows, destination, allow_incomplete=requires_completion)
     return SampleSheetGenerationResult(
         output_file=destination,
+        rejection_report_file=rejection_report,
+        candidate_count=len(files),
         dataset_count=len(rows),
         trait_type=generator_config.trait_type,
         effect_type=generator_config.effect_type,
@@ -583,6 +649,7 @@ def generate_sample_sheet(
         warnings=tuple(warnings),
         requires_completion=requires_completion,
         datasets=tuple(dataset_statuses),
+        rejected_files=tuple(rejected_files),
     )
 
 
@@ -591,15 +658,24 @@ def _generation_summary(result: SampleSheetGenerationResult) -> str:
     ready = result.dataset_count - len(attention)
     lines = [
         "Sample-sheet generation summary",
-        "  Input files       : %d" % result.dataset_count,
+        "  Input files       : %d" % result.candidate_count,
         "  Rows written      : %d" % result.dataset_count,
+        "  Rejected files    : %d" % len(result.rejected_files),
         "  Ready             : %d" % ready,
         "  Need attention    : %d" % len(attention),
         "  Output            : %s" % result.output_file,
+        "  Rejection report  : %s" % result.rejection_report_file,
         "  Trait type        : %s" % result.trait_type,
         "  Effect type       : %s" % result.effect_type,
         "  P-value type      : %s" % result.p_value_type,
     ]
+    if result.rejected_files:
+        lines.extend(("", "Rejected input files"))
+        for rejection in result.rejected_files:
+            lines.append(
+                "  %s: %s" % (rejection.input_file.name, rejection.reason)
+            )
+
     if not attention:
         return "\n".join(lines)
 

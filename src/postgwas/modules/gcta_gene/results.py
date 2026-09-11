@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import polars as pl
@@ -11,6 +12,17 @@ from postgwas.core.io.reports import write_delimited_report
 from postgwas.core.io.tables import read_delimited_table
 from postgwas.core.statistics import adjust_p_values
 from postgwas.modules.gcta_gene.errors import GctaGeneError
+
+
+@dataclass(frozen=True)
+class ValidatedGctaResults:
+    """Parsed raw GCTA results whose schema and scientific values passed."""
+
+    frame: pl.DataFrame
+    p_column: str
+    primary_p_values: tuple[float, ...]
+    input_delimiter: str
+    unit_label: str
 
 
 def multiple_testing_configuration(module_config) -> dict:
@@ -71,12 +83,11 @@ def _add_multiple_testing_columns(
     }
 
 
-def normalize_gcta_results(
+def validate_raw_gcta_results(
     raw_result: str | Path,
-    normalized_result: str | Path,
     module_config,
-) -> dict:
-    """Validate required upstream columns and write an exact normalized TSV."""
+) -> ValidatedGctaResults:
+    """Validate required upstream columns and values without changing results."""
     settings = module_config.results
     schema = settings.schemas[module_config.method]
     required = list(schema.required_columns)
@@ -139,12 +150,28 @@ def normalize_gcta_results(
         raise GctaGeneError(
             "GCTA result contains %d duplicate unit identifiers." % duplicate_units
         )
-    primary_p_values = [
+    primary_p_values = tuple(
         float(value) for value in parsed_p_values[p_column].to_list()
-    ]
+    )
+    return ValidatedGctaResults(
+        frame=frame,
+        p_column=p_column,
+        primary_p_values=primary_p_values,
+        input_delimiter=detected.value,
+        unit_label=schema.unit_label,
+    )
+
+
+def add_multiple_testing_results(
+    validated: ValidatedGctaResults,
+    normalized_result: str | Path,
+    module_config,
+) -> dict:
+    """Add configured correction columns and write the validated normalized TSV."""
+    settings = module_config.results
     frame, multiple_testing = _add_multiple_testing_columns(
-        frame,
-        primary_p_values,
+        validated.frame,
+        list(validated.primary_p_values),
         module_config,
     )
     destination = write_delimited_report(
@@ -154,20 +181,35 @@ def normalize_gcta_results(
         delimiter=settings.normalized_delimiter,
         null_value=settings.normalized_null_value,
     )
-    minimum_p = min(primary_p_values)
+    minimum_p = min(validated.primary_p_values)
     return {
         "tested_units": frame.height,
-        "unit_label": schema.unit_label,
+        "unit_label": validated.unit_label,
         "minimum_p_value": minimum_p,
-        "p_value_column": p_column,
-        "input_delimiter": detected.value,
+        "p_value_column": validated.p_column,
+        "input_delimiter": validated.input_delimiter,
         "normalized_result": str(destination),
         "columns": frame.columns,
         "multiple_testing": multiple_testing,
     }
 
 
+def normalize_gcta_results(
+    raw_result: str | Path,
+    normalized_result: str | Path,
+    module_config,
+) -> dict:
+    """Validate raw results, add corrections, and write a normalized TSV."""
+    validated = validate_raw_gcta_results(raw_result, module_config)
+    return add_multiple_testing_results(
+        validated, normalized_result, module_config,
+    )
+
+
 __all__ = [
+    "ValidatedGctaResults",
+    "add_multiple_testing_results",
     "multiple_testing_configuration",
     "normalize_gcta_results",
+    "validate_raw_gcta_results",
 ]

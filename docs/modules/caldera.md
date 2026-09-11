@@ -24,6 +24,8 @@ PostGWAS never lifts coordinates or treats K-POPS scores as PoPS scores. CALDERA
 
 Installation places the pinned CALDERA repository under the active `postgwas` environment, and PostGWAS resolves it relative to that environment's Python. The R adapter is resolved from the installed PostGWAS package. `--caldera-repository` and `--caldera-adapter-script` remain optional overrides for nonstandard development installations.
 
+Direct and pipeline execution report five validated CALDERA stages. PoPS predictions are validated first, followed by the direct credible-set table or every fine-mapping index/source file supplied internally by the pipeline. CALDERA's repository, upstream script, coding-variant table, build-specific gene locations, trained model, PostGWAS adapter, and Rscript executable are then validated before the external analysis starts. Completed stages display input paths, gene/variant/locus counts, upstream credible-set trimming, selected build, and reference paths; the canonical log records the same preflight evidence. Results are published only after probability, locus, and row-count invariants pass, followed by a concise scientific run summary.
+
 ## Direct mode
 
 ```console
@@ -64,7 +66,14 @@ postgwas pipeline \
   --run-config caldera_pipeline.yaml
 ```
 
-The plan runs MAGMA and PoPS plus fine-mapping prerequisites. SuSiE and FINEMAP already publish validated 95% credible sets in the common FLAMES interchange. CALDERA converts that artifact to `locus/chr/bp/pip`, using the configured index filenames, column names, variant-ID pattern, and locus separator. The converted table is retained with the result for provenance.
+The plan runs MAGMA and PoPS plus fine-mapping prerequisites. MAGMA output is
+consumed by PoPS; CALDERA itself never reads a MAGMA result file. The pinned
+upstream `caldera()` call receives only PoPS predictions, credible-set variants,
+the genome assembly, and the CALDERA repository. SuSiE and FINEMAP already
+publish validated 95% credible sets in the common FLAMES interchange. CALDERA
+converts that artifact to `locus/chr/bp/pip`, using the configured index
+filenames, column names, variant-ID pattern, and locus separator. The converted
+table is retained with the result for provenance.
 
 ## Outputs
 

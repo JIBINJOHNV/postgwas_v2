@@ -14,3 +14,23 @@ font_size: 12
 allelic_shift: false
 flag_coding: false
 file_format: pdf
+output_file: '{dataset_id}_manhattanplots.{file_format}'
+log_file: '{dataset_id}_manhattan.log'
+plot_data_file: '{dataset_id}_manhattan_points.tsv'
+single_chromosome_height: 7.0
+genomewide_height: 3.5
+png_dpi: 150
+pvalue_field: LP
+frequency_field: AF
+allelic_shift_field: AS
+consequence_field: Consequence
+consequence_info_field: CSQ
+coding_terms: [missense, inframe, protein_altering, transcript_amplification, exon_loss, disruptive, start_lost, stop_lost, stop_gained, frameshift, splice_acceptor, splice_donor, transcript_ablation]
+chromosome_label_policy: strip_prefix
+chromosome_prefix: chr
+axis_label_rows: 2
+caption_font_size: 8.0
+caption_template: |-
+  Plotted {plotted_records} of {input_records} records; minimum LP: {minimum_lp}; minimum AF filter: {minimum_af}.
+  Above LP={loglog_threshold}, Y-axis spacing is log-log; the association values are unchanged.
+  Chromosomes with no plotted records: {empty_chromosomes}.

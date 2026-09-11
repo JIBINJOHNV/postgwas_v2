@@ -13,10 +13,10 @@ missing_pvalue_action: remove
 reference_population_tag: EUR
 frequency_difference_max: 0.2
 include_indels: false
-remove_palindromic: true
+remove_palindromic: false
 palindromic_lower: 0.4
 palindromic_upper: 0.6
-remove_mhc: true
+remove_mhc: false
 mhc_regions:
   GRCh37:
     chromosome: "6"
@@ -26,9 +26,28 @@ mhc_regions:
     chromosome: "6"
     start: 28510120
     end: 33480577
+mhc_region_override:
+  chromosome: null
+  start: null
+  end: null
 empty_expression_action: match_all
 sort_output: false
+write_soft_filter_vcf: false
 report_missing_counts: true
+filter_reason_ids:
+  empty_expression: PGWAS_EMPTY_POLICY
+  missing_pvalue: PGWAS_MISSING_LP
+  pvalue_below_threshold: PGWAS_LOW_LP
+  missing_study_af: PGWAS_MISSING_AF
+  maf_outside_range: PGWAS_MAF
+  missing_imputation_quality: PGWAS_MISSING_SI
+  imputation_quality_outside_range: PGWAS_INFO
+  missing_study_info_af: PGWAS_MISSING_INFO_AF
+  missing_external_af: PGWAS_MISSING_REFERENCE_AF
+  frequency_difference: PGWAS_AF_DIFFERENCE
+  non_snp: PGWAS_NON_SNP
+  palindromic: PGWAS_PALINDROMIC
+  mhc: PGWAS_MHC
 vcf_fields:
   chromosome: CHROM
   position: POS
@@ -42,7 +61,10 @@ vcf_fields:
   external_af_info: INFO/{reference_population_tag}
 output_layout:
   filtered_vcf: "{dataset_id}_{genome_build}_filtered.vcf.gz"
+  soft_filtered_vcf: "{dataset_id}_{genome_build}_soft_filtered.vcf.gz"
   log_file: "logs/{dataset_id}_{genome_build}_filter_gwas_vcf_bcftools.log"
   preflight_log: "logs/{dataset_id}_filter_preflight.log"
   reason_summary: "qc_summary/{dataset_id}_{genome_build}_filter_reason_summary.tsv"
+  summary_csv: "qc_summary/{dataset_id}_{genome_build}_filter_summary.csv"
+  html_report: "reports/{dataset_id}_{genome_build}_filter_report.html"
   mhc_exclusion_bed: "{dataset_id}_{genome_build}_mhc_exclude.bed"

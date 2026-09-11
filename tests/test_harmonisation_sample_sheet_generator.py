@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from postgwas.config import load_module_configuration
 from postgwas.core.errors import ConfigurationError
 from postgwas.modules.harmonisation.input_validation import validate_header
 from postgwas.modules.harmonisation.policies import default_policies
@@ -66,6 +67,11 @@ def test_generator_writes_exact_v2_schema_and_validates_output(tmp_path):
 
     assert fields == list(HarmonisationSampleSheetRow.model_fields)
     assert result.dataset_count == 1
+    assert result.candidate_count == 1
+    assert result.rejected_files == ()
+    assert result.rejection_report_file.read_text(encoding="utf-8") == (
+        "input_file\treason\n"
+    )
     assert result.requires_completion is False
     assert loaded.dataset_id == "study"
     assert loaded.effect_column == "OR"
@@ -329,12 +335,62 @@ def test_generator_does_not_treat_total_n_as_controls_when_cases_exist(tmp_path)
     assert not output.exists()
 
 
-def test_one_unmapped_file_prevents_partial_output(tmp_path):
+def test_default_policy_writes_valid_rows_and_reports_unmapped_files(tmp_path):
     _summary_statistics(tmp_path / "valid.tsv")
     (tmp_path / "invalid.tsv").write_text("A\tB\n1\t2\n", encoding="utf-8")
     output = tmp_path / "manifest.csv"
 
+    result = generate_sample_sheet(tmp_path, output)
+    _, generated = _read_row(output)
+    with result.rejection_report_file.open(
+        "r", encoding="utf-8", newline=""
+    ) as handle:
+        rejections = list(csv.DictReader(handle, delimiter="\t"))
+
+    assert load_module_configuration(
+        "harmonisation"
+    ).sample_sheet_generator.failure_policy == "write_valid"
+    assert result.candidate_count == 2
+    assert result.dataset_count == 1
+    assert generated["dataset_id"] == "valid"
+    assert len(result.rejected_files) == 1
+    assert rejections == [{
+        "input_file": str((tmp_path / "invalid.tsv").resolve()),
+        "reason": result.rejected_files[0].reason,
+    }]
+    summary = _generation_summary(result)
+    assert "Rejected files    : 1" in summary
+    assert "invalid.tsv:" in summary
+
+    rerun = generate_sample_sheet(tmp_path, output)
+
+    assert rerun.candidate_count == 2
+    assert rerun.dataset_count == 1
+
+
+def test_fail_all_policy_remains_available_explicitly(tmp_path):
+    _summary_statistics(tmp_path / "valid.tsv")
+    (tmp_path / "invalid.tsv").write_text("A\tB\n1\t2\n", encoding="utf-8")
+    output = tmp_path / "manifest.csv"
+    config = tmp_path / "strict.yaml"
+    config.write_text(
+        "sample_sheet_generator:\n  failure_policy: fail_all\n",
+        encoding="utf-8",
+    )
+
     with pytest.raises(ConfigurationError, match="no output was written"):
+        generate_sample_sheet(tmp_path, output, config_file=config)
+
+    assert not output.exists()
+    assert not (tmp_path / "manifest.csv.rejected_files.tsv").exists()
+
+
+def test_default_policy_fails_when_no_candidate_can_be_mapped(tmp_path):
+    (tmp_path / "invalid.tsv").write_text("A\tB\n1\t2\n", encoding="utf-8")
+    output = tmp_path / "manifest.csv"
+
+    with pytest.raises(ConfigurationError, match="none of the 1 candidate"):
         generate_sample_sheet(tmp_path, output)
 
     assert not output.exists()
+    assert not (tmp_path / "manifest.csv.rejected_files.tsv").exists()

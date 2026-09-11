@@ -80,9 +80,38 @@ input:
   missing_values: median
   maximum_missing_fraction: 0.05
   missing_genes: drop
+multiple_testing:
+  significance_threshold: 0.05
+  primary_method: bonferroni
+  methods: [bonferroni, sidak, holm, fdr_bh]
+  reporting_method_labels:
+    bonferroni: "Bonferroni"
+    sidak: "Šidák"
+    holm: "Holm"
+    fdr_bh: "BH-FDR"
+result_schema:
+  variable_column: "VARIABLE"
+  type_column: "TYPE"
+  gene_count_column: "NGENES"
+  beta_column: "BETA"
+  standardized_beta_column: "BETA_STD"
+  standard_error_column: "SE"
+  p_value_column: "P"
+  adjusted_p_value_column_pattern: "P_{method}_corr"
+  primary_correction_method_column: "primary_correction_method"
+  primary_adjusted_p_value_column: "primary_adjusted_p"
+  primary_significant_column: "primary_significant"
+  delimiter: "\t"
+  null_value: "NA"
+reporting:
+  highlight_method: fdr_bh
+  top_property_count: 5
+  p_value_significant_digits: 4
+  effect_significant_digits: 4
 output_layout:
   output_prefix: "{dataset_id}"
   results_file: "{dataset_id}.gsa.out"
+  corrected_results_file: "{dataset_id}_magmacovar_corrected.tsv"
   native_log_file: "{dataset_id}.log"
   service_log_file: "logs/{dataset_id}_magmacovar.log"
   resolved_config_file: "logs/{dataset_id}_magmacovar_resolved_config.yaml"

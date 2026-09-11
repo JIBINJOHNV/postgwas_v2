@@ -2,10 +2,12 @@
 
 Implements the build rows of plan v3 section 6.4: an explicit ``build.mode``
 instead of the ``--genome-build`` flag the current error message advertises but
-that does not exist, absolute and relative evidence floors
-(``build.min_match_count`` and ``build.min_match_fraction``), optional
-deduplication of the references, and a denominator that counts only variants
-whose exact coordinate occurs in at least one configured build reference.
+that does not exist, absolute-count, chromosome-scoped reference-coverage and
+testable-row evidence floors (``build.min_match_count``,
+``build.min_reference_match_fraction`` and ``build.min_match_fraction``), and
+optional deduplication of the references. Input-wide match fractions remain
+reported as audit evidence but are not a decision threshold because the build
+references are representative marker panels rather than variant inventories.
 
 Build evidence follows the GWAS Catalog summary-statistics convention that a
 variant occupies one row while either allele order is valid. Consequently, a
@@ -17,16 +19,14 @@ https://www.ebi.ac.uk/gwas/docs/methods/summary-statistics.
 
 import polars as pl
 
-from postgwas.core.dataframes import (
-    chromosome_expression,
-    count_non_null,
-    position_expression,
-    validate_cast_retention,
-)
-from postgwas.core.io.tables import read_delimited_table
-
 from .shared.runtime import resolve_policies, step_context
-from .shared.variant_columns import has_canonical_variant_columns
+from .shared.variant_columns import (
+    canonicalize_variant_frame,
+    has_canonical_variant_columns,
+    palindromic_snp_expression,
+    read_reference_variant_table,
+    reverse_complement_expression,
+)
 
 __all__ = ["infer_genome_build", "GenomeBuildError", "POLICY_KEYS"]
 
@@ -35,21 +35,13 @@ POLICY_KEYS = [
     "build.mode",
     "build.confidence_ratio",
     "build.min_match_count",
+    "build.min_reference_match_fraction",
     "build.min_match_fraction",
     "build.deduplicate_reference",
     "chromosome.strip_chr_prefix",
+    "chromosome.strip_leading_zero",
+    "chromosome.rename_map",
 ]
-
-
-def _reverse_complement(column: str) -> pl.Expr:
-    """Reverse-complement a sequence allele using IUPAC DNA bases A/C/G/T."""
-    return (
-        pl.col(column)
-        .cast(pl.Utf8)
-        .str.to_uppercase()
-        .str.replace_many(["A", "C", "G", "T"], ["T", "G", "C", "A"])
-        .str.reverse()
-    )
 
 
 class GenomeBuildError(RuntimeError):
@@ -65,7 +57,6 @@ def _load_reference(
     label,
     step,
     deduplicate,
-    strip_chr_prefix,
     column_mapping,
     policies,
 ):
@@ -74,21 +65,16 @@ def _load_reference(
         "Genome-build reference",
         build=label,
         file=str(path),
-        delimiter=column_mapping["delimiter"],
-        chromosome_column=column_mapping["chr"],
-        position_column=column_mapping["pos"],
-        reference_allele_column=column_mapping["a1"],
-        alternate_allele_column=column_mapping["a2"],
+        delimiter=column_mapping.get("delimiter"),
+        chromosome_column=column_mapping.get("chr"),
+        position_column=column_mapping.get("pos"),
+        reference_allele_column=column_mapping.get("a1"),
+        alternate_allele_column=column_mapping.get("a2"),
     )
-    raw, _detected = read_delimited_table(
+    raw, _detected = read_reference_variant_table(
         path,
-        column_mapping["delimiter"],
-        candidates=list(policies.get("input.delimiter_candidates")),
-        minimum_columns=int(policies.get("input.delimiter_min_columns")),
-        maximum_columns=int(policies.get("input.delimiter_max_columns")),
-        sample_lines=int(policies.get("input.delimiter_sample_rows")),
-        null_values=list(policies.get("input.null_values")),
-        infer_schema_length=int(policies.get("input.schema_inference_rows")),
+        column_mapping,
+        policies,
         error_type=GenomeBuildError,
         description="%s genome-build reference" % label,
     )
@@ -98,35 +84,22 @@ def _load_reference(
         column_mapping["a1"],
         column_mapping["a2"],
     ]
-    missing = [column for column in configured_columns if column not in raw.columns]
-    if missing:
-        raise GenomeBuildError(
-            "%s genome-build reference is missing configured columns: %s"
-            % (label, ", ".join(missing))
-        )
-    raw = raw.select(configured_columns).rename(dict(zip(
+    raw = raw.rename(dict(zip(
         configured_columns,
         ["__build_chr", "__build_pos", "__build_ref", "__build_alt"],
     )))
-    schema = dict(raw.schema)
-    position_before = count_non_null(raw, "__build_pos")
-    reference = raw.with_columns([
-        chromosome_expression(
-            "__build_chr",
-            schema["__build_chr"],
-            strip_chr_prefix=strip_chr_prefix,
-            strip_leading_zero=True,
-        ),
-        position_expression("__build_pos", schema["__build_pos"]),
-        pl.col("__build_ref").cast(pl.Utf8).str.to_uppercase(),
-        pl.col("__build_alt").cast(pl.Utf8).str.to_uppercase(),
-    ])
-    validate_cast_retention(
-        position_before,
-        count_non_null(reference, "__build_pos"),
-        "%s reference position" % label,
+    reference, _normalization = canonicalize_variant_frame(
+        raw,
+        {
+            "chr": "__build_chr",
+            "pos": "__build_pos",
+            "ea": "__build_alt",
+            "oa": "__build_ref",
+        },
+        policies,
         error_type=GenomeBuildError,
         warn=step.warn,
+        label="%s reference" % label,
     )
 
     if deduplicate:
@@ -189,15 +162,19 @@ def infer_genome_build(
         'total_variants' is the denominator behind the percentages: the number
         of study rows whose exact chromosome and position occurs in at least
         one configured reference.
-        'input_variants' is the unfiltered row count.
+        'input_variants' is the cleaned study-row count supplied to this step.
+        'reference_percentages' measures unique matched reference allele records
+        against the unique records on chromosomes present in the study.
     """
     policies = resolve_policies(policies)
     mode = policies.get("build.mode")
     confidence_ratio = float(policies.get("build.confidence_ratio"))
     min_match_count = int(policies.get("build.min_match_count"))
+    min_reference_match_fraction = float(
+        policies.get("build.min_reference_match_fraction")
+    )
     min_match_fraction = float(policies.get("build.min_match_fraction"))
     deduplicate = bool(policies.get("build.deduplicate_reference"))
-    strip_chr_prefix = bool(policies.get("chromosome.strip_chr_prefix"))
     build_names = list(reference_files)
     if len(build_names) < 2:
         raise GenomeBuildError(
@@ -219,23 +196,13 @@ def infer_genome_build(
         if not has_canonical_variant_columns(t_df, sample_column_dict):
             # Keep direct library calls safe; the normal pipeline reaches this
             # step with dataset-level canonical columns and avoids this scan.
-            schema = dict(t_df.schema)
-            position_before = count_non_null(t_df, pos_col)
-            t_df = t_df.with_columns([
-                chromosome_expression(
-                    chr_col, schema[chr_col], strip_chr_prefix=strip_chr_prefix,
-                    strip_leading_zero=True,
-                ),
-                position_expression(pos_col, schema[pos_col]),
-                pl.col(ea_col).cast(pl.Utf8).str.to_uppercase(),
-                pl.col(oa_col).cast(pl.Utf8).str.to_uppercase(),
-            ])
-            validate_cast_retention(
-                position_before,
-                count_non_null(t_df, pos_col),
-                "study position",
+            t_df, _normalization = canonicalize_variant_frame(
+                t_df,
+                {"chr": chr_col, "pos": pos_col, "ea": ea_col, "oa": oa_col},
+                policies,
                 error_type=GenomeBuildError,
                 warn=step.warn,
+                label="study",
             )
 
         references = {
@@ -244,7 +211,6 @@ def infer_genome_build(
                 name,
                 step,
                 deduplicate,
-                strip_chr_prefix,
                 reference_column_mapping,
                 policies,
             )
@@ -257,16 +223,42 @@ def infer_genome_build(
         # reverse-complement representations are indistinguishable.
         study_row = "__build_study_row"
         study = t_df.with_row_index(study_row)
+        study_chromosomes = (
+            study.select(pl.col(chr_col).alias("__build_chr"))
+            .drop_nulls()
+            .unique(maintain_order=True)
+        )
+        reference_marker_columns = [
+            "__build_marker_chr",
+            "__build_marker_pos",
+            "__build_ref",
+            "__build_alt",
+        ]
 
         def match_evidence(ref_df: pl.DataFrame):
+            relevant_reference = ref_df.join(
+                study_chromosomes,
+                on="__build_chr",
+                how="semi",
+            ).with_columns([
+                pl.col("__build_chr").alias("__build_marker_chr"),
+                pl.col("__build_pos").alias("__build_marker_pos"),
+            ])
+            reference_markers = relevant_reference.select(
+                reference_marker_columns
+            ).unique()
             joined = study.join(
-                ref_df,
+                relevant_reference,
                 left_on=[chr_col, pos_col],
                 right_on=["__build_chr", "__build_pos"],
                 how="inner",
             ).with_columns([
-                _reverse_complement(ea_col).alias("__build_ea_rc"),
-                _reverse_complement(oa_col).alias("__build_oa_rc"),
+                reverse_complement_expression(
+                    pl.col(ea_col)
+                ).alias("__build_ea_rc"),
+                reverse_complement_expression(
+                    pl.col(oa_col)
+                ).alias("__build_oa_rc"),
             ])
             ea = pl.col(ea_col)
             oa = pl.col(oa_col)
@@ -283,17 +275,20 @@ def infer_genome_build(
                 & (ref.str.len_chars() == 1)
                 & (alt.str.len_chars() == 1)
             )
-            pair = pl.concat_str([ea, oa])
-            non_palindromic = snv & ~pair.is_in(["AT", "TA", "CG", "GC"])
+            non_palindromic = snv & ~palindromic_snp_expression(ea, oa)
             classified = joined.with_columns([
                 forward.alias("__build_forward"),
                 reverse.alias("__build_reverse"),
                 non_palindromic.alias("__build_informative"),
             ])
             coordinate_rows = classified.select(study_row).unique()
-            matched = classified.filter(
+            matched_rows = classified.filter(
                 pl.col("__build_forward") | pl.col("__build_reverse")
-            ).select(study_row).unique().height
+            )
+            matched = matched_rows.select(study_row).unique().height
+            matched_reference_markers = matched_rows.select(
+                reference_marker_columns
+            ).unique().height
             informative = classified.filter(pl.col("__build_informative"))
             forward_rows = informative.filter(
                 pl.col("__build_forward") & ~pl.col("__build_reverse")
@@ -308,6 +303,8 @@ def infer_genome_build(
                 {
                     "matches": matched,
                     "coordinate_hits": coordinate_rows.height,
+                    "reference_markers": reference_markers.height,
+                    "matched_reference_markers": matched_reference_markers,
                     "forward": forward_rows,
                     "reverse": reverse_rows,
                     "ambiguous": ambiguous_rows,
@@ -345,19 +342,44 @@ def infer_genome_build(
             name: orientation_evidence.get(name, {}).get("coordinate_hits", 0)
             for name in build_names
         }
+        reference_marker_counts = {
+            name: orientation_evidence.get(name, {}).get("reference_markers", 0)
+            for name in build_names
+        }
+        matched_reference_marker_counts = {
+            name: orientation_evidence.get(name, {}).get(
+                "matched_reference_markers", 0
+            )
+            for name in build_names
+        }
         fractions = {
             name: (count / testable if testable else 0.0)
             for name, count in matches.items()
         }
+        input_fractions = {
+            name: (count / t_df.height if t_df.height else 0.0)
+            for name, count in matches.items()
+        }
+        reference_fractions = {
+            name: (
+                matched_reference_marker_counts[name] / count
+                if count else 0.0
+            )
+            for name, count in reference_marker_counts.items()
+        }
 
         total_matches = sum(matches.values())
         match_fraction = max(fractions.values())
+        input_match_fraction = max(input_fractions.values())
+        reference_match_fraction = max(reference_fractions.values())
         ambiguous_reason = None
         confidence = None
         if mode != "auto":
             inferred_build = mode
             confidence = None
             match_fraction = fractions.get(mode, 0.0)
+            input_match_fraction = input_fractions.get(mode, 0.0)
+            reference_match_fraction = reference_fractions.get(mode, 0.0)
         elif testable == 0:
             inferred_build = "Ambiguous"
             ambiguous_reason = (
@@ -374,6 +396,7 @@ def infer_genome_build(
             winner, winning_matches = ordered[0]
             tied = len(ordered) > 1 and winning_matches == ordered[1][1]
             confidence = winning_matches / total_matches
+            reference_match_fraction = reference_fractions[winner]
             if tied:
                 inferred_build = "Ambiguous"
                 ambiguous_reason = "the leading genome-build references tied"
@@ -386,6 +409,20 @@ def infer_genome_build(
                         winner,
                         "{:,}".format(winning_matches),
                         "{:,}".format(min_match_count),
+                    )
+                )
+            elif reference_match_fraction < min_reference_match_fraction:
+                inferred_build = "Ambiguous"
+                ambiguous_reason = (
+                    "only %s of %s unique %s reference markers on the study's "
+                    "chromosomes matched (%.4f%%), below the %.2f%% required "
+                    "by 'build.min_reference_match_fraction'"
+                    % (
+                        "{:,}".format(matched_reference_marker_counts[winner]),
+                        "{:,}".format(reference_marker_counts[winner]),
+                        winner,
+                        reference_match_fraction * 100,
+                        min_reference_match_fraction * 100,
                     )
                 )
             elif match_fraction < min_match_fraction:
@@ -423,7 +460,22 @@ def infer_genome_build(
             evidence["%s allele matches" % name] = "{:,} ({:.2f}%)".format(
                 matches[name], fractions[name] * 100,
             )
+            evidence["%s input-wide match fraction" % name] = "{:.2f}%".format(
+                input_fractions[name] * 100,
+            )
+            evidence["%s relevant reference markers" % name] = "{:,}".format(
+                reference_marker_counts[name]
+            )
+            evidence["%s matched reference markers" % name] = (
+                "{:,} ({:.2f}%)".format(
+                    matched_reference_marker_counts[name],
+                    reference_fractions[name] * 100,
+                )
+            )
         evidence["minimum allele matches"] = "{:,}".format(min_match_count)
+        evidence["minimum relevant-reference coverage"] = "{:.2f}%".format(
+            min_reference_match_fraction * 100
+        )
         evidence["minimum match fraction"] = "{:.2f}%".format(
             min_match_fraction * 100
         )
@@ -448,12 +500,24 @@ def infer_genome_build(
                 name: round(fraction * 100, 2)
                 for name, fraction in fractions.items()
             },
+            "input_percentages": {
+                name: round(fraction * 100, 2)
+                for name, fraction in input_fractions.items()
+            },
+            "reference_marker_counts": reference_marker_counts,
+            "matched_reference_marker_counts": matched_reference_marker_counts,
+            "reference_percentages": {
+                name: round(fraction * 100, 2)
+                for name, fraction in reference_fractions.items()
+            },
             "total_variants": testable,
             "input_variants": t_df.height,
             "testable_variants": testable,
             "untestable_variants": untestable,
             "coordinate_hits": coordinate_hits,
             "match_fraction": match_fraction,
+            "input_match_fraction": input_match_fraction,
+            "reference_match_fraction": reference_match_fraction,
             "confidence": confidence,
             "mode": mode,
             "forced": mode != "auto",

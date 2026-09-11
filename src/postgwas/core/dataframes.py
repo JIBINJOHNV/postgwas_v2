@@ -2,11 +2,44 @@
 
 from __future__ import annotations
 
+import inspect
+from typing import Any, Callable, Type
+
 import polars as pl
-from typing import Callable, Type
 
 
 FLOAT_DTYPES = (pl.Float32, pl.Float64)
+
+
+def streaming_collect_options(
+    collect_method: Callable[..., Any],
+    *,
+    error_type: Type[Exception] = RuntimeError,
+) -> tuple[dict[str, Any], str]:
+    """Select an explicitly supported Polars streaming collection API."""
+    parameters = inspect.signature(collect_method).parameters
+    if "engine" in parameters:
+        return {"engine": "streaming"}, "engine=streaming"
+    if "streaming" in parameters:
+        return {"streaming": True}, "streaming=True"
+    raise error_type(
+        "Installed Polars %s does not expose a supported streaming LazyFrame "
+        "collection option. Install a supported PostGWAS analysis environment."
+        % getattr(pl, "__version__", "unknown")
+    )
+
+
+def collect_streaming(
+    frame: pl.LazyFrame,
+    *,
+    error_type: Type[Exception] = RuntimeError,
+) -> pl.DataFrame:
+    """Collect a lazy frame using a declared Polars streaming option."""
+    options, _ = streaming_collect_options(
+        frame.collect,
+        error_type=error_type,
+    )
+    return frame.collect(**options)
 
 
 def numeric_column(frame: pl.DataFrame, column: str) -> pl.Expr:
@@ -87,9 +120,11 @@ def validate_cast_retention(
 __all__ = [
     "FLOAT_DTYPES",
     "chromosome_expression",
+    "collect_streaming",
     "count_matching_rows",
     "count_non_null",
     "numeric_column",
     "position_expression",
+    "streaming_collect_options",
     "validate_cast_retention",
 ]

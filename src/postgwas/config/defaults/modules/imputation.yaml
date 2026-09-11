@@ -1,15 +1,29 @@
 enabled: false
 engine: pred_ld
+input_directory: null
+ld_reference_directory: null
+# PRED-LD releases do not encode genome build in their files. Declare the
+# build of the supplied reference explicitly; pipeline preflight compares it
+# with the harmonised GWAS-VCF metadata.
+genome_build: null
 population: EUR
+post_harmonisation_directory: imputed_harmonised
 engines:
   pred_ld:
     minimum_r2: 0.8
     minimum_maf: 0.001
     mode: TOP_LD
     correlation_method: pearson
-  raiss:
-    minimum_r2: 0.8
-  ssimp:
-    minimum_r2: 0.8
-  summary_gwas_imputation:
-    minimum_r2: 0.8
+    imputed_dataset_suffix: _imputed
+    # Resource-aware scheduling controls. These affect performance only; they
+    # do not change the PRED-LD statistical model or output interpretation.
+    memory_gb_per_worker: 30.0
+    free_memory_threshold_gb: 20.0
+    free_memory_threshold_fraction: 0.8
+    memory_poll_seconds: 10.0
+    worker_poll_seconds: 2.0
+    large_chromosomes: ['1', '2', '3', '4']
+    preferred_chromosome_order: ['1', '22', '21', '20', '19', '18', '2', '17', '16', '15', '14', '3', '13', '12', '11', '4', '10', '9', '8', '5', '7', '6', 'X']
+    reference_subdirectory_template: '{mode}/{population}/SNV'
+    reference_file_template: '{population}_chr{chromosome}_no_filter_0.2_1000000_{kind}.csv.gz'
+    reference_file_kinds: [info_annotation, LD]

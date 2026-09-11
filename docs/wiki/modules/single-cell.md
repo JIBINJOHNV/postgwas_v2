@@ -90,6 +90,13 @@ harmonised GWAS-VCF and direct mode with exact method-specific inputs.
 
 ## Input requirements
 
+Missing inputs for all selected methods are reported together with their public
+CLI options and canonical YAML keys, before reference scans or native commands.
+Pipeline-generated gene results, gene sets, and summary statistics are exempt
+from this startup requirement; the atlas, identifier crosswalk (when configured),
+and LD-score resources are not. A supplied but invalid file still fails the
+method's scientific validation and is not relabelled as a missing argument.
+
 For `magma_celltype`:
 
 - Pipeline mode requires a harmonised GWAS-VCF and the references required by
@@ -194,10 +201,12 @@ postgwas single_cell \
   --tools magma_celltype \
   --magma-gene-results-file STUDY.genes.raw \
   --single-cell-covariates atlas_celltype_average.tsv \
-  --magma /path/to/magma \
   --dataset-id STUDY \
   --output-directory results
 ```
+
+MAGMA is resolved from `resources.executables.magma` (default `magma`) and
+validated on `PATH` before analysis.
 
 ## Full example
 

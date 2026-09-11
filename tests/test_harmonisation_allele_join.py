@@ -42,6 +42,7 @@ def test_shared_join_preserves_order_and_applies_only_requested_swap_transform()
         reference,
         study_columns=STUDY_COLUMNS,
         reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
         value_column="AF",
         output_column="EAF",
         **DUPLICATE_ACTIONS,
@@ -55,6 +56,67 @@ def test_shared_join_preserves_order_and_applies_only_requested_swap_transform()
     assert stats["direct_key_matches"] == 1
     assert stats["swapped_key_matches"] == 1
     assert stats["unmatched_rows"] == 1
+
+
+def test_shared_join_applies_same_chromosome_aliases_to_reference_keys():
+    study = pl.DataFrame({
+        "CHR": ["1", "X"],
+        "POS": [10, 20],
+        "EA": ["A", "C"],
+        "OA": ["G", "T"],
+    })
+    reference = pl.DataFrame({
+        "CHROM": ["01", "23"],
+        "BP": [10, 20],
+        "A1": ["A", "C"],
+        "A2": ["G", "T"],
+        "VALUE": [0.8, 0.9],
+    })
+
+    result, orientation, stats = allele_oriented_left_join(
+        study,
+        reference,
+        study_columns=STUDY_COLUMNS,
+        reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
+        value_column="VALUE",
+        output_column="VALUE",
+        **DUPLICATE_ACTIONS,
+    )
+
+    assert result["VALUE"].to_list() == pytest.approx([0.8, 0.9])
+    assert result[orientation].to_list() == [0, 0]
+    assert stats["direct_value_matches"] == 2
+    assert stats["unmatched_rows"] == 0
+
+
+def test_reference_aliases_are_canonicalized_before_duplicate_resolution():
+    study = pl.DataFrame({
+        "CHR": ["X"], "POS": [10], "EA": ["A"], "OA": ["G"],
+    })
+    reference = pl.DataFrame({
+        "CHROM": ["23", "X"],
+        "BP": [10, 10],
+        "A1": ["A", "A"],
+        "A2": ["G", "G"],
+        "VALUE": [0.8, 0.9],
+    })
+
+    result, orientation, stats = allele_oriented_left_join(
+        study,
+        reference,
+        study_columns=STUDY_COLUMNS,
+        reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
+        value_column="VALUE",
+        output_column="VALUE",
+        **DUPLICATE_ACTIONS,
+    )
+
+    assert result["VALUE"].to_list() == [None]
+    assert result[orientation].to_list() == [None]
+    assert stats["reference_non_identical_duplicate_groups"] == 1
+    assert stats["reference_duplicate_rows_removed"] == 2
 
 
 def test_shared_join_prefers_direct_and_can_fall_back_from_an_empty_value():
@@ -74,6 +136,7 @@ def test_shared_join_prefers_direct_and_can_fall_back_from_an_empty_value():
         reference,
         study_columns=STUDY_COLUMNS,
         reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
         value_column="VALUE",
         output_column="VALUE",
         **DUPLICATE_ACTIONS,
@@ -85,6 +148,7 @@ def test_shared_join_prefers_direct_and_can_fall_back_from_an_empty_value():
         reference,
         study_columns=STUDY_COLUMNS,
         reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
         value_column="VALUE",
         output_column="VALUE",
         **DUPLICATE_ACTIONS,
@@ -115,6 +179,7 @@ def test_shared_join_discards_missing_and_finite_non_identical_duplicates():
         reference,
         study_columns=STUDY_COLUMNS,
         reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
         value_column="VALUE",
         output_column="VALUE",
         **DUPLICATE_ACTIONS,
@@ -143,6 +208,7 @@ def test_shared_join_discards_conflicting_finite_reference_duplicates():
         reference,
         study_columns=STUDY_COLUMNS,
         reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
         value_column="VALUE",
         output_column="VALUE",
         **DUPLICATE_ACTIONS,
@@ -173,6 +239,7 @@ def test_shared_join_can_fail_on_non_identical_reference_duplicates():
             reference,
             study_columns=STUDY_COLUMNS,
             reference_columns=REFERENCE_COLUMNS,
+            policies=default_policies(),
             value_column="VALUE",
             output_column="VALUE",
             duplicate_exact_action="keep_one",
@@ -195,6 +262,7 @@ def test_shared_join_collapses_equivalent_finite_reference_duplicates():
         reference,
         study_columns=STUDY_COLUMNS,
         reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
         value_column="VALUE",
         output_column="VALUE",
         **DUPLICATE_ACTIONS,
@@ -221,6 +289,7 @@ def test_shared_join_can_discard_all_exact_reference_duplicates():
         reference,
         study_columns=STUDY_COLUMNS,
         reference_columns=REFERENCE_COLUMNS,
+        policies=default_policies(),
         value_column="VALUE",
         output_column="VALUE",
         duplicate_exact_action="discard_all",
@@ -264,7 +333,7 @@ def _info_inputs(tmp_path, duplicate=False):
 
 def _info_policies(**duplicate_overrides):
     return default_policies().with_overrides({
-        "info": {"source": "reference"},
+        "info": {"source": "reference", "score_type": "standard_info"},
         "external_reference": duplicate_overrides,
     })
 
@@ -299,6 +368,39 @@ def test_external_info_uses_one_join_for_direct_swapped_and_unmatched(
     assert qc["matched_direct"] == 1
     assert qc["matched_flipped"] == 1
     assert qc["missing_info"] == 1
+
+
+def test_external_info_matches_policy_mapped_reference_chromosome(tmp_path):
+    reference = tmp_path / "info_x.tsv"
+    reference.write_text(
+        "CHROM\tPOS\tA1\tA2\tINFO\n23\t10\tA\tG\t0.9\n",
+        encoding="utf-8",
+    )
+    study = pl.DataFrame({
+        "CHR": ["X"], "POS": [10], "EA": ["A"], "OA": ["G"],
+    })
+    columns = {
+        "chr_col": "CHR", "pos_col": "POS", "ea_col": "EA", "oa_col": "OA",
+        "imp_info_col": None,
+    }
+    mapping = {
+        "chr": "CHROM", "pos": "POS", "a1": "A1", "a2": "A2",
+        "delimiter": "tab",
+    }
+
+    result, qc, resolved = harmonise_imputation_quality(
+        "X",
+        study,
+        columns,
+        info_file=str(reference),
+        info_column="INFO",
+        external_info_colmap=mapping,
+        policies=_info_policies(),
+    )
+
+    assert result[resolved["imp_info_col"]].to_list() == pytest.approx([0.9])
+    assert qc["matched_direct"] == 1
+    assert qc["missing_info"] == 0
 
 
 def test_external_info_non_identical_duplicates_are_all_discarded(tmp_path):

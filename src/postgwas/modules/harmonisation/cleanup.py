@@ -22,6 +22,7 @@ Three ordering rules are load-bearing:
    the merged file.
 """
 
+import csv
 import gzip
 import json
 import os
@@ -37,11 +38,22 @@ from postgwas.core.paths import (
 )
 from postgwas.core.processes import run_checked_command
 
+from .gwas2vcf_export import (
+    GWAS2VCF_SUMMARY_CHROMOSOME_COLUMN,
+    GWAS2VCF_SUMMARY_COLUMN_COUNT_COLUMN,
+    GWAS2VCF_SUMMARY_COLUMNS,
+    GWAS2VCF_SUMMARY_KEY_COLUMN,
+    GWAS2VCF_SUMMARY_MISSING_COLUMN,
+    GWAS2VCF_SUMMARY_ROW_COUNT_COLUMN,
+    GWAS2VCF_SUMMARY_STATUS_COLUMN,
+    GWAS2VCF_SUMMARY_SUCCESS_STATUS,
+)
 from .shared.runtime import emit_message
 
 
 __all__ = [
     "finalise_harmonisation_outputs",
+    "remove_merged_gwas2vcf_intermediate",
     "remove_partial_chromosome_outputs",
 ]
 
@@ -65,46 +77,214 @@ def _safe_name(value, what):
     return text
 
 
-def _concatenate(sources, destination, logger=None):
-    # type: (Sequence[Path], Path, Any) -> Optional[Path]
-    """Concatenate `sources` into `destination`, or do nothing if there are none.
-
-    Written to a temporary file in the destination directory and renamed into
-    place, so the destination is never left truncated or half written.
-    """
-    sources = [Path(s) for s in sources if Path(s).is_file()]
-    if not sources:
-        _emit(
-            logger,
-            "Nothing matched for %s, so the existing file was left untouched."
-            % destination.name,
+def _summary_integer(value, field, source, row_number, minimum):
+    """Parse one generated adapter-summary integer without numeric coercion."""
+    text = "" if value is None else str(value).strip()
+    try:
+        number = int(text)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "GWAS-to-VCF summary %s row %d has invalid %s=%r; expected an "
+            "integer." % (source, row_number, field, value)
+        ) from exc
+    if number < minimum:
+        raise RuntimeError(
+            "GWAS-to-VCF summary %s row %d has invalid %s=%d; expected a "
+            "value of at least %d."
+            % (source, row_number, field, number, minimum)
         )
-        return None
+    return number
+
+
+def _merge_adapter_summaries(
+    sources,
+    destination,
+    delimiter,
+    expected_rows_by_chromosome,
+    logger=None,
+):
+    """Atomically merge validated chromosome audits with exactly one header."""
+    if not isinstance(delimiter, str) or len(delimiter) != 1:
+        raise RuntimeError(
+            "GWAS-to-VCF summary delimiter must be exactly one character."
+        )
+    expected_columns = list(GWAS2VCF_SUMMARY_COLUMNS)
+    destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".part%d" % os.getpid())
+    rows_by_chromosome = {}
     try:
-        with temporary.open("wb") as out:
-            for source in sources:
-                with source.open("rb") as handle:
-                    shutil.copyfileobj(handle, out)
+        with temporary.open("w", encoding="utf-8", newline="") as output:
+            writer = csv.DictWriter(
+                output,
+                fieldnames=expected_columns,
+                delimiter=delimiter,
+                lineterminator="\n",
+                extrasaction="raise",
+            )
+            writer.writeheader()
+            for expected_chromosome, source in sources:
+                source = Path(source)
+                with source.open("r", encoding="utf-8", newline="") as handle:
+                    reader = csv.DictReader(
+                        handle, delimiter=delimiter, strict=True,
+                    )
+                    if reader.fieldnames != expected_columns:
+                        raise RuntimeError(
+                            "GWAS-to-VCF summary %s has header %s; expected %s. "
+                            "The previous merged audit was left unchanged."
+                            % (
+                                source,
+                                reader.fieldnames,
+                                expected_columns,
+                            )
+                        )
+                    source_rows = 0
+                    observed_row_counts = set()
+                    observed_column_counts = set()
+                    observed_keys = set()
+                    for row_number, row in enumerate(reader, start=2):
+                        if None in row or any(
+                            row.get(column) is None for column in expected_columns
+                        ):
+                            raise RuntimeError(
+                                "GWAS-to-VCF summary %s row %d does not match its "
+                                "validated header." % (source, row_number)
+                            )
+                        chromosome = str(
+                            row[GWAS2VCF_SUMMARY_CHROMOSOME_COLUMN]
+                        ).strip()
+                        if chromosome != expected_chromosome:
+                            raise RuntimeError(
+                                "GWAS-to-VCF summary %s row %d reports chromosome "
+                                "%r; expected chromosome %s."
+                                % (
+                                    source,
+                                    row_number,
+                                    chromosome,
+                                    expected_chromosome,
+                                )
+                            )
+                        status = str(
+                            row[GWAS2VCF_SUMMARY_STATUS_COLUMN]
+                        ).strip()
+                        if status != GWAS2VCF_SUMMARY_SUCCESS_STATUS:
+                            raise RuntimeError(
+                                "GWAS-to-VCF summary %s row %d has status %r; "
+                                "only successfully exported chromosome audits may "
+                                "be merged."
+                                % (source, row_number, status)
+                            )
+                        key = str(row[GWAS2VCF_SUMMARY_KEY_COLUMN]).strip()
+                        if not key or key in observed_keys:
+                            raise RuntimeError(
+                                "GWAS-to-VCF summary %s row %d has an empty or "
+                                "duplicate mapping key %r."
+                                % (source, row_number, key)
+                            )
+                        observed_keys.add(key)
+                        num_rows = _summary_integer(
+                            row[GWAS2VCF_SUMMARY_ROW_COUNT_COLUMN],
+                            GWAS2VCF_SUMMARY_ROW_COUNT_COLUMN,
+                            source,
+                            row_number,
+                            minimum=0,
+                        )
+                        num_cols = _summary_integer(
+                            row[GWAS2VCF_SUMMARY_COLUMN_COUNT_COLUMN],
+                            GWAS2VCF_SUMMARY_COLUMN_COUNT_COLUMN,
+                            source,
+                            row_number,
+                            minimum=1,
+                        )
+                        n_missing = _summary_integer(
+                            row[GWAS2VCF_SUMMARY_MISSING_COLUMN],
+                            GWAS2VCF_SUMMARY_MISSING_COLUMN,
+                            source,
+                            row_number,
+                            minimum=0,
+                        )
+                        if n_missing > num_rows:
+                            raise RuntimeError(
+                                "GWAS-to-VCF summary %s row %d reports n_missing=%d "
+                                "for only %d exported row(s)."
+                                % (source, row_number, n_missing, num_rows)
+                            )
+                        observed_row_counts.add(num_rows)
+                        observed_column_counts.add(num_cols)
+                        writer.writerow(
+                            dict((column, row[column]) for column in expected_columns)
+                        )
+                        source_rows += 1
+                    if source_rows == 0:
+                        raise RuntimeError(
+                            "GWAS-to-VCF summary %s has a header but no audit rows."
+                            % source
+                        )
+                    if len(observed_row_counts) != 1:
+                        raise RuntimeError(
+                            "GWAS-to-VCF summary %s contains inconsistent num_rows "
+                            "values: %s."
+                            % (source, sorted(observed_row_counts))
+                        )
+                    if len(observed_column_counts) != 1:
+                        raise RuntimeError(
+                            "GWAS-to-VCF summary %s contains inconsistent num_cols "
+                            "values: %s."
+                            % (source, sorted(observed_column_counts))
+                        )
+                    observed_rows = next(iter(observed_row_counts))
+                    expected_rows = expected_rows_by_chromosome.get(
+                        expected_chromosome
+                    )
+                    if expected_rows is not None and observed_rows != expected_rows:
+                        raise RuntimeError(
+                            "GWAS-to-VCF summary %s reports %d exported row(s) for "
+                            "chromosome %s, but chromosome reconciliation reports %d. "
+                            "The audit and scientific row accounting disagree."
+                            % (
+                                source,
+                                observed_rows,
+                                expected_chromosome,
+                                expected_rows,
+                            )
+                        )
+                    rows_by_chromosome[expected_chromosome] = observed_rows
         os.replace(str(temporary), str(destination))
-    except OSError as exc:
+    except RuntimeError:
         try:
             temporary.unlink()
         except OSError:
             pass
-        _emit(
-            logger,
-            "Could not write %s (%s); the previous file is unchanged."
-            % (destination, exc),
-            warn=True,
-        )
-        return None
+        raise
+    except (OSError, UnicodeError, csv.Error) as exc:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            "Cannot write the validated GWAS-to-VCF summary audit to %s "
+            "(%s: %s). The previous merged audit and chromosome source audits "
+            "were left unchanged."
+            % (destination, type(exc).__name__, exc)
+        ) from exc
+    total_rows = sum(rows_by_chromosome.values())
     _emit(
         logger,
-        "Merged %d file(s) into %s." % (len(sources), destination),
+        "Validated and merged %d GWAS-to-VCF summary file(s) into %s: %d "
+        "chromosome(s), %d adapter-input row(s), one header."
+        % (
+            len(sources),
+            destination,
+            len(rows_by_chromosome),
+            total_rows,
+        ),
     )
-    return destination
+    return {
+        "path": destination,
+        "rows_by_chromosome": rows_by_chromosome,
+        "total_rows": total_rows,
+    }
 
 
 def _merge_identical_json_mappings(sources, destination, logger=None):
@@ -194,6 +374,76 @@ def _unlink(path, logger=None):
     return True
 
 
+def remove_merged_gwas2vcf_intermediate(
+    vcf_path, *, output_directory, logger=None,
+):
+    """Delete one validated raw adapter VCF and its exact tabix/CSI indexes.
+
+    The caller supplies the path resolved from ``output_layout.merged_raw_vcf``.
+    Wildcards are deliberately forbidden so cleanup cannot affect another study
+    or either final build-specific VCF. A cleanup error is fatal: a successful
+    run must not claim that the configured intermediate was removed when it was
+    left behind.
+    """
+    output_root = Path(output_directory).expanduser().resolve()
+    raw_vcf = Path(vcf_path).expanduser()
+    try:
+        raw_vcf.resolve(strict=False).relative_to(output_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Refusing to remove GWAS-to-VCF intermediate outside the dataset "
+            "output directory %s: %s." % (output_root, raw_vcf)
+        ) from exc
+    if raw_vcf.is_symlink():
+        raise RuntimeError(
+            "Refusing to remove the GWAS-to-VCF intermediate because its "
+            "configured path is a symbolic link: %s." % raw_vcf
+        )
+    if not raw_vcf.is_file() or raw_vcf.stat().st_size == 0:
+        raise RuntimeError(
+            "Cannot remove the validated GWAS-to-VCF intermediate because it "
+            "is missing or empty: %s." % raw_vcf
+        )
+
+    candidates = [
+        raw_vcf,
+        Path(str(raw_vcf) + ".tbi"),
+        Path(str(raw_vcf) + ".csi"),
+    ]
+    for path in candidates[1:]:
+        if not path.exists():
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(
+                "Refusing to remove an invalid index path for the GWAS-to-VCF "
+                "intermediate: %s." % path
+            )
+    removed = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                "Could not remove the GWAS-to-VCF intermediate artifact %s: %s."
+                % (path, exc)
+            ) from exc
+        removed.append(path)
+
+    _emit(
+        logger,
+        "Removed raw GWAS-to-VCF intermediate after successful final "
+        "validation: %s%s."
+        % (
+            raw_vcf,
+            " (and %d index file(s))" % (len(removed) - 1)
+            if len(removed) > 1 else "",
+        ),
+    )
+    return [str(path) for path in removed]
+
+
 def _compress(paths, threads, executable=None, logger=None):
     """Compress each file with pigz, falling back to Python's gzip."""
     paths = [Path(p) for p in paths if Path(p).is_file()]
@@ -246,6 +496,9 @@ def finalise_harmonisation_outputs(
     output_dir: str,
     gwas_outputname,
     output_layout: Dict[str, str],
+    summary_delimiter: str,
+    expected_chromosomes: Sequence[str],
+    expected_rows_by_chromosome: Dict[str, Optional[int]],
     threads: int,
     compression_executable: Optional[str],
     policies=None,
@@ -261,6 +514,13 @@ def finalise_harmonisation_outputs(
         Directory holding the per-chromosome files.
     gwas_outputname : str
         Prefix used in filenames.
+    summary_delimiter : str
+        Resolved delimiter used by the chromosome adapter-summary files.
+    expected_chromosomes : sequence of str
+        Completed chromosomes whose side outputs belong in the final audit.
+    expected_rows_by_chromosome : mapping
+        Independently reconciled exported rows, or ``None`` only when rejection
+        collection was explicitly disabled and reconciliation was unavailable.
     policies : Policies, optional
     logger : PipelineLogger, optional
         When absent the messages are printed, exactly as before.
@@ -272,6 +532,47 @@ def finalise_harmonisation_outputs(
     """
     outdir = Path(output_dir)
     name = _safe_name(gwas_outputname, "gwas_outputname")
+    chromosomes = [
+        _safe_name(chromosome, "expected chromosome")
+        for chromosome in expected_chromosomes
+    ]
+    if not chromosomes:
+        raise RuntimeError(
+            "Cannot finalise GWAS-to-VCF side outputs for dataset %s: no "
+            "completed chromosomes were provided." % name
+        )
+    if len(chromosomes) != len(set(chromosomes)):
+        raise RuntimeError(
+            "Cannot finalise GWAS-to-VCF side outputs for dataset %s: the "
+            "completed chromosome list contains duplicates: %s."
+            % (name, ", ".join(chromosomes))
+        )
+    supplied_expected = dict(expected_rows_by_chromosome or {})
+    if set(supplied_expected) != set(chromosomes):
+        raise RuntimeError(
+            "Cannot finalise GWAS-to-VCF side outputs for dataset %s: expected "
+            "row accounting must name exactly the completed chromosomes %s; "
+            "received %s."
+            % (
+                name,
+                ", ".join(chromosomes),
+                ", ".join(sorted(str(key) for key in supplied_expected)),
+            )
+        )
+    expected_rows = {}
+    for chromosome in chromosomes:
+        value = supplied_expected[chromosome]
+        if value is None:
+            expected_rows[chromosome] = None
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(
+                "Cannot finalise GWAS-to-VCF side outputs for dataset %s: "
+                "independent row accounting for chromosome %s must be a "
+                "non-negative integer or unavailable, found %r."
+                % (name, chromosome, value)
+            )
+        expected_rows[chromosome] = value
 
     qc_dir = configured_output_path(outdir, output_layout["qc_directory"])
     qc_dir.mkdir(parents=True, exist_ok=True)
@@ -293,54 +594,70 @@ def finalise_harmonisation_outputs(
     }
 
     # ------------------------------------------------------------------
-    # 1. Validate and merge the per-chromosome side outputs.
-    #    Shell '>' truncated the destination before cat ran, so an empty
-    #    glob left a 0-byte file where the previous merge used to be.
+    # 1. Validate and merge only completed chromosomes' side outputs.
+    #    The summary merge writes one header, validates its scientific row
+    #    accounting, and replaces the delivered audit atomically.
     # ------------------------------------------------------------------
-    side_outputs = (
-        (
-            "dict", "mapping", "adapter_mapping", mapping_path,
-            _merge_identical_json_mappings,
-        ),
-        (
-            "summary", "summary", "adapter_summary", summary_path,
-            _concatenate,
-        ),
-    )
-    source_groups = {
-        key: sorted(configured_output_matches(
-            outdir, output_layout[pattern_name], **values,
-        ))
-        for key, _label, pattern_name, _destination, _merge in side_outputs
-    }
+    mapping_sources = [
+        configured_output_path(
+            outdir,
+            output_layout["adapter_mapping"],
+            dataset_id=name,
+            chromosome=chromosome,
+        )
+        for chromosome in chromosomes
+    ]
+    summary_sources = [
+        configured_output_path(
+            outdir,
+            output_layout["adapter_summary"],
+            dataset_id=name,
+            chromosome=chromosome,
+        )
+        for chromosome in chromosomes
+    ]
     missing = [
-        label
-        for key, label, _pattern_name, _destination, _merge in side_outputs
-        if not source_groups[key]
+        str(path)
+        for path in mapping_sources + summary_sources
+        if not path.is_file() or path.stat().st_size == 0
     ]
     if missing:
         raise RuntimeError(
-            "Cannot finalise GWAS-to-VCF side outputs for dataset %s: no "
-            "current per-chromosome %s file(s) were found. Existing merged "
-            "files were not accepted because they may belong to an earlier "
-            "run. Re-run the missing chromosome work or use a clean output "
-            "directory."
-            % (name, " or ".join(missing))
+            "Cannot finalise GWAS-to-VCF side outputs for dataset %s: required "
+            "current per-chromosome side output(s) are missing or empty: %s. "
+            "Existing merged files were not accepted because they may belong "
+            "to an earlier run. Re-run the missing chromosome work or use a "
+            "clean output directory."
+            % (name, ", ".join(missing))
         )
 
-    merged_sources = {}
-    for key, label, _pattern_name, destination, merge in side_outputs:
-        sources = source_groups[key]
-        written = merge(sources, destination, logger=logger)
-        if written is None:
-            raise RuntimeError(
-                "Cannot finalise GWAS-to-VCF side outputs for dataset %s: "
-                "the current %s files could not be merged into %s. Any "
-                "existing destination was not accepted as current-run output."
-                % (name, label, destination)
-            )
-        result[key] = str(written)
-        merged_sources[key] = sources
+    mapping_written = _merge_identical_json_mappings(
+        mapping_sources, mapping_path, logger=logger,
+    )
+    if mapping_written is None:
+        raise RuntimeError(
+            "Cannot finalise GWAS-to-VCF side outputs for dataset %s: the "
+            "current mapping files could not be merged into %s. Any existing "
+            "destination was not accepted as current-run output."
+            % (name, mapping_path)
+        )
+    summary_result = _merge_adapter_summaries(
+        list(zip(chromosomes, summary_sources)),
+        summary_path,
+        summary_delimiter,
+        expected_rows,
+        logger=logger,
+    )
+    result["dict"] = str(mapping_written)
+    result["summary"] = str(summary_result["path"])
+    result["adapter_input_rows_by_chromosome"] = dict(
+        summary_result["rows_by_chromosome"]
+    )
+    result["total_adapter_input_rows"] = int(summary_result["total_rows"])
+    merged_sources = {
+        "dict": mapping_sources,
+        "summary": summary_sources,
+    }
 
     # ------------------------------------------------------------------
     # 2. Park the gwas2vcf input files, then compress them in place.
@@ -411,6 +728,7 @@ def finalise_harmonisation_outputs(
     else:
         for pattern_name in (
             "chromosome_table", "chromosome_source_snapshot",
+            "external_eaf_partition", "external_info_partition",
         ):
             for candidate in sorted(configured_output_matches(
                 outdir, output_layout[pattern_name], **values,
@@ -486,11 +804,12 @@ def remove_partial_chromosome_outputs(
     for pattern_name in (
         "chromosome_reject", "adapter_input", "adapter_mapping",
         "adapter_summary", "adapter_output_vcf",
-        "chromosome_raw_vcf", "chromosome_original_vcf",
-        "chromosome_normalized_vcf", "chromosome_id_vcf",
+        "chromosome_raw_vcf", "chromosome_normalized_vcf",
+        "chromosome_id_vcf",
         "chromosome_frequency_vcf", "chromosome_annotated_vcf",
         "chromosome_lifted_vcf", "chromosome_not_lifted_vcf",
         "missing_eaf", "out_of_range_eaf",
+        "post_orientation_duplicates",
     ):
         for path in configured_output_matches(
             base, output_layout[pattern_name] + "*", **values,

@@ -5,14 +5,13 @@ from __future__ import annotations
 import argparse
 from typing import get_args
 
-from rich.console import Console
-
 from postgwas.config import load_configuration
 from postgwas.cli.common import get_common_out_parser, get_genome_build_parser
 from postgwas.cli.compute import get_compute_parser
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.execution.runtime import validate_path
 from postgwas.core.ui import (
+    print_screen_message,
     AlignedRichHelpFormatter,
     format_cli_examples,
     help_with_conditional_requirement,
@@ -270,7 +269,7 @@ def main(argv=None):
     try:
         run_mixer_direct(args)
     except (MixerError, ConfigurationError, OSError, ValueError) as exc:
-        Console(stderr=True).print("\n[bold red]MiXeR failed.[/bold red] %s\n" % exc)
+        print_screen_message("error", "MiXeR failed. %s" % exc, stderr=True)
         return 1
     return 0
 

@@ -3,6 +3,7 @@ genome_build: null
 minimum_gene_count: 10
 gene_universe_policy: strict
 magma_association_prefix: null
+magma_annotated_results_file: null
 feature_matrix_prefix: null
 feature_matrix_chunks: 2
 gene_location_file: null
@@ -28,6 +29,53 @@ verbose: false
 reporting:
   top_gene_count: 10
   score_decimal_places: 4
+integrated_results:
+  delimiter: "\t"
+  null_value: NA
+  html_page_size: 50
+  columns:
+    gene_id: gene_id
+    gene_symbol: gene_symbol
+    pops_chromosome: pops_chromosome
+    pops_tss: pops_tss
+    pops_score: pops_score
+    pops_rank: pops_rank
+    gene_analysis_status: gene_analysis_status
+    magma_zstat: magma_zstat
+    magma_pvalue: magma_pvalue
+    magma_bonferroni_pvalue: magma_bonferroni_pvalue
+    magma_fdr_pvalue: magma_fdr_pvalue
+    magma_chromosome: magma_chromosome
+    magma_start: magma_start
+    magma_end: magma_end
+    magma_snp_count: magma_snp_count
+    magma_parameter_count: magma_parameter_count
+    magma_sample_size: magma_sample_size
+    pops_adjusted_target_score: pops_adjusted_target_score
+    used_for_model_fitting: used_for_model_fitting
+    used_for_feature_selection: used_for_feature_selection
+    used_for_covariate_projection: used_for_covariate_projection
+    target_source: target_source
+    input_target_score: input_target_score
+    compatibility_decision: compatibility_decision
+    retained_as_pops_target: retained_as_pops_target
+    present_in_pops_annotation: present_in_pops_annotation
+    present_in_feature_rows: present_in_feature_rows
+    target_row: target_row
+    input_target_score_available: input_target_score_available
+    pops_score_available: pops_score_available
+    pops_target_score_available: pops_target_score_available
+    pops_target_score: pops_target_score
+    magma_result_available: magma_result_available
+    magma_reference_chromosome: magma_reference_chromosome
+    magma_reference_start: magma_reference_start
+    magma_reference_end: magma_reference_end
+    magma_reference_strand: magma_reference_strand
+  status_labels:
+    scored_and_fitted: scored_and_used_for_model_fitting
+    scored_with_target_not_fitted: scored_with_target_not_used_for_model_fitting
+    scored_without_target: scored_without_input_target_score
+    target_excluded_from_pops: input_target_excluded_from_pops
 input_schema:
   table_delimiter_pattern: '\s+'
   target_table_delimiter: "\t"
@@ -45,8 +93,30 @@ input_schema:
   magma_genes_out_suffix: .genes.out
   magma_genes_raw_suffix: .genes.raw
   prediction_score_column: PoPS_Score
+  prediction_target_column: Y
+  prediction_projected_target_column: Y_proj
+  prediction_covariate_projection_column: project_out_covariates_gene
+  prediction_feature_selection_column: feature_selection_gene
   prediction_training_column: training_gene
   marginal_selected_column: selected
+  magma_annotated:
+    delimiter: "\t"
+    gene_id_column: GENE
+    chromosome_column: CHR
+    start_column: START
+    end_column: STOP
+    snp_count_column: NSNPS
+    parameter_count_column: NPARAM
+    sample_size_column: N
+    zstat_column: ZSTAT
+    pvalue_column: P
+    reference_chromosome_column: GENE_REFERENCE_CHR
+    reference_start_column: GENE_REFERENCE_START
+    reference_end_column: GENE_REFERENCE_END
+    reference_strand_column: GENE_REFERENCE_STRAND
+    gene_symbol_column: GENE_SYMBOL
+    bonferroni_pvalue_column: P_bonferroni_corr
+    fdr_pvalue_column: P_fdr_bh_corr
 output_layout:
   output_prefix: '{dataset_id}_pops'
   staging_directory: '.partial/{dataset_id}_pops'
@@ -65,3 +135,5 @@ output_layout:
   excluded_genes_raw_suffix: .excluded.genes.raw
   gene_compatibility_table_suffix: .gene_compatibility.tsv
   gene_compatibility_report_suffix: .gene_compatibility.yaml
+  integrated_results_suffix: .integrated_gene_results.tsv
+  integrated_report_suffix: .integrated_gene_results.html

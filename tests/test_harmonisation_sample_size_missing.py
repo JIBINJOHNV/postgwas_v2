@@ -9,6 +9,7 @@ from postgwas.modules.harmonisation.rejects import (
     SOURCE_INPUT_ROW_COLUMN,
 )
 from postgwas.modules.harmonisation.sample_size import (
+    effective_sample_size_expression,
     harmonise_sample_sizes,
     prepare_missing_sample_sizes,
 )
@@ -50,7 +51,13 @@ def test_missing_sample_size_policy_defaults_and_validation():
 
 
 def test_case_only_policy_stops_with_clear_scientific_reason():
-    with pytest.raises(ValueError, match="cannot determine case/control effective sample size"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "sample_size.cases_only is 'fail'.*cannot determine "
+            "case/control effective sample size"
+        ),
+    ):
         harmonise_sample_sizes(
             "1",
             pl.DataFrame({"NCASE": [10_000]}),
@@ -234,3 +241,63 @@ def test_default_minimum_rejects_zero_sample_size():
     assert result["variant"].to_list() == ["one"]
     assert result["Neff"].to_list() == [1]
     assert qc["removed_by_reason"]["sample_size_invalid"] == 1
+
+
+def test_effective_sample_size_expression_requires_positive_finite_counts():
+    frame = pl.DataFrame({
+        "NCASE": [100.0, 0.0, -1.0, 100.0, float("inf"), 100.0, None],
+        "NCONTROL": [100.0, 100.0, 100.0, 0.0, 100.0, float("inf"), 100.0],
+    })
+
+    result = frame.select(
+        effective_sample_size_expression(
+            pl.col("NCASE"), pl.col("NCONTROL"),
+        ).alias("Neff")
+    )
+
+    assert result["Neff"].to_list() == [200.0, None, None, None, None, None, None]
+
+
+def test_case_control_counts_must_be_positive_before_neff_is_calculated(tmp_path):
+    frame = pl.DataFrame({
+        "variant": ["case_zero", "control_zero", "case_negative", "valid"],
+        "NCASE": [0, 100, -1, 100],
+        "NCONTROL": [100, 0, 100, 100],
+    }).with_row_index(SOURCE_INPUT_ROW_COLUMN, offset=1)
+    mapping = _mapping(ncase_col="NCASE", ncontrol_col="NCONTROL")
+    rejects = RejectCollector(
+        source_snapshot=frame,
+        logger=None,
+        out_path=str(tmp_path / "rejected.tsv"),
+        delimiter="\t",
+        compress=False,
+    )
+
+    result, qc, _mapping_result = harmonise_sample_sizes(
+        "1", frame, mapping, policies=default_policies(), rejects=rejects,
+    )
+
+    assert result["variant"].to_list() == ["valid"]
+    assert result["Neff"].to_list() == [200]
+    assert qc["removed_by_reason"]["sample_size_invalid"] == 3
+    assert qc["removed_by_reason"]["neff_invalid"] == 0
+    rejected = rejects.frame()
+    assert rejected["variant"].to_list() == [
+        "case_zero", "case_negative", "control_zero",
+    ]
+    assert rejected["reject_reason"].to_list() == [
+        "sample_size_invalid", "sample_size_invalid", "sample_size_invalid",
+    ]
+
+
+def test_fixed_zero_case_count_is_rejected_before_neff_is_calculated():
+    result, qc, _mapping_result = harmonise_sample_sizes(
+        "1",
+        pl.DataFrame({"variant": ["a"], "NCONTROL": [100]}),
+        _mapping(ncase=0, ncontrol_col="NCONTROL"),
+        policies=default_policies(),
+    )
+
+    assert result.is_empty()
+    assert qc["removed_by_reason"]["sample_size_invalid"] == 1
+    assert qc["removed_by_reason"].get("neff_invalid", 0) == 0

@@ -11,6 +11,7 @@ from postgwas.config.models.common import (
     StrictModel,
 )
 from postgwas.core.paths import validate_filename_component
+from postgwas.core.variant_qc import MAXIMUM_SUPPORTED_INFO_SCORE
 from postgwas.core.vcf import VCF_TAG
 
 
@@ -30,6 +31,32 @@ class FilteringInputsConfig(StrictModel):
 
 class FilteringMHCConfig(GenomicRegion):
     start: int = Field(ge=1)
+
+
+class FilteringMHCRegionOverrideConfig(StrictModel):
+    chromosome: str | None = None
+    start: int | None = Field(default=None, ge=1)
+    end: int | None = Field(default=None, gt=0)
+
+    @field_validator("chromosome")
+    @classmethod
+    def nonempty_chromosome(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+    @model_validator(mode="after")
+    def valid_selected_interval(self):
+        if (
+            self.start is not None
+            and self.end is not None
+            and self.end <= self.start
+        ):
+            raise ValueError("end must be greater than start")
+        return self
 
 
 class FilteringVcfFieldsConfig(StrictModel):
@@ -97,9 +124,12 @@ class FilteringVcfFieldsConfig(StrictModel):
 
 class FilteringOutputLayoutConfig(StrictModel):
     filtered_vcf: str
+    soft_filtered_vcf: str
     log_file: str
     preflight_log: str
     reason_summary: str
+    summary_csv: str
+    html_report: str
     mhc_exclusion_bed: str
 
     @field_validator("*")
@@ -126,8 +156,11 @@ class FilteringOutputLayoutConfig(StrictModel):
     def validate_destinations(self):
         build_specific = (
             self.filtered_vcf,
+            self.soft_filtered_vcf,
             self.log_file,
             self.reason_summary,
+            self.summary_csv,
+            self.html_report,
             self.mhc_exclusion_bed,
         )
         if any("{genome_build}" not in pattern for pattern in build_specific):
@@ -142,8 +175,46 @@ class FilteringOutputLayoutConfig(StrictModel):
         values = list(self.model_dump().values())
         if len(values) != len(set(values)):
             raise ValueError("filtering output path patterns must be unique")
-        if not self.filtered_vcf.endswith(".vcf.gz"):
-            raise ValueError("filtered_vcf must end with .vcf.gz for tabix indexing")
+        for name in ("filtered_vcf", "soft_filtered_vcf"):
+            if not getattr(self, name).endswith(".vcf.gz"):
+                raise ValueError("%s must end with .vcf.gz for tabix indexing" % name)
+        if not self.reason_summary.endswith(".tsv"):
+            raise ValueError("reason_summary must end with .tsv")
+        if not self.summary_csv.endswith(".csv"):
+            raise ValueError("summary_csv must end with .csv")
+        if not self.html_report.endswith(".html"):
+            raise ValueError("html_report must end with .html")
+        return self
+
+
+class FilteringReasonIdsConfig(StrictModel):
+    empty_expression: str
+    missing_pvalue: str
+    pvalue_below_threshold: str
+    missing_study_af: str
+    maf_outside_range: str
+    missing_imputation_quality: str
+    imputation_quality_outside_range: str
+    missing_study_info_af: str
+    missing_external_af: str
+    frequency_difference: str
+    non_snp: str
+    palindromic: str
+    mhc: str
+
+    @field_validator("*")
+    @classmethod
+    def valid_filter_id(cls, value: str) -> str:
+        value = value.strip()
+        if not VCF_TAG.fullmatch(value) or value == "PASS":
+            raise ValueError("must be a valid non-PASS VCF FILTER ID")
+        return value
+
+    @model_validator(mode="after")
+    def unique_filter_ids(self):
+        values = list(self.model_dump().values())
+        if len(values) != len(set(values)):
+            raise ValueError("filter reason IDs must be unique")
         return self
 
 
@@ -153,7 +224,12 @@ class FilteringConfig(ModuleConfig):
     maf_min: float | None = Field(default=None, ge=0, le=0.5, allow_inf_nan=False)
     missing_af_action: Literal["keep", "remove"]
     info_min: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
-    info_max: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    info_max: float | None = Field(
+        default=None,
+        ge=0,
+        le=MAXIMUM_SUPPORTED_INFO_SCORE,
+        allow_inf_nan=False,
+    )
     missing_info_action: Literal["keep", "remove"]
     minimum_neglog10_p: float | None = Field(
         default=None, ge=0, allow_inf_nan=False,
@@ -169,9 +245,12 @@ class FilteringConfig(ModuleConfig):
     palindromic_upper: float = Field(ge=0.5, le=1, allow_inf_nan=False)
     remove_mhc: bool
     mhc_regions: dict[GenomeBuild, FilteringMHCConfig]
+    mhc_region_override: FilteringMHCRegionOverrideConfig
     empty_expression_action: Literal["match_all", "match_none"]
     sort_output: bool
+    write_soft_filter_vcf: bool
     report_missing_counts: bool
+    filter_reason_ids: FilteringReasonIdsConfig
     vcf_fields: FilteringVcfFieldsConfig
     output_layout: FilteringOutputLayoutConfig
 
@@ -205,4 +284,9 @@ class FilteringConfig(ModuleConfig):
             raise ValueError("info_max must be greater than or equal to info_min")
         if self.palindromic_upper <= self.palindromic_lower:
             raise ValueError("palindromic_upper must be greater than palindromic_lower")
+        override_values = self.mhc_region_override.model_dump().values()
+        if any(value is not None for value in override_values) and not self.remove_mhc:
+            raise ValueError(
+                "mhc_region_override requires remove_mhc: true or --remove-mhc"
+            )
         return self

@@ -10,8 +10,10 @@ import pandas as pd
 import pytest
 
 import postgwas.modules.flames.service as flames_service
-from postgwas.config import load_module_configuration
+from postgwas.config import load_configuration, load_module_configuration
 from postgwas.core.errors import ConfigurationError
+from postgwas.core.input_validation import InputValidationSession
+from postgwas.core.validation_reporting import FileValidationDisplay
 from postgwas.modules.flames.errors import FlamesError
 from postgwas.modules.flames.cli import build_parser
 from postgwas.modules.flames.service import (
@@ -20,6 +22,8 @@ from postgwas.modules.flames.service import (
     preflight_flames_pipeline,
     validate_fine_mapping_index,
 )
+from postgwas.pipeline.registry import REGISTRY
+from preflight_support import pipeline_input_vcf_evidence
 
 
 def _module():
@@ -91,7 +95,7 @@ def test_handoff_rejects_metadata_accidentally_listed_as_a_credible_set(tmp_path
         validate_fine_mapping_index(interchange, _module())
 
 
-def test_handoff_rejects_multiple_credible_sets_for_one_locus(tmp_path):
+def test_handoff_accepts_multiple_credible_sets_for_one_locus(tmp_path):
     interchange = tmp_path / "flames_input"
     interchange.mkdir()
     for number in (1, 2):
@@ -114,7 +118,34 @@ def test_handoff_rejects_multiple_credible_sets_for_one_locus(tmp_path):
         ]
     ).to_csv(interchange / "indexfile.txt", sep="\t", index=False)
 
-    with pytest.raises(FlamesError, match="one credible set per locus"):
+    result = validate_fine_mapping_index(interchange, _module())
+
+    assert len(result["credible_paths"]) == 2
+    assert result["index"]["GenomicLocus"].tolist() == ["1", "1"]
+
+
+def test_handoff_rejects_duplicate_credible_set_files(tmp_path):
+    interchange = tmp_path / "flames_input"
+    interchange.mkdir()
+    credible_set = interchange / "locus.txt"
+    credible_set.write_text(
+        "index cred1 prob1\n1 1:110:A_G 1.0\n",
+        encoding="utf-8",
+    )
+    pd.DataFrame([
+        {
+            "Filename": credible_set.name,
+            "GenomicLocus": "1",
+            "Annotfiles": str(tmp_path / "annotated_1.txt"),
+        },
+        {
+            "Filename": credible_set.name,
+            "GenomicLocus": "2",
+            "Annotfiles": str(tmp_path / "annotated_2.txt"),
+        },
+    ]).to_csv(interchange / "indexfile.txt", sep="\t", index=False)
+
+    with pytest.raises(FlamesError, match="duplicate credible-set files"):
         validate_fine_mapping_index(interchange, _module())
 
 
@@ -204,7 +235,7 @@ def test_flames_commands_use_one_generated_index_and_no_shell_defaults(tmp_path)
     }
 
     annotation, scoring = _build_commands(
-        configuration, resources, index, tmp_path, "scores",
+        configuration, resources, index, tmp_path, "scores", tmp_path / "api.jsonl",
     )
 
     assert str(index) in annotation
@@ -215,6 +246,8 @@ def test_flames_commands_use_one_generated_index_and_no_shell_defaults(tmp_path)
     assert "--weight" not in scoring
     assert "--cmd_vep" not in annotation
     assert "--CADD_file" not in annotation
+    assert annotation[annotation.index("--annotation-api-log") + 1] == str(tmp_path / "api.jsonl")
+    assert "--annotation-api-settings" in annotation
 
 
 def test_flames_cli_has_no_independent_analysis_defaults():
@@ -229,7 +262,9 @@ def test_flames_cli_has_no_independent_analysis_defaults():
         "flames_genome_build",
         "flames_model_directory",
         "flames_vep_mode",
+        "vep_cache_genome_build",
         "flames_cadd_mode",
+        "cadd_genome_build",
         "dry_run",
     ):
         assert not hasattr(args, name)
@@ -253,9 +288,12 @@ def test_flames_pipeline_preflight_accepts_documented_upstream_models(
     args = argparse.Namespace(
         covariate_model=model,
         covariate_direction=direction,
+        annotation_resource_directory="reference/FLAMES/Annotation_data",
     )
 
-    preflight_flames_pipeline(args)
+    preflight_flames_pipeline(
+        args, preflight_evidence=pipeline_input_vcf_evidence(),
+    )
 
 
 def test_removed_flames_magmacovar_contract_is_rejected_as_unknown_config(tmp_path):
@@ -368,7 +406,9 @@ def test_score_validation_rejects_incorrect_raw_score_normalization(tmp_path):
         _validate_scores(raw_path, prediction_path, module)
 
 
-def test_dry_run_validates_both_commands_without_analysis(tmp_path, monkeypatch):
+def test_dry_run_validates_both_commands_without_analysis(
+    tmp_path, monkeypatch, capsys,
+):
     module = _module()
     files = {}
     for name in (
@@ -395,23 +435,36 @@ def test_dry_run_validates_both_commands_without_analysis(tmp_path, monkeypatch)
         "model": files["model.sav"],
         "features": files["features.txt"],
         "annotation_directory": tmp_path,
+        "annotation_directories": {"ENSG": tmp_path},
+        "annotation_inventory": {"resource": files["annotation_resource.txt"]},
         "annotation_files": {"resource": files["annotation_resource.txt"]},
         "vep_command": None,
         "vep_cache": None,
         "cadd_file": None,
         "cadd_index": None,
         "tabix": None,
+        "feature_names": ["validated fixture"],
         "magma": files["magma.txt"],
         "magma_covariate": files["magma_covariate.txt"],
         "pops": files["pops.txt"],
         "magma_genes": {"ENSG000001"},
         "pops_genes": {"ENSG000001"},
-        "input_metrics": {"credible_sets": 1},
+        "input_metrics": {
+            "credible_sets": 1,
+            "credible_set_variants": 1,
+            "magma_genes": 1,
+            "pops_genes": 1,
+            "shared_magma_pops_genes": 1,
+            "magma_covariates": 1,
+        },
         "interchange": {
             "index_path": files["indexfile.txt"],
             "index": index,
             "credible_paths": [files["credible.txt"]],
-            "credible_metrics": [{"pip_mass": 1.0}],
+            "root": tmp_path,
+            "credible_metrics": [
+                {"pip_mass": 1.0, "chromosome": 1, "variants": 1}
+            ],
         },
     }
     commands = []
@@ -424,7 +477,7 @@ def test_dry_run_validates_both_commands_without_analysis(tmp_path, monkeypatch)
     monkeypatch.setattr(
         flames_service,
         "_validate_scientific_inputs",
-        lambda configured_module, validated_resources: validated_resources,
+        lambda configured_module, validated_resources: resources,
     )
 
     def record_command(command, label, **kwargs):
@@ -432,10 +485,21 @@ def test_dry_run_validates_both_commands_without_analysis(tmp_path, monkeypatch)
         return ""
 
     monkeypatch.setattr(flames_service, "run_checked_command", record_command)
+    run_config = tmp_path / "run.yaml"
+    run_config.write_text(
+        "config_version: 1\nlogging:\n  show_progress: false\n",
+        encoding="utf-8",
+    )
     args = argparse.Namespace(
+        run_config=str(run_config),
         dataset_id="TEST",
         output_directory=str(tmp_path / "output"),
         dry_run=True,
+        credible_sets_directory=str(tmp_path),
+        magma_gene_results_file=str(files["magma.txt"]),
+        magma_covariate_results_file=str(files["magma_covariate.txt"]),
+        pops_scores_file=str(files["pops.txt"]),
+        annotation_resource_directory=str(tmp_path),
     )
 
     result = flames_service.run_flames_direct(args)
@@ -447,16 +511,213 @@ def test_dry_run_validates_both_commands_without_analysis(tmp_path, monkeypatch)
     ]
     assert all(kwargs["dry_run"] is True for _, _, kwargs in commands)
     assert not list((tmp_path / "output").glob("results/*"))
+    screen = " ".join(capsys.readouterr().out.split())
+    assert "FLAMES analysis progress" in screen
+    assert "All 5 stages completed" in screen
+    for label in (
+        "Indexed loci / credible sets",
+        "MAGMA gene-result file",
+        "MAGMAcovar result file",
+        "PoPS score file",
+        "Required annotation directories",
+        "Annotation files inventoried",
+        "Configured Python imports",
+    ):
+        assert label in screen
+    assert (
+        "live API selected; remote content and availability are not pinned"
+        in screen
+    )
 
 
-@pytest.mark.parametrize("probabilities", ((0.4, 0.4), (0.7, 0.4)))
-def test_handoff_rejects_invalid_cumulative_probability_mass(tmp_path, probabilities):
+def test_missing_direct_inputs_are_reported_together_before_runtime(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        flames_service,
+        "_validate_upstream_resources",
+        lambda *args, **kwargs: pytest.fail(
+            "resource and runtime validation must follow required arguments"
+        ),
+    )
+    args = argparse.Namespace(
+        dataset_id="STUDY",
+        output_directory=str(tmp_path / "output"),
+    )
+
+    with pytest.raises(ConfigurationError) as captured:
+        flames_service.run_flames_direct(args)
+
+    message = str(captured.value)
+    required = {
+        "--credible-sets-directory": "modules.flames.credible_sets_directory",
+        "--magma-gene-results-file": "modules.flames.magma_gene_results_file",
+        "--magma-covariate-results-file": (
+            "modules.flames.magma_covariate_results_file"
+        ),
+        "--pops-scores-file": "modules.flames.pops_scores_file",
+        "--flames-annotation-directory": (
+            "modules.flames.annotation_resource_directory"
+        ),
+    }
+    for option, configuration_path in required.items():
+        assert (
+            "Required argument not provided: %s. Provide %s VALUE or set %s "
+            "in the run configuration."
+            % (option, option, configuration_path)
+        ) in message
+    service_log = tmp_path / "output" / "logs" / "STUDY_flames.log"
+    assert "Required argument not provided" in service_log.read_text(
+        encoding="utf-8"
+    )
+    screen = " ".join(capsys.readouterr().out.split())
+    assert "Failed 1/5" in screen
+    assert "All 5 stages completed" not in screen
+    assert "100%" not in screen
+
+
+def test_flames_direct_and_pipeline_help_mark_only_external_requirements():
+    direct = " ".join(build_parser().format_help().split())
+    for invocation in (
+        "--credible-sets-directory PATH",
+        "--magma-gene-results-file PATH",
+        "--magma-covariate-results-file PATH",
+        "--pops-scores-file PATH",
+        "--flames-annotation-directory PATH",
+    ):
+        assert "%s Required:" % invocation in direct
+
+    required = {
+        option.dest: option.config_path
+        for option in REGISTRY.get("flames").required_options
+    }
+    assert required["annotation_resource_directory"] == (
+        "modules.flames.annotation_resource_directory"
+    )
+    for generated in (
+        "credible_sets_directory",
+        "magma_gene_results_file",
+        "magma_covariate_results_file",
+        "pops_scores_file",
+    ):
+        assert generated not in required
+
+
+def test_annotation_preflight_validates_and_inventories_every_resource_file(
+    tmp_path, monkeypatch, capsys,
+):
+    base = _module()
+    annotation_root = tmp_path / "annotation"
+    for relative in base.upstream.required_annotation_directories:
+        directory = annotation_root / relative
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "resource.dat").write_text("reference\n", encoding="utf-8")
+    for pattern in base.upstream.required_annotation_file_patterns:
+        path = annotation_root / pattern.format(genome_build="GRCH37")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("required reference\n", encoding="utf-8")
+    model_directory = tmp_path / "model"
+    model_directory.mkdir()
+    (model_directory / base.upstream.model_file).write_bytes(b"model")
+    (model_directory / base.upstream.feature_file).write_text(
+        "feature_one\nfeature_two\n", encoding="utf-8"
+    )
+    module = base.model_copy(update={
+        "annotation_resource_directory": str(annotation_root),
+        "model_directory": str(model_directory),
+    })
+    configuration = SimpleNamespace(
+        modules=SimpleNamespace(flames=module),
+        resources=SimpleNamespace(
+            executables=SimpleNamespace(python="python", tabix="tabix")
+        ),
+        execution=SimpleNamespace(timeout_seconds=60),
+    )
+    monkeypatch.setattr(
+        flames_service,
+        "_validate_runtime",
+        lambda configuration, module, logger=None: "/validated/python",
+    )
+
+    with InputValidationSession() as session:
+        display = FileValidationDisplay(session, load_configuration())
+        resources = flames_service._validate_upstream_resources(configuration)
+        display.flush()
+
+    expected = {
+        str(path.resolve().relative_to(annotation_root.resolve()))
+        for path in annotation_root.rglob("*")
+        if path.is_file()
+    }
+    assert set(resources["annotation_inventory"]) == expected
+    assert resources["feature_names"] == ["feature_one", "feature_two"]
+    screen = capsys.readouterr().out
+    assert "FLAMES annotation resources — AVAILABLE — availability only" in screen
+    assert "Inventoried annotation files" in screen
+    assert not any(
+        Path(path).name in screen
+        for path in resources["annotation_inventory"].values()
+    )
+
+    empty = annotation_root / base.upstream.required_annotation_directories[0] / "empty.dat"
+    empty.touch()
+    with pytest.raises(FlamesError, match="does not exist or is empty"):
+        flames_service._validate_upstream_resources(configuration)
+
+    mismatched_module = module.model_copy(update={
+        "vep_mode": "local",
+        "vep_command": "vep",
+        "vep_cache": str(tmp_path),
+        "vep_cache_genome_build": type(module.genome_build)("GRCh38"),
+    })
+    mismatched_configuration = SimpleNamespace(
+        modules=SimpleNamespace(flames=mismatched_module),
+        resources=configuration.resources,
+        execution=configuration.execution,
+    )
+    empty.unlink()
+    with pytest.raises(FlamesError, match="does not match FLAMES genome build"):
+        flames_service._validate_upstream_resources(mismatched_configuration)
+
+
+def test_local_annotation_requirements_use_shared_actionable_errors():
+    module = _module().model_copy(update={
+        "annotation_resource_directory": "annotation",
+        "vep_mode": "local",
+        "vep_command": None,
+        "vep_cache": None,
+        "cadd_mode": "local",
+        "cadd_file": None,
+    })
+
+    with pytest.raises(ConfigurationError) as captured:
+        flames_service._require_flames_arguments(module, pipeline=True)
+
+    message = str(captured.value)
+    for option, path in (
+        ("--vep-command", "modules.flames.vep_command"),
+        ("--vep-cache", "modules.flames.vep_cache"),
+        (
+            "--vep-cache-genome-build",
+            "modules.flames.vep_cache_genome_build",
+        ),
+        ("--cadd-file", "modules.flames.cadd_file"),
+        ("--cadd-genome-build", "modules.flames.cadd_genome_build"),
+    ):
+        assert (
+            "Required argument not provided: %s. Provide %s VALUE or set %s "
+            "in the run configuration."
+            % (option, option, path)
+        ) in message
+
+
+def test_handoff_rejects_insufficient_cumulative_probability_mass(tmp_path):
     interchange = tmp_path / "flames_input"
     interchange.mkdir()
     credible_set = interchange / "locus.txt"
     credible_set.write_text(
         "index cred1 prob1\n1 1:110:A_G %s\n2 1:120:C_T %s\n"
-        % probabilities,
+        % (0.4, 0.4),
         encoding="utf-8",
     )
     pd.DataFrame([{
@@ -467,3 +728,22 @@ def test_handoff_rejects_invalid_cumulative_probability_mass(tmp_path, probabili
 
     with pytest.raises(FlamesError, match="cumulative PIP"):
         validate_fine_mapping_index(interchange, _module())
+
+
+def test_handoff_accepts_marginal_pip_sum_above_one(tmp_path):
+    interchange = tmp_path / "flames_input"
+    interchange.mkdir()
+    credible_set = interchange / "locus.txt"
+    credible_set.write_text(
+        "index cred1 prob1\n1 1:110:A_G 0.7\n2 1:120:C_T 0.4\n",
+        encoding="utf-8",
+    )
+    pd.DataFrame([{
+        "Filename": credible_set.name,
+        "GenomicLocus": "1",
+        "Annotfiles": str(tmp_path / "annotated.txt"),
+    }]).to_csv(interchange / "indexfile.txt", sep="\t", index=False)
+
+    result = validate_fine_mapping_index(interchange, _module())
+
+    assert result["credible_metrics"][0]["pip_mass"] == pytest.approx(1.1)

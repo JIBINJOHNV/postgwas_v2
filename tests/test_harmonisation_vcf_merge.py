@@ -41,14 +41,22 @@ def _arguments(tmp_path, policies=None, grch_version="GRCh37"):
     }
 
 
-def _required_inputs(tmp_path, grch_version="GRCh37"):
+def _required_inputs(
+    tmp_path,
+    grch_version="GRCh37",
+    *,
+    dataset_id="study",
+    chromosomes=("1",),
+):
     output_layout, vcf_config = _configuration()
     target_build = vcf_config["target_builds"][grch_version]
     paths = [
         configured_output_path(
-            tmp_path, output_layout[pattern], dataset_id="study", chromosome="1",
+            tmp_path, output_layout[pattern], dataset_id=dataset_id,
+            chromosome=chromosome,
             build=grch_version, target_build=target_build,
         )
+        for chromosome in chromosomes
         for pattern in (
             "chromosome_annotated_vcf",
             "chromosome_lifted_vcf",
@@ -75,10 +83,28 @@ def _merge_output(arguments):
 
 def _merge_header(arguments):
     """Return the configured header from the streamed merge command."""
+    headers = _merge_headers(arguments)
+    return headers[0] if headers else None
+
+
+def _merge_headers(arguments):
+    """Return every configured header from the streamed merge command."""
+    if _merge_output(arguments) is None:
+        return []
+    annotate = shlex.split(arguments[2].split(" | ", 1)[1])
+    return [
+        annotate[index + 1]
+        for index, value in enumerate(annotate)
+        if value == "--header-line"
+    ]
+
+
+def _concat_inputs(arguments):
+    """Return the ordered input paths from the streamed concat command."""
     if _merge_output(arguments) is None:
         return None
-    annotate = shlex.split(arguments[2].split(" | ", 1)[1])
-    return annotate[annotate.index("--header-line") + 1]
+    concat = shlex.split(arguments[2].split(" | ", 1)[0])
+    return [Path(value) for value in concat[concat.index("--output-type") + 2:]]
 
 
 def _expected_header(path):
@@ -89,6 +115,17 @@ def _expected_header(path):
         else "GRCh37"
     )
     return "##genome_build=%s\n" % build
+
+
+def _provenance_output_definitions(vcf_config):
+    lines = []
+    for qualified in dict(vcf_config["provenance"]["output_fields"]).values():
+        category, tag = qualified.split("/", 1)
+        lines.append(
+            '##%s=<ID=%s,Number=1,Type=Float,Description="test">'
+            % (category, tag)
+        )
+    return list(dict.fromkeys(lines))
 
 
 def _annotation_arguments(tmp_path):
@@ -161,18 +198,47 @@ def test_zero_survivor_liftover_fails_independently_of_fraction(tmp_path):
     )
     reject_vcf.write_bytes(b"rejected-vcf")
     counts = [100, 100, 100, 100, 100, 0, 100]
+    header = (
+        "##INFO=<ID=AF,Number=A,Type=Float>\n"
+        "##INFO=<ID=AFR,Number=A,Type=Float>\n"
+        "##INFO=<ID=EAS,Number=A,Type=Float>\n"
+        "##INFO=<ID=EUR,Number=A,Type=Float>\n"
+        "##INFO=<ID=SAS,Number=A,Type=Float>\n"
+        "##FORMAT=<ID=AF,Number=A,Type=Float>\n"
+        "##FORMAT=<ID=ES,Number=A,Type=Float>\n"
+        "##FORMAT=<ID=EZ,Number=A,Type=Float>\n"
+    )
+    liftover_summary = (
+        "Lines   total/swapped/reference added/rejected:\t100/0/0/100\n"
+        "Lines   total/split/joined/realigned/mismatch_removed/dup_removed/skipped:"
+        "\t0/0/0/0/0/0/0\n"
+        "Lines   total/split/joined/realigned/mismatch_removed/dup_removed/skipped:"
+        "\t0/0/0/0/0/0/0\n"
+    )
 
+    def completed_step(_command, _transcript, step, _chromosome, logger=None):
+        return liftover_summary if step == "STEP4_LIFTOVER" else ""
+
+    arguments["qc_info"] = {}
     with patch(
-        "postgwas.modules.harmonisation.vcf_processing._run_bcftools_step"
+        "postgwas.modules.harmonisation.vcf_processing._run_bcftools_step",
+        side_effect=completed_step,
     ), patch(
         "postgwas.modules.harmonisation.vcf_processing.get_vcf_variant_count",
         side_effect=counts,
+    ), patch(
+        "postgwas.modules.harmonisation.vcf_processing.read_vcf_header",
+        return_value=header,
     ), pytest.raises(LiftoverFailureRateError, match="zero variants") as error:
         annotate_and_liftover_vcf(**arguments)
 
     assert "100 annotated variants entered liftover" in str(error.value)
     assert "reported rejected count: 100" in str(error.value)
     assert "regardless of vcf.liftover_fail_fraction" in str(error.value)
+    assert arguments["qc_info"] == {
+        "input": 100, "rejected": 100, "swap_excluded": 0,
+        "swap_policy": "exclude", "final": 0,
+    }
 
 
 def test_zero_record_required_chromosome_vcf_fails_validation(tmp_path):
@@ -443,6 +509,118 @@ def test_success_requires_build_header_readable_vcf_and_index(
     }
 
 
+def test_merge_writes_and_validates_configured_postgwas_provenance(tmp_path):
+    _required_inputs(tmp_path)
+    written_headers = {}
+    merge_scripts = []
+    arguments = _arguments(tmp_path)
+    arguments["provenance"] = {
+        "dataset_id": "study",
+        "resource_directory": "/resources/postgwas/gwas2vcf",
+        "output_directory": str(tmp_path.resolve()),
+        "resolved_resource_files": (
+            "/resources/postgwas/gwas2vcf/GRCh37/reference.fa | "
+            "/resources/postgwas/gwas2vcf/GRCh37/dbsnp.vcf.gz"
+        ),
+        "pvalue_harmonisation": "Converted supplied -log10(P) values to raw P-values",
+        "pvalue_harmonisation_formula": "P = 10^(-input)",
+        "pvalue_vcf_formula": "LP = -log10(P)",
+    }
+
+    def command(command_arguments, _purpose, **_kwargs):
+        output = _merge_output(command_arguments)
+        if output is not None:
+            merge_scripts.append(command_arguments[2])
+            written_headers[str(output)] = _merge_headers(command_arguments)
+            output.write_bytes(b"v" * 200)
+            Path(str(output) + ".tbi").write_bytes(b"index")
+            return ""
+        if (
+            len(command_arguments) > 2
+            and command_arguments[1:3] == ["view", "--header-only"]
+        ):
+            return "\n".join(
+                written_headers[str(command_arguments[-1])]
+                + _provenance_output_definitions(arguments["vcf_config"])
+            ) + "\n"
+        if len(command_arguments) > 2 and command_arguments[1:3] == ["index", "-n"]:
+            return "1\n"
+        raise AssertionError("unexpected command: %r" % command_arguments)
+
+    with patch(
+        "postgwas.modules.harmonisation.vcf_processing.run_checked_command",
+        side_effect=command,
+    ):
+        result = concat_vcfs_by_build(**arguments)
+
+    assert result["merge_status"] == "OK"
+    source_headers = written_headers[result["grch37"]]
+    target_headers = written_headers[result["grch38"]]
+    assert '##postgwas_dataset_id="study"' in source_headers
+    assert (
+        '##postgwas_resource_directory="/resources/postgwas/gwas2vcf"'
+        in source_headers
+    )
+    assert '##postgwas_output_directory="%s"' % tmp_path.resolve() in source_headers
+    assert '##postgwas_input_genome_build="GRCh37"' in source_headers
+    assert '##postgwas_output_genome_build="GRCh37"' in source_headers
+    assert '##postgwas_liftover="Not applied"' in source_headers
+    assert '##postgwas_output_genome_build="GRCh38"' in target_headers
+    assert '##postgwas_liftover="Applied: GRCh37 to GRCh38"' in target_headers
+    assert any(
+        header.startswith('##postgwas_vcf_created_at="')
+        for header in source_headers
+    )
+    assert len(source_headers) == 1 + len(
+        arguments["vcf_config"]["provenance"]["headers"]
+    )
+    assert len(merge_scripts) == 3
+    assert all(script.count("bcftools annotate") == 1 for script in merge_scripts)
+
+
+def test_merge_rejects_provenance_field_missing_from_actual_vcf_header(tmp_path):
+    _required_inputs(tmp_path)
+    arguments = _arguments(tmp_path)
+    actual_vcf_config = arguments["vcf_config"]
+    arguments["vcf_config"] = {
+        **actual_vcf_config,
+        "provenance": {
+            **actual_vcf_config["provenance"],
+            "output_fields": {
+                **actual_vcf_config["provenance"]["output_fields"],
+                "effect": "FORMAT/WRONG",
+            },
+        },
+    }
+    arguments["provenance"] = {"dataset_id": "study"}
+    written_headers = {}
+
+    def command(command_arguments, _purpose, **_kwargs):
+        output = _merge_output(command_arguments)
+        if output is not None:
+            written_headers[str(output)] = _merge_headers(command_arguments)
+            output.write_bytes(b"v" * 200)
+            Path(str(output) + ".tbi").write_bytes(b"index")
+            return ""
+        if (
+            len(command_arguments) > 2
+            and command_arguments[1:3] == ["view", "--header-only"]
+        ):
+            return "\n".join(
+                written_headers[str(command_arguments[-1])]
+                + _provenance_output_definitions(actual_vcf_config)
+            ) + "\n"
+        if len(command_arguments) > 2 and command_arguments[1:3] == ["index", "-n"]:
+            return "1\n"
+        raise AssertionError("unexpected command: %r" % command_arguments)
+
+    with patch(
+        "postgwas.modules.harmonisation.vcf_processing.run_checked_command",
+        side_effect=command,
+    ), pytest.raises(VcfMergeError, match="effect=FORMAT/WRONG"):
+        concat_vcfs_by_build(**arguments)
+
+
 def test_notlifted_vcf_declares_source_not_attempted_target_build(tmp_path):
     _required_inputs(tmp_path)
     output_layout, _vcf_config = _configuration()
@@ -482,6 +660,126 @@ def test_notlifted_vcf_declares_source_not_attempted_target_build(tmp_path):
     assert headers[notlifted] == "##genome_build=GRCh37"
 
 
+def test_merge_uses_configured_chromosome_order_and_explicit_build_groups(tmp_path):
+    dataset_id = "cohort_GRCh38"
+    chromosomes = ("1", "2", "10")
+    required_inputs = _required_inputs(
+        tmp_path,
+        dataset_id=dataset_id,
+        chromosomes=chromosomes,
+    )
+    output_layout, vcf_config = _configuration()
+    target_build = vcf_config["target_builds"]["GRCh37"]
+    optional_inputs = []
+    for chromosome in ("1", "10"):
+        path = configured_output_path(
+            tmp_path,
+            output_layout["chromosome_not_lifted_vcf"],
+            dataset_id=dataset_id,
+            chromosome=chromosome,
+            build="GRCh37",
+            target_build=target_build,
+        )
+        path.write_bytes(b"v" * 200)
+        Path(str(path) + ".tbi").write_bytes(b"index")
+        optional_inputs.append(path)
+    tiny_optional = configured_output_path(
+        tmp_path,
+        output_layout["chromosome_not_lifted_vcf"],
+        dataset_id=dataset_id,
+        chromosome="2",
+        build="GRCh37",
+        target_build=target_build,
+    )
+    tiny_optional.write_bytes(b"tiny")
+
+    concat_inputs = {}
+    written_headers = {}
+
+    def command(arguments, _purpose, **_kwargs):
+        output = _merge_output(arguments)
+        if output is not None:
+            concat_inputs[str(output)] = _concat_inputs(arguments)
+            written_headers[str(output)] = _merge_header(arguments)
+            output.write_bytes(b"v" * 200)
+            Path(str(output) + ".tbi").write_bytes(b"index")
+            return ""
+        if len(arguments) > 2 and arguments[1:3] == ["view", "--header-only"]:
+            return written_headers[str(arguments[-1])] + "\n"
+        if len(arguments) > 2 and arguments[1:3] == ["index", "-n"]:
+            return "1\n"
+        raise AssertionError("unexpected command: %r" % arguments)
+
+    arguments = _arguments(tmp_path)
+    arguments["gwas_outputname"] = dataset_id
+    arguments["expected_chromosomes"] = ["10", "2", "1"]
+    with patch(
+        "postgwas.modules.harmonisation.vcf_processing.run_checked_command",
+        side_effect=command,
+    ):
+        result = concat_vcfs_by_build(**arguments)
+
+    def expected_paths(pattern, selected_chromosomes):
+        return [
+            configured_output_path(
+                tmp_path,
+                output_layout[pattern],
+                dataset_id=dataset_id,
+                chromosome=chromosome,
+                build="GRCh37",
+                target_build=target_build,
+            )
+            for chromosome in selected_chromosomes
+        ]
+
+    source_output = configured_output_path(
+        tmp_path,
+        output_layout["merged_build_vcf"],
+        dataset_id=dataset_id,
+        build="GRCh37",
+        target_build=target_build,
+    )
+    target_output = configured_output_path(
+        tmp_path,
+        output_layout["merged_build_vcf"],
+        dataset_id=dataset_id,
+        build=target_build,
+        target_build=target_build,
+    )
+    raw_output = configured_output_path(
+        tmp_path,
+        output_layout["merged_raw_vcf"],
+        dataset_id=dataset_id,
+        build="GRCh37",
+        target_build=target_build,
+    )
+    notlifted_output = configured_output_path(
+        tmp_path,
+        output_layout["merged_not_lifted_vcf"],
+        dataset_id=dataset_id,
+        build="GRCh37",
+        target_build=target_build,
+    )
+    assert concat_inputs[str(source_output)] == expected_paths(
+        "chromosome_annotated_vcf", chromosomes,
+    )
+    assert concat_inputs[str(target_output)] == expected_paths(
+        "chromosome_lifted_vcf", chromosomes,
+    )
+    assert concat_inputs[str(raw_output)] == expected_paths(
+        "chromosome_raw_vcf", chromosomes,
+    )
+    assert concat_inputs[str(notlifted_output)] == expected_paths(
+        "chromosome_not_lifted_vcf", ("1", "10"),
+    )
+    assert tiny_optional not in concat_inputs[str(notlifted_output)]
+    assert written_headers[str(source_output)] == "##genome_build=GRCh37"
+    assert written_headers[str(target_output)] == "##genome_build=GRCh38"
+    assert result["merge_failures"] == []
+    assert not any(path.exists() for path in required_inputs + optional_inputs)
+    assert tiny_optional.exists()
+
+
 @pytest.mark.skipif(
     not all(shutil.which(command) for command in ("bash", "bcftools", "tabix")),
     reason="bash, bcftools and tabix are required for the merge integration test",
@@ -491,9 +789,11 @@ def test_real_streamed_merge_writes_exact_build_headers(tmp_path):
     source = tmp_path / "source.vcf"
     source.write_text(
         "##fileformat=VCFv4.2\n"
-        "##contig=<ID=1,length=1000>\n"
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
-        "1\t100\t.\tA\tG\t.\tPASS\t.\n",
+        + "\n".join(_provenance_output_definitions(vcf_config))
+        + "\n"
+        + "##contig=<ID=1,length=1000>\n"
+        + "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        + "1\t100\t.\tA\tG\t.\tPASS\t.\n",
         encoding="utf-8",
     )
     for pattern in (
@@ -537,6 +837,11 @@ def test_real_streamed_merge_writes_exact_build_headers(tmp_path):
             for command in ("bash", "bcftools", "tabix")
         },
         vcf_config=vcf_config,
+        provenance={
+            "dataset_id": "study",
+            "resource_directory": "/resources/postgwas/gwas2vcf",
+            "output_directory": str(tmp_path.resolve()),
+        },
         policies=default_policies(),
     )
 
@@ -555,3 +860,11 @@ def test_real_streamed_merge_writes_exact_build_headers(tmp_path):
             line for line in header.splitlines()
             if line.startswith("##genome_build=")
         ] == ["##genome_build=%s" % build]
+        assert [
+            line for line in header.splitlines()
+            if line.startswith("##postgwas_dataset_id=")
+        ] == ['##postgwas_dataset_id="study"']
+        assert [
+            line for line in header.splitlines()
+            if line.startswith("##postgwas_output_directory=")
+        ] == ['##postgwas_output_directory="%s"' % tmp_path.resolve()]

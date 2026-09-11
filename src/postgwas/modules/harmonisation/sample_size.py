@@ -67,10 +67,28 @@ def sample_count_expression(df, column):
 
 
 def effective_sample_size_expression(ncase, ncontrol):
-    """Polars expression for the standard case-control effective sample size."""
+    """Return case-control Neff only for finite, strictly positive counts.
+
+    The harmonic effective-size formula is undefined when either study group
+    is empty.  Returning null for invalid operands protects every caller of the
+    shared expression, including duplicate-quality ranking, from treating a
+    division-by-zero result as a real sample size.
+    """
     cases = ncase.cast(pl.Float64, strict=False)
     controls = ncontrol.cast(pl.Float64, strict=False)
-    return 4 / (1 / cases + 1 / controls)
+    valid = (
+        cases.is_not_null()
+        & controls.is_not_null()
+        & cases.is_finite()
+        & controls.is_finite()
+        & (cases > 0.0)
+        & (controls > 0.0)
+    ).fill_null(False)
+    return (
+        pl.when(valid)
+        .then(4.0 / ((1.0 / cases) + (1.0 / controls)))
+        .otherwise(None)
+    )
 
 
 def _to_counts(df, column, ctx, what):
@@ -533,20 +551,30 @@ def _harmonise(
     # ------------------------------------------------------------------
     # 4. remove counts that cannot be right
     # ------------------------------------------------------------------
-    if min_value is not None:
-        for present, column, what in ((has_cases, ncase_col, "case"),
-                                      (has_controls, ncontrol_col, "control")):
-            if not present:
-                continue
-            # Missing values were already handled by the explicit policy above;
-            # this separate rule handles present values below the numeric floor.
-            df, _ = reject_rows(
-                df,
-                pl.col(column).is_not_null() & (pl.col(column) < min_value),
-                step_label=STEP_LABEL, reason="sample_size_invalid",
-                context=ctx, collector=rejects, counters=counters,
-                detail="%s count below sample_size.min_value (%d)" % (what, min_value),
-            )
+    for present, column, what in ((has_cases, ncase_col, "case"),
+                                  (has_controls, ncontrol_col, "control")):
+        if not present:
+            continue
+        count = pl.col(column)
+        below_configured_minimum = (
+            count < min_value if min_value is not None else pl.lit(False)
+        )
+        # Strict positivity is an invariant of the harmonic Neff formula, not
+        # an optional threshold. Missing values were handled by the explicit
+        # policy above; this rule handles present invalid values in one pass.
+        invalid_count = count.is_not_null() & (
+            (count <= 0) | below_configured_minimum
+        )
+        detail = "%s count is not strictly positive" % what
+        if min_value is not None:
+            detail += " or is below sample_size.min_value (%d)" % min_value
+        df, _ = reject_rows(
+            df,
+            invalid_count,
+            step_label=STEP_LABEL, reason="sample_size_invalid",
+            context=ctx, collector=rejects, counters=counters,
+            detail=detail,
+        )
 
     # ------------------------------------------------------------------
     # 5. the effective sample size
@@ -593,11 +621,17 @@ def _harmonise(
         qc_info["Neff_status"] = "fallback_ncontrol_only:%s" % ncontrol_col
 
     elif has_cases:
+        action = str(policies.sample_size.cases_only)
+        if action == "fail":
+            raise ValueError(
+                "Only a case count is configured and sample_size.cases_only is %r. A case "
+                "count alone cannot determine case/control effective sample size: using it as "
+                "Neff would understate the balanced-design value by two times and the value with "
+                "many controls by up to four times. Configure the control count." % action
+            )
         raise ValueError(
-            "Only a case count is configured and sample_size.cases_only is 'fail'. A case "
-            "count alone cannot determine case/control effective sample size: using it as "
-            "Neff would understate the balanced-design value by two times and the value with "
-            "many controls by up to four times. Configure the control count."
+            "Unsupported sample_size.cases_only policy %r. The schema-validated "
+            "harmonisation configuration currently supports only 'fail'." % action
         )
 
     else:
@@ -618,14 +652,26 @@ def _harmonise(
     # ------------------------------------------------------------------
     # 6. remove effective sample sizes that cannot be right
     # ------------------------------------------------------------------
-    if neff_created and min_value is not None:
+    if neff_created:
+        neff = pl.col("Neff")
+        below_configured_minimum = (
+            neff < min_value if min_value is not None else pl.lit(False)
+        )
+        invalid_neff = (
+            neff.is_null()
+            | ~neff.is_finite()
+            | (neff <= 0)
+            | below_configured_minimum
+        )
+        detail = "Neff is missing, non-finite or not strictly positive"
+        if min_value is not None:
+            detail += " or is below sample_size.min_value (%d)" % min_value
         df, _ = reject_rows(
             df,
-            pl.col("Neff").is_not_null()
-            & (~pl.col("Neff").is_finite() | (pl.col("Neff") < min_value)),
+            invalid_neff,
             step_label=STEP_LABEL, reason="neff_invalid",
             context=ctx, collector=rejects, counters=counters,
-            detail="Neff below sample_size.min_value (%d), or not a finite number" % min_value,
+            detail=detail,
         )
 
     # ------------------------------------------------------------------

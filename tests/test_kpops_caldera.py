@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from argparse import Namespace
+import os
 from pathlib import Path
 import re
 import shutil
@@ -13,6 +14,9 @@ import pandas as pd
 import pytest
 
 from postgwas.config import load_configuration, load_module_configuration
+from postgwas.core.ui import StageProgress
+from postgwas.modules.caldera import cli as caldera_cli
+from postgwas.modules.caldera import service as caldera_service
 from postgwas.modules.caldera.cli import build_parser as build_caldera_parser
 from postgwas.modules.caldera.errors import CalderaError
 from postgwas.modules.caldera.service import (
@@ -26,6 +30,21 @@ from postgwas.modules.kpops.errors import KPopsError
 from postgwas.modules.kpops.service import run_kpops_direct, validate_kpops_configuration
 from postgwas.pipeline.planner import build_pipeline_plan
 from postgwas.pipeline.registry import REGISTRY
+
+
+@pytest.fixture(autouse=True)
+def caldera_unit_runtime(monkeypatch):
+    """These orchestration fixtures mock R; real namespace checks have own tests."""
+    def resolved(rscript, timeout_seconds, required_packages, *, label):
+        assert tuple(required_packages) == ("data.table", "dplyr")
+        assert label == "CALDERA"
+        return {
+            "rscript": str(rscript), "version": "R fixture",
+            "package_versions": {package: "fixture" for package in required_packages},
+            "library_paths": ["fixture-library"],
+            "environment": {**os.environ, "POSTGWAS_CALDERA_TEST_RUNTIME": "validated"},
+        }
+    monkeypatch.setattr("postgwas.modules.caldera.service.resolve_r_runtime", resolved)
 
 
 def _kpops_resources(tmp_path: Path, *, kernel_bytes: int | None = None):
@@ -191,13 +210,14 @@ def test_kpops_missing_inputs_are_reported_together_logged_and_show_help(
 
     captured = capsys.readouterr()
     terminal = captured.out + captured.err
+    terminal_message = " ".join(terminal.split())
     for option in (
         "--kpops-genome-build",
         "--kpops-gene-annotation-file",
         "--kernel-matrix-prefix",
         "--magma-association-prefix",
     ):
-        assert "Required argument not provided: %s." % option in terminal
+        assert "Required argument not provided: %s." % option in terminal_message
     assert "usage: postgwas kpops" in terminal.lower()
     assert "Run K-POPS directly:" in terminal
     service_log = tmp_path / "results/logs/postgwas_kpops.log"
@@ -219,12 +239,39 @@ def test_kpops_missing_inputs_are_reported_together_logged_and_show_help(
     assert not (tmp_path / "results/postgwas_kpops.preds").exists()
 
 
+def test_kpops_invalid_magma_input_fails_before_resource_or_model_execution(
+    tmp_path, monkeypatch, capsys,
+):
+    resources = _kpops_resources(tmp_path)
+    genes_out = Path(str(resources["magma_prefix"]) + ".genes.out")
+    genes_out.write_text(
+        genes_out.read_text(encoding="utf-8").replace("0.000", "not-a-number", 1),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "postgwas.modules.kpops.service.resolve_executable",
+        lambda *args, **kwargs: pytest.fail(
+            "resource and model validation must follow MAGMA input validation"
+        ),
+    )
+
+    with pytest.raises(KPopsError, match="Z statistics must be finite"):
+        run_kpops_direct(_kpops_args(tmp_path, resources))
+
+    screen = capsys.readouterr().out
+    assert "Failed 1/6 · Validate MAGMA gene-association input files" in screen
+    assert "Validate the K-POPS gene-annotation resource" not in screen
+
+
 def test_kpops_infers_installed_command_when_script_override_is_omitted(
     tmp_path, monkeypatch,
 ):
     resources = _kpops_resources(tmp_path)
     resources["script"].chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join((str(tmp_path), os.environ.get("PATH", ""))),
+    )
     args = _kpops_args(tmp_path, resources)
     del args.kpops_script
 
@@ -417,6 +464,12 @@ def test_kpops_runs_in_staging_normalizes_gene_id_and_reports_findings(
     resources = _kpops_resources(tmp_path)
 
     def fake_run(command, purpose, **kwargs):
+        assert "--verbose" in command
+        native_log = Path(kwargs["stdout_path"])
+        for _chromosome in ("1", "2"):
+            with native_log.open("a", encoding="utf-8") as handle:
+                handle.write("INFO: Computing PoPS scores.\n")
+            kwargs["progress_callback"]()
         prefix = Path(command[command.index("--out_prefix") + 1])
         predictions = pd.DataFrame(
             {
@@ -445,11 +498,16 @@ def test_kpops_runs_in_staging_normalizes_gene_id_and_reports_findings(
     assert result["summary"]["top_genes"][0]["gene_id"] == "ENSG010"
     assert "K-POPS gene-prioritisation summary" in screen
     assert "K-POPS analysis progress" in screen
-    assert "Completed 1/4 · Validate K-POPS inputs and reference resources" in screen
-    assert "Completed 2/4 · Resolve the compatible MAGMA gene universe" in screen
-    assert "Completed 3/4 · Fit K-POPS models and calculate gene scores" in screen
-    assert "Completed 4/4 · Validate and publish K-POPS results" in screen
-    assert "All 4 stages completed" in screen
+    assert "Completed 1/6 · Validate MAGMA gene-association input files" in screen
+    assert "Completed 2/6 · Validate the K-POPS gene-annotation resource" in screen
+    assert "Completed 3/6 · Validate the K-POPS kernel and software resources" in screen
+    assert "Completed 4/6 · Resolve the compatible MAGMA gene universe" in screen
+    assert "Completed 5/6 · Fit K-POPS models and calculate gene scores" in screen
+    assert "K-POPS model-fitting progress" in screen
+    assert "Progress 1/2 · Fit K-POPS chromosome models · 50%" in screen
+    assert "Completed 2/2 · Fit K-POPS chromosome models" in screen
+    assert "Completed 6/6 · Validate and publish K-POPS results" in screen
+    assert "All 6 stages completed" in screen
     assert "Kpops progress" not in screen
     assert "Genes with finite K-POPS scores" in screen
     assert "None. K-POPS scores are relative rankings, not p-values." in screen
@@ -471,9 +529,11 @@ def test_kpops_runs_in_staging_normalizes_gene_id_and_reports_findings(
         / "logs"
         / "STUDY_kpops.log"
     )
-    assert "reason=incomplete_outputs" in log.read_text(
-        encoding="utf-8"
-    )
+    log_text = log.read_text(encoding="utf-8")
+    assert "reason=incomplete_outputs" in log_text
+    assert "kpops_model_fit_progress" in log_text
+    assert "completed_models=1" in log_text
+    assert "completed_models=2" in log_text
 
     genes_out = Path(str(resources["magma_prefix"]) + ".genes.out")
     genes_out.write_text(
@@ -487,6 +547,85 @@ def test_kpops_runs_in_staging_normalizes_gene_id_and_reports_findings(
     changed_input_log = log.read_text(encoding="utf-8")
     assert "Input magma_genes_out changed since this checkpoint" in changed_input_log
     assert "reason=changed_inputs" in changed_input_log
+
+
+def test_kpops_model_progress_failure_stays_below_completion(
+    tmp_path, monkeypatch, capsys,
+):
+    resources = _kpops_resources(tmp_path)
+
+    def failed_run(_command, _purpose, **kwargs):
+        native_log = Path(kwargs["stdout_path"])
+        with native_log.open("a", encoding="utf-8") as handle:
+            handle.write("INFO: Computing PoPS scores.\n")
+        kwargs["progress_callback"]()
+        raise KPopsError("fixture model failure")
+
+    monkeypatch.setattr(
+        "postgwas.modules.kpops.service.run_checked_command",
+        failed_run,
+    )
+
+    with pytest.raises(KPopsError, match="fixture model failure"):
+        run_kpops_direct(_kpops_args(tmp_path, resources))
+
+    screen = capsys.readouterr().out
+    assert "Progress 1/2 · Fit K-POPS chromosome models · 50%" in screen
+    assert "Failed 1/2 · Fit K-POPS chromosome models" in screen
+    assert "Failed 5/6 · Fit K-POPS models and calculate gene scores" in screen
+    assert "Completed 2/2 · Fit K-POPS chromosome models" not in screen
+    assert "Completed 5/6 · Fit K-POPS models and calculate gene scores" not in screen
+
+
+def test_kpops_pipeline_reuses_unchanged_resource_preflight(
+    tmp_path, monkeypatch,
+):
+    resources = _kpops_resources(tmp_path)
+    args = _kpops_args(tmp_path, resources)
+    pipeline_resources = validate_kpops_configuration(args, pipeline=True)
+
+    monkeypatch.setattr(
+        "postgwas.modules.kpops.service.np.memmap",
+        lambda *args, **kwargs: pytest.fail(
+            "the validated dense kernel must not be scanned again"
+        ),
+    )
+
+    def fake_run(command, purpose, **kwargs):
+        prefix = Path(command[command.index("--out_prefix") + 1])
+        pd.DataFrame(
+            {
+                "NAME": ["GENE%d" % index for index in range(10)],
+                "PoPS_Score": np.linspace(-1, 1, 10),
+            },
+            index=resources["genes"],
+        ).to_csv(str(prefix) + ".preds", sep="\t")
+        Path(str(prefix) + ".coefs").write_text(
+            "NAME\ttraining-1\nGENE1\t1\n", encoding="utf-8",
+        )
+        return ""
+
+    monkeypatch.setattr(
+        "postgwas.modules.kpops.service.run_checked_command", fake_run,
+    )
+
+    result = run_kpops_direct(args, pipeline_resources=pipeline_resources)
+
+    assert result["status"] == "success"
+    assert result["summary"]["genes_scored"] == len(resources["genes"])
+
+
+def test_kpops_pipeline_rejects_resource_changed_after_preflight(tmp_path):
+    resources = _kpops_resources(tmp_path)
+    args = _kpops_args(tmp_path, resources)
+    pipeline_resources = validate_kpops_configuration(args, pipeline=True)
+    resources["annotation"].write_text(
+        resources["annotation"].read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(KPopsError, match="changed after pipeline preflight"):
+        run_kpops_direct(args, pipeline_resources=pipeline_resources)
 
 
 def test_kpops_summary_warns_about_incomplete_gene_and_chromosome_coverage(
@@ -593,6 +732,62 @@ def test_caldera_accepts_exact_configured_credible_set_coverage(tmp_path):
     assert observed["credible_set_metrics"]["upstream_retained_rows"] == 2
 
 
+def test_caldera_missing_direct_inputs_are_reported_together_before_resources(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "postgwas.modules.caldera.service._installed_repository",
+        lambda *args, **kwargs: pytest.fail(
+            "resource validation must follow required input detection"
+        ),
+    )
+
+    assert caldera_cli.main([]) == 1
+
+    captured = capsys.readouterr()
+    terminal = captured.out + captured.err
+    for option in ("--pops-file", "--credible-set-file"):
+        assert "Required argument not provided: %s." % option in terminal
+    assert "usage: postgwas caldera" in terminal.lower()
+    service_log = tmp_path / "results/logs/postgwas_caldera.log"
+    log_text = service_log.read_text(encoding="utf-8")
+    log_message = " ".join(
+        re.sub(
+            r"(?:^|\n)\[[^]]+\]\s+RUN\s+(?:FAILED\s+)?",
+            " ",
+            log_text,
+        ).split()
+    )
+    for option in ("--pops-file", "--credible-set-file"):
+        assert "Required argument not provided: %s." % option in log_message
+
+
+def test_caldera_invalid_pops_input_fails_before_resources_or_execution(
+    tmp_path, monkeypatch, capsys,
+):
+    resources = _caldera_resources(tmp_path)
+    resources["pops"].write_text(
+        "ENSGID\tPoPS_Score\nENSG001\tnot-a-number\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "postgwas.modules.caldera.service._installed_repository",
+        lambda *args, **kwargs: pytest.fail(
+            "resource validation must follow PoPS input validation"
+        ),
+    )
+    args = _caldera_args(tmp_path, resources)
+    del args.caldera_repository
+
+    with pytest.raises(CalderaError, match="PoPS scores must all be finite"):
+        run_caldera_direct(args)
+
+    screen = capsys.readouterr().out
+    assert "Failed 1/5 · Validate PoPS gene-prioritisation input" in screen
+    assert "Validate CALDERA reference and software resources" not in screen
+
+
 def test_caldera_infers_installed_repository_and_packaged_adapter(
     tmp_path, monkeypatch,
 ):
@@ -602,6 +797,9 @@ def test_caldera_infers_installed_repository_and_packaged_adapter(
     python.parent.mkdir(parents=True)
     python.write_text("fixture\n", encoding="utf-8")
     python.chmod(0o755)
+    rscript = python.with_name("Rscript")
+    rscript.write_text("fixture\n", encoding="utf-8")
+    rscript.chmod(0o755)
     installed = environment / "share" / "postgwas" / "caldera"
     shutil.copytree(resources["repository"], installed)
     monkeypatch.setenv("PATH", str(python.parent))
@@ -615,8 +813,7 @@ def test_caldera_infers_installed_repository_and_packaged_adapter(
     assert configuration.modules.caldera.adapter_script_path is None
     assert observed["repository"] == installed.resolve()
     assert observed["adapter"] == (
-        Path(__file__).parents[1]
-        / "src" / "postgwas" / "modules" / "caldera" / "run_caldera.R"
+        Path(caldera_service.__file__).with_name("run_caldera.R")
     ).resolve()
 
 
@@ -649,10 +846,113 @@ def test_finemap_interchange_conversion_is_explicit_and_validated(tmp_path):
     assert metrics["credible_set_files"] == 1
 
 
-def test_caldera_direct_publishes_only_validated_results(tmp_path, monkeypatch):
+def test_caldera_pipeline_inputs_are_validated_and_reported_before_resources(
+    tmp_path, capsys,
+):
     resources = _caldera_resources(tmp_path)
+    interchange = tmp_path / "finemap"
+    interchange.mkdir()
+    (interchange / "study_CS_L1.txt").write_text(
+        "index cred1 prob1\n"
+        "1 1:100:A_G 0.7\n"
+        "2 1:110:C_T 0.3\n",
+        encoding="utf-8",
+    )
+    (interchange / "indexfile_rows.tsv").write_text(
+        "Filename\tGenomicLocus\n"
+        "study_CS_L1.txt\tchr1:1-200\n",
+        encoding="utf-8",
+    )
+    args = _caldera_args(tmp_path, resources)
+    del args.credible_set_file
+    progress = StageProgress("CALDERA analysis progress", enabled=True)
+    try:
+        _, observed = validate_caldera_configuration(
+            args,
+            pipeline=True,
+            pipeline_pops=resources["pops"],
+            pipeline_credible_sets_directory=interchange,
+            progress=progress,
+        )
+    finally:
+        progress.close()
+
+    screen = capsys.readouterr().out
+    assert observed["pops_metrics"]["genes"] == 2
+    assert observed["credible_set_metrics"]["credible_set_files"] == 1
+    assert "Completed 1/5 · Validate PoPS gene-prioritisation input" in screen
+    assert "Completed 2/5 · Validate credible-set input" in screen
+    assert "Completed 3/5 · Validate CALDERA reference and software resources" in screen
+    assert screen.index("Validate credible-set input") < screen.index(
+        "Validate CALDERA reference and software resources"
+    )
+
+
+def test_caldera_pipeline_reuses_unchanged_external_resource_preflight(
+    tmp_path, monkeypatch,
+):
+    resources = _caldera_resources(tmp_path)
+    args = _caldera_args(tmp_path, resources)
+    preflight_resources = validate_caldera_configuration(args, pipeline=True)
+    interchange = tmp_path / "finemap_reuse"
+    interchange.mkdir()
+    (interchange / "study_CS_L1.txt").write_text(
+        "index cred1 prob1\n1 1:100:A_G 0.7\n2 1:110:C_T 0.3\n",
+        encoding="utf-8",
+    )
+    (interchange / "indexfile_rows.tsv").write_text(
+        "Filename\tGenomicLocus\nstudy_CS_L1.txt\tchr1:1-200\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "postgwas.modules.caldera.service._repository_file",
+        lambda *args, **kwargs: pytest.fail(
+            "validated CALDERA repository files must not be resolved again"
+        ),
+    )
+    monkeypatch.setattr(
+        "postgwas.modules.caldera.service.resolve_executable",
+        lambda *args, **kwargs: pytest.fail(
+            "validated Rscript must not be resolved again"
+        ),
+    )
+
+    _, observed = validate_caldera_configuration(
+        args,
+        pipeline=True,
+        pipeline_pops=resources["pops"],
+        pipeline_credible_sets_directory=interchange,
+        validated_pipeline_resources=preflight_resources,
+    )
+
+    assert observed["pops_metrics"]["genes"] == 2
+    assert observed["credible_set_metrics"]["credible_set_files"] == 1
+    assert observed["model"] == preflight_resources[1]["model"]
+
+
+def test_caldera_pipeline_rejects_resource_changed_after_preflight(tmp_path):
+    resources = _caldera_resources(tmp_path)
+    args = _caldera_args(tmp_path, resources)
+    preflight_resources = validate_caldera_configuration(args, pipeline=True)
+    resources["adapter"].write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(CalderaError, match="changed after pipeline preflight"):
+        validate_caldera_configuration(
+            args,
+            pipeline=True,
+            validated_pipeline_resources=preflight_resources,
+        )
+
+
+def test_caldera_direct_publishes_only_validated_results(
+    tmp_path, monkeypatch, capsys,
+):
+    resources = _caldera_resources(tmp_path)
+    monkeypatch.setenv("POSTGWAS_CALDERA_TEST_SECRET", "never-log-this-fixture-value")
 
     def fake_run(command, purpose, **kwargs):
+        assert kwargs["env"]["POSTGWAS_CALDERA_TEST_RUNTIME"] == "validated"
+        assert command[1] == "--vanilla"
         output = Path(command[-2])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
@@ -665,8 +965,18 @@ def test_caldera_direct_publishes_only_validated_results(tmp_path, monkeypatch):
 
     monkeypatch.setattr("postgwas.modules.caldera.service.run_checked_command", fake_run)
     result = run_caldera_direct(_caldera_args(tmp_path, resources))
+    screen = capsys.readouterr().out
     assert Path(result["caldera_file"]).is_file()
     assert Path(result["completion_manifest"]).is_file()
+    assert "CALDERA analysis progress" in screen
+    assert "Completed 1/5 · Validate PoPS gene-prioritisation input" in screen
+    assert "Completed 2/5 · Validate credible-set input" in screen
+    assert "Completed 3/5 · Validate CALDERA reference and software resources" in screen
+    assert "Completed 4/5 · Run CALDERA gene prioritisation" in screen
+    assert "Completed 5/5 · Validate and publish CALDERA results" in screen
+    assert "All 5 stages completed" in screen
+    assert "CALDERA gene-prioritisation summary" in screen
+    assert "Complete CALDERA results" in screen
 
     Path(result["caldera_file"]).unlink()
     restarted = run_caldera_direct(_caldera_args(tmp_path, resources))
@@ -679,6 +989,7 @@ def test_caldera_direct_publishes_only_validated_results(tmp_path, monkeypatch):
     assert "reason=incomplete_outputs" in log.read_text(
         encoding="utf-8"
     )
+    assert "never-log-this-fixture-value" not in log.read_text(encoding="utf-8")
 
 
 def test_docker_pins_upstream_commits_and_uses_main_environment():
@@ -695,6 +1006,9 @@ def test_docker_pins_upstream_commits_and_uses_main_environment():
 
 def test_resource_preparation_scripts_pin_and_verify_upstream_archives():
     root = Path(__file__).parents[1] / "tools" / "resource_preparation"
+    versions = (
+        Path(__file__).parents[1] / "tools" / "setup" / "software_versions.env"
+    ).read_text(encoding="utf-8")
     preparation = (root / "prepare_kpops_caldera_resources.sh").read_text(
         encoding="utf-8",
     )
@@ -707,9 +1021,11 @@ def test_resource_preparation_scripts_pin_and_verify_upstream_archives():
         "e162e01c59e084c3cb395c6f9171609ec535a2f6e769a213f042872f590745d3",
         "8ab5259671afe93767bca9db22e9088cb47d674b9cdf3733006fba09958a62b5",
     ):
-        assert value in preparation
+        assert value in versions
+    assert "software_versions.env" in preparation
     assert "--resource-root" in preparation
     assert "--prepare-linear-kernel" in preparation
+    assert "--software-only" in preparation
     assert "--python" in preparation
     assert 'install -m 0755 "${kpops_destination}/k-pops.py" "$kpops_command"' in preparation
     assert 'caldera_install="${python_environment}/share/postgwas/caldera"' in preparation

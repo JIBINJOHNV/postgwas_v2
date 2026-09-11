@@ -5,9 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "postgwas"
 version = "1.0.0"
-description = "PostGWAS analysis toolkit"  # Customize
-authors = [{name = "Jibin", email = "johnjibinv@email.com"}]  # Customize
+description = "Configuration-driven workflows for reproducible post-GWAS analysis"
+readme = "README.md"
+authors = [{name = "Jibin John"}]
 requires-python = ">=3.10"
+keywords = [
+    "bioinformatics",
+    "genome-wide association study",
+    "human genetics",
+    "post-GWAS",
+    "statistical genetics",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
     "pydantic>=2.7,<3",
     "PyYAML>=6",
@@ -56,11 +74,16 @@ test = [
 ]
 
 [project.scripts]
-postgwas = "postgwas.__main__:main"  # Assumes src/postgwas/main.py has def cli(): ... (update if different)
+postgwas = "postgwas.__main__:main"
+
+[project.urls]
+Documentation = "https://github.com/JIBINJOHNV/postgwas_v2/tree/main/docs/wiki"
+Issues = "https://github.com/JIBINJOHNV/postgwas_v2/issues"
+Repository = "https://github.com/JIBINJOHNV/postgwas_v2"
 
 [tool.setuptools.packages.find]
-where = ["src"]  # Look for packages under src/
-namespaces = false  # Optional: Avoid implicit namespaces
+where = ["src"]
+namespaces = false
 
 [tool.setuptools.package-data]
 postgwas = [

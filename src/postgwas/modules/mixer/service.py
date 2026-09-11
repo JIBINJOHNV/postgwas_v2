@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from postgwas.config import (
     load_configuration,
@@ -16,8 +16,23 @@ from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.core.execution.runtime import validate_path
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
 from postgwas.core.paths import configured_output_path, expand_token_path, resolve_executable
+from postgwas.core.reference_resources import require_file_inventory
+from postgwas.core.preflight import (
+    PipelinePreflightEvidence,
+    PreflightFileIdentity,
+    capture_preflight_file_identities,
+    pipeline_preflight_evidence,
+    require_pipeline_input_vcf,
+    require_unchanged_preflight_files,
+)
 from postgwas.core.processes import build_container_command, run_checked_command
+from postgwas.core.required_arguments import (
+    RequiredArgument,
+    require_resolved_arguments,
+)
+from postgwas.core.ui import MeasuredProgress, PipelineStageController, StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
+from postgwas.core.validation_reporting import register_file_availability_bundle
 from postgwas.modules.mixer.results import (
     build_gsa_summary,
     build_mixer_summary,
@@ -42,6 +57,222 @@ class MixerReference:
     ld_file_pattern: str
 
 
+@dataclass(frozen=True)
+class MixerPipelineResources:
+    """External MiXeR resources validated before formatter table creation."""
+
+    configuration: Any
+    bim_file_pattern: str
+    ld_file_pattern: str | None
+    gsa_resources: Mapping[str, str] | None
+    tool: tuple[str, ...]
+    figures_tool: tuple[str, ...] | None
+    backend: str
+    file_identities: tuple[PreflightFileIdentity, ...]
+
+
+class _MixerNativeProgress:
+    """Report only work units observed in an active upstream MiXeR log."""
+
+    _STAGES = (
+        "Initialize the reference and GWAS summary statistics",
+        "Load chromosome LD reference data",
+        "Optimize and validate the MiXeR model",
+    )
+
+    def __init__(
+        self,
+        log_path: Path,
+        purpose: str,
+        ld_files: Sequence[Path],
+        configuration,
+        logger: PipelineLogger,
+    ) -> None:
+        self.log_path = log_path
+        self.purpose = purpose
+        self.ld_files = tuple(str(path) for path in ld_files)
+        self.logger = logger
+        self.progress = StageProgress(
+            "%s execution progress" % purpose,
+            enabled=configuration.logging.show_progress,
+        )
+        self.progress.start_step(1, len(self._STAGES), self._STAGES[0])
+        self.current_stage = 1
+        self.offset = 0
+        self.pending = ""
+        self.started_ld_files: set[str] = set()
+        self.ld_progress: MeasuredProgress | None = None
+        self.optimizer_progress: MeasuredProgress | None = None
+        self.optimizer_evaluations = 0
+        self.optimizer_phase: str | None = None
+        self.optimizer_title: str | None = None
+        self.closed = False
+
+    def _advance(self, target_stage: int) -> None:
+        while self.current_stage < target_stage:
+            self.progress.complete_step(
+                self.current_stage,
+                len(self._STAGES),
+                self._STAGES[self.current_stage - 1],
+            )
+            self.current_stage += 1
+            self.progress.start_step(
+                self.current_stage,
+                len(self._STAGES),
+                self._STAGES[self.current_stage - 1],
+            )
+
+    def _observe_ld_start(self, line: str) -> None:
+        matched = next((path for path in self.ld_files if path in line), None)
+        if matched is None or matched in self.started_ld_files:
+            return
+        self._advance(2)
+        self.started_ld_files.add(matched)
+        if self.ld_progress is None:
+            self.ld_progress = MeasuredProgress(
+                "MiXeR chromosome LD-loading progress",
+                enabled=self.progress.enabled,
+            )
+            self.ld_progress.start(
+                "Load chromosome LD references",
+                total=len(self.ld_files),
+            )
+        self.ld_progress.update(
+            max(0, len(self.started_ld_files) - 1),
+            total=len(self.ld_files),
+            title="Load chromosome LD references",
+        )
+
+    def _complete_ld_loading(self) -> None:
+        self._advance(2)
+        if self.ld_progress is not None:
+            self.ld_progress.complete(
+                len(self.ld_files),
+                total=len(self.ld_files),
+                title="Load chromosome LD references",
+            )
+            self.ld_progress = None
+        self._advance(3)
+
+    def _observe_optimizer(self, lines: Sequence[str]) -> None:
+        added_evaluations = sum(
+            "<calc_" in line and ", cost=" in line for line in lines
+        )
+        phase = self.optimizer_phase
+        for line in lines:
+            marker = "fit_type=="
+            if marker in line and " done " not in line:
+                candidate = line.split(marker, 1)[1].split("...", 1)[0].strip()
+                if candidate:
+                    phase = candidate
+            elif "Calculate AIC/BIC w.r.t. infinitesimal model" in line:
+                phase = "infinitesimal comparison"
+        if not added_evaluations:
+            self.optimizer_phase = phase
+            return
+        self._advance(3)
+        self.optimizer_evaluations += added_evaluations
+        title = "Observed MiXeR cost-function evaluations"
+        if phase:
+            title += " · %s" % phase
+        if self.optimizer_progress is None:
+            self.optimizer_progress = MeasuredProgress(
+                "MiXeR optimizer activity",
+                enabled=self.progress.enabled,
+            )
+            self.optimizer_progress.start(title)
+        elif phase != self.optimizer_phase:
+            self.optimizer_progress.set_phase(title)
+        self.optimizer_progress.update(self.optimizer_evaluations, title=title)
+        self.optimizer_phase = phase
+        self.optimizer_title = title
+        self.logger.record(
+            "OBSERVED",
+            "mixer_optimizer_progress",
+            purpose=self.purpose,
+            completed_cost_evaluations=self.optimizer_evaluations,
+            total_cost_evaluations="unknown_until_convergence",
+            optimization_phase=phase,
+        )
+
+    def observe(self) -> None:
+        """Read only newly appended complete native-log lines."""
+        try:
+            with self.log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(self.offset)
+                chunk = handle.read()
+                self.offset = handle.tell()
+        except FileNotFoundError:
+            return
+        if not chunk:
+            return
+        text = self.pending + chunk
+        lines = text.splitlines(keepends=True)
+        self.pending = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self.pending = lines.pop()
+        complete_lines = [line.rstrip("\r\n") for line in lines]
+        for line in complete_lines:
+            if "<init(" in line and "elapsed time" in line:
+                self._advance(2)
+            if ">load_ld_matrix(filename=" in line:
+                self._observe_ld_start(line)
+            if "--fit-sequence:" in line:
+                self._complete_ld_loading()
+        self._observe_optimizer(complete_lines)
+
+    def complete(self) -> None:
+        """Reach 100% only after checked-command output validation succeeds."""
+        if self.closed:
+            return
+        self.observe()
+        if self.ld_progress is not None:
+            self.ld_progress.complete(
+                len(self.ld_files),
+                total=len(self.ld_files),
+                title="Load chromosome LD references",
+            )
+            self.ld_progress = None
+        if self.optimizer_progress is not None:
+            self.optimizer_progress.complete(
+                self.optimizer_evaluations,
+                total=self.optimizer_evaluations,
+                title=self.optimizer_title,
+            )
+            self.optimizer_progress = None
+        self._advance(len(self._STAGES))
+        self.progress.complete_step(
+            len(self._STAGES), len(self._STAGES), self._STAGES[-1],
+        )
+        self.logger.record(
+            "OBSERVED",
+            "mixer_native_progress_complete",
+            purpose=self.purpose,
+            chromosome_ld_loads_observed=len(self.started_ld_files),
+            chromosome_ld_files_expected=len(self.ld_files),
+            cost_function_evaluations=self.optimizer_evaluations,
+        )
+        self.closed = True
+
+    def fail(self) -> None:
+        """Preserve the last observed work count below completion."""
+        if self.closed:
+            return
+        self.observe()
+        if self.optimizer_progress is not None:
+            self.optimizer_progress.fail(title=self.optimizer_title)
+            self.optimizer_progress = None
+        elif self.ld_progress is not None:
+            self.ld_progress.fail(title="Load chromosome LD references")
+            self.ld_progress = None
+        self.progress.fail_step(
+            self.current_stage,
+            len(self._STAGES),
+            self._STAGES[self.current_stage - 1],
+        )
+        self.closed = True
+
+
 def _result_path(prefix: Path, suffix: str) -> Path:
     """Apply one fixed upstream ``--out PREFIX`` result suffix."""
     return Path("%s%s" % (prefix, suffix))
@@ -58,20 +289,32 @@ def validate_reference_pattern(
     label: str,
     chromosomes: Sequence[str],
     placeholder: str,
-) -> None:
+) -> tuple[Path, ...]:
     """Require every configured chromosome resource before expensive analysis."""
-    missing = [
-        str(path)
+    paths = tuple(
+        expand_chromosome_pattern(pattern, chromosome, placeholder)
         for chromosome in chromosomes
-        if not (
-            path := expand_chromosome_pattern(pattern, chromosome, placeholder)
-        ).is_file()
-        or path.stat().st_size <= 0
-    ]
-    if missing:
-        preview = ", ".join(missing[:5])
-        suffix = " (and %d more)" % (len(missing) - 5) if len(missing) > 5 else ""
-        raise MixerError("Missing or empty %s reference files: %s%s" % (label, preview, suffix))
+    )
+    require_file_inventory(
+        paths, "%s reference" % label,
+        missing_message="Missing or empty %s reference files" % label,
+        error_type=MixerError,
+    )
+    register_file_availability_bundle(
+        paths,
+        "MiXeR chromosome resource bundle",
+        (
+            ("analysis", "mixer_resource_type", label),
+            ("count", "chromosomes", list(chromosomes)),
+            (
+                "success",
+                "mixer_chromosome_files",
+                "%d / %d" % (len(paths), len(paths)),
+            ),
+            ("info", "mixer_pattern", pattern, True),
+        ),
+    )
+    return paths
 
 
 def validate_standard_reference(
@@ -101,6 +344,8 @@ def _resolved_configuration(args):
         "gsa_test_go_file": "gsa.test_go_file",
     })
     global_overrides = explicit_overrides(args, {
+        "dataset_id": "run.dataset_id",
+        "output_directory": "run.output_directory",
         "threads": "execution.threads",
         "memory_gb": "execution.memory_gb",
         "seed": "execution.random_seed",
@@ -191,6 +436,7 @@ def _run_step(
     logger: PipelineLogger,
     *,
     dry_run: bool,
+    progress_factory: Callable[[], _MixerNativeProgress] | None = None,
 ) -> None:
     complete = all(path.is_file() and path.stat().st_size > 0 for path in expected_outputs)
     existing = [path for path in expected_outputs if path.exists()]
@@ -211,15 +457,34 @@ def _run_step(
             "Incomplete MiXeR output exists: %s. Use --overwrite to replace the "
             "partial result." % ", ".join(str(path) for path in existing)
         )
-    run_checked_command(
-        command,
-        purpose,
-        logger=logger,
-        error_type=MixerError,
-        timeout_seconds=configuration.execution.timeout_seconds,
-        expected_outputs=expected_outputs,
-        dry_run=dry_run,
+    native_progress = (
+        None if dry_run or progress_factory is None else progress_factory()
     )
+    try:
+        run_checked_command(
+            command,
+            purpose,
+            logger=logger,
+            error_type=MixerError,
+            timeout_seconds=configuration.execution.timeout_seconds,
+            expected_outputs=expected_outputs,
+            dry_run=dry_run,
+            progress_callback=(
+                None if native_progress is None else native_progress.observe
+            ),
+            progress_refresh_seconds=(
+                None
+                if native_progress is None
+                else configuration.logging.progress_refresh_seconds
+            ),
+        )
+    except BaseException:
+        if native_progress is not None:
+            native_progress.fail()
+        raise
+    else:
+        if native_progress is not None:
+            native_progress.complete()
 
 
 def _chromosome_argument(chromosomes: Sequence[str]) -> str:
@@ -264,7 +529,9 @@ def _run_univariate(
     input_warnings,
     *,
     first_step: int,
+    progress_first_step: int,
     total_steps: int,
+    progress: PipelineStageController,
     dry_run: bool,
 ) -> dict:
     module = configuration.modules.mixer
@@ -292,43 +559,75 @@ def _run_univariate(
     test_json = _result_path(test_prefix, ".json")
     test_log = _result_path(test_prefix, ".log")
     seed = str(configuration.execution.random_seed)
-
-    with logger.step(
-        first_step, total_steps, "Fit single-trait MiXeR model", "mixer.fit1",
-    ) as step:
-        step.input("mixer_input", path=str(trait_file))
-        _run_step(
-            [
-                *tool, module.workflow.fit_command, *common, *module.fit_arguments,
-                "--trait1-file", str(trait_file), "--seed", seed,
-                "--out", str(fit_prefix),
-            ],
-            "MiXeR fit1",
-            [fit_json, fit_log],
-            configuration,
-            logger,
-            dry_run=dry_run,
+    ld_files = tuple(
+        expand_chromosome_pattern(
+            reference.ld_file_pattern,
+            chromosome,
+            module.workflow.chromosome_placeholder,
         )
-        step.output("fit_parameters", path=str(fit_json))
-        step.output("fit_log", path=str(fit_log))
+        for chromosome in module.chromosomes
+    )
 
-    with logger.step(
-        first_step + 1, total_steps, "Evaluate single-trait MiXeR model", "mixer.test1",
-    ) as step:
-        _run_step(
-            [
-                *tool, module.workflow.test_command, *common, *module.test_arguments,
-                "--trait1-file", str(trait_file), "--load-params", str(fit_json),
-                "--seed", seed, "--out", str(test_prefix),
-            ],
-            "MiXeR test1",
-            [test_json, test_log],
-            configuration,
-            logger,
-            dry_run=dry_run,
-        )
-        step.output("test_statistics", path=str(test_json))
-        step.output("test_log", path=str(test_log))
+    progress.start(progress_first_step)
+    try:
+        with logger.step(
+            first_step, total_steps, "Fit single-trait MiXeR model", "mixer.fit1",
+        ) as step:
+            step.input("mixer_input", path=str(trait_file))
+            _run_step(
+                [
+                    *tool, module.workflow.fit_command, *common,
+                    *module.fit_arguments, "--trait1-file", str(trait_file),
+                    "--seed", seed, "--out", str(fit_prefix),
+                ],
+                "MiXeR fit1",
+                [fit_json, fit_log],
+                configuration,
+                logger,
+                dry_run=dry_run,
+                progress_factory=lambda: _MixerNativeProgress(
+                    fit_log, "MiXeR fit1", ld_files, configuration, logger,
+                ),
+            )
+            step.output("fit_parameters", path=str(fit_json))
+            step.output("fit_log", path=str(fit_log))
+    except BaseException:
+        progress.fail_active()
+        raise
+    else:
+        progress.complete(progress_first_step)
+
+    progress.start(progress_first_step + 1)
+    try:
+        with logger.step(
+            first_step + 1,
+            total_steps,
+            "Evaluate single-trait MiXeR model",
+            "mixer.test1",
+        ) as step:
+            _run_step(
+                [
+                    *tool, module.workflow.test_command, *common,
+                    *module.test_arguments, "--trait1-file", str(trait_file),
+                    "--load-params", str(fit_json), "--seed", seed,
+                    "--out", str(test_prefix),
+                ],
+                "MiXeR test1",
+                [test_json, test_log],
+                configuration,
+                logger,
+                dry_run=dry_run,
+                progress_factory=lambda: _MixerNativeProgress(
+                    test_log, "MiXeR test1", ld_files, configuration, logger,
+                ),
+            )
+            step.output("test_statistics", path=str(test_json))
+            step.output("test_log", path=str(test_log))
+    except BaseException:
+        progress.fail_active()
+        raise
+    else:
+        progress.complete(progress_first_step + 1)
     return {
         "mixer_input": str(trait_file),
         "fit": str(fit_json),
@@ -358,6 +657,172 @@ def _gsa_resources(module) -> dict[str, str]:
     if settings.loadlib_file_pattern:
         resources["loadlib"] = _absolute_pattern(settings.loadlib_file_pattern)
     return resources
+
+
+def _require_mixer_pipeline_arguments(configuration) -> None:
+    """Validate all mode-dependent external MiXeR requirements together."""
+    module = configuration.modules.mixer
+    run_univariate = module.analysis in {"univariate", "all"}
+    run_gsa = module.analysis in {"gsa", "all"}
+    requirements = [RequiredArgument(
+        "--bim-file-pattern", "modules.mixer.bim_file_pattern",
+        module.bim_file_pattern,
+    )]
+    if run_univariate or (run_gsa and not module.gsa.loadlib_file_pattern):
+        requirements.append(RequiredArgument(
+            "--ld-file-pattern", "modules.mixer.ld_file_pattern",
+            module.ld_file_pattern,
+        ))
+    if run_gsa:
+        requirements.extend([
+            RequiredArgument(
+                "--gsa-annotation-file-pattern",
+                "modules.mixer.gsa.annotation_file_pattern",
+                module.gsa.annotation_file_pattern,
+            ),
+            RequiredArgument(
+                "--gsa-baseline-go-file",
+                "modules.mixer.gsa.baseline_go_file",
+                module.gsa.baseline_go_file,
+            ),
+            RequiredArgument(
+                "--gsa-model-go-file",
+                "modules.mixer.gsa.model_go_file",
+                module.gsa.model_go_file,
+            ),
+            RequiredArgument(
+                "--gsa-test-go-file",
+                "modules.mixer.gsa.test_go_file",
+                module.gsa.test_go_file,
+            ),
+        ])
+    require_resolved_arguments(requirements)
+
+
+def _existing_output_mount_directory(output_directory: str | Path) -> Path:
+    """Return the nearest existing non-root parent for a future output path."""
+    candidate = Path(output_directory).expanduser().resolve()
+    while not candidate.is_dir() and candidate != Path(candidate.anchor):
+        candidate = candidate.parent
+    if candidate == Path(candidate.anchor):
+        raise MixerError(
+            "MiXeR container execution requires the configured output path to "
+            "have an existing parent below the filesystem root."
+        )
+    return candidate
+
+
+def _mixer_pipeline_execution_configuration(args, resources):
+    """Retain preflight settings while applying the pipeline stage directory."""
+    run = resources.configuration.run.model_copy(update={
+        "output_directory": Path(args.output_directory).expanduser().resolve(),
+    })
+    return resources.configuration.model_copy(update={"run": run}, deep=True)
+
+
+def preflight_mixer_pipeline(
+    args,
+    *,
+    preflight_evidence=None,
+) -> PipelinePreflightEvidence:
+    """Validate entry data, references, and the selected MiXeR backend early."""
+    entry_vcf = require_pipeline_input_vcf(preflight_evidence)
+    configuration = _resolved_configuration(args)
+    module = configuration.modules.mixer
+    _require_mixer_pipeline_arguments(configuration)
+    observed_build = str(entry_vcf["harmonised"]["genome_build"])
+    if str(module.genome_build) != observed_build:
+        raise MixerError(
+            "The harmonised GWAS-VCF declares genome build %s, but MiXeR "
+            "resolves to %s. The GWAS, BIM, LD, and annotation resources "
+            "must use the same build." % (observed_build, module.genome_build)
+        )
+
+    run_univariate = module.analysis in {"univariate", "all"}
+    run_gsa = module.analysis in {"gsa", "all"}
+    placeholder = module.workflow.chromosome_placeholder
+    bim_pattern = _absolute_pattern(module.bim_file_pattern)
+    resource_files = list(validate_reference_pattern(
+        bim_pattern, "BIM", module.chromosomes, placeholder,
+    ))
+    ld_pattern = None
+    if run_univariate or (run_gsa and not module.gsa.loadlib_file_pattern):
+        ld_pattern = _absolute_pattern(module.ld_file_pattern)
+        resource_files.extend(validate_reference_pattern(
+            ld_pattern, "LD", module.chromosomes, placeholder,
+        ))
+
+    gsa_resources = None
+    if run_gsa:
+        gsa_resources = _gsa_resources(module)
+        resource_files.extend(validate_reference_pattern(
+            gsa_resources["annotation"], "GSA annotation",
+            module.chromosomes, placeholder,
+        ))
+        if "loadlib" in gsa_resources:
+            resource_files.extend(validate_reference_pattern(
+                gsa_resources["loadlib"], "GSA load-library",
+                module.chromosomes, placeholder,
+            ))
+        for key in ("baseline_go", "model_go", "test_go"):
+            validate_gsa_go_file(gsa_resources[key], module.gsa, MixerError)
+            resource_files.append(Path(gsa_resources[key]).expanduser().resolve())
+
+    mount_directories = {path.parent for path in resource_files}
+    mount_directories.add(_existing_output_mount_directory(
+        configuration.run.output_directory,
+    ))
+    dry_run = bool(getattr(args, "dry_run", False))
+    tool, backend = _tool_command(
+        configuration,
+        mount_directories=sorted(mount_directories, key=str),
+        validate=not dry_run,
+    )
+    figures_tool = None
+    if (
+        run_univariate
+        and module.reporting.enabled
+        and module.reporting.generate_figures
+        and not dry_run
+    ):
+        figures_tool, figures_backend = _tool_command(
+            configuration,
+            figures=True,
+            mount_directories=sorted(mount_directories, key=str),
+        )
+        if figures_backend != backend:
+            raise MixerError(
+                "MiXeR and mixer_figures resolved to different execution backends"
+            )
+
+    executable_files = [
+        Path(value).expanduser().resolve()
+        for value in (*tool, *(figures_tool or ()))
+        if Path(value).expanduser().is_file()
+    ]
+    resources = MixerPipelineResources(
+        configuration=configuration,
+        bim_file_pattern=bim_pattern,
+        ld_file_pattern=ld_pattern,
+        gsa_resources=gsa_resources,
+        tool=tuple(tool),
+        figures_tool=None if figures_tool is None else tuple(figures_tool),
+        backend=backend,
+        file_identities=capture_preflight_file_identities(
+            [*resource_files, *executable_files],
+            error_type=MixerError,
+            label="MiXeR resource",
+        ),
+    )
+    return pipeline_preflight_evidence(
+        "mixer",
+        preflight_evidence,
+        resources=resources,
+        deferred_checks=(
+            "Validate the formatter-created MiXeR summary-statistics table.",
+            "Validate its chromosome coverage against the resolved analysis range.",
+        ),
+    )
 
 
 def _gsa_common_arguments(
@@ -408,7 +873,9 @@ def _run_gsa(
     resources,
     *,
     first_step: int,
+    progress_first_step: int,
     total_steps: int,
+    progress: PipelineStageController,
     dry_run: bool,
 ) -> dict:
     module = configuration.modules.mixer
@@ -423,23 +890,32 @@ def _run_gsa(
         Path(str(split_pattern).replace(placeholder, chromosome))
         for chromosome in module.chromosomes
     ]
-    with logger.step(
-        first_step, total_steps, "Split one-trait summary statistics by chromosome",
-        "mixer.split_sumstats",
-    ) as step:
-        _run_step(
-            [
-                *tool, module.workflow.split_sumstats_command,
-                "--trait1-file", str(trait_file), "--out", str(split_pattern),
-                "--chr2use", _chromosome_argument(module.chromosomes),
-            ],
-            "GSA-MiXeR split_sumstats",
-            split_outputs,
-            configuration,
-            logger,
-            dry_run=dry_run,
-        )
-        step.output("chromosome_sumstats", pattern=str(split_pattern))
+    progress.start(progress_first_step)
+    try:
+        with logger.step(
+            first_step,
+            total_steps,
+            "Split one-trait summary statistics by chromosome",
+            "mixer.split_sumstats",
+        ) as step:
+            _run_step(
+                [
+                    *tool, module.workflow.split_sumstats_command,
+                    "--trait1-file", str(trait_file), "--out", str(split_pattern),
+                    "--chr2use", _chromosome_argument(module.chromosomes),
+                ],
+                "GSA-MiXeR split_sumstats",
+                split_outputs,
+                configuration,
+                logger,
+                dry_run=dry_run,
+            )
+            step.output("chromosome_sumstats", pattern=str(split_pattern))
+    except BaseException:
+        progress.fail_active()
+        raise
+    else:
+        progress.complete(progress_first_step)
 
     baseline_prefix = configured_output_path(
         output, layout.gsa_baseline_prefix, error_type=MixerError, dataset_id=dataset_id,
@@ -460,43 +936,65 @@ def _run_gsa(
         module, configuration, split_pattern, resources,
     )
 
-    with logger.step(
-        first_step + 1, total_steps, "Fit GSA-MiXeR baseline model", "mixer.gsa_base",
-    ) as step:
-        _run_step(
-            [
-                *tool, module.workflow.gsa_command, "--gsa-base", *common,
-                "--go-file", resources["baseline_go"], "--out", str(baseline_prefix),
-            ],
-            "GSA-MiXeR baseline model",
-            [baseline_json, baseline_log, baseline_snps, baseline_weights],
-            configuration,
-            logger,
-            dry_run=dry_run,
-        )
-        step.output("gsa_baseline", path=str(baseline_json))
+    progress.start(progress_first_step + 1)
+    try:
+        with logger.step(
+            first_step + 1,
+            total_steps,
+            "Fit GSA-MiXeR baseline model",
+            "mixer.gsa_base",
+        ) as step:
+            _run_step(
+                [
+                    *tool, module.workflow.gsa_command, "--gsa-base", *common,
+                    "--go-file", resources["baseline_go"],
+                    "--out", str(baseline_prefix),
+                ],
+                "GSA-MiXeR baseline model",
+                [baseline_json, baseline_log, baseline_snps, baseline_weights],
+                configuration,
+                logger,
+                dry_run=dry_run,
+            )
+            step.output("gsa_baseline", path=str(baseline_json))
+    except BaseException:
+        progress.fail_active()
+        raise
+    else:
+        progress.complete(progress_first_step + 1)
 
-    with logger.step(
-        first_step + 2, total_steps, "Fit GSA-MiXeR enrichment model", "mixer.gsa_full",
-    ) as step:
-        _run_step(
-            [
-                *tool, module.workflow.gsa_command, "--gsa-full", *common,
-                "--go-file", resources["model_go"],
-                "--go-file-test", resources["test_go"],
-                "--load-params-file", str(baseline_json),
-                "--load-baseline-params-file", str(baseline_json),
-                "--calc-loglike-diff-go-test", settings.loglike_difference_method,
-                "--se-samples", str(settings.standard_error_samples),
-                "--out", str(full_prefix),
-            ],
-            "GSA-MiXeR enrichment model",
-            [full_json, full_log, enrichment_results],
-            configuration,
-            logger,
-            dry_run=dry_run,
-        )
-        step.output("gsa_enrichment", path=str(enrichment_results))
+    progress.start(progress_first_step + 2)
+    try:
+        with logger.step(
+            first_step + 2,
+            total_steps,
+            "Fit GSA-MiXeR enrichment model",
+            "mixer.gsa_full",
+        ) as step:
+            _run_step(
+                [
+                    *tool, module.workflow.gsa_command, "--gsa-full", *common,
+                    "--go-file", resources["model_go"],
+                    "--go-file-test", resources["test_go"],
+                    "--load-params-file", str(baseline_json),
+                    "--load-baseline-params-file", str(baseline_json),
+                    "--calc-loglike-diff-go-test",
+                    settings.loglike_difference_method,
+                    "--se-samples", str(settings.standard_error_samples),
+                    "--out", str(full_prefix),
+                ],
+                "GSA-MiXeR enrichment model",
+                [full_json, full_log, enrichment_results],
+                configuration,
+                logger,
+                dry_run=dry_run,
+            )
+            step.output("gsa_enrichment", path=str(enrichment_results))
+    except BaseException:
+        progress.fail_active()
+        raise
+    else:
+        progress.complete(progress_first_step + 2)
     return {
         "mixer_input": str(trait_file),
         "split_sumstats_pattern": str(split_pattern),
@@ -513,7 +1011,25 @@ def _run_gsa(
     }
 
 
-def run_single_trait_mixer(
+def _mixer_progress_stages(module, *, include_reporting: bool) -> tuple[str, ...]:
+    stages = ["Validate the MiXeR input and resolved resources"]
+    if module.analysis in {"univariate", "all"}:
+        stages.extend((
+            "Fit the single-trait MiXeR model",
+            "Evaluate the fitted single-trait MiXeR model",
+        ))
+    if module.analysis in {"gsa", "all"}:
+        stages.extend((
+            "Split summary statistics by chromosome for GSA-MiXeR",
+            "Fit the GSA-MiXeR baseline model",
+            "Fit the GSA-MiXeR enrichment model",
+        ))
+    if include_reporting:
+        stages.append("Validate and report the selected MiXeR results")
+    return tuple(stages)
+
+
+def _run_single_trait_mixer_impl(
     mixer_input_file: str | Path,
     output_directory: str | Path,
     dataset_id: str,
@@ -521,14 +1037,17 @@ def run_single_trait_mixer(
     logger: PipelineLogger,
     *,
     dry_run: bool = False,
+    pipeline_resources: MixerPipelineResources | None = None,
+    progress: PipelineStageController,
 ) -> dict:
     """Run the configured single-trait MiXeR analysis selection."""
     module = configuration.modules.mixer
+    if progress.current == 0:
+        progress.start(1)
     trait_file = Path(mixer_input_file).expanduser().resolve()
     if not trait_file.is_file() or trait_file.stat().st_size <= 0:
         raise MixerError("MiXeR input file does not exist or is empty: %s" % trait_file)
-    if module.bim_file_pattern is None:
-        raise MixerError("--bim-file-pattern is required for every MiXeR analysis")
+    _require_mixer_pipeline_arguments(configuration)
     run_univariate = module.analysis in {"univariate", "all"}
     run_gsa = module.analysis in {"gsa", "all"}
     if (run_univariate or (run_gsa and not module.gsa.loadlib_file_pattern)) and not module.ld_file_pattern:
@@ -552,22 +1071,41 @@ def run_single_trait_mixer(
     logger.record("OBSERVED", "mixer_input", **input_metrics)
 
     placeholder = module.workflow.chromosome_placeholder
-    bim_pattern = _absolute_pattern(module.bim_file_pattern)
-    validate_reference_pattern(bim_pattern, "BIM", module.chromosomes, placeholder)
-    if module.ld_file_pattern and (run_univariate or not module.gsa.loadlib_file_pattern):
+    bim_pattern = (
+        pipeline_resources.bim_file_pattern
+        if pipeline_resources is not None
+        else _absolute_pattern(module.bim_file_pattern)
+    )
+    if pipeline_resources is None:
         validate_reference_pattern(
-            _absolute_pattern(module.ld_file_pattern), "LD", module.chromosomes, placeholder,
+            bim_pattern, "BIM", module.chromosomes, placeholder,
         )
+        if module.ld_file_pattern and (
+            run_univariate or not module.gsa.loadlib_file_pattern
+        ):
+            validate_reference_pattern(
+                _absolute_pattern(module.ld_file_pattern), "LD",
+                module.chromosomes, placeholder,
+            )
 
-    gsa_resources = None
-    if run_gsa:
-        gsa_resources = _gsa_resources(module)
+    gsa_resources = (
+        None
+        if not run_gsa
+        else (
+            dict(pipeline_resources.gsa_resources or {})
+            if pipeline_resources is not None
+            else _gsa_resources(module)
+        )
+    )
+    if run_gsa and pipeline_resources is None:
         validate_reference_pattern(
-            gsa_resources["annotation"], "GSA annotation", module.chromosomes, placeholder,
+            gsa_resources["annotation"], "GSA annotation",
+            module.chromosomes, placeholder,
         )
         if "loadlib" in gsa_resources:
             validate_reference_pattern(
-                gsa_resources["loadlib"], "GSA load-library", module.chromosomes, placeholder,
+                gsa_resources["loadlib"], "GSA load-library",
+                module.chromosomes, placeholder,
             )
         for key in ("baseline_go", "model_go", "test_go"):
             validate_gsa_go_file(gsa_resources[key], module.gsa, MixerError)
@@ -579,18 +1117,30 @@ def run_single_trait_mixer(
         mount_directories.add(Path(_absolute_pattern(module.ld_file_pattern)).parent)
     if gsa_resources:
         mount_directories.update(Path(value).parent for value in gsa_resources.values())
-    tool, backend = _tool_command(
-        configuration,
-        mount_directories=sorted(mount_directories, key=str),
-        work_directory=output,
-        validate=not dry_run,
-    )
+    if pipeline_resources is None:
+        tool, backend = _tool_command(
+            configuration,
+            mount_directories=sorted(mount_directories, key=str),
+            work_directory=output,
+            validate=not dry_run,
+        )
+    else:
+        tool = list(pipeline_resources.tool)
+        backend = pipeline_resources.backend
     logger.record(
         "PARAM", "mixer_backend", analysis=module.analysis,
         requested=module.execution_backend, selected=backend,
         container_image=(
             configuration.resources.containers.mixer.image if backend == "docker" else None
         ),
+    )
+    progress.complete(
+        1,
+        outcome_fields=[
+            ("count", "Validated input variants", input_metrics["formatted_variants"]),
+            ("count", "Configured chromosomes", len(module.chromosomes)),
+            ("success", "Execution backend", backend),
+        ],
     )
     total_steps = (2 if run_univariate else 0) + (3 if run_gsa else 0)
     result = {
@@ -602,20 +1152,63 @@ def run_single_trait_mixer(
         "dry_run": dry_run,
     }
     next_step = 1
+    next_progress_step = 2
     if run_univariate:
         result["univariate"] = _run_univariate(
             trait_file, output, dataset_id, configuration, logger, tool, backend,
             input_metrics, input_warnings, first_step=next_step,
-            total_steps=total_steps, dry_run=dry_run,
+            progress_first_step=next_progress_step,
+            total_steps=total_steps, progress=progress, dry_run=dry_run,
         )
         next_step += 2
+        next_progress_step += 2
     if run_gsa:
         result["gsa"] = _run_gsa(
             trait_file, output, dataset_id, configuration, logger, tool, backend,
             input_metrics, gsa_resources, first_step=next_step,
-            total_steps=total_steps, dry_run=dry_run,
+            progress_first_step=next_progress_step,
+            total_steps=total_steps, progress=progress, dry_run=dry_run,
         )
     return result
+
+
+def run_single_trait_mixer(
+    mixer_input_file: str | Path,
+    output_directory: str | Path,
+    dataset_id: str,
+    configuration,
+    logger: PipelineLogger,
+    *,
+    dry_run: bool = False,
+    pipeline_resources: MixerPipelineResources | None = None,
+    progress: PipelineStageController | None = None,
+) -> dict:
+    """Run MiXeR with a caller-owned or invocation-local progress controller."""
+    owns_progress = progress is None
+    controller = progress or PipelineStageController(
+        "MiXeR analysis progress",
+        _mixer_progress_stages(
+            configuration.modules.mixer,
+            include_reporting=False,
+        ),
+    )
+    try:
+        return _run_single_trait_mixer_impl(
+            mixer_input_file,
+            output_directory,
+            dataset_id,
+            configuration,
+            logger,
+            dry_run=dry_run,
+            pipeline_resources=pipeline_resources,
+            progress=controller,
+        )
+    except BaseException:
+        controller.fail_active()
+        raise
+    finally:
+        if owns_progress:
+            controller.close()
 
 
 def _generate_figures(
@@ -624,6 +1217,9 @@ def _generate_figures(
     dataset_id: str,
     configuration,
     logger: PipelineLogger,
+    *,
+    figures_tool: Sequence[str] | None = None,
+    expected_backend: str | None = None,
 ) -> list[str]:
     module = configuration.modules.mixer
     prefix = configured_output_path(
@@ -631,16 +1227,20 @@ def _generate_figures(
         error_type=MixerError, dataset_id=dataset_id,
     )
     prefix.parent.mkdir(parents=True, exist_ok=True)
-    figures_tool, backend = _tool_command(
-        configuration,
-        figures=True,
-        mount_directories=[output_directory],
-        work_directory=output_directory,
-    )
+    if figures_tool is None:
+        resolved_tool, backend = _tool_command(
+            configuration,
+            figures=True,
+            mount_directories=[output_directory],
+            work_directory=output_directory,
+        )
+    else:
+        resolved_tool = list(figures_tool)
+        backend = expected_backend or result["execution_backend"]
     if backend != result["execution_backend"]:
         raise MixerError("MiXeR and mixer_figures resolved to different execution backends")
     command = [
-        *figures_tool, module.workflow.figure_command,
+        *resolved_tool, module.workflow.figure_command,
         "--json", result["test"], "--trait1", dataset_id,
         "--out", str(prefix), "--ext", *module.reporting.figure_extensions,
         "--statistic", *module.reporting.figure_statistics,
@@ -674,10 +1274,19 @@ def _dry_run_summary(dataset_id: str, result: dict, log_path: Path) -> str:
     ])
 
 
-def run_mixer_direct(args, ctx=None):
+def run_mixer_direct(
+    args,
+    ctx=None,
+    *,
+    pipeline_resources: MixerPipelineResources | None = None,
+):
     """Resolve configuration, run selected one-trait analyses, and close the log."""
     try:
-        configuration = _resolved_configuration(args)
+        configuration = (
+            _mixer_pipeline_execution_configuration(args, pipeline_resources)
+            if pipeline_resources is not None
+            else _resolved_configuration(args)
+        )
     except BaseException as exc:
         fallback = load_configuration()
         failure_output = Path(
@@ -730,7 +1339,21 @@ def run_mixer_direct(args, ctx=None):
         screen_level=configuration.logging.console_level,
         log_path=str(log_path),
     )
+    mixer_progress = PipelineStageController(
+        "MiXeR analysis progress",
+        _mixer_progress_stages(
+            configuration.modules.mixer,
+            include_reporting=True,
+        ),
+    )
+    mixer_progress.start(1)
     try:
+        if pipeline_resources is not None:
+            require_unchanged_preflight_files(
+                pipeline_resources.file_identities,
+                error_type=MixerError,
+                label="MiXeR resource",
+            )
         if not mixer_input:
             raise MixerError("Provide the formatter-created file with --mixer-input-file PATH.")
         write_resolved_configuration(
@@ -763,7 +1386,11 @@ def run_mixer_direct(args, ctx=None):
             configuration,
             logger,
             dry_run=bool(getattr(args, "dry_run", False)),
+            pipeline_resources=pipeline_resources,
+            progress=mixer_progress,
         )
+        final_progress_step = len(mixer_progress.stages)
+        mixer_progress.start(final_progress_step)
         result["log_file"] = str(log_path)
         result["run_id"] = run_id
         rendered = []
@@ -777,6 +1404,16 @@ def run_mixer_direct(args, ctx=None):
                 figures = (
                     _generate_figures(
                         univariate, output_directory, dataset_id, configuration, logger,
+                        figures_tool=(
+                            None
+                            if pipeline_resources is None
+                            else pipeline_resources.figures_tool
+                        ),
+                        expected_backend=(
+                            None
+                            if pipeline_resources is None
+                            else pipeline_resources.backend
+                        ),
                     )
                     if configuration.modules.mixer.reporting.generate_figures else []
                 )
@@ -869,20 +1506,31 @@ def run_mixer_direct(args, ctx=None):
         if ctx is not None:
             ctx["mixer"] = result
         logger.record("STATUS", "mixer_run", status="COMPLETED")
+        mixer_progress.complete(
+            final_progress_step,
+            outcome_fields=[
+                ("success", "Selected analysis", result["analysis"]),
+                ("success", "Canonical log", log_path),
+            ],
+        )
         print("\n".join(rendered))
         return result
     except BaseException as exc:
+        mixer_progress.fail_active()
         if not logger.summary()["failed"]:
             logger.error("MiXeR failed: %s: %s" % (type(exc).__name__, exc))
         raise
     finally:
+        mixer_progress.close()
         logger.close()
 
 
 __all__ = [
     "MixerError",
+    "MixerPipelineResources",
     "MixerReference",
     "expand_chromosome_pattern",
+    "preflight_mixer_pipeline",
     "run_mixer_direct",
     "run_single_trait_mixer",
     "validate_reference_pattern",

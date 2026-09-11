@@ -1,15 +1,23 @@
 """Tests for dataset-level user-facing harmonisation output."""
 
 import inspect
+from io import StringIO
 
 import polars as pl
+from rich.console import Console
 
+from postgwas.config import load_configuration
+from postgwas.core.pipeline_logging import PipelineLogger
 from postgwas.modules.harmonisation.cli import (
     _dataset_start_block,
+    _engine_defaults,
     _preparation_block,
     _run_validated_rows,
 )
 from postgwas.modules.harmonisation.service import (
+    DATASET_STEP_TOTAL,
+    POST_MERGE_STEP_TOTAL,
+    _HarmonisationProgress,
     _input_validation_summary_block,
     _ready_variant_type_counts,
     _study_decisions_block,
@@ -67,6 +75,102 @@ def test_each_dataset_start_shows_position_identity_and_input_file():
     assert source.index("_dataset_start_block(") < source.index("_write_run_metadata(")
 
 
+def test_harmonisation_progress_uses_canonical_setting_and_validated_boundaries(
+    tmp_path,
+):
+    configuration = load_configuration()
+    engine = _engine_defaults(configuration)
+    assert engine["terminal_progress"] == {
+        "enabled": configuration.logging.show_progress,
+        "outcome_label_width": configuration.logging.terminal_label_width,
+    }
+
+    stream = StringIO()
+    progress = _HarmonisationProgress(
+        enabled=True,
+        outcome_label_width=configuration.logging.terminal_label_width,
+        console=Console(
+            file=stream,
+            force_terminal=False,
+            color_system=None,
+            width=120,
+        ),
+    )
+    logger = PipelineLogger(
+        "study",
+        "dataset",
+        str(tmp_path),
+        stage_progress=progress.dataset_stages,
+    )
+
+    for number in range(1, DATASET_STEP_TOTAL + 1):
+        with logger.step(
+            number,
+            DATASET_STEP_TOTAL,
+            "Dataset stage %d" % number,
+            "test.dataset_stage",
+        ):
+            pass
+
+    progress.start_chromosomes(("1", "2"))
+    progress.record_chromosome_result("1", "ok", 1)
+    progress.record_chromosome_result("2", "failed", 1)
+    progress.record_chromosome_result("2", "ok", 2)
+    progress.finish_chromosomes()
+
+    logger.set_stage_progress(progress.start_post_merge())
+    for number in range(1, POST_MERGE_STEP_TOTAL + 1):
+        with logger.step(
+            number,
+            POST_MERGE_STEP_TOTAL,
+            "Post-merge stage %d" % number,
+            "test.post_merge_stage",
+        ):
+            pass
+    logger.close()
+    progress.close()
+
+    text = stream.getvalue()
+    assert "Harmonisation dataset stages" in text
+    assert "Completed 8/8 · Dataset stage 8" in text
+    assert "All 8 stages completed" in text
+    assert "Harmonisation chromosome progress" in text
+    assert "Progress 1/2 · Chromosome 1 completed on attempt 1 · 50%" in text
+    assert "Current 1/2 · Chromosome 2 failed on attempt 1" in text
+    assert (
+        "Completed 2/2 · All chromosome outputs and required counts validated"
+        in text
+    )
+    assert "Harmonisation post-merge stages" in text
+    assert "Completed 5/5 · Post-merge stage 5" in text
+    assert "All 5 stages completed" in text
+
+
+def test_harmonisation_chromosome_progress_fails_below_completion():
+    stream = StringIO()
+    progress = _HarmonisationProgress(
+        enabled=True,
+        outcome_label_width=24,
+        console=Console(
+            file=stream,
+            force_terminal=False,
+            color_system=None,
+            width=120,
+        ),
+    )
+
+    progress.start_chromosomes(("1", "2", "X"))
+    progress.record_chromosome_result("1", "ok", 1)
+    progress.record_chromosome_result("2", "failed", 1)
+    progress.finish_chromosomes(("2", "X"))
+    progress.close()
+
+    text = stream.getvalue()
+    assert "Progress 1/3 · Chromosome 1 completed on attempt 1 · 33%" in text
+    assert "Failed 1/3 · 2 chromosomes incomplete: 2, X" in text
+    assert "Completed 3/3" not in text
+
+
 def test_study_decisions_are_shown_as_aligned_user_facing_values():
     text = _study_decisions_block({
         "effect_type": "odds_ratio",
@@ -101,6 +205,7 @@ def test_input_validation_reports_ready_snp_and_indel_other_counts():
         variants_read=6,
         missing_required=1,
         invalid_coordinates=0,
+        unsupported_chromosomes=0,
         non_standard_alleles=0,
         duplicate_variants=1,
         ready_variants=4,
@@ -109,6 +214,8 @@ def test_input_validation_reports_ready_snp_and_indel_other_counts():
     )
 
     assert "Ready for harmonisation        : 4" in text
+    assert "Missing read-stage mandatory values" in " ".join(text.split())
+    assert "Unsupported chromosomes" in text
     assert "Ready SNPs                     : 2" in text
     assert "Ready indels / other variants  : 2" in text
 

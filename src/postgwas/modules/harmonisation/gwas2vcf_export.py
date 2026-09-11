@@ -8,6 +8,36 @@ import polars as pl
 from postgwas.core.paths import configured_output_path
 from postgwas.core.values import optional_text
 
+from .p_values import P_VALUE_EXACT_RAW_KEY
+from .strand import EXPORTABLE_STRAND_ACTIONS, STRAND_ACTION_COLUMN
+
+
+# This is the internal audit contract shared by the chromosome exporter and
+# the dataset-level atomic merge. These names are protocol invariants rather
+# than user-selectable study columns.
+GWAS2VCF_SUMMARY_COLUMNS = (
+    "chromosome",
+    "key",
+    "column_name",
+    "dtype",
+    "n_missing",
+    "min",
+    "max",
+    "mean",
+    "median",
+    "std",
+    "num_rows",
+    "num_cols",
+    "status",
+)
+GWAS2VCF_SUMMARY_CHROMOSOME_COLUMN = "chromosome"
+GWAS2VCF_SUMMARY_KEY_COLUMN = "key"
+GWAS2VCF_SUMMARY_MISSING_COLUMN = "n_missing"
+GWAS2VCF_SUMMARY_ROW_COUNT_COLUMN = "num_rows"
+GWAS2VCF_SUMMARY_COLUMN_COUNT_COLUMN = "num_cols"
+GWAS2VCF_SUMMARY_STATUS_COLUMN = "status"
+GWAS2VCF_SUMMARY_SUCCESS_STATUS = "success"
+
 
 def summarise_gwas2vcf_columns(
     df: pl.DataFrame, exported_column_mappings: Dict, chromosome: str
@@ -123,6 +153,26 @@ def export_gwas2vcf_input(
                 ),
             )
         )
+    if STRAND_ACTION_COLUMN in audit_columns:
+        invalid_actions = (
+            df.filter(
+                ~pl.col(STRAND_ACTION_COLUMN)
+                .is_in(list(EXPORTABLE_STRAND_ACTIONS))
+                .fill_null(False)
+            )
+            .get_column(STRAND_ACTION_COLUMN)
+            .drop_nulls()
+            .unique()
+            .sort()
+            .to_list()
+        )
+        if invalid_actions:
+            raise ValueError(
+                "Cannot export chromosome %s; strand_action contains values that "
+                "are neither reference-resolved nor explicitly retained for "
+                "mandatory genome-FASTA validation: %s"
+                % (chromosome, ", ".join(str(value) for value in invalid_actions))
+            )
     mapped_audit = sorted(set(pairs.values()) & set(audit_columns))
     if mapped_audit:
         raise ValueError(
@@ -133,7 +183,42 @@ def export_gwas2vcf_input(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    export_df = df.select(list(pairs.values()) + list(audit_columns))
+    export_columns = list(pairs.values()) + list(audit_columns)
+    pvalue_column = optional_text(pairs.get("pval_col"))
+    exact_raw_column = optional_text(
+        sample_column_dict.get(P_VALUE_EXACT_RAW_KEY)
+    )
+    use_exact_raw = bool(
+        exact_raw_column is not None
+        and exact_raw_column in df.columns
+        and df.get_column(exact_raw_column).null_count() < df.height
+    )
+    expressions = []
+    for column in export_columns:
+        if (
+            column == pvalue_column
+            and use_exact_raw
+        ):
+            # The vendored adapter accepts raw P as Decimal text and creates
+            # FORMAT/LP itself. Prefer exact underflow text at this boundary;
+            # changing the adapter contract to LP would be incorrect.
+            expressions.append(
+                pl.coalesce(
+                    pl.col(exact_raw_column).cast(pl.String, strict=False),
+                    pl.col(column).cast(pl.String, strict=False),
+                ).alias(column)
+            )
+        else:
+            expressions.append(pl.col(column))
+    export_df = df.select(expressions)
+    if pvalue_column is not None:
+        missing_export_p = export_df.get_column(pvalue_column).null_count()
+        if missing_export_p:
+            raise ValueError(
+                "Cannot export chromosome %s; %s p-values have neither a raw "
+                "Float64 representation nor preserved exact raw text."
+                % (chromosome, missing_export_p)
+            )
     values = {"dataset_id": gwas_outputname, "chromosome": chromosome}
     tsv_path = configured_output_path(
         output, layout["adapter_input"], **values,
@@ -162,10 +247,12 @@ def export_gwas2vcf_input(
 
     summary = summarise_gwas2vcf_columns(export_df, pairs, chromosome)
     summary = summary.with_columns(
-        pl.lit(export_df.height).alias("num_rows"),
-        pl.lit(export_df.width).alias("num_cols"),
-        pl.lit("success").alias("status"),
-    )
+        pl.lit(export_df.height).alias(GWAS2VCF_SUMMARY_ROW_COUNT_COLUMN),
+        pl.lit(export_df.width).alias(GWAS2VCF_SUMMARY_COLUMN_COUNT_COLUMN),
+        pl.lit(GWAS2VCF_SUMMARY_SUCCESS_STATUS).alias(
+            GWAS2VCF_SUMMARY_STATUS_COLUMN
+        ),
+    ).select(list(GWAS2VCF_SUMMARY_COLUMNS))
     summary.write_csv(summary_path, separator=input_config["delimiter"])
     if logger is not None:
         logger.record(

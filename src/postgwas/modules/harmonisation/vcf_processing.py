@@ -7,7 +7,8 @@ validated defaults.
 
 Policy keys read by this module::
 
-    vcf.liftover_swap                exclude | update_tags | keep
+    chromosome.allowed_after_split  ordered chromosome merge contract
+    vcf.liftover_swap                exclude | keep
     vcf.liftover_warn_fraction       0.10
     vcf.liftover_critical_fraction   0.30
     vcf.liftover_fail_fraction       0.50
@@ -19,20 +20,40 @@ Policy keys read by this module::
     vcf.on_merge_failure             continue | fail
 """
 
+from datetime import datetime
 from pathlib import Path
+import re
 import shlex
 import shutil
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Sequence
 
 
 from .policies import default_policies
 from postgwas.core.paths import configured_output_path, resolve_executable
 from postgwas.core.processes import run_checked_command
 from postgwas.core.ui.screen import screen_line
+from postgwas.core.vcf import (
+    annotation_vcf_fields,
+    count_indexed_vcf_records,
+    declared_vcf_tag_definitions,
+    read_vcf_header,
+)
 
-LIFTOVER_SWAP_CHOICES = ("exclude", "update_tags", "keep")
+LIFTOVER_SWAP_CHOICES = ("exclude", "keep")
 ON_MERGE_FAILURE_CHOICES = ("continue", "fail")
+
+_LIFTOVER_SUMMARY = re.compile(
+    r"^Lines\s+total/swapped/reference added/rejected:\s*"
+    r"(\d+)/(\d+)/(\d+)/(\d+)\s*$",
+    re.MULTILINE,
+)
+_NORM_SUMMARY = re.compile(
+    r"^Lines\s+total/split/joined/realigned/mismatch_removed/"
+    r"dup_removed/skipped:\s*"
+    r"(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)\s*$",
+    re.MULTILINE,
+)
 
 
 # ============================================================
@@ -79,6 +100,47 @@ def _emit(message: str, logger=None, level: str = "info") -> None:
         ))
 
 
+def _vcf_metadata_line(name: str, value: Any) -> str:
+    """Render one safe, quoted custom VCF metadata line."""
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", str(name)):
+        raise ValueError("Invalid configured VCF metadata name: %r" % name)
+    text = str(value).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = text.replace("\\", "\\\\").replace('"', '\\"')
+    return '##%s="%s"' % (name, text)
+
+
+def _render_provenance_headers(
+    provenance: Mapping[str, Any] | None,
+    *,
+    vcf_config: Mapping[str, Any],
+    input_build: str,
+    output_build: str,
+    merge_group: str,
+) -> list[str]:
+    """Render configured provenance in the same pass as VCF concatenation."""
+    if provenance is None:
+        return []
+    settings = dict(vcf_config["provenance"])
+    values = dict(provenance)
+    values.update({
+        "vcf_created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "input_genome_build": input_build,
+        "output_genome_build": output_build,
+        "liftover": (
+            "Applied: %s to %s" % (input_build, output_build)
+            if output_build != input_build
+            else "Not applied; records failed target liftover"
+            if merge_group == "notlifted"
+            else "Not applied"
+        ),
+    })
+    missing = str(settings["missing_value"])
+    return [
+        _vcf_metadata_line(header_name, values.get(logical_name, missing))
+        for logical_name, header_name in dict(settings["headers"]).items()
+    ]
+
+
 def require_binaries(
     executables: Mapping[str, str],
     plugins: Sequence[str] = (),
@@ -116,7 +178,9 @@ def require_binaries(
 # HELPER: Run bcftools step
 # ============================================================
 def _run_bcftools_step(cmd, transcript_file, step_name, chromosome, logger=None):
-    """Run one configured VCF command and append its complete transcript."""
+    """Run one configured VCF command and return its appended transcript block."""
+    transcript_path = Path(transcript_file)
+    start = transcript_path.stat().st_size if transcript_path.exists() else 0
     run_checked_command(
         cmd,
         "Chromosome %s VCF step %s; transcript: %s"
@@ -131,6 +195,16 @@ def _run_bcftools_step(cmd, transcript_file, step_name, chromosome, logger=None)
             % (chromosome, step_name, shlex.join(str(part) for part in cmd))
         ),
     )
+    try:
+        with transcript_path.open("rb") as handle:
+            handle.seek(start)
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise RuntimeError(
+            "Chromosome %s VCF step %s completed but its audit transcript "
+            "could not be read from %s: %s"
+            % (chromosome, step_name, transcript_path, exc)
+        ) from exc
 
 
 # ============================================================
@@ -143,27 +217,116 @@ def get_vcf_variant_count(vcf_path: str, bcftools: str, logger=None):
     unindexed file cannot disable count-based QC without an explanation.
     """
     try:
-        text = run_checked_command(
-            [bcftools, "index", "-n", vcf_path],
-            "Counting VCF variants in %s" % vcf_path,
+        return count_indexed_vcf_records(
+            vcf_path,
+            bcftools,
             logger=logger,
             error_type=RuntimeError,
-        ).strip()
+        )
     except RuntimeError as exc:
         _emit(
             "The VCF variant count is unavailable: %s" % exc,
             logger=logger, level="warn",
         )
         return None
-    try:
-        return int(text)
-    except ValueError:
-        _emit(
-            "Could not read a variant count from %s: expected a number, got %r."
-            % (vcf_path, text),
-            logger=logger, level="warn",
+
+
+def _resolve_liftover_tag_arguments(
+    header: str,
+    vcf_config: Mapping[str, object],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Validate canonical allele roles and build explicit plugin tag lists.
+
+    Population-frequency fields are derived from the annotation columns, so a
+    panel field cannot be attached to the source-build VCF and then omitted
+    from allele-aware liftover by a second, independently maintained list.
+    """
+    roles = dict(vcf_config["liftover_tag_roles"])
+    external_frequency_fields = annotation_vcf_fields(
+        vcf_config["external_frequency_columns"], "INFO",
+    )
+    frequency_fields = list(dict.fromkeys(
+        [str(value) for value in roles["allele_frequency"]]
+        + external_frequency_fields
+    ))
+    effect_fields = list(dict.fromkeys(
+        str(value) for value in roles["signed_effect"]
+    ))
+    definitions = {
+        category: declared_vcf_tag_definitions(header, category)
+        for category in ("INFO", "FORMAT")
+    }
+    problems = []
+    for role, fields in (
+        ("allele-frequency", frequency_fields),
+        ("signed-effect", effect_fields),
+    ):
+        for field in fields:
+            category, tag = field.split("/", 1)
+            metadata = definitions[category].get(tag)
+            if metadata is None:
+                problems.append("%s is not declared" % field)
+                continue
+            if metadata.get("number") != "A":
+                problems.append(
+                    "%s has Number=%s, expected Number=A for its %s role"
+                    % (field, metadata.get("number", "missing"), role)
+                )
+            if metadata.get("type") != "Float":
+                problems.append(
+                    "%s has Type=%s, expected Type=Float for its %s role"
+                    % (field, metadata.get("type", "missing"), role)
+                )
+    if problems:
+        raise ValueError(
+            "Annotated VCF allele-dependent fields are incompatible with safe "
+            "liftover: %s." % "; ".join(problems)
         )
-        return None
+
+    def plugin_field(field: str) -> str:
+        category, tag = field.split("/", 1)
+        return ("FMT" if category == "FORMAT" else category) + "/" + tag
+
+    resolved = {
+        "allele_frequency": frequency_fields,
+        "signed_effect": effect_fields,
+    }
+    return [
+        "--af-tags", ",".join(plugin_field(field) for field in frequency_fields),
+        "--es-tags", ",".join(plugin_field(field) for field in effect_fields),
+    ], resolved
+
+
+def _parse_liftover_audit(transcript: str) -> dict[str, dict[str, int]]:
+    """Parse the pinned plugin and bcftools norm accounting summaries."""
+    if not isinstance(transcript, str):
+        raise RuntimeError("The liftover command did not return a readable transcript.")
+    liftover_matches = _LIFTOVER_SUMMARY.findall(transcript)
+    norm_matches = _NORM_SUMMARY.findall(transcript)
+    if len(liftover_matches) != 1 or len(norm_matches) != 2:
+        raise RuntimeError(
+            "The liftover transcript must contain one plugin accounting summary "
+            "and two normalization summaries; found %d and %d."
+            % (len(liftover_matches), len(norm_matches))
+        )
+    total, swapped, reference_added, rejected = map(int, liftover_matches[0])
+    norm_keys = (
+        "total", "split", "joined", "realigned", "mismatch_removed",
+        "duplicate_removed", "skipped",
+    )
+    normalization, deduplication = [
+        dict(zip(norm_keys, map(int, match))) for match in norm_matches
+    ]
+    return {
+        "plugin": {
+            "total": total,
+            "swapped": swapped,
+            "reference_added": reference_added,
+            "rejected": rejected,
+        },
+        "normalization": normalization,
+        "deduplication": deduplication,
+    }
 
 
 # ============================================================
@@ -224,6 +387,7 @@ def annotate_and_liftover_vcf(
     vcf_config: Mapping[str, object],
     policies=None,
     logger=None,
+    qc_info=None,
 ) -> str:
 
     plugin = str(vcf_config["liftover_plugin"])
@@ -250,7 +414,6 @@ def annotate_and_liftover_vcf(
 
     # ---- policy resolution -------------------------------------------------
     liftover_swap = _policy_value(policies, "vcf.liftover_swap")
-    liftover_update_tag_args = _policy_value(policies, "vcf.liftover_update_tag_args")
     if liftover_swap not in LIFTOVER_SWAP_CHOICES:
         raise ValueError(
             "vcf.liftover_swap must be one of %s - got %r"
@@ -278,18 +441,6 @@ def annotate_and_liftover_vcf(
 
     if not input_vcf.exists():
         raise FileNotFoundError(f"[chr{chromosome}] Missing VCF: {input_vcf}")
-
-    original_vcf = configured_output_path(
-        outdir, output_layout["chromosome_original_vcf"], **values,
-    )
-
-    # =======================================================
-    # SAFE COPY (VCF + INDEX)
-    # =======================================================
-    if not original_vcf.exists():
-        shutil.copy2(input_vcf, original_vcf)
-        if Path(f"{input_vcf}.tbi").exists():
-            shutil.copy2(f"{input_vcf}.tbi", f"{original_vcf}.tbi")
 
     norm_vcf = configured_output_path(
         outdir, output_layout["chromosome_normalized_vcf"], **values,
@@ -323,7 +474,7 @@ def annotate_and_liftover_vcf(
         # ORIGINAL COUNT
         # =======================================================
         counts["ORIGINAL"] = get_vcf_variant_count(
-            str(original_vcf), bcftools, logger=logger,
+            str(input_vcf), bcftools, logger=logger,
         )
         record_vcf_variant_counts(
             "ORIGINAL", counts["ORIGINAL"], None, chromosome,
@@ -424,20 +575,26 @@ def annotate_and_liftover_vcf(
             drop_warn_fraction=drop_warn_fraction, logger=logger,
         )
 
+        csq_header = read_vcf_header(
+            csq_vcf, bcftools, logger=logger, error_type=RuntimeError,
+        )
+        plugin_tag_args, resolved_liftover_tags = _resolve_liftover_tag_arguments(
+            csq_header, vcf_config,
+        )
+        if logger is not None:
+            logger.record(
+                "PARAM", "liftover_allele_dependent_fields",
+                allele_frequency=resolved_liftover_tags["allele_frequency"],
+                signed_effect=resolved_liftover_tags["signed_effect"],
+            )
+
         # =======================================================
         # STEP 4: LIFTOVER
         # =======================================================
         # vcf.liftover_swap:
-        #   exclude      - every variant the plugin had
-        #                  to allele-swap is DISCARDED, even though it lifted over
-        #                  correctly and the plugin can update its AF/effect tags.
-        #   update_tags  - keep those variants and ask the plugin to rewrite the
-        #                  frequency and effect-size tags (recommended).
-        #   keep         - keep them exactly as the plugin emitted them.
-        plugin_tag_args = (
-            shlex.split(str(liftover_update_tag_args))
-            if liftover_swap == "update_tags" else []
-        )
+        #   exclude - count and discard successfully harmonised SWAP records.
+        #   keep    - retain successfully harmonised SWAP records.
+        # Tag harmonisation is mandatory in both modes.
         if logger is not None:
             logger.record(
                 "ACTION", "liftover_allele_swap",
@@ -463,16 +620,19 @@ def annotate_and_liftover_vcf(
             ])
         liftover_commands.extend([
             [bcftools, "norm", "--threads", str(threads), "-Ou", "-m-any",
-             "-d", "exact", "--fasta-ref", str(target_genome_fasta_file)],
+             "--fasta-ref", str(target_genome_fasta_file)],
             [bcftools, "sort", "-m", "%dM" % sort_mem_mb, "--temp-dir",
-             str(sort_tmp_dir), "-Oz", "-o", str(target_vcf), "--write-index=tbi"],
+             str(sort_tmp_dir), "-Ou"],
+            [bcftools, "norm", "--threads", str(threads), "-d", "exact",
+             "-Oz", "-o", str(target_vcf), "--write-index=tbi"],
         ])
-        _run_bcftools_step(
+        liftover_transcript = _run_bcftools_step(
             [bash, "-c", "set -euo pipefail\n" + " | ".join(
                 shlex.join(command) for command in liftover_commands
             )],
             transcript_file, "STEP4_LIFTOVER", chromosome, logger=logger,
         )
+        liftover_audit = _parse_liftover_audit(liftover_transcript)
 
         if reject_vcf.is_file() and reject_vcf.stat().st_size > 0:
             _run_bcftools_step(
@@ -497,6 +657,107 @@ def annotate_and_liftover_vcf(
                 str(reject_vcf), bcftools, logger=logger,
             )
 
+        plugin_counts = liftover_audit["plugin"]
+        normalization_counts = liftover_audit["normalization"]
+        deduplication_counts = liftover_audit["deduplication"]
+        swap_candidates = (
+            plugin_counts["swapped"] + plugin_counts["reference_added"]
+        )
+        swap_excluded = swap_candidates if liftover_swap == "exclude" else 0
+        expected_normalization_input = (
+            plugin_counts["total"] - plugin_counts["rejected"] - swap_excluded
+        )
+        accounting_problems = []
+        if expected_normalization_input < 0:
+            accounting_problems.append(
+                "plugin rejection and policy-exclusion counts exceed plugin input"
+            )
+        if counts["CSQ"] is not None and counts["CSQ"] != plugin_counts["total"]:
+            accounting_problems.append(
+                "CSQ=%s but the plugin processed %s"
+                % (counts["CSQ"], plugin_counts["total"])
+            )
+        if (
+            counts["REJECTED"] is not None
+            and counts["REJECTED"] != plugin_counts["rejected"]
+        ):
+            accounting_problems.append(
+                "reject VCF=%s but the plugin reported %s"
+                % (counts["REJECTED"], plugin_counts["rejected"])
+            )
+        if normalization_counts["total"] != expected_normalization_input:
+            accounting_problems.append(
+                "target normalization received %s records, expected %s after "
+                "plugin rejection and swap policy"
+                % (normalization_counts["total"], expected_normalization_input)
+            )
+        expected_lifted = (
+            deduplication_counts["total"]
+            - deduplication_counts["duplicate_removed"]
+        )
+        if counts["LIFTED"] is not None and counts["LIFTED"] != expected_lifted:
+            accounting_problems.append(
+                "final target VCF=%s but sorted exact deduplication predicts %s"
+                % (counts["LIFTED"], expected_lifted)
+            )
+        if accounting_problems:
+            raise RuntimeError(
+                "Liftover record accounting is inconsistent: %s."
+                % "; ".join(accounting_problems)
+            )
+
+        if qc_info is not None:
+            qc_info.update(
+                input=plugin_counts["total"],
+                rejected=plugin_counts["rejected"],
+                swap_excluded=swap_excluded,
+                swap_policy=liftover_swap,
+                final=counts["LIFTED"],
+            )
+        if logger is not None:
+            logger.record(
+                "OBSERVED", "liftover_record_accounting",
+                input=plugin_counts["total"],
+                rejected=plugin_counts["rejected"],
+                swapped=plugin_counts["swapped"],
+                reference_added=plugin_counts["reference_added"],
+                swap_excluded=swap_excluded,
+                normalization_split=normalization_counts["split"],
+                normalization_input=normalization_counts["total"],
+                normalization_realigned=normalization_counts["realigned"],
+                normalization_mismatch_removed=normalization_counts[
+                    "mismatch_removed"
+                ],
+                normalization_skipped=normalization_counts["skipped"],
+                deduplication_input=deduplication_counts["total"],
+                duplicates_removed=deduplication_counts["duplicate_removed"],
+                final=counts["LIFTED"],
+            )
+        if liftover_swap == "exclude" and swap_excluded:
+            _emit(
+                "Liftover excluded %s successfully harmonised SWAP records "
+                "under vcf.liftover_swap='exclude' (swapped=%s, "
+                "reference-added=%s)."
+                % (
+                    swap_excluded,
+                    plugin_counts["swapped"],
+                    plugin_counts["reference_added"],
+                ),
+                logger=logger,
+                level="warn",
+            )
+        elif liftover_swap == "keep" and swap_candidates:
+            _emit(
+                "Liftover retained %s successfully harmonised SWAP records "
+                "(swapped=%s, reference-added=%s)."
+                % (
+                    swap_candidates,
+                    plugin_counts["swapped"],
+                    plugin_counts["reference_added"],
+                ),
+                logger=logger,
+            )
+
         record_vcf_variant_counts(
             "LIFTED", counts["LIFTED"], counts["CSQ"], chromosome,
             drop_warn_fraction=drop_warn_fraction, logger=logger,
@@ -510,8 +771,8 @@ def annotate_and_liftover_vcf(
 
         # A required target-build chromosome containing no records is never a
         # scientifically usable liftover result. This invariant is independent
-        # of the configurable failure-rate limit because swap filtering and
-        # normalization losses are not necessarily represented in REJECTED.
+        # of the configurable plugin-rejection limit because policy exclusion,
+        # normalization and deduplication are separate audited transformations.
         if (
             counts["CSQ"] is not None
             and counts["CSQ"] > 0
@@ -525,37 +786,41 @@ def annotate_and_liftover_vcf(
                 % (chromosome, counts["CSQ"], counts["REJECTED"])
             )
 
-        # 🚨 LIFTOVER FAILURE WARNING
+        # 🚨 LIFTOVER PLUGIN REJECTION WARNING
         if counts["CSQ"] and counts["REJECTED"] is not None:
             failure_rate = counts["REJECTED"] / counts["CSQ"]
             _emit(
-                "Liftover failure rate: %.2f%%." % (failure_rate * 100),
+                "Liftover plugin rejection rate: %.2f%%."
+                % (failure_rate * 100),
                 logger=logger,
             )
 
             if failure_rate > critical_fraction:
                 message = (
-                    "[chr%s] 🚨 WARNING: >%.0f%% variants failed liftover"
+                    "[chr%s] 🚨 WARNING: >%.0f%% variants were rejected by "
+                    "the liftover plugin"
                     % (chromosome, critical_fraction * 100)
                 )
                 _emit(message, logger=logger, level="warn")
             elif failure_rate > warn_fraction:
                 message = (
-                    "[chr%s] ⚠️ Notice: >%.0f%% variants failed liftover"
+                    "[chr%s] ⚠️ Notice: >%.0f%% variants were rejected by "
+                    "the liftover plugin"
                     % (chromosome, warn_fraction * 100)
                 )
                 _emit(message, logger=logger, level="warn")
 
             if failure_rate > fail_fraction:
                 message = (
-                    "chr%s: %.2f%% of variants failed liftover, which is above "
+                    "chr%s: the liftover plugin rejected %.2f%% of variants, "
+                    "which is above "
                     "vcf.liftover_fail_fraction (%.2f%%)."
                     % (chromosome, failure_rate * 100, fail_fraction * 100)
                 )
                 raise LiftoverFailureRateError(message)
         else:
             message = (
-                "[chr%s] ⚠️ Liftover failure rate could not be computed "
+                "[chr%s] ⚠️ Liftover plugin rejection rate could not be computed "
                 "(CSQ count %r, rejected count %r), so the failure-rate gate did not run."
                 % (chromosome, counts.get("CSQ"), counts.get("REJECTED"))
             )
@@ -579,6 +844,7 @@ def concat_vcfs_by_build(
     output_layout: Mapping[str, str],
     executables: Mapping[str, str],
     vcf_config: Mapping[str, object],
+    provenance: Mapping[str, Any] | None = None,
     policies=None,
     logger=None,
 ):
@@ -676,15 +942,28 @@ def concat_vcfs_by_build(
 
         return vcf, None
 
-    allowed_chromosomes = {
-        str(value) for value in _policy_value(policies, "chromosome.allowed_after_split")
-    }
+    configured_chromosome_order = list(dict.fromkeys(
+        str(value)
+        for value in _policy_value(policies, "chromosome.allowed_after_split")
+    ))
+    allowed_chromosomes = set(configured_chromosome_order)
     chromosomes = list(dict.fromkeys(str(value) for value in expected_chromosomes))
     unexpected = [value for value in chromosomes if value not in allowed_chromosomes]
     if unexpected:
         raise ValueError(
             "Expected merge chromosomes are not allowed by "
             "chromosome.allowed_after_split: %s" % ", ".join(unexpected)
+        )
+    chromosome_rank = {
+        chromosome: rank
+        for rank, chromosome in enumerate(configured_chromosome_order)
+    }
+    chromosomes.sort(key=chromosome_rank.__getitem__)
+    if logger is not None:
+        logger.record(
+            "PARAM", "vcf_concat_chromosome_order",
+            chromosomes=chromosomes,
+            source="chromosome.allowed_after_split",
         )
 
     def chromosome_outputs(pattern_name, *, build, target):
@@ -741,6 +1020,9 @@ def concat_vcfs_by_build(
                 valid.append(checked)
         return valid
 
+    # Build membership is carried by the resolved source/target build values
+    # and rendered output-layout paths. A dataset ID containing a build name
+    # therefore cannot move a chromosome VCF into the wrong merge group.
     source_annotated, source_failures = required_chromosome_outputs(
         "chromosome_annotated_vcf", build=grch_version, target=target_build,
     )
@@ -769,7 +1051,9 @@ def concat_vcfs_by_build(
     # -------------------------------------------------------
     header_template = str(vcf_config["genome_build_header"])
 
-    def merge(tag, vcf_list, out, *, genome_build, require_records):
+    def merge(
+        tag, vcf_list, out, *, genome_build, merge_group, require_records,
+    ):
         if not vcf_list:
             return None, "no valid chromosome inputs", 0
 
@@ -781,6 +1065,22 @@ def concat_vcfs_by_build(
                 % (genome_build, exc)
             ) from exc
 
+        provenance_headers = _render_provenance_headers(
+            provenance,
+            vcf_config=vcf_config,
+            input_build=grch_version,
+            output_build=genome_build,
+            merge_group=merge_group,
+        )
+        declared_headers = [build_header, *provenance_headers]
+        annotate_command = [bcftools, "annotate"]
+        for header_line in declared_headers:
+            annotate_command.extend(["--header-line", header_line])
+        annotate_command.extend([
+            "--output-type", "z", "--output", str(out),
+            "--threads", str(threads_per_job), "--write-index=tbi",
+        ])
+
         index_path = Path(str(out) + ".tbi")
         failures = []
         for attempt in range(1, concat_max_attempts + 1):
@@ -791,11 +1091,7 @@ def concat_vcfs_by_build(
                         bcftools, "concat", "-a", "--output-type", "u",
                         *map(str, vcf_list),
                     ],
-                    [
-                        bcftools, "annotate", "--header-line", build_header,
-                        "--output-type", "z", "--output", str(out),
-                        "--threads", str(threads_per_job), "--write-index=tbi",
-                    ],
+                    annotate_command,
                 ]
                 run_checked_command(
                     [
@@ -832,6 +1128,36 @@ def concat_vcfs_by_build(
                         "merged VCF %s must contain exactly one %r header; found %r"
                         % (out, build_header, build_headers)
                     )
+                for expected_header in provenance_headers:
+                    matching_headers = [
+                        line.strip()
+                        for line in header.splitlines()
+                        if line.strip() == expected_header
+                    ]
+                    if matching_headers != [expected_header]:
+                        raise RuntimeError(
+                            "merged VCF %s must contain exactly one provenance "
+                            "header %r; found %d"
+                            % (out, expected_header, len(matching_headers))
+                        )
+                if provenance_headers:
+                    definitions = {
+                        category: declared_vcf_tag_definitions(header, category)
+                        for category in ("INFO", "FORMAT")
+                    }
+                    absent_output_fields = []
+                    for role, field in dict(
+                        vcf_config["provenance"]["output_fields"]
+                    ).items():
+                        category, tag_name = str(field).split("/", 1)
+                        if tag_name not in definitions[category]:
+                            absent_output_fields.append("%s=%s" % (role, field))
+                    if absent_output_fields:
+                        raise RuntimeError(
+                            "merged VCF %s is missing configured provenance output "
+                            "field(s): %s"
+                            % (out, ", ".join(absent_output_fields))
+                        )
                 count_text = run_checked_command(
                     [bcftools, "index", "-n", str(out)],
                     "Validating merged VCF and index for %s (attempt %d/%d)"
@@ -861,6 +1187,11 @@ def concat_vcfs_by_build(
                     logger.record(
                         "OUTPUT", "vcf_genome_build_header",
                         build=genome_build, header=build_header, path=str(out),
+                    )
+                    logger.record(
+                        "OUTPUT", "vcf_postgwas_provenance_headers",
+                        path=str(out), merge_group=merge_group,
+                        header_count=len(provenance_headers),
                     )
                 return str(out), None, attempt
             except RuntimeError as exc:
@@ -963,6 +1294,7 @@ def concat_vcfs_by_build(
                     files,
                     out_path,
                     genome_build=build,
+                    merge_group=key,
                     require_records=key in required_groups,
                 )
 
@@ -1001,8 +1333,8 @@ def concat_vcfs_by_build(
     # the discarded wait status hid whether the removal had even worked.
     # Pure intermediates: nothing downstream reads them, so they always go.
     for pattern_name in (
-        "chromosome_original_vcf", "chromosome_normalized_vcf",
-        "chromosome_id_vcf", "chromosome_frequency_vcf",
+        "chromosome_normalized_vcf", "chromosome_id_vcf",
+        "chromosome_frequency_vcf",
     ):
         for path in chromosome_outputs(
             pattern_name, build=grch_version, target=target_build,

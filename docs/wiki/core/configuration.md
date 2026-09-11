@@ -95,12 +95,13 @@ resource versions needed to reproduce the analysis.
 ## Screen display and transcript
 
 `logging.show_screen` defaults to `true`. All scientific module and pipeline
-commands accept `--show-screen` and `--hide-screen`, with an explicit command
-line flag taking precedence over YAML. PostGWAS always appends the complete
-standard-output and standard-error stream to the relative
-`logging.screen_log_file` under `run.output_directory`; its packaged location is
-`run_metadata/screen.log`. `--hide-screen` suppresses the terminal copy only, so
-the transcript and canonical module logs are still written.
+commands accept `--hide-screen` as a one-way command-line override. PostGWAS
+always appends the complete standard-output and standard-error stream to the
+relative `logging.screen_log_file` under `run.output_directory`; its packaged
+location is `run_metadata/screen.log`. `--hide-screen` suppresses the terminal
+copy only, so the transcript and canonical module logs are still written. Set
+`logging.show_screen: true` in YAML to enable display when a run configuration
+has disabled it.
 
 `logging.progress_refresh_seconds` controls how often PostGWAS samples
 append-only native outputs when an external tool exposes measurable work units.
@@ -132,6 +133,10 @@ run:
 - A completed stage is reused only after its identity, resolved parameters,
   tracked inputs, software, upstream dependencies, declared outputs, SHA-256
   checksums, and scientific completion state validate.
+- An unchanged input may reuse its recorded SHA-256 only when its canonical
+  path, device, inode, size, modification time, and change time all match the
+  checkpoint. Any mismatch forces a fresh content hash, and an input change
+  during execution prevents checkpoint publication.
 - A real partial run resumes completed pipeline stages or validated internal
   module stages and reruns the incomplete stage from its earliest safe boundary.
 - Changed parameters, software, tracked inputs, or upstream checkpoints produce
@@ -141,8 +146,10 @@ run:
   inside the configured output root. Modified outputs, symlinks, unknown files,
   paths outside that root, and missing tracked inputs are preserved and cause an
   actionable error instead of unsafe replacement.
-- `--no-resume` disables reuse for one command. `run.overwrite: true` or
-  `--overwrite` explicitly forces replacement and takes precedence over resume.
+- Set `run.resume: false` in YAML to disable reuse without requesting output
+  replacement. `run.overwrite: true` or `--overwrite` starts the analysis from
+  its first step and replaces files created by the previous run. The CLI
+  `--resume` and `--overwrite` options are mutually exclusive.
 
 Resume and overwrite are execution controls and do not enter the scientific
 checkpoint content digest or get restored from an earlier pipeline stage. A

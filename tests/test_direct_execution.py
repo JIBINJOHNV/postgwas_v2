@@ -132,7 +132,7 @@ def test_modified_direct_output_is_preserved_and_operation_is_not_called(tmp_pat
     assert changed.read_bytes() == b"user replacement"
 
 
-def test_no_resume_failure_does_not_replace_prior_completed_manifest(tmp_path):
+def test_yaml_disabled_resume_failure_does_not_replace_prior_manifest(tmp_path):
     output = tmp_path / "results"
 
     def completed():
@@ -148,7 +148,11 @@ def test_no_resume_failure_does_not_replace_prior_completed_manifest(tmp_path):
         raise RuntimeError("rerun failed before output mutation")
 
     with pytest.raises(RuntimeError, match="rerun failed"):
-        _run(failed, output, arguments=("--no-resume",))
+        _run(
+            failed,
+            output,
+            configuration_overrides={"run.resume": False},
+        )
 
     assert manifest.read_bytes() == before
     assert (output / "plot.png").read_bytes() == b"validated plot"

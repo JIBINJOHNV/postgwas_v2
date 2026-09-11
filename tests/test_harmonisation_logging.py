@@ -2,6 +2,7 @@
 
 import io
 import inspect
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from postgwas.core.pipeline_logging import (
     print_chromosome_summary,
 )
 from postgwas.modules.harmonisation.policies import default_policies
+from postgwas.modules.harmonisation import service as service_module
 from postgwas.modules.harmonisation.service import (
     CHR_STEP_TOTAL,
     process_one_chromosome,
@@ -214,11 +216,11 @@ def test_chromosome_screen_block_shows_concise_outcomes_without_duplicate_qc():
             },
             "z_from_beta_se_qc": {
                 "z_source": "calculated_from_beta_se",
+            },
+            "effect_statistics_validation_qc": {
                 "variants_with_zero_beta": 261,
                 "beta_zero_action": "keep",
                 "variants_removed_invalid_beta_se": 0,
-            },
-            "effect_statistics_validation_qc": {
                 "removed_total": 0,
                 "removed_by_reason": {},
                 "z_pval_concordance": {"action": "off"},
@@ -229,7 +231,7 @@ def test_chromosome_screen_block_shows_concise_outcomes_without_duplicate_qc():
                 "info_clip_min": 0,
                 "info_clip_max": 1,
                 "info_clip_tolerance": 1.05,
-                "info_out_of_range_action": "clip",
+                "info_out_of_range_action": "reject",
                 "info_on_missing_action": "keep",
                 "rescaled_within_tolerance": 8,
                 "out_of_range": 0,
@@ -264,34 +266,45 @@ def test_chromosome_screen_block_shows_concise_outcomes_without_duplicate_qc():
     assert "🧮  Variants read" in text
     assert ": 112,557" in text
     assert "Allele frequency" in text
-    assert "Strand orientation" in text
-    assert "reference GRCh37_1000G_freq_chr8.tsv.gz, AF column EUR" in flat
-    assert "study consensus forward; 110,060 matched" in flat
-    assert "forward 10, forward-swapped 110,000" in flat
-    assert "reverse-complement 20, reverse-complement-swapped 30" in flat
-    assert "111 unmatched, 2,256 palindromic ambiguous and 1 reference ambiguous removed" in flat
-    assert "internal column FRQ_U_186843 interpreted as EAF" in flat
+    assert "Strand and allele alignment" in text
+    assert "Reference : GRCh37_1000G_freq_chr8.tsv.gz" in flat
+    assert "Reference population : EUR" in flat
+    assert "Matched : 110,060" in flat
+    for label, expected in [("Alleles unchanged", "10"), ("Alleles swapped", "110,000"),
+                            ("Reverse-complement", "20"), ("Complement + swap", "30"),
+                            ("Unmatched removed", "111"), ("Palindromic ambiguous", "2,256"),
+                            ("Reference ambiguous", "1")]:
+        assert "%s : %s" % (label, expected) in flat
+    assert "Study column FRQ_U_186843" in flat
     assert "110,030 allele-swapped frequencies inverted" in flat
-    assert "cases from column Nca; controls from column Nco" in flat
-    assert "effect from column OR and SE from column SE" in flat
-    assert "positive OR converted with BETA = log(OR)" in flat
-    assert "column P; raw scale" in flat
-    assert "accepted range 1e-300 to 0.999999" in flat
+    assert "Cases : column Nca" in flat
+    assert "Controls / total N : column Nco" in flat
+    assert "Effect estimate : OR (BETA already converted from odds ratios)" in flat
+    assert "Standard error column : SE" in flat
+    assert "Transformation : BETA = log(OR)" in flat
+    assert flat.index("Effect-scale conversion") < flat.index("Strand and allele alignment")
+    assert "Input column / scale : P / raw" in flat
+    assert "Accepted range : 1e-300 to 0.999999" in flat
     assert "supplied SE used directly" in flat
-    assert "calculated as BETA / SE; 261 exact zero effects kept" in flat
+    assert "calculated as BETA / SE" in flat
+    assert "Exact zero effects : 261" in flat
+    assert "Zero-effect action : keep" in flat
     assert "study column INFO" in flat
-    assert "8 corrected" in flat
+    assert "Tolerance corrections : 8 values above 1 and ≤1.05 set to 1" in flat
     assert "study column SNP" in flat
-    assert "1 missing IDs filled" in flat
-    assert "7 required fields checked" in flat
-    assert "🔹  Final result" in text
-    assert "112,557 harmonised; none removed." in text
-    assert "🔻  VCF and liftover" in text
-    assert "112,251 of 112,557 retained after liftover (306 not lifted)" in flat
+    assert "Missing IDs filled : 1" in flat
+    assert "Required fields : chr, pos, eaf, beta, se, zscore, pval" in flat
+    assert "Harmonisation accounting" in text
+    assert "Harmonised : 112,557" in flat
+    assert "Total removed : 0" in flat
+    assert "VCF creation and liftover" in text
+    assert "Target VCF retained : 112,251" in flat
+    assert "Net reduction : 306; cause breakdown not recorded" in flat
+    assert "not lifted" not in flat
     assert "🔹  Messages" in text
     assert "no warnings or errors." in text
     assert "study_chr8_GRCh38_CSQ.vcf.gz" in text
-    assert "study_chr8.log (detailed log)" in text
+    assert "Detailed log" in text and "study_chr8.log" in text
     assert "/results/" not in text
     assert "Load the chromosome file" not in text
     assert "derive_z_score_from_effect_and_standard_error" not in text
@@ -325,8 +338,10 @@ def test_chromosome_screen_reports_external_frequency_orientation_counts():
     )
     flat = " ".join(text.split())
 
-    assert "external file reference_chr3.tsv.gz, column EUR" in flat
-    assert "90 direct matches, 7 allele-swapped matches, 3 unmatched; 3 removed" in flat
+    for expected in ["Source : reference_chr3.tsv.gz", "Reference column : EUR",
+                     "Direct matches : 90", "Swapped matches : 7", "Unmatched : 3",
+                     "Total strand/EAF removals : 3"]:
+        assert expected in flat
 
 
 def test_chromosome_screen_labels_z_only_effect_as_standardized():
@@ -340,7 +355,11 @@ def test_chromosome_screen_labels_z_only_effect_as_standardized():
                 "beta_computed": True,
                 "se_computed": True,
                 "effect_estimate_scale": "standardized_effect_estimate",
-                "effect_estimate_citation": "Zhu et al. 2016; PMID 27019110",
+                "effect_estimate_method": "metal_large_n",
+                "effect_estimate_citation": (
+                    "Willer et al. 2010 (METAL; PMID 20616382); "
+                    "Lee et al. 2018 (PMID 30038396)"
+                ),
                 "variants_removed_total": 0,
             },
         },
@@ -356,7 +375,60 @@ def test_chromosome_screen_labels_z_only_effect_as_standardized():
     flat = " ".join(text.split())
 
     assert "standardized BETA estimate and SE derived from Z, EAF and NEFF" in flat
-    assert "Zhu et al. 2016; PMID 27019110" in flat
+    assert "Willer et al. 2010 (METAL; PMID 20616382)" in flat
+
+
+def test_chromosome_screen_reports_signed_beta_z_se_recovery():
+    summary = {
+        "stage_qc": {
+            "effect_from_z_qc": {
+                "has_beta": True,
+                "has_se": False,
+                "has_zscore": True,
+                "effect_column": "BETA",
+                "z_column": "Z",
+                "se_computed": True,
+                "se_recovered_from_z": 98,
+                "beta_z_sign_mismatch_action": "reject",
+                "beta_z_sign_mismatches": 2,
+                "removed_beta_z_sign_mismatches": 2,
+                "variants_removed_total": 2,
+            },
+        },
+        "warnings": 1,
+        "errors": 0,
+        "log_path": "/results/logs/study_chr3.log",
+    }
+
+    text = print_chromosome_summary(
+        "3", "study", 1, "OK", 1.0, "", summary,
+        stream=io.StringIO(), width=128,
+    )
+    flat = " ".join(text.split())
+
+    assert "positive SE derived as abs(BETA / Z) after signed agreement" in flat
+    assert "BETA/Z sign mismatches : 2" in flat
+    assert "Sign mismatch action : reject" in flat
+    assert "Removed : 2" in flat
+
+
+@pytest.mark.parametrize("width", [80, 128])
+def test_chromosome_screen_explains_palindromic_conflicts(width):
+    summary = {"stage_qc": {"eaf_qc": {"strand_orientation": {
+        "actions": {"forward_swapped": 197084},
+        "palindromic_frequency_conflict": 3,
+        "study_strand_consensus": "forward",
+    }}}}
+    flat = " ".join(print_chromosome_summary(
+        "16", "study", 1, "OK", 120.0, "", summary,
+        stream=io.StringIO(), width=width,
+    ).split())
+    assert "Matched : 197,084" in flat
+    assert (
+        "3 removed; study-wide strand and "
+        "allele-frequency evidence supported opposite orientations"
+    ) in flat
+    assert "palindrome consensus/AF conflicts" not in flat
 
 
 def test_chromosome_screen_reports_absent_strand_actions_as_zero():
@@ -385,10 +457,54 @@ def test_chromosome_screen_reports_absent_strand_actions_as_zero():
     )
     flat = " ".join(text.split())
 
-    assert "24,227 matched" in flat
-    assert "forward 0, forward-swapped 24,227" in flat
-    assert "reverse-complement 0, reverse-complement-swapped 0" in flat
+    assert "Matched : 24,227" in flat
+    assert "Alleles unchanged : 0" in flat
+    assert "Alleles swapped : 24,227" in flat
+    assert "Reverse-complement : 0" in flat
+    assert "Complement + swap : 0" in flat
     assert "unknown" not in flat
+
+
+@pytest.mark.parametrize("width", [80, 128])
+def test_chromosome_report_reconciles_af_and_liftover_without_false_changes(width):
+    summary = {
+        "rows_in": 197087, "rows_out": 197036, "rejected": 51,
+        "reject_counts": {"af_discordant": 48, "palindromic_frequency_conflict": 3},
+        "warnings": 2, "errors": 0,
+        "steps": [
+            {"number": 12, "extra": {"source": "study_column:SNP", "missing_identifiers": 0}},
+            {"number": 16, "extra": {"liftover_accounting": {
+                "input": 197036, "rejected": 0, "swap_excluded": 5,
+                "swap_policy": "exclude", "final": 197031,
+            }}},
+        ],
+        "stage_qc": {"eaf_qc": {
+            "final_eaf_col": "FRQ", "study_decision_eaf_is_maf": False,
+            "variants_removed": 51, "final_variants": 197036,
+            "strand_af_tolerance": 0.2, "strand_af_discordance_action": "warn",
+            "strand_non_palindromic_af_discordant": 200,
+            "strand_non_palindromic_af_comparable": 180000,
+            "strand_palindromic_af_discordant": 48,
+            "strand_palindromic_af_comparable": 17084,
+            "strand_palindromic_af_discordance_action": "reject",
+            "strand_orientation": {"actions": {"forward_swapped": 197084},
+                                   "palindromic_frequency_conflict": 3, "final_variants": 197084},
+        }},
+    }
+    raw = "non-palindromic study/reference frequency concordance affected=200 removed=0 changed=200\nmatched=0"
+    flat = " ".join(print_chromosome_summary(
+        "16", "study", 1, "OK", 128, raw, summary, stream=io.StringIO(), width=width,
+    ).split())
+    for expected in ["Additional AF removals : 48", "Total strand/EAF removals : 51",
+                     "200 / 180,000 comparable variants disagree; retained with warning",
+                     "no frequencies changed by this check", "Missing IDs filled : 0",
+                     "5 successfully lifted variants with swapped alleles",
+                     "Target VCF retained : 197,031", "Liftover rejected : 0"]:
+        assert expected in flat
+    assert "changed=200" not in flat
+    assert "matched=0" not in flat
+    assert "not lifted" not in flat
+    assert "unknown missing" not in flat
 
 
 def test_failed_chromosome_screen_never_claims_there_were_no_errors():
@@ -426,3 +542,114 @@ def test_failure_is_actionable_on_screen_and_complete_in_file(tmp_path):
     assert "status=FAILED" in text
     assert "FileNotFoundError: missing.tsv" in text
     assert "Traceback" in text
+
+
+def _failure_worker_arguments(tmp_path, study_decisions):
+    policies = default_policies().with_overrides({"rejects.enabled": False})
+    return {
+        "chromosome": "1",
+        "chr_file": "unused.parquet",
+        "sample_column_dict": {
+            "gwas_outputname": "study",
+            "beta_or_col": None,
+        },
+        "resource_folder": str(tmp_path),
+        "grch_version": "GRCh37",
+        "user_eaf_file": None,
+        "default_eaf_reference_source": "1000G",
+        "default_comparison_af_file": "1000G",
+        "resource_layout": {},
+        "output_layout": {
+            "logs_directory": "logs",
+            "chromosome_log": "logs/{dataset_id}_chr{chromosome}.log",
+        },
+        "gwas2vcf_input": {"delimiter": "\t"},
+        "executables": {},
+        "vcf_config": {"target_builds": {"GRCh37": "GRCh38"}},
+        "gwas2vcf_main_script_path": "unused.py",
+        "user_info_file": None,
+        "user_eaf_column": None,
+        "default_eaf_reference_column": "EUR",
+        "default_comparison_af_column": "EUR",
+        "user_info_column": None,
+        "dbsnp": "dbsnp",
+        "output_dir": str(tmp_path),
+        "threads": 1,
+        "external_eaf_colmap": {},
+        "default_eaf_colmap": {},
+        "external_info_colmap": {},
+        "policies": policies,
+        "study_decisions": study_decisions,
+        "missing_sample_size_plan": {},
+        "attempt": 1,
+        "prevalidated_resource_map": {
+            "default_eaf_file": "default.tsv",
+            "default_comparison_af_file": "comparison.tsv",
+            "dbsnp_file": "dbsnp.vcf.gz",
+            "genome_fasta_file": "source.fa",
+            "target_fasta": "target.fa",
+            "annot_path": "genes.gff.gz",
+            "chain_file": "lift.chain.gz",
+        },
+    }
+
+
+def test_unstepped_chromosome_failure_preserves_complete_traceback(
+    tmp_path, monkeypatch,
+):
+    class BrokenDecisions(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            return iter(["chr_col"])
+
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(
+        service_module.pl,
+        "read_parquet",
+        lambda _path: service_module.pl.DataFrame({"value": [1]}),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "recheck_preflighted_resource_map",
+        lambda *_args, **_kwargs: None,
+    )
+
+    _chromosome, qc, screen_text, status = process_one_chromosome(
+        **_failure_worker_arguments(tmp_path, BrokenDecisions())
+    )
+
+    assert status == "failed"
+    assert qc["error"] == "KeyError: 'chr_col'"
+    assert "KeyError: 'chr_col'" in qc["traceback"]
+    assert "Traceback" not in screen_text
+    log_text = (tmp_path / "logs" / "study_chr1.log").read_text(
+        encoding="utf-8",
+    )
+    assert "For developers - traceback:" in log_text
+    assert "KeyError: 'chr_col'" in log_text
+
+
+def test_chromosome_memory_error_is_logged_once_and_re_raised(
+    tmp_path, monkeypatch,
+):
+    def raise_memory_error(_path):
+        raise MemoryError("allocation failed")
+
+    monkeypatch.setattr(service_module.pl, "read_parquet", raise_memory_error)
+
+    with pytest.raises(MemoryError, match="allocation failed"):
+        process_one_chromosome(
+            **_failure_worker_arguments(tmp_path, {})
+        )
+
+    log_text = (tmp_path / "logs" / "study_chr1.log").read_text(
+        encoding="utf-8",
+    )
+    assert "This memory" in log_text
+    assert "failure is non-retryable" in log_text
+    assert log_text.count("For developers - traceback:") == 1
+    assert "MemoryError: allocation failed" in log_text

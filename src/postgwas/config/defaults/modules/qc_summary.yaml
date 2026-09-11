@@ -5,7 +5,6 @@ inputs:
   dataset_id: null
 output_directory: null
 
-target_build: GRCh37
 reference_af_column: EUR
 
 rules:
@@ -18,10 +17,10 @@ rules:
   missing_info_action: remove
   maximum_af_difference: 0.2
   include_indels: false
-  remove_palindromic: true
+  remove_palindromic: false
   palindromic_lower: 0.4
   palindromic_upper: 0.6
-  remove_mhc: true
+  remove_mhc: false
   mhc_regions:
     GRCh37:
       chromosome: '6'
@@ -32,6 +31,8 @@ rules:
       start: 28510120
       end: 33480577
   sample_size_outlier_standard_deviations: 5.0
+  sample_size_reference_quantile: 0.9
+  sample_size_minimum_fraction_of_reference: 0.6666666666666666
 
 vcf_fields:
   chromosome: '%CHROM'
@@ -56,7 +57,10 @@ output_layout:
   metric_report: 'qc_summary/{dataset_id}_{build}_vcf_qc_metrics.tsv'
   rule_report: 'qc_summary/{dataset_id}_{build}_vcf_qc_rule_results.tsv'
   assessment_json: 'qc_summary/{dataset_id}_{build}_qc_assessment.json'
+  summary_csv: 'qc_summary/{dataset_id}_{build}_qc_summary.csv'
+  html_report: 'reports/{dataset_id}_{build}_qc_report.html'
   temporary_table_prefix: 'qc_summary/.{dataset_id}_{build}_qc_table_'
   resolved_config_file: 'qc_summary/{dataset_id}_{build}_qc_resolved.yaml'
+  preflight_log_file: 'qc_summary/{dataset_id}_qc_preflight.log'
   service_log_file: 'qc_summary/{dataset_id}_{build}_qc.log'
   completion_manifest: 'qc_summary/{dataset_id}_{build}_qc_complete.yaml'

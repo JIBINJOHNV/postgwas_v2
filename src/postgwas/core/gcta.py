@@ -43,12 +43,13 @@ def require_supported_gcta(
                 module_config.version_probe_output_argument,
                 str(output_prefix),
             ]
-            logger.record(
-                "INPUT",
-                "external_command",
-                purpose="Read GCTA version",
-                command=command,
-            )
+            if logger is not None and hasattr(logger, "record"):
+                logger.record(
+                    "INPUT",
+                    "external_command",
+                    purpose="Read GCTA version",
+                    command=command,
+                )
             result = subprocess.run(
                 command,
                 capture_output=True,
@@ -83,10 +84,11 @@ def require_supported_gcta(
             "GCTA %s is too old; %s requires at least %s."
             % (version, analysis_name, module_config.minimum_gcta_version)
         )
-    logger.record(
-        "OBSERVED", "gcta_version", version=version, executable=executable,
-        probe_exit_code=result.returncode,
-    )
+    if logger is not None and hasattr(logger, "record"):
+        logger.record(
+            "OBSERVED", "gcta_version", version=version, executable=executable,
+            probe_exit_code=result.returncode,
+        )
     return version
 
 

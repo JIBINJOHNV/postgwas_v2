@@ -13,7 +13,7 @@ class RequiredArgument:
     """One public option and its canonical resolved configuration value."""
 
     option: str
-    configuration_path: str
+    configuration_path: str | None
     value: object
 
 
@@ -34,26 +34,51 @@ def require_resolved_arguments(
     alternatives: Sequence[RequiredAlternative] = (),
 ) -> None:
     """Report all independently missing resolved requirements in one error."""
-    messages = [
-        "Required argument not provided: %s. Provide %s VALUE or set %s in the "
-        "run configuration."
-        % (requirement.option, requirement.option, requirement.configuration_path)
-        for requirement in requirements
-        if _missing(requirement.value)
-    ]
+    messages = []
+    for requirement in requirements:
+        if not _missing(requirement.value):
+            continue
+        if requirement.configuration_path:
+            message = (
+                "Required argument not provided: %s. Provide %s VALUE or set %s "
+                "in the run configuration."
+                % (
+                    requirement.option,
+                    requirement.option,
+                    requirement.configuration_path,
+                )
+            )
+        else:
+            message = (
+                "Required argument not provided: %s. Provide %s VALUE."
+                % (requirement.option, requirement.option)
+            )
+        if message not in messages:
+            messages.append(message)
     for alternative in alternatives:
         if not alternative.arguments:
             raise ValueError("RequiredAlternative must contain at least one argument")
         if all(_missing(argument.value) for argument in alternative.arguments):
             options = " or ".join(argument.option for argument in alternative.arguments)
             configuration_paths = " or ".join(
-                argument.configuration_path for argument in alternative.arguments
+                argument.configuration_path
+                for argument in alternative.arguments
+                if argument.configuration_path
             )
-            messages.append(
+            message = (
                 "Required argument not provided: %s. Provide one of these options "
-                "with a VALUE or set %s in the run configuration."
-                % (options, configuration_paths)
+                "with a VALUE%s."
+                % (
+                    options,
+                    (
+                        " or set %s in the run configuration"
+                        % configuration_paths
+                        if configuration_paths else ""
+                    ),
+                )
             )
+            if message not in messages:
+                messages.append(message)
     if messages:
         raise MissingRequiredArgumentsError("\n".join(messages))
 

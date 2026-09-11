@@ -7,8 +7,8 @@ What this module does, in order:
 1.  Join the raw chromosome reference once on chromosome and position, resolve
     forward/swapped/reverse-complement orientations, and transform allele-specific
     statistics consistently.
-2.  If the study supplies its own frequency column, describe it, force out-of-range
-    values back into range (policy ``eaf.out_of_range``), and decide whether the
+2.  If the study supplies its own frequency column, describe it, apply the configured
+    out-of-range action without silently clipping under other policies, and decide whether the
     column is really an *effect* allele frequency or a *minor* allele frequency.
     A MAF-like distribution is checked against the configured default EAF table:
     direct matches use ALT frequency and swapped matches use ``1-AF``. This follows
@@ -16,10 +16,21 @@ What this module does, in order:
     (https://www.ebi.ac.uk/gwas/docs/methods/summary-statistics).
 3.  Otherwise take the frequency from an external panel, matching each variant in
     the two orientations named by ``eaf.match_orientations`` (direct and swap —
-    never complement). Palindromic strand has already been decided from
-    full-study non-palindromic consensus; external frequency never reorients it.
-4.  Remove frequencies of exactly 0 or 1 (policy ``eaf.degenerate``); those make
-    the standard-error formula divide by zero further down the pipeline.
+    never complement). Before swap alignment, screen the deduplicated raw
+    frequency column for a MAF-like distribution. A non-MAF-like result retains
+    the user's declared ALT/EAF contract. A MAF-like result must be confirmed
+    against an independent default EAF panel; using the same file, confirmed
+    MAF, or inconclusive evidence stops rather than guessing or auto-converting.
+    Strand orientation has already been validated against reference REF/ALT. The
+    external file's configured allele mapping determines whether its frequency
+    is used as listed or as ``1-AF``; it never re-decides strand or changes study
+    beta, Z, or ``strand_action``.
+4.  Re-run the configured duplicate validation after REF/ALT and EAF alignment,
+    catching opposite-strand representations that now identify the same
+    physical variant.
+5.  Apply policy ``eaf.degenerate`` to frequencies of exactly 0 or 1; the
+    default removes them, and Z-only reconstruction always rejects any endpoint
+    retained by an explicit alternative because its denominator would be zero.
 
 Logging and rejected variants
 -----------------------------
@@ -34,14 +45,13 @@ Every threshold is a policy. ``policies=None`` means "use the canonical YAML
 defaults"; ``eaf.degenerate`` defaults to ``reject`` as documented there.
 """
 
-import contextlib
+import math
 import os
 from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
 
 from postgwas.core.paths import configured_output_path
-from postgwas.core.io.tables import read_delimited_table
 
 from postgwas.core.values import (
     format_count,
@@ -49,11 +59,24 @@ from postgwas.core.values import (
     optional_text,
 )
 
-from .shared.runtime import resolve_policies
+from .shared.runtime import (
+    active_context,
+    reject_rows,
+    resolve_policies,
+    step_context as shared_step_context,
+)
 from .shared.allele_join import allele_oriented_left_join
+from .shared.statistics import valid_frequency_mask
+from .shared.variant_columns import (
+    palindromic_snp_expression,
+    read_reference_variant_table,
+)
+from .summary_statistics_io import resolve_duplicate_variants
 from .strand import (
     POLICY_KEYS as STRAND_POLICY_KEYS,
     REFERENCE_AF_COLUMN,
+    RESOLVED_STRAND_ACTIONS,
+    STEP_LABEL as STRAND_STEP_LABEL,
     STRAND_ACTION_COLUMN,
     harmonise_strand_orientation,
 )
@@ -63,8 +86,6 @@ __all__ = [
     "STEP_LABEL",
     "STEP_TITLE",
     "POLICY_KEYS",
-    "PALINDROMIC_FLAG_COLUMN",
-    "read_reference_table",
     "summarise_allele_frequency",
     "validate_allele_frequency",
     "confirm_eaf_with_reference",
@@ -80,12 +101,6 @@ STEP_LABEL = "04 eaf_harmonisation"
 STEP_TITLE = "Allele orientation and effect allele frequency"
 FUNC_NAME = "allele_frequency.harmonise_allele_frequency"
 
-#: Column added to the frame when ``eaf.palindromic_handling`` is not ``ignore``.
-PALINDROMIC_FLAG_COLUMN = "eaf_palindromic_flag"
-
-#: An ordered allele pair whose complement is itself.
-PALINDROMIC_PAIRS = ("AT", "TA", "CG", "GC")
-
 #: The settings block printed at the top of the step.
 POLICY_KEYS = (
     "eaf.out_of_range",
@@ -93,15 +108,26 @@ POLICY_KEYS = (
     "eaf.degenerate",
     "eaf.maf_decision_cutoff",
     "eaf.maf_reference_min_overlap",
+    "eaf.maf_reference_correlation_method",
+    "eaf.maf_reference_min_correlation",
+    "eaf.maf_reference_max_mean_absolute_difference",
     "eaf.reference_minor_fraction_cutoff",
     "eaf.maf_reference_error_margin",
     "eaf.external_min_match_fraction",
     "external_reference.exact_duplicate_action",
     "external_reference.non_identical_duplicate_action",
     "eaf.match_orientations",
-    "eaf.palindromic_handling",
+    "chromosome.strip_chr_prefix",
+    "chromosome.strip_leading_zero",
+    "chromosome.rename_map",
     "eaf.invalid_fraction_cutoff",
     "eaf.missing_fraction_cutoff",
+    "duplicates.key",
+    "duplicates.consistency_fields",
+    "duplicates.post_orientation_relative_tolerance",
+    "duplicates.quality_fields",
+    "duplicates.selection_order",
+    "duplicates.conflicting_action",
 )
 
 class AlleleFrequencyError(RuntimeError):
@@ -112,80 +138,36 @@ class AlleleFrequencyError(RuntimeError):
     """
 
 
-# -------------------------------------------------------
-class _Emitter(object):
-    """Route messages to the active StepContext or PipelineLogger."""
-
-    __slots__ = ("logger", "ctx")
-
-    def __init__(self, logger=None, ctx=None):
-        self.logger = logger
-        self.ctx = ctx
-
-    @property
-    def target(self):
-        if self.ctx is not None:
-            return self.ctx
-        return self.logger
-
-    @property
-    def wired(self) -> bool:
-        return self.target is not None
-
-    def info(self, message, indent=0):
-        target = self.target
-        if target is not None:
-            target.info(message, indent=indent)
-
-    def warn(self, message, indent=0):
-        target = self.target
-        if target is not None:
-            target.warn(message, indent=indent)
-
-    def decide(self, what, evidence, decision):
-        target = self.target
-        if target is not None:
-            target.decide(what, evidence, decision)
-
-    def qc(self, check_name, plain_english, before, after, reason=None, changed=None, warn=False):
-        """Record a QC action.  ``before`` and ``after`` are mandatory (rule 5)."""
-        if before is None or after is None:
-            raise AlleleFrequencyError(
-                "QC check '%s' was recorded without a variant count before and after. "
-                "Every QC action must carry both." % check_name
-            )
-        target = self.target
-        if target is not None:
-            return target.qc(
-                check_name,
-                plain_english,
-                int(before),
-                int(after),
-                reason=reason,
-                changed=changed,
-                warn=warn,
-                step=STEP_LABEL,
-            )
-        removed = int(before) - int(after)
-        return {
-            "step": STEP_LABEL,
-            "check": check_name,
-            "reason": reason,
-            "before": int(before),
-            "after": int(after),
-            "removed": removed,
-            "changed": changed,
-        }
-
 _fmt_int = format_count
 _fmt_pct = format_fraction_percentage
 
 
-def _pol(policies, key, override=None):
-    """Policy value for ``key``, unless the caller passed an explicit override."""
-    if override is not None:
-        return override
-    return resolve_policies(policies).get(key)
+def _fmt_metric(value: Any) -> str:
+    """Render one optional finite QC metric without hiding missing evidence."""
+    if value is None:
+        return "not available"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return "%.6g" % number if math.isfinite(number) else "not available"
+
+
+def _maf_reference_suitability_text(evidence: Dict[str, Any]) -> str:
+    """Summarise the YAML-controlled folded-MAF suitability evidence."""
+    return (
+        "folded-MAF %s correlation: %s (minimum %s); mean absolute "
+        "folded-MAF difference: %s (maximum %s)"
+        % (
+            evidence.get("maf_correlation_method", "unknown"),
+            _fmt_metric(evidence.get("maf_correlation")),
+            _fmt_metric(evidence.get("minimum_maf_correlation")),
+            _fmt_metric(evidence.get("mean_absolute_maf_difference")),
+            _fmt_metric(evidence.get(
+                "maximum_mean_absolute_maf_difference"
+            )),
+        )
+    )
 
 
 def _study_decision_flag(study_decision) -> Optional[bool]:
@@ -209,93 +191,6 @@ def _study_decision_flag(study_decision) -> Optional[bool]:
 
 
 # -------------------------------------------------------
-# 3. Removing variants
-# -------------------------------------------------------
-def _reject_rows(
-    df: pl.DataFrame,
-    mask: pl.Expr,
-    reason: str,
-    emit: "_Emitter",
-    rejects=None,
-    detail: Optional[str] = None,
-    check_name: Optional[str] = None,
-    plain_english: Optional[str] = None,
-) -> pl.DataFrame:
-    """Remove the rows where ``mask`` is true and return the survivors.
-
-    With a ``RejectCollector`` the rows are written to the rejected-variants file
-    and the collector logs the QC line itself.  Without one the rows are still
-    removed — the policy asked for it — but a warning says they could not be
-    written out, and the QC line is emitted here so the before/after counts are
-    never lost.
-    """
-    before = df.height
-    if rejects is not None:
-        survivors = rejects.reject(df, mask, STEP_LABEL, reason, detail=detail)
-        if getattr(rejects, "logger", None) is None:
-            emit.qc(
-                check_name or reason,
-                plain_english or "",
-                before,
-                survivors.height,
-                reason=reason,
-                warn=survivors.height < before,
-            )
-        return survivors
-    survivors = df.filter(~mask.fill_null(True))
-    removed = before - survivors.height
-    emit.qc(
-        check_name or reason,
-        plain_english or "",
-        before,
-        survivors.height,
-        reason=reason,
-        warn=removed > 0,
-    )
-    if removed > 0:
-        emit.warn(
-            "No rejected-variants collector was supplied to this step, so those %s variants were "
-            "removed without being written to the rejected-variants file." % _fmt_int(removed)
-        )
-    return survivors
-
-
-def read_reference_table(
-    path: str,
-    policies,
-    configured_delimiter: str,
-    what: str = "reference file",
-    emit: Optional["_Emitter"] = None,
-) -> pl.DataFrame:
-    """Read a headed text table, detecting the separator from its header line.
-
-    Raises :class:`AlleleFrequencyError` when the file cannot be parsed.
-    """
-    pol = resolve_policies(policies)
-    frame, detected = read_delimited_table(
-        path,
-        configured_delimiter,
-        candidates=list(pol.get("input.delimiter_candidates")),
-        minimum_columns=int(pol.get("input.delimiter_min_columns")),
-        maximum_columns=int(pol.get("input.delimiter_max_columns")),
-        sample_lines=int(pol.get("input.delimiter_sample_rows")),
-        null_values=list(pol.get("input.null_values")),
-        infer_schema_length=int(pol.get("input.schema_inference_rows")),
-        error_type=AlleleFrequencyError,
-        description=what,
-    )
-    if emit is not None:
-        emit.info(
-            "Read the %s %s: %s rows, %d columns, %s separated."
-            % (
-                what, os.path.basename(path), _fmt_int(frame.height), frame.width,
-                detected.method,
-            )
-        )
-    return frame
-
-
-# -------------------------------------------------------
 # 5. Helper: Compute detailed AF/EAF statistics
 # -------------------------------------------------------
 def summarise_allele_frequency(
@@ -308,15 +203,19 @@ def summarise_allele_frequency(
     Comprehensive descriptive statistics for AF/EAF-like columns.
     Works on the DataFrame exactly as passed in.
 
-    ``clip_tolerance`` (policy ``eaf.clip_tolerance``, default 1.05) is the value
-    above which a frequency is corruption rather than rounding error.
+    ``clip_tolerance`` (policy ``eaf.clip_tolerance``) is retained as a
+    diagnostic boundary for overshoots. It never makes a value above 1 valid.
     """
     if colname not in df.columns:
         return {
             "column_present": False,
             "total_rows": df.height,
         }
-    tolerance = float(_pol(policies, "eaf.clip_tolerance", clip_tolerance))
+    tolerance = float(
+        clip_tolerance
+        if clip_tolerance is not None
+        else resolve_policies(policies).get("eaf.clip_tolerance")
+    )
     total_rows = df.height
     if total_rows == 0:
         return {
@@ -326,26 +225,39 @@ def summarise_allele_frequency(
             "null_rows": 0,
             "clip_tolerance": tolerance,
         }
+    value = pl.col(colname).cast(pl.Float64, strict=False)
+    usable = valid_frequency_mask(value)
     stats_row = df.select([
         pl.len().alias("total_rows"),
-        pl.col(colname).is_not_null().sum().alias("non_null_rows"),
-        pl.col(colname).is_null().sum().alias("null_rows"),
-        (pl.col(colname) < 0.0).sum().alias("lt_0_rows"),
-        (pl.col(colname) > 1.0).sum().alias("gt_1_rows"),
-        (pl.col(colname) > tolerance).sum().alias("gt_1_05_rows"),
-        (pl.col(colname) < 0.0).sum().alias("invalid_negative_rows"),
-        ((pl.col(colname) < 0.0) | (pl.col(colname) > tolerance)).sum().alias("invalid_total_rows"),
-        (pl.col(colname) == 0.0).sum().alias("eq_0_rows"),
-        (pl.col(colname) == 1.0).sum().alias("eq_1_rows"),
-        (pl.col(colname) <= 0.5).sum().alias("le_0_5_rows"),
-        pl.col(colname).min().alias("min"),
-        pl.col(colname).max().alias("max"),
-        pl.col(colname).mean().alias("mean"),
-        pl.col(colname).median().alias("median"),
-        pl.col(colname).quantile(0.25).alias("q25"),
-        pl.col(colname).quantile(0.75).alias("q75"),
+        value.is_not_null().sum().alias("non_null_rows"),
+        value.is_null().sum().alias("null_rows"),
+        usable.sum().alias("usable_rows"),
+        (value < 0.0).sum().alias("lt_0_rows"),
+        (value > 1.0).sum().alias("gt_1_rows"),
+        (value > tolerance).sum().alias("gt_1_05_rows"),
+        (
+            value.is_not_null() & ~value.is_finite()
+        ).sum().alias("non_finite_rows"),
+        (value < 0.0).sum().alias("invalid_negative_rows"),
+        (
+            value.is_not_null()
+            & (
+                ~value.is_finite()
+                | (value < 0.0)
+                | (value > 1.0)
+            )
+        ).sum().alias("invalid_total_rows"),
+        (usable & (value == 0.0)).sum().alias("eq_0_rows"),
+        (usable & (value == 1.0)).sum().alias("eq_1_rows"),
+        (usable & (value <= 0.5)).sum().alias("le_0_5_rows"),
+        pl.when(usable).then(value).min().alias("min"),
+        pl.when(usable).then(value).max().alias("max"),
+        pl.when(usable).then(value).mean().alias("mean"),
+        pl.when(usable).then(value).median().alias("median"),
+        pl.when(usable).then(value).quantile(0.25).alias("q25"),
+        pl.when(usable).then(value).quantile(0.75).alias("q75"),
     ]).to_dicts()[0]
-    non_null_rows = stats_row["non_null_rows"] or 0
+    usable_rows = stats_row["usable_rows"] or 0
     total_rows = stats_row["total_rows"] or 0
 
     def frac(n, d):
@@ -353,8 +265,10 @@ def summarise_allele_frequency(
 
     stats_row["null_fraction"] = frac(stats_row["null_rows"], total_rows)
     stats_row["invalid_total_fraction"] = frac(stats_row["invalid_total_rows"], total_rows)
+    stats_row["unusable_rows"] = total_rows - usable_rows
+    stats_row["usable_fraction"] = frac(usable_rows, total_rows)
     stats_row["le_0_5_fraction_among_total"] = frac(stats_row["le_0_5_rows"], total_rows)
-    stats_row["le_0_5_fraction_among_non_null"] = frac(stats_row["le_0_5_rows"], non_null_rows)
+    stats_row["le_0_5_fraction_among_usable"] = frac(stats_row["le_0_5_rows"], usable_rows)
     stats_row["degenerate_rows"] = (stats_row["eq_0_rows"] or 0) + (stats_row["eq_1_rows"] or 0)
     stats_row["clip_tolerance"] = tolerance
     stats_row["column_present"] = True
@@ -383,8 +297,7 @@ def validate_allele_frequency(
     Out-of-range values are counted *before* anything is modified, then handled
     according to ``eaf.out_of_range``:
 
-    ``clip``   force them back into 0..1 (the default, and what the code did
-               before this migration)
+    ``clip``   explicitly force them back into 0..1
     ``null``   blank them, keeping the variant
     ``reject`` remove the variant, reason ``eaf_out_of_range``
     ``fail``   raise :class:`AlleleFrequencyError`
@@ -401,15 +314,24 @@ def validate_allele_frequency(
         stats_dict
     )
 
-    ``is_valid_range`` is now reported honestly (it used to be hardcoded
-    ``True``): it is ``False`` when the share of values outside 0..tolerance
+    ``is_valid_range`` is reported honestly: it is ``False`` when the share of
+    non-finite values or values outside the closed interval 0..1
     exceeds ``invalid_fraction_cutoff``.  ``missing_count`` is the null count of
     the column — it used to be a row-count difference across ``with_columns``,
     which never changes the row count and so was always 0.
     """
-    emit = _Emitter(logger=logger, ctx=ctx)
-    tolerance = float(_pol(policies, "eaf.clip_tolerance", clip_tolerance))
-    action = str(_pol(policies, "eaf.out_of_range", out_of_range))
+    emit = active_context(logger, ctx, df.height)
+    resolved = resolve_policies(policies)
+    tolerance = float(
+        clip_tolerance
+        if clip_tolerance is not None
+        else resolved.get("eaf.clip_tolerance")
+    )
+    action = str(
+        out_of_range
+        if out_of_range is not None
+        else resolved.get("eaf.out_of_range")
+    )
 
     if colname not in df.columns:
         stats = {"column_present": False, "total_rows": df.height}
@@ -425,9 +347,7 @@ def validate_allele_frequency(
     # aggregate pass over the untouched column; reuse them rather than scanning
     # the chromosome a second time before applying the configured action.
     out_of_range_count = int(initial_stats["invalid_total_rows"] or 0)
-    outside_unit_count = int(
-        (initial_stats["lt_0_rows"] or 0) + (initial_stats["gt_1_rows"] or 0)
-    )
+    outside_unit_count = out_of_range_count
     n_missing = int(initial_stats["null_rows"] or 0)
 
     out_of_range_fraction = out_of_range_count / total_before if total_before else 0.0
@@ -435,12 +355,11 @@ def validate_allele_frequency(
 
     if out_of_range_count and out_of_range_fraction > invalid_fraction_cutoff:
         emit.warn(
-            "Column '%s' has %s values below 0 or above %s, which is %s of all %s variants - far more "
+            "Column '%s' has %s non-finite values or values outside 0 to 1, which is %s of all %s variants - far more "
             "than the %s allowed by eaf.invalid_fraction_cutoff. The column may not be a frequency at all."
             % (
                 colname,
                 _fmt_int(out_of_range_count),
-                tolerance,
                 _fmt_pct(out_of_range_fraction),
                 _fmt_int(total_before),
                 _fmt_pct(invalid_fraction_cutoff),
@@ -449,93 +368,116 @@ def validate_allele_frequency(
 
     # ---- apply the out-of-range policy ---------------------------------
     cleaned_df = df
+    invalid_frequency = (
+        pl.col(colname).is_not_null()
+        & (
+            ~pl.col(colname).is_finite()
+            | (pl.col(colname) < 0.0)
+            | (pl.col(colname) > 1.0)
+        )
+    ).fill_null(False)
     if out_of_range_count and action == "fail":
         raise AlleleFrequencyError(
-            "Column '%s' has %s frequency values below 0 or above %s and policy eaf.out_of_range is "
-            "'fail'." % (colname, _fmt_int(out_of_range_count), tolerance)
+            "Column '%s' has %s non-finite frequency values or values outside 0 to 1 and policy "
+            "eaf.out_of_range is 'fail'." % (colname, _fmt_int(out_of_range_count))
         )
     if action == "reject":
         # fill_null(False): a null frequency is not out of range, it is missing,
         # and missingness is somebody else's decision
-        cleaned_df = _reject_rows(
+        cleaned_df, _ = reject_rows(
             cleaned_df,
-            ((pl.col(colname) < 0.0) | (pl.col(colname) > tolerance)).fill_null(False),
-            "eaf_out_of_range",
-            emit,
-            rejects=rejects,
-            detail="%s outside 0 to %s" % (colname, tolerance),
+            invalid_frequency,
+            step_label=STEP_LABEL,
+            reason="eaf_out_of_range",
+            context=emit,
+            collector=rejects,
+            detail="%s non-finite or outside 0 to 1" % colname,
             check_name="frequency range",
-            plain_english=(
-                "Frequencies below 0 or above %s cannot be real; policy eaf.out_of_range is 'reject', "
-                "so those variants were removed." % tolerance
+            description=(
+                "Non-finite frequencies and frequencies outside 0 to 1 cannot be probabilities; "
+                "policy eaf.out_of_range is 'reject', so those variants were removed."
             ),
+            warn_on_remove=True,
+            warn_without_collector=True,
+            record_empty=True,
         )
     elif action == "null":
         before = cleaned_df.height
         cleaned_df = cleaned_df.with_columns(
-            pl.when((pl.col(colname) < 0.0) | (pl.col(colname) > tolerance))
+            pl.when(invalid_frequency)
             .then(None)
             .otherwise(pl.col(colname))
             .alias(colname)
         )
         emit.qc(
             "frequency range",
-            "%s values are outside 0 to %s; policy eaf.out_of_range is 'null', so those frequencies "
-            "were blanked and the variants kept." % (_fmt_int(out_of_range_count), tolerance),
+            "%s values are non-finite or outside 0 to 1; policy eaf.out_of_range is 'null', so those "
+            "frequencies were blanked and the variants kept." % _fmt_int(out_of_range_count),
             before,
             cleaned_df.height,
             changed=out_of_range_count,
             warn=out_of_range_count > 0,
+            step=STEP_LABEL,
         )
-    else:  # "clip" - the behaviour before this migration
+    elif action == "clip":  # explicit opt-in correction
         before = cleaned_df.height
+        cleaned_df = cleaned_df.with_columns(
+            pl.when(pl.col(colname).is_not_null() & pl.col(colname).is_finite())
+            .then(pl.col(colname).clip(0.0, 1.0))
+            .otherwise(None)
+            .alias(colname)
+        )
         emit.qc(
             "frequency range",
-            "%s values are outside 0 to 1; policy eaf.out_of_range is 'clip', so they were forced "
-            "back into range." % _fmt_int(outside_unit_count),
+            "%s values are non-finite or outside 0 to 1; policy eaf.out_of_range is 'clip', so "
+            "finite values were forced into range and non-finite values were blanked."
+            % _fmt_int(outside_unit_count),
             before,
             before,
             changed=outside_unit_count,
             warn=outside_unit_count > 0,
+            step=STEP_LABEL,
+        )
+    else:  # "fail" with no invalid values
+        emit.qc(
+            "frequency range",
+            "No non-finite frequencies or values outside 0 to 1 were found; "
+            "policy eaf.out_of_range is 'fail', so no action was needed.",
+            cleaned_df.height,
+            cleaned_df.height,
+            changed=0,
+            step=STEP_LABEL,
         )
 
-    # every surviving value is squeezed into 0..1: this is a no-op for values
-    # already in range and turns rounding error such as 1.02 into 1.0
-    cleaned_df = cleaned_df.with_columns(
-        pl.when(pl.col(colname).is_not_null())
-        .then(pl.col(colname).clip(0.0, 1.0))
-        .otherwise(None)
-        .alias(colname)
-    )
-
     # ---- missingness (null_count, not a row-count difference) ----------
-    missing_fraction = n_missing / total_before if total_before else 0.0
+    final_stats = summarise_allele_frequency(cleaned_df, colname, clip_tolerance=tolerance)
+    final_missing = int(final_stats.get("null_rows") or 0)
+    missing_fraction = final_missing / total_before if total_before else 0.0
     if missing_fraction > missing_fraction_cutoff:
         emit.warn(
             "Column '%s' is empty for %s of the %s variants (%s), more than the %s allowed by "
             "eaf.missing_fraction_cutoff."
             % (
                 colname,
-                _fmt_int(n_missing),
+                _fmt_int(final_missing),
                 _fmt_int(total_before),
                 _fmt_pct(missing_fraction),
                 _fmt_pct(missing_fraction_cutoff),
             )
         )
 
-    # ---- MAF-likeness, measured over the NON-NULL values ---------------
+    # ---- MAF-likeness, measured over usable finite probabilities --------
     total_after = cleaned_df.height
-    final_stats = summarise_allele_frequency(cleaned_df, colname, clip_tolerance=tolerance)
     low_freq = int(final_stats.get("le_0_5_rows") or 0)
-    low_freq_pct = float(final_stats.get("le_0_5_fraction_among_non_null") or 0.0)
-    non_null_rows = int(final_stats.get("non_null_rows") or 0)
+    low_freq_pct = float(final_stats.get("le_0_5_fraction_among_usable") or 0.0)
+    usable_rows = int(final_stats.get("usable_rows") or 0)
     is_suspicious = low_freq_pct > maf_cutoff
     if is_suspicious:
         emit.warn(
-            "Column '%s': %s of its %s non-empty values are at or below 0.5, more than the %s set by "
+            "Column '%s': %s of its %s usable finite frequencies are at or below 0.5, more than the %s set by "
             "eaf.maf_decision_cutoff. That is what a minor allele frequency looks like, not an effect "
             "allele frequency."
-            % (colname, _fmt_pct(low_freq_pct), _fmt_int(non_null_rows), _fmt_pct(maf_cutoff))
+            % (colname, _fmt_pct(low_freq_pct), _fmt_int(usable_rows), _fmt_pct(maf_cutoff))
         )
 
     combined_stats = {
@@ -550,19 +492,20 @@ def validate_allele_frequency(
         "is_valid_range": is_valid_range,
         # kept under the old key for the QC summary; it is now the honest null
         # count rather than a row-count difference that was always 0
-        "missing_count_removed": n_missing,
+        "initial_missing_count": n_missing,
+        "missing_count_removed": final_missing,
         "missing_fraction_removed": missing_fraction,
-        "missing_count": n_missing,
+        "missing_count": final_missing,
         "missing_fraction": missing_fraction,
         "low_freq_count_after_cleaning": low_freq,
         "low_freq_fraction_after_cleaning": low_freq_pct,
         "maf_like_flag": is_suspicious,
     }
-    return is_valid_range, is_suspicious, out_of_range_count, n_missing, cleaned_df, low_freq_pct, combined_stats
+    return is_valid_range, is_suspicious, out_of_range_count, final_missing, cleaned_df, low_freq_pct, combined_stats
 
 
 # -------------------------------------------------------
-# 7. Confirm a MAF-like study column against default EAF
+# 7. Confirm a MAF-like frequency column against default EAF
 # -------------------------------------------------------
 def confirm_eaf_with_reference(
     df: pl.DataFrame,
@@ -582,14 +525,28 @@ def confirm_eaf_with_reference(
     The reference population column is ALT frequency. Direct matches use it as
     supplied; allele-swapped matches use ``1-AF`` so every comparison is against
     the frequency of the study's listed effect allele. Palindromic SNPs are
-    excluded because their strand cannot be inferred from the allele pair. A
-    reference set dominated by minor effect alleles is inconclusive because
-    aligned EAF and folded MAF are then nearly identical; otherwise the two mean
-    errors must differ by the configured minimum margin.
+    excluded because their strand cannot be inferred from the allele pair. Before
+    testing direction, both frequencies are folded as ``min(AF, 1-AF)`` and the
+    configured correlation plus mean-absolute-difference gates must show that
+    the independent default panel meets the selected suitability criteria for
+    these variants. Folding is a scientific invariant that removes allele
+    direction; it cannot itself prove EAF. A reference set dominated by minor
+    effect alleles is inconclusive because aligned EAF and folded MAF are then
+    nearly identical; otherwise the two mean errors must differ by the
+    configured minimum margin.
     """
-    emit = _Emitter(logger=logger, ctx=ctx)
+    emit = active_context(logger, ctx, df.height)
     resolved = resolve_policies(policies)
     minimum = int(resolved.get("eaf.maf_reference_min_overlap"))
+    correlation_method = str(
+        resolved.get("eaf.maf_reference_correlation_method")
+    )
+    minimum_maf_correlation = float(
+        resolved.get("eaf.maf_reference_min_correlation")
+    )
+    maximum_maf_difference = float(
+        resolved.get("eaf.maf_reference_max_mean_absolute_difference")
+    )
     reference_minor_cutoff = float(
         resolved.get("eaf.reference_minor_fraction_cutoff")
     )
@@ -597,13 +554,9 @@ def confirm_eaf_with_reference(
         resolved.get("eaf.maf_reference_error_margin")
     )
     keys = [std_cols[name] for name in ("chr", "pos", "ea", "oa")]
-    allele_expressions = [pl.col(std_cols[name]) for name in ("ea", "oa")]
-    if not study_columns_canonical:
-        allele_expressions = [
-            expression.cast(pl.Utf8).str.to_uppercase()
-            for expression in allele_expressions
-        ]
-    pair = pl.concat_str(allele_expressions)
+    palindromic = palindromic_snp_expression(
+        pl.col(std_cols["ea"]), pl.col(std_cols["oa"])
+    )
     use_aligned = aligned_reference_col in df.columns if aligned_reference_col else False
     selected = keys + [input_af_col]
     if use_aligned:
@@ -611,8 +564,8 @@ def confirm_eaf_with_reference(
         if STRAND_ACTION_COLUMN in df.columns:
             selected.append(STRAND_ACTION_COLUMN)
     study = df.select(selected).filter(
-        pl.col(input_af_col).is_not_null()
-        & ~pair.is_in(list(PALINDROMIC_PAIRS)).fill_null(False)
+        valid_frequency_mask(pl.col(input_af_col))
+        & ~palindromic
     ).rename({input_af_col: "_study_af"})
     if use_aligned:
         reference_col = "__maf_expected_study_eaf"
@@ -662,7 +615,6 @@ def confirm_eaf_with_reference(
             logger=logger,
             ctx=ctx,
             min_match_fraction=0.0,
-            palindromic_handling="ignore",
             study_columns_canonical=study_columns_canonical,
         )
     matched = merged.filter(pl.col(reference_col).is_not_null())
@@ -672,6 +624,13 @@ def confirm_eaf_with_reference(
         "swapped_matches": merge_stats["flip_match_rows"],
         "comparable_variants": matched.height,
         "minimum_overlap": minimum,
+        "maf_correlation_method": correlation_method,
+        "maf_correlation": None,
+        "minimum_maf_correlation": minimum_maf_correlation,
+        "mean_absolute_maf_difference": None,
+        "maximum_mean_absolute_maf_difference": maximum_maf_difference,
+        "reference_suitability_status": "not_evaluated",
+        "reference_suitability_reason": None,
         "reference_effect_allele_minor_fraction": None,
         "reference_minor_fraction_cutoff": reference_minor_cutoff,
         "mean_eaf_error": None,
@@ -681,22 +640,13 @@ def confirm_eaf_with_reference(
         "decision_reason": None,
     }
     reference_value = pl.col(reference_col).cast(pl.Float64, strict=False)
-    comparison = matched.select([
+    invalid_reference = int(matched.select(
         (
             ~reference_value.is_finite()
             | (reference_value < 0.0)
             | (reference_value > 1.0)
-        ).sum().alias("invalid_reference"),
-        (pl.col("_study_af") - pl.col(reference_col)).abs().mean().alias("eaf"),
-        (
-            pl.col("_study_af")
-            - pl.min_horizontal(
-                pl.col(reference_col), 1.0 - pl.col(reference_col)
-            )
-        ).abs().mean().alias("maf"),
-        (pl.col(reference_col) <= 0.5).mean().alias("minor_fraction"),
-    ]).to_dicts()[0]
-    invalid_reference = int(comparison["invalid_reference"] or 0)
+        ).sum().alias("invalid_reference")
+    ).item() or 0)
     if invalid_reference:
         raise AlleleFrequencyError(
             "The default EAF table '%s' contains %s matched non-finite values or values outside "
@@ -705,6 +655,8 @@ def confirm_eaf_with_reference(
         )
     if matched.height < minimum:
         stats["decision_reason"] = "insufficient_overlap"
+        stats["reference_suitability_status"] = "inconclusive"
+        stats["reference_suitability_reason"] = "insufficient_overlap"
         emit.warn(
             "The MAF-like column '%s' had only %s non-palindromic matches to the default EAF table; "
             "%s are required by eaf.maf_reference_min_overlap."
@@ -712,14 +664,75 @@ def confirm_eaf_with_reference(
         )
         return "inconclusive", stats
 
+    study_value = pl.col("_study_af").cast(pl.Float64, strict=False)
+    study_maf = pl.min_horizontal(study_value, 1.0 - study_value)
+    reference_maf = pl.min_horizontal(
+        reference_value, 1.0 - reference_value
+    )
+    comparison = matched.select([
+        pl.corr(
+            study_maf, reference_maf, method=correlation_method
+        ).alias("maf_correlation"),
+        (study_maf - reference_maf).abs().mean().alias("maf_difference"),
+        (study_value - reference_value).abs().mean().alias("eaf"),
+        (
+            study_value - reference_maf
+        ).abs().mean().alias("maf"),
+        (reference_value <= 0.5).mean().alias("minor_fraction"),
+    ]).to_dicts()[0]
+
     eaf_error = float(comparison["eaf"])
     maf_error = float(comparison["maf"])
+    maf_difference = float(comparison["maf_difference"])
+    correlation_value = comparison["maf_correlation"]
+    maf_correlation = None
+    if correlation_value is not None:
+        candidate_correlation = float(correlation_value)
+        if math.isfinite(candidate_correlation):
+            maf_correlation = candidate_correlation
     error_difference = abs(eaf_error - maf_error)
     reference_minor_fraction = float(comparison["minor_fraction"])
+    stats["maf_correlation"] = maf_correlation
+    stats["mean_absolute_maf_difference"] = maf_difference
     stats["mean_eaf_error"] = eaf_error
     stats["mean_maf_error"] = maf_error
     stats["absolute_error_difference"] = error_difference
     stats["reference_effect_allele_minor_fraction"] = reference_minor_fraction
+
+    if maf_correlation is None:
+        suitability_reason = "maf_correlation_unavailable"
+    elif maf_correlation < minimum_maf_correlation:
+        suitability_reason = "maf_correlation_below_minimum"
+    elif maf_difference > maximum_maf_difference:
+        suitability_reason = "maf_difference_above_maximum"
+    else:
+        suitability_reason = "maf_correlation_and_difference_passed"
+    reference_suitable = (
+        suitability_reason == "maf_correlation_and_difference_passed"
+    )
+    stats["reference_suitability_status"] = (
+        "suitable" if reference_suitable else "inconclusive"
+    )
+    stats["reference_suitability_reason"] = suitability_reason
+    emit.decide(
+        "Default EAF reference suitability",
+        {
+            "non-palindromic matches": _fmt_int(matched.height),
+            "folded-MAF correlation method": correlation_method,
+            "folded-MAF correlation": _fmt_metric(maf_correlation),
+            "minimum correlation": minimum_maf_correlation,
+            "mean absolute folded-MAF difference": maf_difference,
+            "maximum mean absolute difference": maximum_maf_difference,
+        },
+        (
+            "suitable for directional MAF/EAF confirmation"
+            if reference_suitable
+            else "inconclusive; the default panel is not proven suitable"
+        ),
+    )
+    if not reference_suitable:
+        stats["decision_reason"] = suitability_reason
+        return "inconclusive", stats
 
     if reference_minor_fraction > reference_minor_cutoff:
         decision = "inconclusive"
@@ -769,8 +782,10 @@ def merge_external_allele_frequencies(
     ctx=None,
     rejects=None,
     min_match_fraction: Optional[float] = None,
-    palindromic_handling: Optional[str] = None,
     study_columns_canonical: bool = False,
+    validation_reference_col: Optional[str] = None,
+    validation_reference_file: Optional[str] = None,
+    validation_reference_column: Optional[str] = None,
 ) -> Tuple[pl.DataFrame, str, Dict[str, Any]]:
     """Take the frequency from an external panel.
 
@@ -780,11 +795,19 @@ def merge_external_allele_frequencies(
     gate counts only allele-key matches whose frequency is finite and between 0
     and 1; if that usable share falls below
     ``eaf.external_min_match_fraction`` the step fails instead of quietly
-    reporting success.
+    reporting success. The raw external column is screened before swap-based
+    alignment. When that screen is MAF-like and ``validation_reference_col``
+    is available on the study frame, the existing EAF-versus-folded-MAF
+    classifier validates the external column against that independent,
+    allele-aligned reference before the caller adopts it.
     """
-    emit = _Emitter(logger=logger, ctx=ctx)
-    min_match_fraction = float(_pol(policies, "eaf.external_min_match_fraction", min_match_fraction))
     resolved_policies = resolve_policies(policies)
+    emit = active_context(logger, ctx, df.height)
+    min_match_fraction = float(
+        min_match_fraction
+        if min_match_fraction is not None
+        else resolved_policies.get("eaf.external_min_match_fraction")
+    )
     duplicate_exact_action = str(
         resolved_policies.get("external_reference.exact_duplicate_action")
     )
@@ -793,7 +816,6 @@ def merge_external_allele_frequencies(
             "external_reference.non_identical_duplicate_action"
         )
     )
-    palindromic_handling = str(_pol(policies, "eaf.palindromic_handling", palindromic_handling))
     orientations = [
         str(value).lower()
         for value in resolved_policies.get("eaf.match_orientations")
@@ -801,9 +823,10 @@ def merge_external_allele_frequencies(
     unsupported = [o for o in orientations if o not in ("direct", "swap")]
     if unsupported:
         raise AlleleFrequencyError(
-            "eaf.match_orientations asks for %s, but only 'direct' and 'swap' are implemented. Strand is "
-            "a property of the study, not of individual variants (plan section 5.3): use dataset-level "
-            "strand detection instead of complement passes." % unsupported
+            "eaf.match_orientations asks for %s, but only 'direct' and 'swap' are implemented. "
+            "Study rows have already received a validated per-variant strand_action; the external "
+            "frequency join must not perform a second complement pass or re-decide effect direction."
+            % unsupported
         )
     stats: Dict[str, Any] = {
         "external_rows_loaded": 0,
@@ -827,7 +850,10 @@ def merge_external_allele_frequencies(
         "match_fraction": 0.0,
         "min_match_fraction": min_match_fraction,
         "orientations": orientations,
-        "palindromic_handling": palindromic_handling,
+        "palindromic_evaluated_rows": 0,
+        "palindromic_orientation_resolved_rows": 0,
+        "palindromic_orientation_rejected_rows": 0,
+        "palindromic_orientation_state_counts": {},
     }
     # --------------------------------------------------
     # Load file
@@ -838,30 +864,35 @@ def merge_external_allele_frequencies(
             "The external effect-allele-frequency file was not found: '%s'. Check the 'eaffile' setting "
             "for this dataset." % load_path
         )
-    ext_df = read_reference_table(
+    ext_df, detected = read_reference_variant_table(
         load_path,
+        colmap,
         policies,
-        colmap["delimiter"],
-        what="external frequency file",
-        emit=emit,
+        value_columns=[eaf_col],
+        error_type=AlleleFrequencyError,
+        description="external frequency file",
+    )
+    input_format = (
+        detected.method
+        if detected.kind == "unknown"
+        else "%s separated" % detected.method
+    )
+    emit.info(
+        "Read the external frequency file %s: %s rows, %d required columns, %s."
+        % (
+            os.path.basename(load_path),
+            _fmt_int(ext_df.height),
+            ext_df.width,
+            input_format,
+        )
     )
     stats["external_rows_loaded"] = ext_df.height
-    # --------------------------------------------------
-    # Validate columns
-    # --------------------------------------------------
-    missing_cols = []
-    for key in ["chr", "pos", "a1", "a2"]:
-        if colmap[key] not in ext_df.columns:
-            missing_cols.append(colmap[key])
-    if eaf_col not in ext_df.columns:
-        missing_cols.append(eaf_col)
-    if missing_cols:
-        raise AlleleFrequencyError(
-            "The external frequency file '%s' does not contain the columns %s. It has: %s"
-            % (load_path, missing_cols, ", ".join(ext_df.columns))
-        )
+    row_col = "__postgwas_external_eaf_row"
+    while row_col in df.columns:
+        row_col += "_"
+    study_for_join = df.with_row_index(row_col)
     matched_all, orientation_col, join_stats = allele_oriented_left_join(
-        df,
+        study_for_join,
         ext_df,
         study_columns=std_cols,
         reference_columns={
@@ -870,6 +901,7 @@ def merge_external_allele_frequencies(
             "ea": colmap["a1"],
             "oa": colmap["a2"],
         },
+        policies=resolved_policies,
         value_column=eaf_col,
         output_column=eaf_col,
         duplicate_exact_action=duplicate_exact_action,
@@ -900,12 +932,128 @@ def merge_external_allele_frequencies(
         )
     stats.update(join_stats)
 
+    raw_frequency_screen = dict(
+        join_stats.get("raw_frequency_screen") or {}
+    )
+    stats["raw_frequency_screen"] = raw_frequency_screen
+    stats["maf_reference_decision"] = "not_required"
+    stats["maf_reference_validation"] = {}
+    if (
+        raw_frequency_screen.get("maf_like") is True
+        and validation_reference_col is not None
+    ):
+        if validation_reference_col not in matched_all.columns:
+            raise AlleleFrequencyError(
+                "Internal PostGWAS execution-order error: external AF was "
+                "MAF-like, but the aligned default reference column '%s' was "
+                "not available for confirmation."
+                % validation_reference_col
+            )
+        candidate_col = "__postgwas_external_raw_af"
+        while candidate_col in matched_all.columns:
+            candidate_col += "_"
+        expected_col = "__postgwas_external_validation_eaf"
+        while expected_col in matched_all.columns or expected_col == candidate_col:
+            expected_col += "_"
+        swapped = pl.col(orientation_col) == 1
+        semantic_frame = matched_all.select([
+            *[pl.col(std_cols[name]) for name in ("chr", "pos", "ea", "oa")],
+            pl.when(swapped)
+            .then(1.0 - pl.col(eaf_col).cast(pl.Float64, strict=False))
+            .otherwise(pl.col(eaf_col).cast(pl.Float64, strict=False))
+            .alias(candidate_col),
+            pl.when(swapped)
+            .then(
+                1.0
+                - pl.col(validation_reference_col).cast(
+                    pl.Float64, strict=False,
+                )
+            )
+            .otherwise(
+                pl.col(validation_reference_col).cast(
+                    pl.Float64, strict=False,
+                )
+            )
+            .alias(expected_col),
+        ])
+        decision, validation = confirm_eaf_with_reference(
+            semantic_frame,
+            candidate_col,
+            validation_reference_file or "aligned default EAF reference",
+            validation_reference_column or validation_reference_col,
+            colmap,
+            std_cols,
+            policies=resolved_policies,
+            logger=logger,
+            ctx=ctx,
+            aligned_reference_col=expected_col,
+            study_columns_canonical=True,
+        )
+        stats["maf_reference_decision"] = decision
+        stats["maf_reference_validation"] = validation
+
+    # The study row is already reference-oriented. The external mapping declares
+    # which columns are REF and ALT/effect allele, so the shared direct/swap join
+    # has already put its frequency on the final study EA (= reference ALT).
+    # A palindrome is retained only when upstream strand_action proves that this
+    # orientation was resolved; a reference-panel frequency must never be used
+    # to infer the missing study strand.
+    is_palindromic = palindromic_snp_expression(
+        pl.col(std_cols["ea"]), pl.col(std_cols["oa"])
+    )
+    has_key_match = pl.col(orientation_col).is_not_null()
+    matched_palindromic = is_palindromic & has_key_match
+    orientation_resolved = (
+        pl.col(STRAND_ACTION_COLUMN).is_in(list(RESOLVED_STRAND_ACTIONS))
+        if STRAND_ACTION_COLUMN in matched_all.columns
+        else pl.lit(False)
+    ).fill_null(False)
+    palindromic_orientation = (
+        matched_all.filter(matched_palindromic)
+        .select(row_col, orientation_resolved.alias("__orientation_resolved"))
+        .with_columns(
+            pl.when(pl.col("__orientation_resolved"))
+            .then(pl.lit("resolved_by_study_orientation"))
+            .otherwise(pl.lit("orientation_unavailable"))
+            .alias("palindromic_orientation_state")
+        )
+        .drop("__orientation_resolved")
+    )
+    matched_all = matched_all.join(
+        palindromic_orientation, on=row_col, how="left", coalesce=True
+    ).with_columns(
+        pl.when(
+            matched_palindromic
+            & (
+                pl.col("palindromic_orientation_state")
+                != "resolved_by_study_orientation"
+            ).fill_null(True)
+        )
+        .then(None)
+        .otherwise(pl.col(eaf_col))
+        .alias(eaf_col)
+    )
+    palindromic_state_counts = {
+        str(row["palindromic_orientation_state"]): int(row["len"])
+        for row in palindromic_orientation.group_by(
+            "palindromic_orientation_state"
+        ).len().to_dicts()
+    }
+    stats["palindromic_evaluated_rows"] = palindromic_orientation.height
+    stats["palindromic_orientation_resolved_rows"] = int(
+        palindromic_state_counts.get("resolved_by_study_orientation", 0)
+    )
+    stats["palindromic_orientation_rejected_rows"] = (
+        palindromic_orientation.height
+        - stats["palindromic_orientation_resolved_rows"]
+    )
+    stats["palindromic_orientation_state_counts"] = palindromic_state_counts
+
     # An allele-key match is only evidence that the panel contains the variant;
     # it does not supply an EAF when the matched value is null, non-finite or
     # outside the probability interval. Count all value states in one Polars
     # aggregation so the configured coverage gate measures usable frequencies.
     reference_value = pl.col(eaf_col).cast(pl.Float64, strict=False)
-    has_key_match = pl.col(orientation_col).is_not_null()
     finite_value = reference_value.is_finite().fill_null(False)
     in_frequency_range = (
         (reference_value >= 0.0) & (reference_value <= 1.0)
@@ -965,73 +1113,49 @@ def merge_external_allele_frequencies(
     # Keep the established public name, but make its meaning scientifically
     # correct: it is now the usable EAF share, not merely the allele-key share.
     stats["match_fraction"] = stats["usable_match_fraction"]
-    # ==================================================
-    # STEP 4: OPTIONAL EXTERNAL-EAF PALINDROMIC EXCLUSION
-    # ==================================================
-    if palindromic_handling not in ("ignore", "null", "reject"):
-        raise AlleleFrequencyError(
-            "eaf.palindromic_handling must be 'ignore', 'null' or 'reject'; "
-            "received %r. Frequency-based strand resolution is not permitted."
-            % palindromic_handling
-        )
     final_df = matched_all
-    if palindromic_handling != "ignore":
-        is_palindromic = (
-            pl.concat_str([
-                pl.col(std_cols["ea"]).cast(pl.Utf8).str.to_uppercase(),
-                pl.col(std_cols["oa"]).cast(pl.Utf8).str.to_uppercase(),
-            ])
-            .is_in(list(PALINDROMIC_PAIRS))
-            .fill_null(False)
-        )
-        matched_palindromic = is_palindromic & has_key_match
-        palindromic_rows = int(
-            final_df.select(matched_palindromic.sum()).item() or 0
-        )
-        final_df = final_df.with_columns(
-            pl.when(matched_palindromic)
-            .then(pl.lit("excluded_by_external_eaf_policy"))
-            .otherwise(pl.lit(None, dtype=pl.Utf8))
-            .alias(PALINDROMIC_FLAG_COLUMN)
-        )
-        if palindromic_handling == "null":
-            final_df = final_df.with_columns(
-                pl.when(matched_palindromic)
-                .then(None)
-                .otherwise(pl.col(eaf_col))
-                .alias(eaf_col)
-            )
-        stats["palindromic"] = {
-            "mode": palindromic_handling,
-            "palindromic_rows": palindromic_rows,
-        }
-
-    if palindromic_handling != "ignore":
-        pal = stats.get("palindromic", {})
+    if stats["palindromic_evaluated_rows"]:
         emit.info(
-            "Palindromic variants (A/T or C/G, which look the same on either strand): %s of the matched "
-            "variants. Policy eaf.palindromic_handling is '%s'."
-            % (_fmt_int(pal.get("palindromic_rows", 0)), palindromic_handling)
+            "External EAF for palindromic variants: %s evaluated after study "
+            "orientation, %s retained, and %s rejected because orientation "
+            "evidence was unavailable."
+            % (
+                _fmt_int(stats["palindromic_evaluated_rows"]),
+                _fmt_int(stats["palindromic_orientation_resolved_rows"]),
+                _fmt_int(stats["palindromic_orientation_rejected_rows"]),
+            )
         )
-    if palindromic_handling == "reject":
-        final_df = _reject_rows(
-            final_df,
-            (
-                pl.col(PALINDROMIC_FLAG_COLUMN)
-                == "excluded_by_external_eaf_policy"
-            ).fill_null(False),
-            "palindromic_ambiguous",
-            emit,
-            rejects=rejects,
-            detail="A/T or C/G variant excluded by external-EAF policy",
-            check_name="external-EAF palindromic exclusion",
-            plain_english=(
-                "The configured external-EAF policy explicitly removes matched A/T "
-                "and C/G variants. Frequency was not used to choose their strand."
-            ),
-        )
+    final_df, _ = reject_rows(
+        final_df,
+        matched_palindromic
+        & (
+            pl.col("palindromic_orientation_state")
+            != "resolved_by_study_orientation"
+        ).fill_null(True),
+        step_label=STEP_LABEL,
+        reason="palindromic_orientation_unavailable",
+        context=emit,
+        collector=rejects,
+        detail=(
+            "external reference AF was available, but no resolved upstream "
+            "strand_action proved the study palindrome's orientation"
+        ),
+        check_name="external-EAF palindromic orientation",
+        description=(
+            "A matched A/T or C/G external frequency is used only after automatic "
+            "consensus/internal-study-EAF resolution or an explicit "
+            "reference_aligned declaration has oriented the study row."
+        ),
+        warn_on_remove=True,
+        warn_without_collector=True,
+        record_empty=True,
+    )
 
-    final_df = final_df.drop(orientation_col)
+    final_df = final_df.drop([
+        orientation_col,
+        row_col,
+        "palindromic_orientation_state",
+    ])
 
     emit.info("Direct allele-key matches  : %s" % _fmt_int(stats["direct_match_rows"]))
     emit.info("Swapped allele-key matches : %s" % _fmt_int(stats["flip_match_rows"]))
@@ -1101,14 +1225,96 @@ def _add_prefixed_statistics(
 
 
 def _out_of_bound_frame(frame: pl.DataFrame, colname: str) -> pl.DataFrame:
-    """Rows whose frequency lies outside 0..1, taken BEFORE any clipping."""
+    """Rows whose frequency is non-finite or outside 0..1 before correction."""
     if colname not in frame.columns:
         return frame.head(0)
     # Cast defensively: a frequency column read with schema inference disabled
     # arrives as Utf8, and comparing that against a float raises ComputeError.
     # Every sibling module casts with strict=False first; match them.
     value = pl.col(colname).cast(pl.Float64, strict=False)
-    return frame.filter(((value < 0.0) | (value > 1.0)).fill_null(False))
+    return frame.filter(
+        (
+            value.is_not_null()
+            & (~value.is_finite() | (value < 0.0) | (value > 1.0))
+        ).fill_null(False)
+    )
+
+
+def _resolve_reference_aligned_duplicates(
+    chromosome: str,
+    df: pl.DataFrame,
+    sample_column_dict: dict,
+    output_layout: Dict[str, str],
+    output_delimiter: str,
+    policies,
+    logger=None,
+    ctx=None,
+    rejects=None,
+) -> Tuple[pl.DataFrame, Dict[str, Any]]:
+    """Resolve rows that become identical only after reference orientation.
+
+    Strand orientation has already made the study effect allele reference ALT
+    and the other allele reference REF, and the final effect-frequency source
+    has been aligned to ALT. Running the shared duplicate resolver at this
+    boundary catches opposite-strand representations without applying a
+    complement-based key to unnormalised indels. With the canonical key,
+    distinct alternate alleles at one coordinate remain distinct because both
+    REF and ALT participate in the key.
+    """
+    retained, report, statistics = resolve_duplicate_variants(
+        df,
+        sample_column_dict,
+        policies=policies,
+        logger=logger,
+        rejects=rejects,
+        step_label=STRAND_STEP_LABEL,
+        reference_aligned=True,
+    )
+    report_path = configured_output_path(
+        sample_column_dict["output_folder"],
+        output_layout["post_orientation_duplicates"],
+        error_type=AlleleFrequencyError,
+        dataset_id=sample_column_dict["gwas_outputname"],
+        chromosome=chromosome,
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report.write_csv(report_path, separator=output_delimiter)
+    statistics["report"] = str(report_path)
+    if ctx is not None:
+        ctx.extra["post_orientation_duplicates"] = dict(statistics)
+        if report.height:
+            ctx.info(
+                "Reference-aligned duplicate evidence for %s row%s was written "
+                "to %s."
+                % (
+                    "{:,}".format(report.height),
+                    "" if report.height == 1 else "s",
+                    report_path,
+                )
+            )
+
+    unsafe_groups = (
+        int(statistics["conflicting_groups"])
+        + int(statistics["swapped_orientation_groups"])
+    )
+    if (
+        unsafe_groups
+        and str(policies.get("duplicates.conflicting_action"))
+        == "fail_dataset"
+    ):
+        raise AlleleFrequencyError(
+            "Chromosome %s contains %s unsafe reference-aligned duplicate "
+            "group%s. Their rows were recorded in %s and the rejected-variant "
+            "output; processing stopped because duplicates.conflicting_action "
+            "is 'fail_dataset'."
+            % (
+                chromosome,
+                "{:,}".format(unsafe_groups),
+                "" if unsafe_groups == 1 else "s",
+                report_path,
+            )
+        )
+    return retained, statistics
 
 
 # -------------------------------------------------------
@@ -1148,7 +1354,7 @@ def harmonise_allele_frequency(
                    ``{"eaf_is_maf": False}``. The decision is made once from
                    the whole study and then applied consistently to each chromosome.
     default_eaf_*  the raw chromosome REF/ALT/population-AF reference used for
-                   strand orientation, and reused for a MAF-like study column.
+                   strand orientation and independent MAF/EAF confirmation.
     """
     gwas_outputname = sample_column_dict["gwas_outputname"]
     output_dir = sample_column_dict["output_folder"]
@@ -1172,24 +1378,22 @@ def harmonise_allele_frequency(
         "Total_number_of_variants": df.height,
         "final_status": "started",
         "decision_source": None,
+        "eaf_provenance": None,
         "final_eaf_col": None,
     }
 
     final_df = None
-    with contextlib.ExitStack() as stack:
-        ctx = step_context
-        if ctx is None and logger is not None:
-            ctx = stack.enter_context(
-                logger.step(
-                    step_number,
-                    step_total,
-                    STEP_TITLE,
-                    FUNC_NAME,
-                    rows_in=df.height,
-                    policy_keys=list(STRAND_POLICY_KEYS) + list(POLICY_KEYS),
-                )
-            )
-        emit = _Emitter(logger=logger, ctx=ctx)
+    with shared_step_context(
+        logger,
+        step_context,
+        number=step_number,
+        total=step_total,
+        title=STEP_TITLE,
+        operation=FUNC_NAME,
+        rows_in=df.height,
+        policy_keys=list(STRAND_POLICY_KEYS) + list(POLICY_KEYS),
+    ) as ctx:
+        emit = ctx
         emit.info(
             "Giving every variant on chromosome %s an effect allele frequency. Starting with %s variants."
             % (chromosome, _fmt_int(df.height))
@@ -1235,8 +1439,10 @@ def harmonise_allele_frequency(
             # ------------------------------
             if internal_eaf and internal_eaf in df.columns:
                 emit.info("The study supplies its own frequency column '%s'." % internal_eaf)
+                qc_info["eaf_provenance"] = "study_supplied"
 
-                # captured BEFORE anything is clipped, so the count is real
+                # Capture the original invalid values before the configured
+                # reject, null, clip or fail action changes the working frame.
                 out_of_bound_df = _out_of_bound_frame(df, internal_eaf)
 
                 valid_range, is_suspicious, out_of_range, n_missing, cleaned_df, low_freq_pct, stats = \
@@ -1313,7 +1519,7 @@ def harmonise_allele_frequency(
                             raise AlleleFrequencyError(
                                 "Column '%s' is MAF-like, but the reference comparison was "
                                 "inconclusive (%s). Comparable non-palindromic variants: %s "
-                                "(minimum %s); mean error as EAF: %s; mean error as MAF: %s; "
+                                "(minimum %s); %s; mean error as EAF: %s; mean error as MAF: %s; "
                                 "required error separation: %s; reference-aligned EAF values at "
                                 "or below 0.5: %s (uninformative above %s). PostGWAS will not "
                                 "guess or apply the deferred allele-swap frequency flip. Provide "
@@ -1324,6 +1530,9 @@ def harmonise_allele_frequency(
                                     reference_stats.get("decision_reason", "unknown reason"),
                                     _fmt_int(reference_stats.get("comparable_variants", 0)),
                                     _fmt_int(reference_stats.get("minimum_overlap", 0)),
+                                    _maf_reference_suitability_text(
+                                        reference_stats
+                                    ),
                                     reference_stats.get("mean_eaf_error"),
                                     reference_stats.get("mean_maf_error"),
                                     reference_stats.get("minimum_error_margin"),
@@ -1391,23 +1600,288 @@ def harmonise_allele_frequency(
                 qc_info["external_eaf_file"] = os.path.basename(target_file)
                 qc_info["external_eaf_column"] = target_col
 
-                merged_df, new_col_name, merge_stats = merge_external_allele_frequencies(
-                    df,
-                    target_file,
-                    target_col,
-                    target_map,
-                    std_cols,
-                    chromosome,
-                    policies=pol,
-                    logger=logger,
-                    ctx=ctx,
-                    rejects=rejects,
-                    study_columns_canonical=True,
+                mapping_keys = ("chr", "pos", "a1", "a2")
+                target_delimiter = target_map.get("delimiter")
+                default_delimiter = (
+                    default_eaf_colmap.get("delimiter")
+                    if default_eaf_colmap
+                    else None
                 )
+                compatible_delimiter = (
+                    target_delimiter == default_delimiter
+                    or target_delimiter == "auto"
+                    or default_delimiter == "auto"
+                )
+                same_reference_file = (
+                    optional_text(default_eaf_file) is not None
+                    and os.path.realpath(target_file)
+                    == os.path.realpath(str(default_eaf_file))
+                )
+                same_reference_source = (
+                    same_reference_file
+                    and optional_text(default_eaf_column) == target_col
+                    and default_eaf_colmap is not None
+                    and compatible_delimiter
+                    and all(
+                        target_map.get(key) == default_eaf_colmap.get(key)
+                        for key in mapping_keys
+                    )
+                )
+                if same_reference_source:
+                    if REFERENCE_AF_COLUMN not in df.columns:
+                        raise AlleleFrequencyError(
+                            "Internal PostGWAS execution-order error: the explicitly selected "
+                            "external EAF source is identical to the strand reference, but its "
+                            "validated aligned frequency column is unavailable."
+                        )
+                    raw_frequency_screen = strand_qc.get(
+                        "raw_frequency_screen"
+                    )
+                    if not isinstance(raw_frequency_screen, dict):
+                        raise AlleleFrequencyError(
+                            "Internal PostGWAS execution-order error: the raw "
+                            "external-frequency screen was not retained from "
+                            "the identical strand reference."
+                        )
+                    reference_value = pl.col(REFERENCE_AF_COLUMN).cast(
+                        pl.Float64, strict=False
+                    )
+                    finite_value = reference_value.is_finite().fill_null(False)
+                    in_range = (
+                        (reference_value >= 0.0) & (reference_value <= 1.0)
+                    ).fill_null(False)
+                    usable_value = finite_value & in_range
+                    value_counts = df.select([
+                        usable_value.sum().alias("usable"),
+                        reference_value.is_null().sum().alias("missing"),
+                        (
+                            reference_value.is_not_null() & ~finite_value
+                        ).sum().alias("non_finite"),
+                        (
+                            reference_value.is_not_null()
+                            & finite_value
+                            & ~in_range
+                        ).sum().alias("out_of_range"),
+                        palindromic_snp_expression(
+                            pl.col(std_cols["ea"]), pl.col(std_cols["oa"])
+                        ).sum().alias("palindromic"),
+                    ]).to_dicts()[0]
+                    usable_rows = int(value_counts["usable"] or 0)
+                    usable_fraction = usable_rows / df.height if df.height else 0.0
+                    minimum_fraction = float(
+                        pol.get("eaf.external_min_match_fraction")
+                    )
+                    if df.height and usable_fraction < minimum_fraction:
+                        raise AlleleFrequencyError(
+                            "The external frequency file '%s' is identical to the validated "
+                            "strand reference, but its aligned column '%s' supplied a usable EAF "
+                            "for only %s of %s retained variants on chromosome %s (%s). This is "
+                            "below the %s required by eaf.external_min_match_fraction."
+                            % (
+                                target_file,
+                                target_col,
+                                _fmt_int(usable_rows),
+                                _fmt_int(df.height),
+                                chromosome,
+                                _fmt_pct(usable_fraction),
+                                _fmt_pct(minimum_fraction),
+                            )
+                        )
+                    actions = strand_qc.get("actions", {})
+                    direct_rows = int(actions.get("forward", 0) or 0) + int(
+                        actions.get("reverse_complement", 0) or 0
+                    )
+                    swapped_rows = int(
+                        actions.get("forward_swapped", 0) or 0
+                    ) + int(actions.get("reverse_complement_swapped", 0) or 0)
+                    palindromic_rows = int(value_counts["palindromic"] or 0)
+                    missing_rows = int(value_counts["missing"] or 0)
+                    non_finite_rows = int(value_counts["non_finite"] or 0)
+                    out_of_range_rows = int(value_counts["out_of_range"] or 0)
+                    merge_stats = {
+                        "external_rows_loaded": 0,
+                        "input_rows_before_merge": df.height,
+                        "direct_match_rows": direct_rows,
+                        "flip_match_rows": swapped_rows,
+                        "key_match_rows": df.height,
+                        "key_match_fraction": 1.0 if df.height else 0.0,
+                        "usable_match_rows": usable_rows,
+                        "usable_match_fraction": usable_fraction,
+                        "match_fraction": usable_fraction,
+                        "matched_missing_frequency_rows": missing_rows,
+                        "matched_non_finite_frequency_rows": non_finite_rows,
+                        "matched_out_of_range_frequency_rows": out_of_range_rows,
+                        "matched_unusable_frequency_rows": (
+                            missing_rows + non_finite_rows + out_of_range_rows
+                        ),
+                        "unusable_frequency_rows": df.height - usable_rows,
+                        "unmatched_rows": 0,
+                        "total_missing": missing_rows,
+                        "missing_fraction": (
+                            missing_rows / df.height if df.height else 0.0
+                        ),
+                        "min_match_fraction": minimum_fraction,
+                        "palindromic_evaluated_rows": palindromic_rows,
+                        "palindromic_orientation_resolved_rows": palindromic_rows,
+                        "palindromic_orientation_rejected_rows": 0,
+                        "palindromic_orientation_state_counts": (
+                            {"resolved_by_study_orientation": palindromic_rows}
+                            if palindromic_rows
+                            else {}
+                        ),
+                        "reused_aligned_strand_reference": True,
+                        "raw_frequency_screen": raw_frequency_screen,
+                        "maf_reference_decision": "not_required",
+                        "maf_reference_validation": {},
+                    }
+                    merged_df = df
+                    new_col_name = REFERENCE_AF_COLUMN
+                    emit.info(
+                        "Reused the allele-aligned population AF already retained from "
+                        "strand orientation because the explicitly selected external EAF "
+                        "file, column and allele mapping are identical; the reference "
+                        "table was not read a second time."
+                    )
+                else:
+                    merged_df, new_col_name, merge_stats = merge_external_allele_frequencies(
+                        df,
+                        target_file,
+                        target_col,
+                        target_map,
+                        std_cols,
+                        chromosome,
+                        policies=pol,
+                        logger=logger,
+                        ctx=ctx,
+                        rejects=rejects,
+                        study_columns_canonical=True,
+                        validation_reference_col=(
+                            None
+                            if same_reference_file
+                            else REFERENCE_AF_COLUMN
+                        ),
+                        validation_reference_file=default_eaf_file,
+                        validation_reference_column=default_eaf_column,
+                    )
+
+                raw_frequency_screen = dict(
+                    merge_stats.get("raw_frequency_screen") or {}
+                )
+                _add_prefixed_statistics(
+                    qc_info,
+                    "external_raw_af",
+                    raw_frequency_screen,
+                )
+                if raw_frequency_screen:
+                    emit.decide(
+                        "Raw external frequency column '%s'" % target_col,
+                        {
+                            "usable frequencies": _fmt_int(
+                                raw_frequency_screen.get("usable", 0)
+                            ),
+                            "at or below 0.5": "%s (%s)"
+                            % (
+                                _fmt_int(raw_frequency_screen.get(
+                                    "at_or_below_0_5", 0
+                                )),
+                                _fmt_pct(raw_frequency_screen.get(
+                                    "low_fraction_of_usable", 0.0
+                                )),
+                            ),
+                            "decision cutoff": raw_frequency_screen.get(
+                                "decision_cutoff"
+                            ),
+                        },
+                        (
+                            "MAF-like and requiring independent reference confirmation"
+                            if raw_frequency_screen.get("maf_like") is True
+                            else (
+                                "not MAF-like; retaining the declared external "
+                                "ALT/EAF contract"
+                            )
+                        ),
+                    )
+                if raw_frequency_screen.get("maf_like") is True:
+                    if same_reference_file:
+                        raise AlleleFrequencyError(
+                            "The external AF column '%s' is MAF-like: %s of %s "
+                            "usable values are at or below 0.5 (%s), exceeding "
+                            "eaf.maf_decision_cutoff=%s. external_eaf_file and "
+                            "the resource selected by "
+                            "modules.harmonisation.default_eaf.source resolve "
+                            "to the same file '%s', so PostGWAS cannot independently "
+                            "determine whether the column is ALT/EAF or MAF. "
+                            "Configure a different modules.harmonisation.default_eaf.source "
+                            "and rerun."
+                            % (
+                                target_col,
+                                _fmt_int(raw_frequency_screen.get(
+                                    "at_or_below_0_5", 0
+                                )),
+                                _fmt_int(raw_frequency_screen.get("usable", 0)),
+                                _fmt_pct(raw_frequency_screen.get(
+                                    "low_fraction_of_usable", 0.0
+                                )),
+                                raw_frequency_screen.get("decision_cutoff"),
+                                target_file,
+                            )
+                        )
+                    external_decision = merge_stats.get(
+                        "maf_reference_decision"
+                    )
+                    external_validation = dict(
+                        merge_stats.get("maf_reference_validation") or {}
+                    )
+                    _add_prefixed_statistics(
+                        qc_info,
+                        "external_maf_reference",
+                        external_validation,
+                    )
+                    qc_info["external_maf_reference_decision"] = (
+                        external_decision
+                    )
+                    if external_decision == "maf":
+                        raise AlleleFrequencyError(
+                            "The external AF column '%s' was confirmed as minor "
+                            "allele frequency rather than ALT/effect-allele "
+                            "frequency. Configure an external_eaf_column containing "
+                            "the frequency of the file's declared ALT allele."
+                            % target_col
+                        )
+                    if external_decision != "eaf":
+                        raise AlleleFrequencyError(
+                            "The external AF column '%s' is MAF-like, but comparison "
+                            "with the independent default EAF reference was "
+                            "inconclusive (%s). Comparable non-palindromic variants: "
+                            "%s (minimum %s); %s; mean error as EAF: %s; mean error as "
+                            "MAF: %s; required error separation: %s. PostGWAS will "
+                            "not guess. Configure a different external ALT/EAF "
+                            "column or a more suitable independent "
+                            "modules.harmonisation.default_eaf reference."
+                            % (
+                                target_col,
+                                external_validation.get(
+                                    "decision_reason", "unknown reason"
+                                ),
+                                _fmt_int(external_validation.get(
+                                    "comparable_variants", 0
+                                )),
+                                _fmt_int(external_validation.get(
+                                    "minimum_overlap", 0
+                                )),
+                                _maf_reference_suitability_text(
+                                    external_validation
+                                ),
+                                external_validation.get("mean_eaf_error"),
+                                external_validation.get("mean_maf_error"),
+                                external_validation.get("minimum_error_margin"),
+                            )
+                        )
 
                 _add_prefixed_statistics(qc_info, "external_merge", merge_stats)
 
-                # captured BEFORE the clip inside validate_allele_frequency
+                # Capture invalid reference values before the configured
+                # frequency-range action changes the working frame.
                 out_of_bound_df = _out_of_bound_frame(merged_df, new_col_name)
 
                 _, _, _, _, cleaned_df, _, stats = validate_allele_frequency(
@@ -1428,12 +1902,36 @@ def harmonise_allele_frequency(
                 final_eaf_col = new_col_name
                 if qc_info["decision_source"] != "internal_eaf_rejected_inconclusive":
                     qc_info["decision_source"] = "external_eaf"
+                qc_info["eaf_provenance"] = "reference_imputed"
 
             # ------------------------------
             # FINALIZE
             # ------------------------------
             if final_df is None or final_eaf_col is None:
                 raise AlleleFrequencyError("Failed to determine which column holds the effect allele frequency.")
+
+            # The reference has now fixed ALT/REF orientation, and any deferred
+            # MAF-like-column proof has also applied the required 1-EAF change
+            # to swapped rows. Comparing duplicates before this boundary could
+            # falsely call an EAF disagreement that step 04 was still required
+            # to reconcile.
+            sample_column_dict["eaf_col"] = final_eaf_col
+            final_df, post_orientation_duplicate_qc = (
+                _resolve_reference_aligned_duplicates(
+                    chromosome=chromosome,
+                    df=final_df,
+                    sample_column_dict=sample_column_dict,
+                    output_layout=output_layout,
+                    output_delimiter=output_delimiter,
+                    policies=pol,
+                    logger=logger,
+                    ctx=ctx,
+                    rejects=rejects,
+                )
+            )
+            qc_info["post_orientation_duplicates"] = (
+                post_orientation_duplicate_qc
+            )
 
             missing_eaf_df = final_df.filter(pl.col(final_eaf_col).is_null())
             missing_eaf_count = missing_eaf_df.height
@@ -1490,11 +1988,9 @@ def harmonise_allele_frequency(
                     pl.col(final_eaf_col).is_not_null()
                     & pl.col(REFERENCE_AF_COLUMN).is_not_null()
                 )
-                allele_pair = pl.concat_str([
-                    pl.col(std_cols["ea"]).cast(pl.Utf8).str.to_uppercase(),
-                    pl.col(std_cols["oa"]).cast(pl.Utf8).str.to_uppercase(),
-                ])
-                palindromic = allele_pair.is_in(list(PALINDROMIC_PAIRS)).fill_null(False)
+                palindromic = palindromic_snp_expression(
+                    pl.col(std_cols["ea"]), pl.col(std_cols["oa"])
+                )
                 discordant = (
                     comparable & (pl.col(af_difference_col) > tolerance)
                 ).fill_null(False)
@@ -1534,7 +2030,7 @@ def harmonise_allele_frequency(
                 if n_pal_discordant and palindromic_action == "fail":
                     raise AlleleFrequencyError(
                         "%s palindromic variants differ from the aligned population "
-                        "reference AF by more than %s after study-consensus orientation, "
+                        "reference AF by more than %s after resolved study orientation, "
                         "and strand.palindromic_af_discordance_action is 'fail'."
                         % (_fmt_int(n_pal_discordant), tolerance)
                     )
@@ -1546,22 +2042,27 @@ def harmonise_allele_frequency(
                         % (_fmt_int(n_non_pal_discordant), tolerance)
                     )
                 if palindromic_action == "reject":
-                    final_df = _reject_rows(
+                    final_df, _ = reject_rows(
                         final_df,
                         palindromic_discordant,
-                        "af_discordant",
-                        emit,
-                        rejects=rejects,
+                        step_label=STEP_LABEL,
+                        reason="af_discordant",
+                        context=emit,
+                        collector=rejects,
                         detail=(
                             "palindromic variant has absolute EAF difference above %s "
-                            "after study-consensus orientation" % tolerance
+                            "after resolved study orientation" % tolerance
                         ),
                         check_name="palindromic study/reference frequency concordance",
-                        plain_english=(
-                            "After study-wide strand consensus selected the orientation, "
+                        description=(
+                            "After automatic consensus/internal study EAF or an explicit "
+                            "reference-aligned declaration selected the orientation, "
                             "the palindromic variant's aligned study EAF differs from the "
                             "configured population reference by more than %s." % tolerance
                         ),
+                        warn_on_remove=True,
+                        warn_without_collector=True,
+                        record_empty=True,
                     )
                 else:
                     emit.qc(
@@ -1574,22 +2075,28 @@ def harmonise_allele_frequency(
                         ),
                         final_df.height,
                         final_df.height,
-                        changed=n_pal_discordant,
+                        matched=n_pal_discordant,
+                        outcome="retained_without_frequency_change",
                         warn=n_pal_discordant > 0,
+                        step=STEP_LABEL,
                     )
                 if non_palindromic_action == "reject":
-                    final_df = _reject_rows(
+                    final_df, _ = reject_rows(
                         final_df,
                         non_palindromic_discordant,
-                        "af_discordant",
-                        emit,
-                        rejects=rejects,
+                        step_label=STEP_LABEL,
+                        reason="af_discordant",
+                        context=emit,
+                        collector=rejects,
                         detail="absolute EAF difference above %s" % tolerance,
                         check_name="non-palindromic study/reference frequency concordance",
-                        plain_english=(
+                        description=(
                             "The aligned study EAF differs from the configured population "
                             "reference by more than %s." % tolerance
                         ),
+                        warn_on_remove=True,
+                        warn_without_collector=True,
+                        record_empty=True,
                     )
                 else:
                     emit.qc(
@@ -1603,8 +2110,10 @@ def harmonise_allele_frequency(
                         ),
                         final_df.height,
                         final_df.height,
-                        changed=n_non_pal_discordant,
+                        matched=n_non_pal_discordant,
+                        outcome="retained_without_frequency_change",
                         warn=n_non_pal_discordant > 0,
+                        step=STEP_LABEL,
                     )
             else:
                 qc_info["strand_af_comparable"] = 0
@@ -1614,22 +2123,10 @@ def harmonise_allele_frequency(
                 qc_info["strand_non_palindromic_af_comparable"] = 0
                 qc_info["strand_non_palindromic_af_discordant"] = 0
 
-            final_df = final_df.with_columns([
-                pl.when(pl.col(final_eaf_col).is_null())
-                .then(None)
-                .when(pl.col(final_eaf_col) <= 0.5)
-                .then(pl.col(final_eaf_col))
-                .otherwise(1 - pl.col(final_eaf_col))
-                .alias("zmaf"),
-
-                pl.col(final_eaf_col).clip(0.0, 1.0).alias(final_eaf_col),
-            ])
-
             # ---- frequencies of exactly 0 or 1 ----------------------------
-            # These make the standard-error denominator 2*p*(1-p)*(Neff+z^2)
-            # exactly zero, which yields inf rather than null and slips through
-            # every later gate.  Clipping is what creates them, so this has to
-            # run after the clip above.
+            # These make either configured step-06 reconstruction denominator
+            # exactly zero, which yields inf rather than null without its
+            # reconstruction-specific guard.
             # fill_null(False): a missing frequency is not a degenerate one
             degenerate_expr = (
                 (pl.col(final_eaf_col) == 0.0) | (pl.col(final_eaf_col) == 1.0)
@@ -1644,26 +2141,32 @@ def harmonise_allele_frequency(
                 )
             if degenerate_action == "reject":
                 before_degenerate = final_df.height
-                final_df = _reject_rows(
+                final_df, _ = reject_rows(
                     final_df,
                     degenerate_expr,
-                    "eaf_degenerate",
-                    emit,
-                    rejects=rejects,
+                    step_label=STEP_LABEL,
+                    reason="eaf_degenerate",
+                    context=emit,
+                    collector=rejects,
                     detail="%s is exactly 0 or 1" % final_eaf_col,
                     check_name="degenerate frequencies",
-                    plain_english=(
+                    description=(
                         "A frequency of exactly 0 or 1 makes the standard-error formula divide by zero, "
                         "so those variants were removed."
                     ),
+                    warn_on_remove=True,
+                    warn_without_collector=True,
+                    record_empty=True,
                 )
                 qc_info["eaf_degenerate_removed"] = before_degenerate - final_df.height
             elif degenerate_action == "null":
                 before_degenerate = final_df.height
-                final_df = final_df.with_columns([
-                    pl.when(degenerate_expr).then(None).otherwise(pl.col(final_eaf_col)).alias(final_eaf_col),
-                    pl.when(degenerate_expr).then(None).otherwise(pl.col("zmaf")).alias("zmaf"),
-                ])
+                final_df = final_df.with_columns(
+                    pl.when(degenerate_expr)
+                    .then(None)
+                    .otherwise(pl.col(final_eaf_col))
+                    .alias(final_eaf_col)
+                )
                 emit.qc(
                     "degenerate frequencies",
                     "%s variants have a frequency of exactly 0 or 1, which makes the standard-error "
@@ -1673,9 +2176,10 @@ def harmonise_allele_frequency(
                     final_df.height,
                     changed=n_degenerate,
                     warn=n_degenerate > 0,
+                    step=STEP_LABEL,
                 )
                 qc_info["eaf_degenerate_removed"] = 0
-            else:  # "keep"
+            elif degenerate_action == "keep":
                 emit.qc(
                     "degenerate frequencies",
                     "%s variants have a frequency of exactly 0 or 1; policy eaf.degenerate is 'keep', so "
@@ -1683,6 +2187,18 @@ def harmonise_allele_frequency(
                     final_df.height,
                     final_df.height,
                     warn=n_degenerate > 0,
+                    step=STEP_LABEL,
+                )
+                qc_info["eaf_degenerate_removed"] = 0
+            else:  # "fail" with no degenerate values
+                emit.qc(
+                    "degenerate frequencies",
+                    "No frequencies of exactly 0 or 1 were found; policy "
+                    "eaf.degenerate is 'fail', so no action was needed.",
+                    final_df.height,
+                    final_df.height,
+                    changed=0,
+                    step=STEP_LABEL,
                 )
                 qc_info["eaf_degenerate_removed"] = 0
 

@@ -22,6 +22,12 @@ Provide either `chromosome_column` plus `position_column`, or
 `other_allele_column` are required. `variant_id_column` is optional because an
 identifier can be constructed after validation.
 
+Positions are ordinary 1-based GWAS coordinates and must resolve to finite
+whole numbers of at least 1. Integer-valued representations such as `100`,
+`100.0`, and `1e2` are accepted without changing their value. Fractional,
+non-finite, zero, negative, and unreadable positions are rejected as
+`invalid_position`; PostGWAS never truncates a fractional coordinate.
+
 Allele order is scientifically meaningful: the effect estimate and effect
 allele frequency refer to `effect_allele_column`.
 
@@ -32,8 +38,10 @@ Provide `effect_column` or `z_score_column`. `effect_type` accepts `beta`,
 harmonisation. `standard_error_column` is optional because PostGWAS can derive a
 standard error from valid statistics under configured policies.
 
-`p_value_column` is required. Declare `p_value_type` as `raw`, `neglog10`,
-`negln`, or `auto` so transformed P values are not treated as raw values.
+`p_value_column` is required. Declare `p_value_type` as `raw`, `neglog10`, or
+`auto` so transformed P values are not treated as raw values. Convert signed
+logarithms and natural-log representations to raw P or non-negative -log10 P
+before harmonisation.
 
 ## EAF and INFO mappings
 
@@ -57,6 +65,19 @@ example `/references/GRCh37_panel_chr{chromosome}.tsv.gz`. Do not enter only the
 common filename prefix: PostGWAS does not guess which matching file belongs to
 each chromosome.
 
+`external_eaf_column` declares an ALT/effect-allele frequency, not MAF. Before
+allele-swapped matches apply `1-AF`, PostGWAS screens the deduplicated raw column.
+A non-MAF-like distribution retains that declaration. A MAF-like distribution
+must be confirmed against the independently configured
+`modules.harmonisation.default_eaf` panel. Confirmed MAF or inconclusive evidence
+stops; PostGWAS does not auto-convert it. If both sources resolve to the same
+physical file, choose a different `modules.harmonisation.default_eaf.source` so
+the comparison is independent. Before deciding EAF versus MAF, PostGWAS also
+requires the supplied and default panels to have compatible folded-MAF spectra
+under the YAML-configured correlation and mean-absolute-difference limits. This
+checks whether the chosen default population panel is suitable; it does not use
+correlation alone to infer allele direction.
+
 ## Sample-size mappings
 
 For a quantitative trait, provide `control_count_column` or `control_count`;
@@ -66,6 +87,44 @@ For a case-control trait, provide controls using `control_count_column` or
 `control_count`, and cases using `case_count_column` or `case_count`. Counts
 must be positive whole numbers. Effective N is
 `4 / (1/Ncase + 1/Ncontrol)`.
+
+### A case-control file containing only precomputed Neff
+
+The version-2 sample sheet has no separate effective-N field. If the source
+contains a valid, already calculated Neff but does not contain case and control
+counts, mapping that Neff column to `control_count_column` preserves the number
+for downstream consumers that require effective N only. MiXeR is such a
+consumer: its
+[official input guidance](https://github.com/precimed/mixer)
+defines case-control N as effective N.
+
+Use this sample-sheet mapping only when the source column is explicitly defined
+as precomputed effective N by the study documentation:
+
+```csv
+trait_type,control_count_column,case_count_column
+auto,NEFF,NA
+```
+
+Do not declare the binary source quantitative. An explicit `case_control`
+declaration requires case counts, so `auto` is the only current compatibility
+route when those counts are unavailable.
+
+This mapping is a compatibility workaround, not a complete representation of
+the study design. Without a case column, downstream formatting classifies the
+study as quantitative. The resulting VCF records the supplied value as total
+sample size and control count as well as effective sample size. Consequently,
+do not use the workaround when an analysis needs any of the following:
+
+- actual total sample size;
+- separate case and control counts;
+- sample prevalence or automatic case-control classification;
+- liability-scale LDSC without separately supplied sample prevalence.
+
+The input column must already be Neff. A binary study's total N alone, or its
+actual control count alone, is not Neff and cannot determine Neff without the
+case/control ratio. When those downstream meanings matter, obtain and map both
+case and control counts instead.
 
 ## Inference and aliases
 
@@ -87,16 +146,22 @@ python -m postgwas.modules.harmonisation.sample_sheet_generator \
 ```
 
 The generator reads only enough records to determine the delimiter and header.
-Every supported input file becomes one row in the same output CSV, ordered by
-filename. Selected column mappings preserve the source header spelling exactly,
-including a leading `#` in names such as `#chr` or `#chrom`. The terminal summary
-reports the number of ready rows and lists only datasets requiring attention.
-The complete recognized file suffix is removed from `dataset_id`; for example,
-`study.vcf.gz` becomes `study`, not `study.vcf`.
+Every valid supported input file becomes one row in the same output CSV,
+ordered by filename. Selected column mappings preserve the source header
+spelling exactly, including a leading `#` in names such as `#chr` or `#chrom`.
+The terminal summary reports the number of ready rows and lists only datasets
+requiring attention. The complete recognized file suffix is removed from
+`dataset_id`; for example, `study.vcf.gz` becomes `study`, not `study.vcf`.
 An unresolved EAF mapping is written as `NA` so the user can add either the
-exact internal frequency column or an external EAF file/column pair. Unresolved
-chromosome, position, allele, effect, or p-value mappings still stop generation
-without publishing a partial multi-study sheet.
+exact internal frequency column or an external EAF file/column pair. Under the
+default `sample_sheet_generator.failure_policy: write_valid` policy, files with
+unresolved chromosome, position, allele, effect, or p-value mappings are
+omitted from the draft and recorded with their full path and exact reason in
+the companion `<output>.rejected_files.tsv` report. The terminal summary also
+lists every rejected file, so exclusion is never silent. Generation still
+fails when no candidate can be mapped. Set `failure_policy: fail_all` in a run
+configuration to require every candidate file to map before any output is
+published.
 
 It writes the same fields as the validated sample-sheet model and sets
 `trait_type`, `effect_type`, and `p_value_type` to `auto` for every dataset.
@@ -115,9 +180,9 @@ Missing sample size is written as `NA` under the default
 `sample_sheet_generator.on_missing_sample_size: write_draft` policy. The
 terminal warning identifies the exact fields that must be completed, and the
 normal harmonisation sample-sheet validator still rejects the draft until they
-are supplied. Set the policy to `fail` to retain strict generation. Other
-unresolved required mappings stop generation without publishing partial
-output, except for EAF as described above.
+are supplied. Set the policy to `fail` to reject that individual file during
+generation. The separate `failure_policy` then decides whether other valid
+files may still be written.
 
 MAF-like and allele-ambiguous frequency headers are retained with visible
 review warnings; reference-panel frequency columns are never relabelled as

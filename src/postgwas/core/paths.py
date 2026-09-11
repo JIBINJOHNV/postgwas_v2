@@ -6,6 +6,8 @@ from pathlib import Path
 import shutil
 from typing import Type
 
+from postgwas.core.input_validation import record_file_validation
+
 
 def configured_output_path(
     root: str | Path,
@@ -105,10 +107,20 @@ def require_nonempty_file(
 ) -> Path:
     """Resolve and require one regular, non-empty input file."""
     if value is None or not str(value).strip():
-        raise error_type("%s is required" % label)
+        message = "%s is required" % label
+        record_file_validation(None, label, status="failed", message=message)
+        raise error_type(message)
     path = Path(value).expanduser().resolve()
     if not path.is_file() or path.stat().st_size <= 0:
-        raise error_type("%s does not exist or is empty: %s" % (label, path))
+        message = "%s does not exist or is empty: %s" % (label, path)
+        record_file_validation(
+            path, label, status="failed", message=message,
+            checks=("regular file", "non-empty file"),
+        )
+        raise error_type(message)
+    record_file_validation(
+        path, label, checks=("regular file", "non-empty file"),
+    )
     return path
 
 

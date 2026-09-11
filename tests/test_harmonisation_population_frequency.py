@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from postgwas.config import load_configuration
 from postgwas.modules.harmonisation.population_frequency import (
     assess_population_frequency_table,
@@ -75,6 +77,41 @@ def test_only_the_best_population_must_pass_the_minimum_correlation(tmp_path):
     )
 
     assert result["closest_population"] == "EUR"
+
+
+def test_strong_negative_correlation_is_named_as_frequency_inversion(tmp_path):
+    table = tmp_path / "inverted_frequencies.tsv"
+    table.write_text(
+        "STUDY_AF\tAFR\tEAS\tEUR\tSAS\n"
+        "0.90\t0.11\t0.12\t0.10\t0.13\n"
+        "0.80\t0.21\t0.22\t0.20\t0.23\n"
+        "0.70\t0.31\t0.32\t0.30\t0.33\n"
+        "0.60\t0.41\t0.42\t0.40\t0.43\n",
+        encoding="utf-8",
+    )
+
+    result = assess_population_frequency_table(
+        table,
+        _settings(),
+        delimiter="\t",
+        null_values=["", "."],
+    )
+    selected, selected_warnings = check_selected_population(
+        result["closest_population"], "EUR", ["AFR", "EAS", "EUR", "SAS"],
+    )
+
+    assert result["status"] == "frequency_inversion_suspected"
+    assert result["closest_population"] is None
+    assert result["inversion_candidate_population"] == "EUR"
+    assert result["populations"]["EUR"]["pearson_correlation"] == pytest.approx(
+        -1.0
+    )
+    assert result["populations"]["EUR"][
+        "inverted_mean_absolute_difference"
+    ] == pytest.approx(0.0)
+    assert "non-effect allele" in result["warnings"][0]
+    assert selected["status"] == "not_compared"
+    assert selected_warnings == []
 
 
 def test_external_eaf_and_info_filenames_receive_the_same_mismatch_warning():

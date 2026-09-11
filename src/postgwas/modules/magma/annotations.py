@@ -9,8 +9,10 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from postgwas.core.gene_coordinates import read_gene_coordinates
+from postgwas.core.input_validation import record_file_validation
 from postgwas.core.io.delimiters import open_text
-from postgwas.core.io.reports import write_delimited_report
+from postgwas.core.io.reports import write_delimited_report, write_text_lines_report
 from postgwas.core.paths import require_nonempty_file
 from postgwas.modules.magma.errors import MagmaError
 from postgwas.modules.magma.reference import read_reference_bim_matches
@@ -20,75 +22,113 @@ def read_gene_locations(
     gene_location_file: str | Path,
     module_config,
     label: str = "MAGMA gene-location reference",
+    *,
+    has_header: bool | None = None,
 ) -> dict[str, tuple[str, int, int, str, str | None]]:
-    """Read the configured five-column MAGMA locations plus optional alias."""
-    source = require_nonempty_file(
-        gene_location_file, label, error_type=MagmaError,
-    )
+    """Apply MAGMA's chromosome policy to the shared immutable gene reader."""
     input_config = module_config.input
-    roles = input_config.gene_location_columns
-    indexes = {role: roles.index(role) for role in roles}
-    delimiter = re.compile(input_config.table_delimiter_pattern)
-    locations: dict[str, tuple[str, int, int, str, str | None]] = {}
-    header_pending = input_config.gene_location_has_header
-    try:
-        with open_text(source) as handle:
-            for line_number, raw in enumerate(handle, 1):
-                text = raw.strip()
-                if not text or text.startswith(
-                    module_config.annotation_validation.comment_prefix
-                ):
-                    continue
-                if header_pending:
-                    header_pending = False
-                    continue
-                fields = delimiter.split(text)
-                if len(fields) not in {5, 6}:
-                    raise MagmaError(
-                        "%s line %d must contain five columns plus an optional "
-                        "alternate gene identifier; found %d"
-                        % (label, line_number, len(fields))
-                    )
-                gene = fields[indexes["gene_id"]].strip()
-                chromosome = fields[indexes["chromosome"]].strip()
-                try:
-                    start = int(fields[indexes["start"]])
-                    end = int(fields[indexes["end"]])
-                except ValueError as exc:
-                    raise MagmaError(
-                        "%s line %d requires integer start and end coordinates"
-                        % (label, line_number)
-                    ) from exc
-                strand = fields[indexes["strand"]].strip()
-                if (
-                    not gene
-                    or not chromosome
-                    or chromosome in input_config.invalid_chromosome_labels
-                    or start < 1
-                    or end < start
-                    or strand not in {"+", "-"}
-                ):
-                    raise MagmaError(
-                        "%s line %d has an invalid gene ID, chromosome, interval, "
-                        "or strand" % (label, line_number)
-                    )
-                if gene in locations:
-                    raise MagmaError(
-                        "%s repeats primary gene ID %s at line %d"
-                        % (label, gene, line_number)
-                    )
-                alternate_index = indexes.get("alternate_gene_id")
-                alternate = (
-                    fields[alternate_index].strip() or None
-                    if alternate_index is not None and alternate_index < len(fields)
-                    else None
-                )
-                locations[gene] = (chromosome, start, end, strand, alternate)
-    except (OSError, UnicodeError) as exc:
-        raise MagmaError("Cannot read %s %s: %s" % (label, source, exc)) from exc
-    if not locations:
-        raise MagmaError("%s contains no genes" % label)
-    return locations
+    rows = read_gene_coordinates(
+        gene_location_file,
+        column_roles=["gene" if role == "gene_id" else role for role in input_config.gene_location_columns],
+        delimiter_pattern=input_config.table_delimiter_pattern,
+        has_header=input_config.gene_location_has_header if has_header is None else has_header,
+        comment_prefix=module_config.annotation_validation.comment_prefix,
+        compressed=True,
+        label=label,
+        error_type=MagmaError,
+    )
+    invalid_chromosomes = set(input_config.invalid_chromosome_labels)
+    for row in rows:
+        if row.chromosome in invalid_chromosomes:
+            message = "%s has an invalid gene ID, chromosome, interval, or strand for gene %s" % (label, row.gene)
+            record_file_validation(gene_location_file, label, status="failed", message=message)
+            raise MagmaError(message)
+    return {
+        row.gene: (row.chromosome, row.start, row.end, row.strand, row.alternate)
+        for row in rows
+    }
+
+
+def write_pathway_compatible_gene_locations(
+    gene_location_file: str | Path,
+    output_file: str | Path,
+    module_config,
+    logger,
+) -> tuple[Path, dict]:
+    """Write a positional MAGMA location file keyed by alternate gene IDs."""
+    locations = read_gene_locations(gene_location_file, module_config)
+    roles = module_config.input.gene_location_columns
+    alternate_column = (
+        roles.index("alternate_gene_id") + 1
+        if "alternate_gene_id" in roles else None
+    )
+    grouped: dict[str, list[tuple[str, str, int, int, str]]] = {}
+    missing_alternate_ids = 0
+    for primary, (chromosome, start, end, strand, alternate) in locations.items():
+        if alternate is None:
+            missing_alternate_ids += 1
+            continue
+        grouped.setdefault(alternate, []).append(
+            (primary, chromosome, start, end, strand)
+        )
+    if not grouped:
+        raise MagmaError(
+            "The configured gene-location file contains no non-empty alternate "
+            "gene identifiers%s"
+            % (
+                " in column %d" % alternate_column
+                if alternate_column is not None else ""
+            )
+        )
+    ambiguous = {
+        alternate: candidates
+        for alternate, candidates in grouped.items()
+        if len(candidates) > 1
+    }
+    policy = module_config.gene_sets.alternate_id_duplicate_policy
+    if ambiguous and policy == "error":
+        raise MagmaError(
+            "Gene-location column %d contains %d identifiers assigned to multiple "
+            "intervals; examples: %s. Change "
+            "gene_sets.alternate_id_duplicate_policy or provide unique identifiers."
+            % (
+                alternate_column,
+                len(ambiguous),
+                ", ".join(list(ambiguous)[:5]),
+            )
+        )
+    selected = []
+    for alternate, candidates in grouped.items():
+        # The configured longest-interval policy is deterministic: primary ID
+        # breaks equal-length ties without depending on input row order.
+        primary, chromosome, start, end, strand = sorted(
+            candidates,
+            key=lambda value: (-(value[3] - value[2] + 1), value[0]),
+        )[0]
+        selected.append((alternate, chromosome, start, end, strand, primary))
+    delimiter = module_config.input.output_table_delimiter
+    destination = write_text_lines_report(
+        [delimiter.join(map(str, record)) for record in selected],
+        output_file,
+    )
+    metrics = {
+        "input_rows": len(locations),
+        "missing_alternate_id_rows": missing_alternate_ids,
+        "unique_alternate_ids": len(grouped),
+        "ambiguous_alternate_ids": len(ambiguous),
+        "duplicate_rows_removed": sum(
+            len(candidates) - 1 for candidates in ambiguous.values()
+        ),
+        "duplicate_policy": policy,
+        "retained_rows": len(selected),
+    }
+    logger.record(
+        "OUTPUT",
+        "magma_pathway_compatible_gene_locations",
+        path=str(destination),
+        **metrics,
+    )
+    return destination, metrics
 
 
 def validate_gene_annotation(
@@ -177,6 +217,148 @@ def validate_gene_annotation(
         "minimum_bim_overlap_fraction": minimum,
     }
     logger.record("RESULT", "magma_annotation_validation", **result)
+    return result
+
+
+def prepare_scoped_gene_annotation(
+    annotation_file: str | Path,
+    output_file: str | Path,
+    excluded_genes_file: str | Path,
+    summary_file: str | Path,
+    module_config,
+    analysis_scope: dict,
+    logger,
+) -> dict:
+    """Create a run-owned MAGMA annotation restricted to the configured scope."""
+    source = require_nonempty_file(
+        annotation_file, "MAGMA gene annotation", error_type=MagmaError,
+    )
+    policy = module_config.annotation_validation
+    coordinate = re.compile(policy.coordinate_pattern)
+    delimiter = re.compile(module_config.input.table_delimiter_pattern)
+    chromosome_exclusions = set(analysis_scope["exclude_chromosomes"])
+    exclude_mhc = analysis_scope.get("exclude_mhc_genes", False)
+    mhc = analysis_scope["mhc_region"]
+    retained: list[str] = []
+    exclusions: list[tuple[str, str, str, int, int]] = []
+    total = 0
+    report = module_config.exclusion_reporting
+    try:
+        with open_text(source) as handle:
+            for line_number, raw in enumerate(handle, 1):
+                text = raw.strip()
+                if not text or text.startswith(policy.comment_prefix):
+                    continue
+                fields = delimiter.split(text)
+                if len(fields) < 2:
+                    raise MagmaError(
+                        "MAGMA annotation line %d has fewer than two fields: %s"
+                        % (line_number, source)
+                    )
+                match = coordinate.fullmatch(fields[1])
+                if match is None:
+                    raise MagmaError(
+                        "MAGMA annotation line %d has an invalid configured "
+                        "coordinate: %s" % (line_number, fields[1])
+                    )
+                chromosome = re.sub(
+                    module_config.input.chromosome_prefix_pattern,
+                    "",
+                    match.group("chromosome"),
+                ).upper()
+                chromosome = module_config.input.chromosome_aliases.get(
+                    chromosome, chromosome,
+                )
+                start = int(match.group("start"))
+                end = int(match.group("end"))
+                total += 1
+                reason = None
+                if chromosome in chromosome_exclusions:
+                    reason = report.chromosome_reason
+                elif (
+                    exclude_mhc
+                    and mhc is not None
+                    and chromosome == mhc["chromosome"]
+                    and start <= mhc["end"]
+                    and end >= mhc["start"]
+                ):
+                    reason = report.mhc_reason
+                if reason is None:
+                    retained.append(text)
+                else:
+                    exclusions.append((fields[0], reason, chromosome, start, end))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise MagmaError(
+            "Cannot apply MAGMA gene exclusions to %s: %s" % (source, exc)
+        ) from exc
+    if not retained:
+        raise MagmaError(
+            "MAGMA chromosome and MHC policies excluded every annotated unit"
+        )
+    destination = Path(output_file)
+    excluded_destination = Path(excluded_genes_file)
+    summary_destination = Path(summary_file)
+    for path in (destination, excluded_destination, summary_destination):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.write_text("\n".join(retained) + "\n", encoding="utf-8")
+        excluded_destination.write_text(
+            "%s\t%s\t%s\t%s\t%s\n"
+            % (
+                module_config.result_schema.gene_id_column,
+                report.reason_column,
+                module_config.input.chromosome_column,
+                report.start_column,
+                report.end_column,
+            )
+            + "".join(
+                "%s\t%s\t%s\t%d\t%d\n" % record for record in exclusions
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        raise MagmaError(
+            "Cannot write MAGMA scoped annotation or exclusion audit: %s" % exc
+        ) from exc
+    by_reason = {
+        reason: sum(record[1] == reason for record in exclusions)
+        for reason in (report.chromosome_reason, report.mhc_reason)
+    }
+    summary = [
+        {
+            report.scope_column: report.annotated_units_scope,
+            report.reason_column: reason,
+            report.excluded_count_column: count,
+            report.input_count_column: total,
+            report.retained_count_column: len(retained),
+        }
+        for reason, count in by_reason.items()
+    ]
+    write_delimited_report(
+        summary,
+        summary_destination,
+        fieldnames=[
+            report.scope_column,
+            report.reason_column,
+            report.excluded_count_column,
+            report.input_count_column,
+            report.retained_count_column,
+        ],
+        delimiter=module_config.result_schema.report_delimiter,
+        null_value=module_config.result_schema.report_null_value,
+    )
+    result = {
+        "source_annotation": str(source),
+        "analysis_annotation": str(destination),
+        "input_units": total,
+        "retained_units": len(retained),
+        "excluded_units": len(exclusions),
+        "excluded_by_reason": by_reason,
+        "excluded_gene_ids": [record[0] for record in exclusions],
+        "excluded_genes_file": str(excluded_destination),
+        "exclusion_summary": str(summary_destination),
+    }
+    logger.record("RESULT", "magma_gene_scope", **result)
     return result
 
 
@@ -565,5 +747,6 @@ def map_regulatory_elements_to_genes(
 __all__ = [
     "map_regulatory_elements_to_genes",
     "merge_gene_annotations",
+    "prepare_scoped_gene_annotation",
     "validate_gene_annotation",
 ]

@@ -116,6 +116,45 @@ def test_pipeline_flames_runner_rejects_missing_credible_set_handoff(tmp_path):
         run_flames_runner(args, context)
 
 
+def test_pipeline_flames_runner_uses_native_not_corrected_magmacovar_result(
+    tmp_path, monkeypatch,
+):
+    args = argparse.Namespace(output_directory=str(tmp_path))
+    context = {
+        "finemap": {"status": SUSIE_STATUS_SUCCESS, "flames_input": "credible"},
+        "magma": {
+            "primary_mapping": "positional",
+            "mapping_analyses": {
+                "positional": {
+                    "result_statistic_type": "calibrated_gene_p_value",
+                },
+            },
+            "magma_genes_out": "study.genes.out",
+        },
+        "magma_covar": {
+            "raw_results": "study.gsa.out",
+            "corrected_results": "study_magmacovar_corrected.tsv",
+        },
+        "pops_output": "study.pops.tsv",
+    }
+    observed = {}
+
+    def fake_flames(runtime_args):
+        observed["magmacovar"] = runtime_args.magma_covariate_results_file
+        return "completed"
+
+    monkeypatch.setattr(
+        "postgwas.modules.flames.service.run_flames_direct", fake_flames,
+    )
+
+    result = run_flames_runner(args, context)
+
+    assert result == "completed"
+    assert observed["magmacovar"] == "study.gsa.out"
+    assert context["flames"] == "completed"
+    assert args.output_directory == str(tmp_path)
+
+
 def test_recovery_audit_summary_counts_scientific_outcomes(tmp_path):
     audit_file = tmp_path / "recovery.tsv"
     pd.DataFrame(

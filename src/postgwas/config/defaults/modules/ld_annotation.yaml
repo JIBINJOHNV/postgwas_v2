@@ -1,4 +1,15 @@
 enabled: false
-genome_build: GRCh37
+inputs:
+  vcf: null
+  ld_region_dir: null
+  dataset_id: null
+output_directory: null
 populations: [EUR, AFR, EAS]
 include_unassigned: false
+bed_filename_template: "{genome_build}_{population}_ldetect.bed.gz"
+info_field_template: "{population}_LDblock"
+info_description_template: "LD Block ID from Berisa & Pickrell 2016 ({population}, {genome_build})"
+output_filename_template: "{dataset_id}_ldblock.vcf.gz"
+summary_filename_template: "{dataset_id}_ldblock_summary.csv"
+html_report_filename_template: "{dataset_id}_ldblock_report.html"
+canonical_log_filename_template: "{dataset_id}_ldblock.log"

@@ -14,6 +14,7 @@ from postgwas.config.exporter import render_module_configuration
 from postgwas.core.errors import ConfigurationError
 from postgwas.modules.harmonisation.cli import _engine_defaults
 from postgwas.modules.harmonisation.policies import (
+    FIELD_LIFECYCLE,
     PolicyError,
     default_policies,
     registry_path,
@@ -36,6 +37,223 @@ from postgwas.modules.harmonisation.input_validation import validate_header
 
 
 class HarmonisationConfigTests(unittest.TestCase):
+    def test_reference_unmatched_retain_is_opt_in_and_reject_remains_default(self):
+        policies = default_policies()
+
+        self.assertEqual(policies.get("strand.unmatched_action"), "reject")
+        self.assertEqual(
+            policies.with_overrides({
+                "strand.unmatched_action": "retain",
+            }).get("strand.unmatched_action"),
+            "retain",
+        )
+        with self.assertRaisesRegex(PolicyError, "strand.unmatched_action"):
+            policies.with_overrides({
+                "strand.unmatched_action": "keep",
+            })
+
+    def test_raw_gwas2vcf_intermediate_is_deleted_by_default(self):
+        policies = default_policies()
+
+        self.assertFalse(policies.get("vcf.keep_gwas2vcf_intermediate"))
+        self.assertTrue(
+            policies.with_overrides({
+                "vcf.keep_gwas2vcf_intermediate": True,
+            }).get("vcf.keep_gwas2vcf_intermediate")
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "vcf.keep_gwas2vcf_intermediate",
+        ):
+            policies.with_overrides({
+                "vcf.keep_gwas2vcf_intermediate": "sometimes",
+            })
+
+    def test_adapter_summary_delimiter_is_validated_before_analysis(self):
+        for invalid in ("", "||"):
+            with self.subTest(delimiter=invalid), self.assertRaisesRegex(
+                ConfigurationError, "delimiter must be exactly one character",
+            ):
+                load_configuration(cli_overrides={
+                    "modules.harmonisation.gwas2vcf_input.delimiter": invalid,
+                })
+
+    def test_reject_concat_batch_rows_is_yaml_defined_and_schema_validated(self):
+        policies = default_policies()
+
+        self.assertEqual(policies.get("rejects.concat_batch_rows"), 100000)
+        self.assertEqual(
+            policies.with_overrides({
+                "rejects.concat_batch_rows": 17,
+            }).get("rejects.concat_batch_rows"),
+            17,
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "rejects.concat_batch_rows",
+        ):
+            policies.with_overrides({"rejects.concat_batch_rows": 0})
+
+    def test_chromosome_leading_zero_policy_is_schema_validated(self):
+        policies = default_policies()
+
+        self.assertTrue(policies.get("chromosome.strip_leading_zero"))
+        self.assertFalse(
+            policies.with_overrides({
+                "chromosome.strip_leading_zero": False,
+            }).get("chromosome.strip_leading_zero")
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "chromosome.strip_leading_zero",
+        ):
+            policies.with_overrides({
+                "chromosome.strip_leading_zero": "sometimes",
+            })
+
+    def test_position_minimum_is_one_based_and_schema_validated(self):
+        policies = default_policies()
+
+        self.assertEqual(policies.get("position.min_value"), 1)
+        self.assertEqual(
+            policies.with_overrides({
+                "position.min_value": 10,
+            }).get("position.min_value"),
+            10,
+        )
+        with self.assertRaisesRegex(PolicyError, "position.min_value"):
+            policies.with_overrides({"position.min_value": 0})
+
+    def test_field_lifecycle_registry_has_only_schema_validated_keys(self):
+        expected = {"at_read", "at_export", "recovered", "note"}
+
+        self.assertTrue(FIELD_LIFECYCLE)
+        for field, specification in FIELD_LIFECYCLE.items():
+            self.assertEqual(set(specification), expected, field)
+            self.assertTrue(str(specification["note"]).strip(), field)
+
+    def test_z_reconstruction_and_eaf_safety_defaults_are_schema_validated(self):
+        policies = default_policies()
+
+        self.assertEqual(policies.get("eaf.out_of_range"), "reject")
+        self.assertEqual(
+            policies.get("duplicates.post_orientation_relative_tolerance"),
+            1.0e-12,
+        )
+        self.assertEqual(
+            policies.get("effect_from_z.x_chromosome_z_only_action"),
+            "fail",
+        )
+        self.assertEqual(
+            policies.get("effect_from_z.beta_z_sign_mismatch"),
+            "reject",
+        )
+        self.assertEqual(
+            policies.get(
+                "effect_from_z.max_beta_z_sign_mismatch_fraction"
+            ),
+            0.01,
+        )
+        self.assertEqual(policies.get("effect_from_z.method"), "metal_large_n")
+        self.assertIsNone(
+            policies.get("effect_from_z.phenotype_standard_deviation")
+        )
+        self.assertEqual(
+            policies.get("effect_from_z.minimum_effective_variance"), 1.0
+        )
+        self.assertEqual(
+            policies.get("effect_from_z.low_effective_variance_action"),
+            "reject",
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "effect_from_z.x_chromosome_z_only_action",
+        ):
+            policies.with_overrides({
+                "effect_from_z.x_chromosome_z_only_action": "warn",
+            })
+        self.assertEqual(
+            policies.with_overrides({
+                "effect_from_z.x_chromosome_z_only_action": (
+                    "allow_autosomal_assumption"
+                ),
+            }).get("effect_from_z.x_chromosome_z_only_action"),
+                "allow_autosomal_assumption",
+        )
+        self.assertEqual(
+            policies.with_overrides({
+                "effect_from_z.beta_z_sign_mismatch": "fail",
+            }).get("effect_from_z.beta_z_sign_mismatch"),
+            "fail",
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "effect_from_z.beta_z_sign_mismatch",
+        ):
+            policies.with_overrides({
+                "effect_from_z.beta_z_sign_mismatch": "warn",
+            })
+        self.assertEqual(
+            policies.with_overrides({
+                "effect_from_z.max_beta_z_sign_mismatch_fraction": 0.0,
+            }).get("effect_from_z.max_beta_z_sign_mismatch_fraction"),
+            0.0,
+        )
+        with self.assertRaisesRegex(
+            PolicyError,
+            "effect_from_z.max_beta_z_sign_mismatch_fraction",
+        ):
+            policies.with_overrides({
+                "effect_from_z.max_beta_z_sign_mismatch_fraction": 1.01,
+            })
+        with self.assertRaisesRegex(
+            PolicyError, "effect_from_z.method",
+        ):
+            policies.with_overrides({
+                "effect_from_z.method": "unknown",
+            })
+        with self.assertRaisesRegex(
+            PolicyError, "effect_from_z.phenotype_standard_deviation",
+        ):
+            policies.with_overrides({
+                "effect_from_z.phenotype_standard_deviation": 0,
+            })
+        with self.assertRaisesRegex(
+            PolicyError, "effect_from_z.minimum_effective_variance",
+        ):
+            policies.with_overrides({
+                "effect_from_z.minimum_effective_variance": -1,
+            })
+        with self.assertRaisesRegex(
+            PolicyError, "effect_from_z.low_effective_variance_action",
+        ):
+            policies.with_overrides({
+                "effect_from_z.low_effective_variance_action": "warn",
+            })
+        with self.assertRaisesRegex(
+            PolicyError, "duplicates.post_orientation_relative_tolerance",
+        ):
+            policies.with_overrides({
+                "duplicates.post_orientation_relative_tolerance": -1.0,
+            })
+        with self.assertRaisesRegex(
+            PolicyError, "duplicates.post_orientation_relative_tolerance",
+        ):
+            policies.with_overrides({
+                "duplicates.post_orientation_relative_tolerance": 1.0e-6,
+            })
+
+    def test_z_reconstruction_help_contains_verified_pubmed_references(self):
+        registry = yaml.safe_load(Path(registry_path()).read_text(encoding="utf-8"))
+        help_text = registry["policies"]["effect_from_z"]["method"]["help"]
+
+        for pmid in ("20616382", "23722424", "27225129", "30038396", "27019110"):
+            self.assertIn(
+                "https://pubmed.ncbi.nlm.nih.gov/%s/" % pmid,
+                help_text,
+            )
+
+        x_help = registry["policies"]["effect_from_z"][
+            "x_chromosome_z_only_action"
+        ]["help"]
+        self.assertIn("https://pubmed.ncbi.nlm.nih.gov/18441336/", x_help)
+        self.assertIn("https://www.cog-genomics.org/plink/2.0/assoc", x_help)
+
     def test_quantitative_trait_help_matches_enforced_runtime_behavior(self):
         registry = yaml.safe_load(Path(registry_path()).read_text(encoding="utf-8"))
         help_text = registry["policies"]["sample_size"]["trait_type"]["help"]
@@ -85,7 +303,7 @@ class HarmonisationConfigTests(unittest.TestCase):
             defaults,
             {
                 "declared_effect_type": "beta",
-                "declared_pvalue_type": "negln",
+                "declared_pvalue_type": "neglog10",
                 "delimiter": "comma",
                 "policies": {
                     "effect": {"type": "odds_ratio"},
@@ -96,7 +314,7 @@ class HarmonisationConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(policies.get("effect.type"), "beta")
-        self.assertEqual(policies.get("pvalue.type"), "negln")
+        self.assertEqual(policies.get("pvalue.type"), "neglog10")
         self.assertEqual(policies.get("input.delimiter"), "comma")
 
     def test_auto_sample_sheet_values_preserve_yaml_policies(self):
@@ -168,7 +386,7 @@ class HarmonisationConfigTests(unittest.TestCase):
         decisions = resolve_study_properties(
             pl.DataFrame({
                 "BETA": [-0.2, -0.1, 0.1, 0.2, -0.3, 0.3, -0.4, 0.4, -0.5, 0.5],
-                "P": [0.1, 0.2, 0.3, 0.3, 0.4, 0.5, 0.1, 0.2, 0.3, 2.0],
+                "P": [0.1, 0.2, 0.3, 0.3, 0.4, 0.5, 0.1, 0.2, 2.0, 2.0],
                 "EAF": [0.6] * 10,
             }),
             {
@@ -231,7 +449,7 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertIn("declaration differs", stream.getvalue())
 
     def test_raw_pvalue_equal_to_one_is_valid_and_unchanged(self):
-        frame, qc, _ = harmonise_p_values(
+        frame, qc, mapping = harmonise_p_values(
             chromosome="1",
             df=pl.DataFrame({"P": [1.0, 0.5]}),
             sample_column_dict={"pval_col": "P"},
@@ -239,7 +457,9 @@ class HarmonisationConfigTests(unittest.TestCase):
             policies=default_policies(),
         )
         self.assertEqual(default_policies().get("pvalue.clip_high"), 1.0)
-        self.assertEqual(frame["LP"].to_list(), [1.0, 0.5])
+        self.assertEqual(frame["PVAL"].to_list(), [1.0, 0.5])
+        self.assertEqual(mapping["pval_col"], "PVAL")
+        self.assertNotIn("LP", frame.columns)
         self.assertEqual(frame[CLIPPED_HIGH_COLUMN].to_list(), [False, False])
         self.assertEqual(qc["variants_with_pvalues_clipped_high"], 0)
 
@@ -263,6 +483,25 @@ class HarmonisationConfigTests(unittest.TestCase):
             "rejected/{dataset_id}_chr{chromosome}_source.parquet",
         )
         self.assertEqual(
+            config.output_layout.root["chromosome_table"],
+            "{dataset_id}_chr{chromosome}.parquet",
+        )
+        self.assertNotIn("chromosome_original_vcf", config.output_layout.root)
+        policies = default_policies()
+        self.assertEqual(
+            policies.get("input.chromosome_partition_compression"), "zstd"
+        )
+        self.assertNotIn("input.chromosome_null_values", policies)
+        self.assertNotIn(
+            "input.chromosome_schema_inference_rows", policies
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "input.chromosome_partition_compression",
+        ):
+            policies.with_overrides({
+                "input.chromosome_partition_compression": "unknown",
+            })
+        self.assertEqual(
             config.output_layout.root["dataset_reject"],
             "rejected/{dataset_id}_rejected_variants.tsv.gz",
         )
@@ -271,8 +510,19 @@ class HarmonisationConfigTests(unittest.TestCase):
             "qc_summary/{dataset_id}_duplicates.tsv",
         )
         self.assertEqual(
+            config.output_layout.root["post_orientation_duplicates"],
+            (
+                "qc_summary/{dataset_id}_post_orientation_duplicates_"
+                "chr{chromosome}.tsv"
+            ),
+        )
+        self.assertEqual(
             config.output_layout.root["qc_summary"],
             "qc_summary/{dataset_id}_chromosomewise_harmonisation_metrics.tsv",
+        )
+        self.assertEqual(
+            config.output_layout.root["field_completeness"],
+            "qc_summary/{dataset_id}_field_completeness.tsv",
         )
         qc = load_configuration().modules.qc_summary.output_layout
         self.assertEqual(
@@ -282,6 +532,14 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertEqual(
             qc.rule_report,
             "qc_summary/{dataset_id}_{build}_vcf_qc_rule_results.tsv",
+        )
+        self.assertEqual(
+            qc.summary_csv,
+            "qc_summary/{dataset_id}_{build}_qc_summary.csv",
+        )
+        self.assertEqual(
+            qc.html_report,
+            "reports/{dataset_id}_{build}_qc_report.html",
         )
 
     def test_export_has_no_duplicate_module_and_policy_settings(self):
@@ -344,9 +602,23 @@ class HarmonisationConfigTests(unittest.TestCase):
         )
         self.assertNotIn("deduplicate_reference", exported["policies"]["eaf"])
         self.assertNotIn("deduplicate_reference", exported["policies"]["info"])
+        self.assertNotIn("palindromic_handling", exported["policies"]["eaf"])
         self.assertEqual(
-            exported["policies"]["eaf"]["palindromic_handling"],
-            "ignore",
+            {
+                key: exported["policies"]["strand"][key]
+                for key in (
+                    "palindromic_af_ambiguity_lower",
+                    "palindromic_af_ambiguity_upper",
+                    "palindromic_af_max_difference",
+                    "palindromic_af_min_error_margin",
+                )
+            },
+            {
+                "palindromic_af_ambiguity_lower": 0.40,
+                "palindromic_af_ambiguity_upper": 0.60,
+                "palindromic_af_max_difference": 0.10,
+                "palindromic_af_min_error_margin": 0.20,
+            },
         )
         self.assertNotIn(
             "palindromic_resolve_tolerance", exported["policies"]["eaf"]
@@ -355,7 +627,8 @@ class HarmonisationConfigTests(unittest.TestCase):
             list(exported["policies"]["build"]),
             [
                 "mode", "confidence_ratio", "min_match_count",
-                "min_match_fraction", "deduplicate_reference",
+                "min_reference_match_fraction", "min_match_fraction",
+                "deduplicate_reference",
             ],
         )
         self.assertNotIn("filter", exported["policies"])
@@ -367,6 +640,34 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertTrue(
             exported["policies"]["execution"]["fail_dataset_on_chr_error"]
         )
+
+    def test_palindromic_frequency_threshold_relationships_are_validated(self):
+        policies = default_policies()
+
+        self.assertEqual(
+            policies.get("strand.palindromic_af_ambiguity_lower"), 0.40
+        )
+        self.assertEqual(
+            policies.get("strand.palindromic_af_ambiguity_upper"), 0.60
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "strand.palindromic_af_ambiguity_lower",
+        ):
+            policies.with_overrides({
+                "strand.palindromic_af_ambiguity_lower": 0.50,
+            })
+        with self.assertRaisesRegex(
+            PolicyError, "strand.palindromic_af_ambiguity_upper",
+        ):
+            policies.with_overrides({
+                "strand.palindromic_af_ambiguity_upper": 0.50,
+            })
+        with self.assertRaisesRegex(
+            PolicyError, "strand.palindromic_af_min_error_margin",
+        ):
+            policies.with_overrides({
+                "strand.palindromic_af_min_error_margin": 0.0,
+            })
 
     def test_module_defaults_and_policy_registry_share_one_canonical_file(self):
         project = Path(__file__).parents[1]
@@ -416,6 +717,21 @@ class HarmonisationConfigTests(unittest.TestCase):
             config = load_configuration()
         self.assertEqual(config.execution.threads, 15)
         self.assertEqual(config.execution.memory_gb, 57)
+        execution = _engine_defaults(config)["policies"]["execution"]
+        self.assertEqual(execution["total_cpu_budget"], 15)
+        self.assertEqual(execution["memory_budget_gb"], 57)
+
+        policies = default_policies()
+        self.assertIsNone(policies.get("execution.memory_budget_gb"))
+        self.assertEqual(
+            policies.get("execution.memory_gb_per_chromosome"), 20.0
+        )
+        with self.assertRaisesRegex(
+            PolicyError, "execution.memory_gb_per_chromosome",
+        ):
+            policies.with_overrides({
+                "execution.memory_gb_per_chromosome": 0,
+            })
 
     def test_explicit_execution_values_override_automatic_values(self):
         config = load_configuration(
@@ -464,6 +780,14 @@ class HarmonisationConfigTests(unittest.TestCase):
         )
         self.assertEqual(
             defaults["population_frequency_qc"], config.model_dump()
+        )
+        self.assertEqual(config.inversion_minimum_absolute_correlation, 0.80)
+        self.assertEqual(
+            config.inversion_maximum_mean_absolute_difference, 0.10
+        )
+        self.assertEqual(
+            config.inversion_minimum_mean_absolute_difference_improvement,
+            0.10,
         )
 
     def test_default_eaf_table_contract_comes_from_configuration(self):
@@ -558,12 +882,96 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertEqual(defaults["policies"]["eaf"]["maf_decision_cutoff"], 0.9)
         self.assertNotIn("maf_eaf_decision_cutoff", defaults)
 
+    def test_maf_screen_uses_only_finite_in_range_frequency_values(self):
+        decisions = resolve_study_properties(
+            pl.DataFrame({
+                "AF": ["0.2"] * 90
+                + [
+                    None,
+                    "NaN",
+                    "inf",
+                    "inf",
+                    "1.1",
+                    "1.2",
+                    "1.3",
+                    "1.4",
+                    "not-a-number",
+                    "bad",
+                ],
+            }),
+            {"eaf_col": "AF"},
+            policies=default_policies(),
+        )
+
+        evidence = decisions["eaf_evidence"]
+        self.assertTrue(decisions["eaf_is_maf"])
+        self.assertEqual(evidence["usable"], 90)
+        self.assertEqual(evidence["unusable"], 10)
+        self.assertEqual(evidence["input_missing"], 1)
+        self.assertEqual(evidence["unparseable"], 2)
+        self.assertEqual(evidence["non_finite"], 3)
+        self.assertEqual(evidence["out_of_range"], 4)
+        self.assertEqual(evidence["at_or_below_0_5"], 90)
+        self.assertEqual(evidence["low_fraction_of_usable"], 1.0)
+
+    def test_maf_screen_fails_when_no_usable_frequency_exists(self):
+        with self.assertRaisesRegex(
+            StudyPropertyError,
+            "no usable finite numeric frequency between 0 and 1",
+        ):
+            resolve_study_properties(
+                pl.DataFrame({
+                    "AF": [None, "NaN", "inf", "-0.1", "1.1", "not-a-number"],
+                }),
+                {"eaf_col": "AF"},
+                policies=default_policies(),
+            )
+
     def test_maf_reference_confirmation_has_conservative_canonical_defaults(self):
         defaults = default_policies()
 
+        self.assertEqual(
+            defaults.get("eaf.maf_reference_correlation_method"), "pearson"
+        )
+        self.assertEqual(
+            defaults.get("eaf.maf_reference_min_correlation"), 0.80
+        )
+        self.assertEqual(
+            defaults.get("eaf.maf_reference_max_mean_absolute_difference"),
+            0.10,
+        )
         self.assertEqual(defaults.get("eaf.reference_minor_fraction_cutoff"), 0.95)
         self.assertEqual(defaults.get("eaf.maf_reference_error_margin"), 0.02)
+        self.assertEqual(
+            defaults.get("eaf.non_effect_frequency_min_overlap"), 1000
+        )
+        self.assertEqual(
+            defaults.get("eaf.non_effect_frequency_min_correlation"), 0.80
+        )
+        self.assertEqual(
+            defaults.get("eaf.non_effect_frequency_max_error"), 0.10
+        )
+        self.assertEqual(
+            defaults.get("eaf.non_effect_frequency_error_margin"), 0.10
+        )
         self.assertNotIn("eaf.on_maf_check_inconclusive", defaults)
+
+        self.assertEqual(
+            defaults.with_overrides({
+                "eaf.maf_reference_correlation_method": "spearman",
+            }).get("eaf.maf_reference_correlation_method"),
+            "spearman",
+        )
+        for key, value in (
+            ("eaf.maf_reference_min_overlap", 1),
+            ("eaf.maf_reference_correlation_method", "kendall"),
+            ("eaf.maf_reference_min_correlation", 1.01),
+            ("eaf.maf_reference_max_mean_absolute_difference", 0.51),
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(
+                PolicyError, key
+            ):
+                defaults.with_overrides({key: value})
 
     @patch(
         "postgwas.modules.harmonisation.service.resolve_resource_file",
@@ -633,6 +1041,77 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertEqual(defaults["external_eaf_colmap"]["delimiter"], "comma")
         self.assertEqual(defaults["build_check_colmap"]["pos"], "BUILD_POS")
 
+    def test_external_reference_staging_is_schema_validated_and_reaches_engine(self):
+        config = load_configuration(
+            cli_overrides={
+                "modules.harmonisation.external_reference_staging.batch_rows": 17,
+                "modules.harmonisation.external_reference_staging.compression": "gzip",
+                "modules.harmonisation.external_reference_staging.atomic_output_suffix": ".part",
+            }
+        )
+
+        self.assertEqual(
+            _engine_defaults(config)["external_reference_staging"],
+            {
+                "batch_rows": 17,
+                "compression": "gzip",
+                "compressed_suffixes": [
+                    ".gz", ".bgz", ".bz2", ".xz", ".lzma", ".zip",
+                ],
+                "atomic_output_suffix": ".part",
+            },
+        )
+        self.assertTrue(
+            config.modules.harmonisation.output_layout.root[
+                "external_eaf_partition"
+            ].endswith(".parquet")
+        )
+        with self.assertRaises(ConfigurationError):
+            load_configuration(
+                cli_overrides={
+                    "modules.harmonisation.external_reference_staging.batch_rows": 0,
+                }
+            )
+        with self.assertRaises(ConfigurationError):
+            load_configuration(
+                cli_overrides={
+                    "modules.harmonisation.output_layout.chromosome_table": (
+                        "{dataset_id}_chr{chromosome}.tsv"
+                    ),
+                }
+            )
+        with self.assertRaises(ConfigurationError):
+            load_configuration(
+                cli_overrides={
+                    (
+                        "modules.harmonisation.output_layout."
+                        "post_orientation_duplicates"
+                    ): "qc_summary/{dataset_id}_duplicates.tsv",
+                }
+            )
+        with self.assertRaises(ConfigurationError):
+            load_configuration(
+                cli_overrides={
+                    "modules.harmonisation.external_reference_staging.atomic_output_suffix": "tmp",
+                }
+            )
+        with self.assertRaises(ConfigurationError):
+            load_configuration(
+                cli_overrides={
+                    "modules.harmonisation.external_reference_staging.compressed_suffixes": [
+                        "gz",
+                    ],
+                }
+            )
+        with self.assertRaises(ConfigurationError):
+            load_configuration(
+                cli_overrides={
+                    "modules.harmonisation.output_layout.external_eaf_partition": (
+                        "qc_summary/{dataset_id}_eaf.csv"
+                    ),
+                }
+            )
+
     def test_build_inference_uses_configured_build_names_columns_and_delimiter(self):
         from tempfile import TemporaryDirectory
 
@@ -666,6 +1145,44 @@ class HarmonisationConfigTests(unittest.TestCase):
 
         self.assertEqual(result["inferred_build"], "ReferenceA")
         self.assertEqual(result["matches"], {"ReferenceA": 2, "ReferenceB": 0})
+
+    def test_build_references_use_shared_chromosome_alias_policies(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.csv"
+            second = root / "second.csv"
+            first.write_text(
+                "C,P,R,A\n01,100,A,G\n23,200,C,T\n", encoding="utf-8"
+            )
+            second.write_text(
+                "C,P,R,A\n1,101,A,G\nX,201,C,T\n", encoding="utf-8"
+            )
+            result = infer_genome_build(
+                pl.DataFrame({
+                    "chr": ["1", "X"],
+                    "pos": [100, 200],
+                    "ea": ["A", "C"],
+                    "oa": ["G", "T"],
+                }),
+                {"ReferenceA": str(first), "ReferenceB": str(second)},
+                {
+                    "chr": "C", "pos": "P", "a1": "R", "a2": "A",
+                    "delimiter": "comma",
+                },
+                {
+                    "chr_col": "chr", "pos_col": "pos",
+                    "ea_col": "ea", "oa_col": "oa",
+                },
+                policies=default_policies().with_overrides({
+                    "build.min_match_count": 1,
+                }),
+            )
+
+        self.assertEqual(result["inferred_build"], "ReferenceA")
+        self.assertEqual(result["matches"], {"ReferenceA": 2, "ReferenceB": 0})
+        self.assertEqual(result["testable_variants"], 2)
 
     def test_build_inference_log_identifies_every_reference_file_and_mapping(self):
         from tempfile import TemporaryDirectory
@@ -701,8 +1218,11 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertIn("alternate_allele_column=A", text)
         self.assertIn("coordinate-testable variants 1", text)
         self.assertIn("ReferenceA coordinate hits 1", text)
-        self.assertIn("minimum allele matches", text)
-        self.assertIn("100; minimum match fraction 80.00%", text)
+        self.assertIn("ReferenceA relevant reference markers 1", text)
+        self.assertIn("ReferenceA matched reference markers 1 (100.00%)", text)
+        self.assertIn("PARAM    build.min_match_count=100", text)
+        self.assertIn("PARAM    build.min_reference_match_fraction=0.1", text)
+        self.assertIn("PARAM    build.min_match_fraction=0.8", text)
 
     def test_build_inference_counts_each_study_row_once_per_reference(self):
         from tempfile import TemporaryDirectory
@@ -737,6 +1257,15 @@ class HarmonisationConfigTests(unittest.TestCase):
 
         self.assertEqual(result["matches"], {"ReferenceA": 1, "ReferenceB": 0})
         self.assertEqual(result["match_fraction"], 1.0)
+        self.assertEqual(result["input_match_fraction"], 1.0)
+        self.assertEqual(result["reference_match_fraction"], 1.0)
+        self.assertEqual(result["reference_marker_counts"]["ReferenceA"], 2)
+        self.assertEqual(
+            result["matched_reference_marker_counts"]["ReferenceA"], 2
+        )
+        self.assertEqual(result["percentages"]["ReferenceA"], 100.0)
+        self.assertEqual(result["strand_evidence"]["ReferenceA"]["forward"], 0)
+        self.assertEqual(result["strand_evidence"]["ReferenceA"]["reverse"], 0)
 
     def test_build_inference_accepts_reverse_complement_and_reports_strand_evidence(self):
         from tempfile import TemporaryDirectory
@@ -768,11 +1297,26 @@ class HarmonisationConfigTests(unittest.TestCase):
         policies = default_policies()
 
         self.assertEqual(policies.get("build.min_match_count"), 100)
+        self.assertEqual(policies.get("build.min_reference_match_fraction"), 0.1)
         self.assertEqual(policies.get("build.min_match_fraction"), 0.8)
         self.assertEqual(policies.get("build.confidence_ratio"), 0.9)
         self.assertTrue(policies.get("build.deduplicate_reference"))
         with self.assertRaisesRegex(PolicyError, "build.min_match_count"):
             policies.with_overrides({"build.min_match_count": 0})
+        with self.assertRaisesRegex(
+            PolicyError, "build.min_reference_match_fraction",
+        ):
+            policies.with_overrides({"build.min_reference_match_fraction": -0.01})
+        with self.assertRaisesRegex(
+            PolicyError, "build.min_reference_match_fraction",
+        ):
+            policies.with_overrides({"build.min_reference_match_fraction": 1.01})
+        self.assertEqual(
+            policies.with_overrides({
+                "build.min_reference_match_fraction": 0.25,
+            }).get("build.min_reference_match_fraction"),
+            0.25,
+        )
 
     def test_build_fraction_uses_only_exact_coordinate_testable_rows(self):
         from tempfile import TemporaryDirectory
@@ -804,6 +1348,144 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertEqual(result["untestable_variants"], 2)
         self.assertEqual(result["coordinate_hits"], {"ReferenceA": 1, "ReferenceB": 0})
         self.assertEqual(result["percentages"], {"ReferenceA": 100.0, "ReferenceB": 0.0})
+        self.assertEqual(
+            result["input_percentages"],
+            {"ReferenceA": 33.33, "ReferenceB": 0.0},
+        )
+        self.assertAlmostEqual(result["input_match_fraction"], 1 / 3)
+        self.assertEqual(result["reference_marker_counts"]["ReferenceA"], 1)
+        self.assertEqual(
+            result["matched_reference_marker_counts"]["ReferenceA"], 1
+        )
+        self.assertEqual(result["reference_match_fraction"], 1.0)
+        self.assertIsNone(result["ambiguous_reason"])
+
+    def test_build_inference_returns_ambiguous_when_match_denominator_is_zero(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.csv"
+            second = root / "second.csv"
+            first.write_text("C,P,R,A\n1,100,A,C\n", encoding="utf-8")
+            second.write_text("C,P,R,A\n1,200,A,C\n", encoding="utf-8")
+            result = infer_genome_build(
+                pl.DataFrame({
+                    "chr": ["1", "1"], "pos": [100, 200],
+                    "ea": ["A", "C"], "oa": ["G", "T"],
+                }),
+                {"ReferenceA": str(first), "ReferenceB": str(second)},
+                {
+                    "chr": "C", "pos": "P", "a1": "R", "a2": "A",
+                    "delimiter": "comma",
+                },
+                {"chr_col": "chr", "pos_col": "pos", "ea_col": "ea", "oa_col": "oa"},
+                policies=default_policies().with_overrides({
+                    "build.min_match_count": 1,
+                }),
+            )
+
+        self.assertEqual(result["inferred_build"], "Ambiguous")
+        self.assertEqual(result["testable_variants"], 2)
+        self.assertEqual(result["matches"], {"ReferenceA": 0, "ReferenceB": 0})
+        self.assertEqual(result["input_match_fraction"], 0.0)
+        self.assertIsNone(result["confidence"])
+        self.assertIn("none of the 2", result["ambiguous_reason"])
+
+    def test_build_inference_rejects_low_relevant_reference_coverage(self):
+        from tempfile import TemporaryDirectory
+
+        positions = list(range(100, 200))
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.csv"
+            second = root / "second.csv"
+            first.write_text(
+                "C,P,R,A\n"
+                "1,100,A,G\n1,101,A,G\n"
+                + "".join(
+                    "1,%d,A,G\n" % position
+                    for position in range(1000, 1028)
+                ),
+                encoding="utf-8",
+            )
+            second.write_text("C,P,R,A\n1,1000,A,G\n", encoding="utf-8")
+            result = infer_genome_build(
+                pl.DataFrame({
+                    "chr": ["1"] * len(positions),
+                    "pos": positions,
+                    "ea": ["A"] * len(positions),
+                    "oa": ["G"] * len(positions),
+                }),
+                {"ReferenceA": str(first), "ReferenceB": str(second)},
+                {
+                    "chr": "C", "pos": "P", "a1": "R", "a2": "A",
+                    "delimiter": "comma",
+                },
+                {"chr_col": "chr", "pos_col": "pos", "ea_col": "ea", "oa_col": "oa"},
+                policies=default_policies().with_overrides({
+                    "build.min_match_count": 1,
+                }),
+            )
+
+        self.assertEqual(result["matches"], {"ReferenceA": 2, "ReferenceB": 0})
+        self.assertEqual(result["confidence"], 1.0)
+        self.assertEqual(result["match_fraction"], 1.0)
+        self.assertEqual(result["input_match_fraction"], 0.02)
+        self.assertEqual(result["reference_marker_counts"]["ReferenceA"], 30)
+        self.assertEqual(
+            result["matched_reference_marker_counts"]["ReferenceA"], 2
+        )
+        self.assertAlmostEqual(result["reference_match_fraction"], 2 / 30)
+        self.assertEqual(result["inferred_build"], "Ambiguous")
+        self.assertIn(
+            "build.min_reference_match_fraction", result["ambiguous_reason"]
+        )
+
+    def test_build_inference_accepts_reference_floor_and_scopes_by_chromosome(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.csv"
+            second = root / "second.csv"
+            first.write_text(
+                "C,P,R,A\n"
+                "chr1,100,A,T\nchr1,101,C,G\n"
+                "chr1,1000,A,G\nchr1,1001,A,G\n"
+                "chr2,2000,A,G\n",
+                encoding="utf-8",
+            )
+            second.write_text("C,P,R,A\nchr1,1000,A,G\n", encoding="utf-8")
+            positions = list(range(100, 200))
+            result = infer_genome_build(
+                pl.DataFrame({
+                    "chr": ["1"] * len(positions),
+                    "pos": positions,
+                    "ea": ["A", "C"] + ["A"] * (len(positions) - 2),
+                    "oa": ["T", "G"] + ["G"] * (len(positions) - 2),
+                }),
+                {"ReferenceA": str(first), "ReferenceB": str(second)},
+                {
+                    "chr": "C", "pos": "P", "a1": "R", "a2": "A",
+                    "delimiter": "comma",
+                },
+                {"chr_col": "chr", "pos_col": "pos", "ea_col": "ea", "oa_col": "oa"},
+                policies=default_policies().with_overrides({
+                    "build.min_match_count": 1,
+                }),
+            )
+
+        self.assertEqual(result["inferred_build"], "ReferenceA")
+        self.assertEqual(result["matches"], {"ReferenceA": 2, "ReferenceB": 0})
+        self.assertEqual(result["input_match_fraction"], 0.02)
+        self.assertEqual(result["reference_marker_counts"]["ReferenceA"], 4)
+        self.assertEqual(
+            result["matched_reference_marker_counts"]["ReferenceA"], 2
+        )
+        self.assertEqual(result["reference_match_fraction"], 0.5)
+        self.assertEqual(result["reference_percentages"]["ReferenceA"], 50.0)
+        self.assertLessEqual(result["percentages"]["ReferenceA"], 100.0)
 
     def test_build_inference_rejects_evidence_below_absolute_default(self):
         from tempfile import TemporaryDirectory
@@ -834,7 +1516,7 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertIn("build.min_match_count", result["ambiguous_reason"])
         self.assertIn("only 3", result["ambiguous_reason"])
 
-    def test_build_inference_accepts_exact_absolute_default_boundary(self):
+    def test_build_inference_accepts_exact_default_evidence_boundaries(self):
         from tempfile import TemporaryDirectory
 
         positions = list(range(100, 200))
@@ -845,6 +1527,8 @@ class HarmonisationConfigTests(unittest.TestCase):
             first.write_text(
                 "C,P,R,A\n" + "".join(
                     "1,%d,A,G\n" % position for position in positions
+                ) + "".join(
+                    "1,%d,A,G\n" % position for position in range(1000, 1900)
                 ),
                 encoding="utf-8",
             )
@@ -865,6 +1549,8 @@ class HarmonisationConfigTests(unittest.TestCase):
         self.assertEqual(result["inferred_build"], "ReferenceA")
         self.assertEqual(result["matches"]["ReferenceA"], 100)
         self.assertEqual(result["match_fraction"], 1.0)
+        self.assertEqual(result["reference_marker_counts"]["ReferenceA"], 1000)
+        self.assertEqual(result["reference_match_fraction"], 0.1)
 
     def test_build_inference_rejects_low_fraction_of_testable_rows(self):
         from tempfile import TemporaryDirectory

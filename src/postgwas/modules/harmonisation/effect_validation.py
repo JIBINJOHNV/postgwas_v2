@@ -22,12 +22,10 @@ does not go through the collector never reaches the reject file.
 Step 10 - why the order of the SE tests is the whole point
 --------------------------------------------------------------------------
 Finiteness is tested BEFORE positivity.  ``inf > 0`` is True in Python and in
-polars, so a ``> 0`` test alone lets an infinite SE straight through.  Infinite
-SEs are not hypothetical: the default EAF policy is ``clip``, which puts an
-out-of-range frequency at exactly 0 or 1, and the denominator
-``2*p*(1-p)*(Neff + z**2)`` is then exactly zero, which polars evaluates to
-``inf`` rather than null.  Testing ``is_finite()`` first is what makes keeping
-``eaf.out_of_range = clip`` a safe default.
+polars, so a ``> 0`` test alone lets an infinite SE straight through. The
+effect-from-Z step now rejects a non-finite or non-positive denominator before
+division, while this later gate remains independent defence in depth for
+supplied statistics and explicit non-default policies.
 
 The second rule has no other line of defence at all. Clipping an invalid p-value
 and then deriving SE can produce a positive, finite value that is invisible to
@@ -40,12 +38,15 @@ Step 13 - the final completeness gate
 --------------------------------------------------------------------------
 Immediately before export, any variant with a missing value in a required field
 is removed, where "missing" means null, NaN OR inf - a NaN is as unusable
-downstream as a null.  Fields are evaluated ONE AT A TIME, in the configured
-order, so a variant missing three fields is attributed to the first one, which
-is what keeps "a variant appears exactly once" true.  INFO is deliberately not
-in the list; it stays under ``info.on_missing``. Unmapped internal working
-columns are then removed. An internal column still named by the resolved column
-mapping must survive until adapter export, which selects only mapped columns.
+downstream as a null. A raw p-value below Float64 is the one intentional
+exception: its validated exact raw text and natural-log probability jointly
+satisfy the p-value requirement. Fields are evaluated ONE AT A TIME, in the
+configured order, so a variant missing three fields is attributed to the first
+one, which is what keeps "a variant appears exactly once" true. INFO is
+deliberately not in the list; it stays under ``info.on_missing``. Unmapped
+internal working columns are then removed. An internal column still named by
+the resolved column mapping must survive until adapter export, which selects
+only mapped columns.
 
 Python 3.8 compatible.  Imports polars and the standard library at module level;
 policies / numpy / scipy are imported lazily so the module stays importable in a
@@ -58,9 +59,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import polars as pl
 
 from postgwas.core.dataframes import count_matching_rows, numeric_column
-from postgwas.core.values import format_percentage
+from postgwas.core.values import format_number, format_percentage
 
-from .shared.runtime import NullLogger, configured_column, resolve_policies
+from .p_values import (
+    P_VALUE_EXACT_RAW_KEY,
+    P_VALUE_LOG_KEY,
+)
+from .shared.runtime import (
+    NullLogger,
+    configured_column,
+    reject_rows,
+    resolve_policies,
+)
 from .shared.statistics import two_sided_negative_log10_p_from_z
 
 __all__ = [
@@ -148,6 +158,7 @@ _column = configured_column
 _numeric = numeric_column
 _count_mask = partial(count_matching_rows, null_is_match=True)
 _percent = format_percentage
+_fmt = partial(format_number, pattern="%.6f", missing="n/a")
 
 
 def _apply_rule(df, mask, reason, action, ctx, rejects, step_label,
@@ -166,16 +177,19 @@ def _apply_rule(df, mask, reason, action, ctx, rejects, step_label,
     before = df.height
 
     if action == "reject":
-        if rejects is not None:
-            df = rejects.reject(df, mask, step_label, reason, detail=detail)
-            removed = before - df.height
-            return df, removed, removed
-        # No collector (unit tests): filter, and log the counts ourselves so
-        # rule 5 - never a QC action without before and after - still holds.
-        df = df.filter(~mask.fill_null(True))
-        removed = before - df.height
-        ctx.qc(check_name, plain_english, before, df.height,
-               reason=reason, step=step_label, warn=removed > 0)
+        df, removed = reject_rows(
+            df,
+            mask,
+            step_label=step_label,
+            reason=reason,
+            context=ctx,
+            collector=rejects,
+            detail=detail,
+            check_name=check_name,
+            description=plain_english,
+            warn_on_remove=True,
+            record_empty=True,
+        )
         return df, removed, removed
 
     matched = _count_mask(df, mask)
@@ -217,6 +231,7 @@ def _apply_rule(df, mask, reason, action, ctx, rejects, step_label,
 # =============================================================================
 
 _EFFECT_VALIDATION_POLICY_KEYS = [
+    "validation.se_division_floor",
     "validation.se_invalid",
     "validation.se_from_clipped_pval",
     "validation.beta_invalid",
@@ -231,40 +246,137 @@ _EFFECT_VALIDATION_POLICY_KEYS = [
     "validation.max_reject_fraction",
 ]
 
-_BASIC_CHECK_POLICIES = {
-    "se_invalid": "validation.se_invalid",
-    "beta_invalid": "validation.beta_invalid",
-    "beta_zero": "validation.beta_zero",
-    "z_invalid": "validation.z_invalid",
-}
 
+def _validate_basic_effect_statistics(
+    df, se_col, beta_col, z_col, pol, ctx, rejects,
+):
+    # type: (pl.DataFrame, Optional[str], Optional[str], Optional[str], Any, Any, Any) -> Tuple[pl.DataFrame, Dict[str, Any]]
+    """Apply the six basic SE, BETA and Z checks exactly once.
 
-def _reusable_basic_checks(state, df, columns, policies):
-    # type: (Any, pl.DataFrame, Dict[str, Optional[str]], Any) -> set
-    """Return upstream checks that are valid for this exact DataFrame.
-
-    Object identity is deliberate: row-count equality alone cannot prove that
-    values or row order were unchanged.  A subset created later in this step is
-    still safe because removing rows cannot invalidate a per-row check already
-    applied to the parent frame.
+    The three SE masks are mutually exclusive and intentionally ordered:
+    missing, non-finite, then finite but at or below the configured numerical
+    division floor. BETA missing/non-finite, BETA zero, and Z missing/non-finite
+    complete the shared gate. This function is called only by chromosome step
+    10; step 09 performs calculation but no validation-policy action.
     """
-    if not isinstance(state, dict):
-        return set()
-    if state.get("frame") is not df or state.get("row_count") != df.height:
-        return set()
-    if state.get("columns") != columns:
-        return set()
-    if float(state.get("se_division_floor", 0.0)) <= 0.0:
-        return set()
+    rows_in = df.height
+    removed_by_reason = {}  # type: Dict[str, int]
+    matched_by_reason = {}  # type: Dict[str, int]
+    checks_skipped = []  # type: List[str]
 
-    completed = set(state.get("completed") or ())
-    recorded_policies = state.get("policies") or {}
-    return {
-        check
-        for check, policy_key in _BASIC_CHECK_POLICIES.items()
-        if check in completed
-        and recorded_policies.get(policy_key) == policies.get(policy_key)
+    def apply(mask, reason, action, check_name, description,
+              detail=None, warn_on_keep=True):
+        nonlocal df
+        df, removed, matched = _apply_rule(
+            df, mask, reason, action, ctx, rejects, STEP_LABEL,
+            check_name, description, detail=detail,
+            warn_on_keep=warn_on_keep,
+        )
+        removed_by_reason[reason] = int(removed)
+        matched_by_reason[reason] = int(matched)
+
+    se_action = pol.get("validation.se_invalid")
+    division_floor = float(pol.get("validation.se_division_floor"))
+    if se_col is None:
+        checks_skipped.append("se_invalid:no_se_column")
+        ctx.warn(
+            "No standard-error column is present, so the standard-error checks "
+            "could not run. Every variant passed this part of the gate untested."
+        )
+    else:
+        se = _numeric(df, se_col)
+        apply(
+            se.is_null(), "se_null", se_action, "standard error missing",
+            "The standard error is missing, so no confidence interval or Z score "
+            "can be formed for these variants.",
+        )
+        apply(
+            se.is_not_null() & ~se.is_finite(),
+            "se_non_finite", se_action, "standard error not finite",
+            "The standard error is infinite or not a number. Finiteness is checked "
+            "before the denominator threshold because positive infinity would pass "
+            "a simple greater-than-zero test.",
+        )
+        apply(
+            se.is_not_null() & se.is_finite() & (se <= division_floor),
+            "se_non_positive", se_action,
+            "standard error large enough for stable division",
+            "The standard error is at or below validation.se_division_floor (%s), "
+            "so BETA / SE would be numerically unstable." % division_floor,
+            detail="column '{}'".format(se_col),
+        )
+
+    beta_action = pol.get("validation.beta_invalid")
+    zero_action = pol.get("validation.beta_zero")
+    if beta_col is None:
+        checks_skipped.append("beta_invalid:no_beta_column")
+        ctx.warn(
+            "No effect-size column is present, so the effect-size checks could not "
+            "run. Every variant passed this part of the gate untested."
+        )
+    else:
+        beta = _numeric(df, beta_col)
+        apply(
+            beta.is_null() | ~beta.is_finite(),
+            "beta_invalid", beta_action, "effect size missing or not finite",
+            "The effect size is missing, infinite or not a number, so the variant "
+            "carries no usable estimate.",
+        )
+        apply(
+            beta.is_not_null() & beta.is_finite() & (beta == 0),
+            "beta_zero", zero_action, "effect size exactly zero",
+            "The effect size is exactly zero. With a valid standard error this is a "
+            "legitimate null result giving a Z score of zero, which is why the "
+            "default is to keep it.",
+            warn_on_keep=False,
+        )
+
+    z_action = pol.get("validation.z_invalid")
+    if z_col is None:
+        checks_skipped.append("z_invalid:no_z_column")
+        ctx.warn(
+            "No Z-score column is present, so the Z-score check could not run. "
+            "Every variant passed this part of the gate untested."
+        )
+    else:
+        z = _numeric(df, z_col)
+        apply(
+            z.is_null() | ~z.is_finite(),
+            "z_invalid", z_action, "Z score missing or not finite",
+            "The Z score is missing, infinite or not a number, so the variant "
+            "cannot be meta-analysed or fine-mapped.",
+        )
+
+    rows_out = df.height
+    metrics = {
+        "basic_checks_executed": list(matched_by_reason),
+        "basic_checks_skipped": checks_skipped,
+        "basic_matched_by_reason": matched_by_reason,
+        "basic_removed_by_reason": removed_by_reason,
+        "variants_removed_due_to_null_beta": removed_by_reason.get(
+            "beta_invalid", 0
+        ),
+        "variants_removed_due_to_null_se": (
+            removed_by_reason.get("se_null", 0)
+            + removed_by_reason.get("se_non_finite", 0)
+        ),
+        "variants_removed_due_to_missing_se": removed_by_reason.get("se_null", 0),
+        "variants_removed_due_to_non_finite_se": removed_by_reason.get(
+            "se_non_finite", 0
+        ),
+        "variants_removed_due_to_zero_beta": removed_by_reason.get("beta_zero", 0),
+        "variants_with_zero_beta": matched_by_reason.get("beta_zero", 0),
+        "variants_removed_due_to_invalid_se": removed_by_reason.get(
+            "se_non_positive", 0
+        ),
+        "variants_removed_due_to_invalid_z": removed_by_reason.get("z_invalid", 0),
+        "variants_removed_invalid_beta_se": rows_in - rows_out,
+        "variants_after_filter_invalid_beta_se": rows_out,
+        "beta_zero_removed_flag": zero_action == "reject",
+        "beta_zero_action": zero_action,
+        "se_division_floor": division_floor,
     }
+    return df, metrics
 
 
 def validate_effect_statistics(
@@ -276,17 +388,12 @@ def validate_effect_statistics(
     rejects=None,
     step_number=10,
     step_total=16,
-    upstream_validation=None,
 ):
-    # type: (str, pl.DataFrame, Dict[str, Any], Any, Any, Any, int, int, Any) -> Tuple[pl.DataFrame, Dict[str, Any], Dict[str, Any]]
+    # type: (str, pl.DataFrame, Dict[str, Any], Any, Any, Any, int, int) -> Tuple[pl.DataFrame, Dict[str, Any], Dict[str, Any]]
     """Pipeline step 10 - remove variants whose effect statistics are unusable.
 
     Order is load-bearing: SE null, then SE non-finite, then SE non-positive.
     ``inf > 0`` is True, so a positivity test alone would pass an infinite SE.
-
-    ``upstream_validation`` may contain the internal certificate produced by
-    the immediately preceding Z step. Standalone callers omit it and receive
-    the complete validation gate.
 
     Returns ``(df, qc_info, sample_column_dict)``.
     """
@@ -298,21 +405,20 @@ def validate_effect_statistics(
     beta_col = _column(sample_column_dict, FIELD_COLUMN_KEYS["beta"], df)
     z_col = _column(sample_column_dict, FIELD_COLUMN_KEYS["zscore"], df)
     pval_col = _column(sample_column_dict, FIELD_COLUMN_KEYS["pval"], df)
-    basic_columns = {"se": se_col, "beta": beta_col, "zscore": z_col}
-    reused_checks = _reusable_basic_checks(
-        upstream_validation, df, basic_columns, pol,
-    )
-
+    log_p_col = _column(sample_column_dict, (P_VALUE_LOG_KEY,), df)
     qc_info = {
         "chromosome": str(chromosome),
         "step": STEP_LABEL,
         "initial_variants": rows_in,
         "columns_used": {
-            "se": se_col, "beta": beta_col, "zscore": z_col, "pval": pval_col,
+            "se": se_col,
+            "beta": beta_col,
+            "zscore": z_col,
+            "pval": pval_col,
+            "log_p": log_p_col,
         },
         "removed_by_reason": {},
         "checks_skipped": [],
-        "checks_reused": sorted(reused_checks),
     }  # type: Dict[str, Any]
 
     with log.step(step_number, step_total, "Effect statistics validation",
@@ -325,52 +431,16 @@ def validate_effect_statistics(
                     qc_info["removed_by_reason"].get(reason, 0) + int(removed)
                 )
 
-        if reused_checks:
-            ctx.info(
-                "Reused the immediately preceding Z-step results for: %s. The exact "
-                "same DataFrame and policy values were verified, so these basic "
-                "columns were not scanned twice."
-                % ", ".join(sorted(reused_checks))
-            )
-
         # ------------------------------------------------------------------
-        # 1. Standard error.  Null, then non-finite, then non-positive.
+        # 1. Six basic SE, BETA and Z checks, owned only by this step.
         # ------------------------------------------------------------------
-        se_action = pol.get("validation.se_invalid")
-        if se_col is None:
-            qc_info["checks_skipped"].append("se_invalid:no_se_column")
-            ctx.warn(
-                "No standard-error column is present, so the standard-error checks "
-                "could not run. Every variant passed this part of the gate untested."
-            )
-        elif "se_invalid" not in reused_checks:
-            se = _numeric(df, se_col)
-
-            df, removed, _matched = _apply_rule(
-                df, se.is_null(), "se_null", se_action, ctx, rejects, STEP_LABEL,
-                "standard error missing",
-                "The standard error is missing, so no confidence interval or Z score "
-                "can be formed for these variants.",
-            )
-            record("se_null", removed)
-
-            df, removed, _matched = _apply_rule(
-                df, ~se.is_finite(), "se_non_finite", se_action, ctx, rejects, STEP_LABEL,
-                "standard error not finite",
-                "The standard error is infinite or not a number. This is what a "
-                "frequency clipped to exactly 0 or 1 produces, because the variance "
-                "denominator 2*p*(1-p)*(Neff + z^2) becomes exactly zero. Checked "
-                "before the 'greater than zero' test, because infinity passes that test.",
-            )
-            record("se_non_finite", removed)
-
-            df, removed, _matched = _apply_rule(
-                df, se <= 0, "se_non_positive", se_action, ctx, rejects, STEP_LABEL,
-                "standard error not positive",
-                "The standard error is zero or negative, which is not a possible "
-                "value for a standard error.",
-            )
-            record("se_non_positive", removed)
+        df, basic_qc = _validate_basic_effect_statistics(
+            df, se_col, beta_col, z_col, pol, ctx, rejects,
+        )
+        qc_info.update(basic_qc)
+        qc_info["checks_skipped"].extend(basic_qc["basic_checks_skipped"])
+        for reason, removed in basic_qc["basic_removed_by_reason"].items():
+            record(reason, removed)
 
         # ------------------------------------------------------------------
         # 2. SE fabricated from a clipped p-value.
@@ -409,62 +479,6 @@ def validate_effect_statistics(
             record("se_from_clipped_pval", removed)
 
         # ------------------------------------------------------------------
-        # 3. BETA
-        # ------------------------------------------------------------------
-        beta_action = pol.get("validation.beta_invalid")
-        zero_action = pol.get("validation.beta_zero")
-        if beta_col is None:
-            qc_info["checks_skipped"].append("beta_invalid:no_beta_column")
-            ctx.warn(
-                "No effect-size column is present, so the effect-size checks could not "
-                "run. Every variant passed this part of the gate untested."
-            )
-        elif not {"beta_invalid", "beta_zero"}.issubset(reused_checks):
-            beta = _numeric(df, beta_col)
-
-            if "beta_invalid" not in reused_checks:
-                df, removed, _matched = _apply_rule(
-                    df, beta.is_null() | ~beta.is_finite(), "beta_invalid", beta_action,
-                    ctx, rejects, STEP_LABEL,
-                    "effect size missing or not finite",
-                    "The effect size is missing, infinite or not a number, so the variant "
-                    "carries no usable estimate.",
-                )
-                record("beta_invalid", removed)
-
-            if "beta_zero" not in reused_checks:
-                df, removed, _matched = _apply_rule(
-                    df, beta == 0, "beta_zero", zero_action, ctx, rejects, STEP_LABEL,
-                    "effect size exactly zero",
-                    "The effect size is exactly zero. With a valid standard error this is a "
-                    "legitimate null result giving a Z score of zero, which is why the "
-                    "default is to keep it.",
-                    warn_on_keep=False,
-                )
-                record("beta_zero", removed)
-
-        # ------------------------------------------------------------------
-        # 4. Z score
-        # ------------------------------------------------------------------
-        z_action = pol.get("validation.z_invalid")
-        if z_col is None:
-            qc_info["checks_skipped"].append("z_invalid:no_z_column")
-            ctx.warn(
-                "No Z-score column is present, so the Z-score checks could not run. "
-                "Every variant passed this part of the gate untested."
-            )
-        elif "z_invalid" not in reused_checks:
-            z = _numeric(df, z_col)
-            df, removed, _matched = _apply_rule(
-                df, z.is_null() | ~z.is_finite(), "z_invalid", z_action,
-                ctx, rejects, STEP_LABEL,
-                "Z score missing or not finite",
-                "The Z score is missing, infinite or not a number, so the variant "
-                "cannot be meta-analysed or fine-mapped.",
-            )
-            record("z_invalid", removed)
-
-        # ------------------------------------------------------------------
         # 5. Optional supplied-Z vs BETA / SE concordance
         # ------------------------------------------------------------------
         df, concordance = _beta_se_z_concordance(
@@ -477,10 +491,31 @@ def validate_effect_statistics(
         # 6. Optional Z vs p-value concordance
         # ------------------------------------------------------------------
         df, concordance = _z_pval_concordance(
-            df, z_col, pval_col, pol, ctx, rejects, qc_info,
+            df, z_col, pval_col, log_p_col, pol, ctx, rejects, qc_info,
         )
         qc_info["z_pval_concordance"] = concordance
         record("z_pval_discordant", concordance.get("removed", 0))
+
+        if z_col is not None:
+            z_summary = df.select(
+                pl.col(z_col).cast(pl.Float64, strict=False).min().alias("z_min"),
+                pl.col(z_col).cast(pl.Float64, strict=False).max().alias("z_max"),
+                pl.col(z_col).cast(pl.Float64, strict=False).mean().alias("z_mean"),
+                pl.col(z_col).cast(pl.Float64, strict=False).std().alias("z_std"),
+                pl.len().alias("total_variants"),
+            ).row(0, named=True)
+            qc_info.update(z_summary)
+            ctx.info(
+                "Validated Z score summary: min=%s, max=%s, mean=%s, std=%s "
+                "(n=%s)."
+                % (
+                    _fmt(z_summary["z_min"]),
+                    _fmt(z_summary["z_max"]),
+                    _fmt(z_summary["z_mean"]),
+                    _fmt(z_summary["z_std"]),
+                    "{:,}".format(z_summary["total_variants"]),
+                )
+            )
 
         # ------------------------------------------------------------------
         # 7. How much of the chromosome did this step take?
@@ -618,22 +653,23 @@ def _beta_se_z_concordance(df, beta_col, se_col, z_col, pol, ctx, rejects, qc_in
 
     if action == "reject":
         mask = df.select(discordant.alias("__beta_se_z_discordant")).to_series()
-        before = df.height
-        if rejects is not None:
-            df = rejects.reject(
-                df, mask, STEP_LABEL, "beta_se_z_discordant",
-                detail=(
-                    "|Z - BETA/SE| > %s + %s*|BETA/SE|"
-                    % (absolute_tolerance, relative_tolerance)
-                ),
-            )
-        else:
-            df = df.filter(~mask)
-            ctx.qc(
-                "BETA/SE versus Z agreement", plain, before, df.height,
-                reason="beta_se_z_discordant", step=STEP_LABEL, warn=True,
-            )
-        result["removed"] = before - df.height
+        df, removed = reject_rows(
+            df,
+            mask,
+            step_label=STEP_LABEL,
+            reason="beta_se_z_discordant",
+            context=ctx,
+            collector=rejects,
+            detail=(
+                "|Z - BETA/SE| > %s + %s*|BETA/SE|"
+                % (absolute_tolerance, relative_tolerance)
+            ),
+            check_name="BETA/SE versus Z agreement",
+            description=plain,
+            warn_on_remove=True,
+            record_empty=True,
+        )
+        result["removed"] = removed
         return df, result
 
     ctx.warn(
@@ -643,8 +679,10 @@ def _beta_se_z_concordance(df, beta_col, se_col, z_col, pol, ctx, rejects, qc_in
     return df, result
 
 
-def _z_pval_concordance(df, z_col, pval_col, pol, ctx, rejects, qc_info):
-    # type: (pl.DataFrame, Optional[str], Optional[str], Any, Any, Any, Dict[str, Any]) -> Tuple[pl.DataFrame, Dict[str, Any]]
+def _z_pval_concordance(
+    df, z_col, pval_col, log_p_col, pol, ctx, rejects, qc_info,
+):
+    # type: (pl.DataFrame, Optional[str], Optional[str], Optional[str], Any, Any, Any, Dict[str, Any]) -> Tuple[pl.DataFrame, Dict[str, Any]]
     """Compare -log10(2 * P(Z > |z|)) with the harmonised -log10 p.
 
     One check that catches a fabricated standard error, a capped p-value and a
@@ -686,10 +724,19 @@ def _z_pval_concordance(df, z_col, pval_col, pol, ctx, rejects, qc_info):
 
     z_values = df.get_column(z_col).cast(pl.Float64, strict=False).to_numpy()
     p_values = df.get_column(pval_col).cast(pl.Float64, strict=False).to_numpy()
+    if log_p_col is not None:
+        logged_values = (
+            df.get_column(log_p_col).cast(pl.Float64, strict=False).to_numpy()
+        )
+    else:
+        logged_values = np.full(df.height, np.nan, dtype=float)
 
     with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
         expected = two_sided_negative_log10_p_from_z(z_values)
-        observed = -np.log10(p_values)
+        fallback_log = np.log(p_values)
+        source_log_is_valid = np.isfinite(logged_values) & (logged_values <= 0.0)
+        natural_log_p = np.where(source_log_is_valid, logged_values, fallback_log)
+        observed = -natural_log_p / np.log(10.0)
         difference = np.abs(expected - observed)
 
     comparable = np.isfinite(difference)
@@ -703,8 +750,8 @@ def _z_pval_concordance(df, z_col, pval_col, pol, ctx, rejects, qc_info):
     plain = (
         "The p-value implied by the Z score disagrees with the reported p-value by "
         "more than %s orders of magnitude. That happens when the standard error was "
-        "fabricated from a clipped p-value, when the p-value column was capped, or "
-        "when the effect-size type was detected wrongly." % tolerance
+        "fabricated from a corrected p-value, when p-value precision was lost before "
+        "input, or when the effect-size type was detected wrongly." % tolerance
     )
 
     if n_discordant == 0:
@@ -733,16 +780,22 @@ def _z_pval_concordance(df, z_col, pval_col, pol, ctx, rejects, qc_info):
 
     if action == "reject":
         mask = pl.Series("__z_pval_discordant", discordant)
-        before = df.height
-        if rejects is not None:
-            df = rejects.reject(df, mask, STEP_LABEL, "z_pval_discordant",
-                                detail="|expected - observed| > %s on the -log10 scale"
-                                       % tolerance)
-        else:
-            df = df.filter(~mask)
-            ctx.qc("Z versus p-value agreement", plain, before, df.height,
-                   reason="z_pval_discordant", step=STEP_LABEL, warn=True)
-        result["removed"] = before - df.height
+        df, removed = reject_rows(
+            df,
+            mask,
+            step_label=STEP_LABEL,
+            reason="z_pval_discordant",
+            context=ctx,
+            collector=rejects,
+            detail=(
+                "|expected - observed| > %s on the -log10 scale" % tolerance
+            ),
+            check_name="Z versus p-value agreement",
+            description=plain,
+            warn_on_remove=True,
+            record_empty=True,
+        )
+        result["removed"] = removed
         return df, result
 
     ctx.warn(
@@ -834,6 +887,10 @@ def final_completeness_check(
     required = list(pol.get("final_check.require"))
     treat_as_missing = list(pol.get("final_check.treat_as_missing"))
     action = pol.get("final_check.on_missing")
+    log_p_col = _column(sample_column_dict, (P_VALUE_LOG_KEY,), df)
+    exact_raw_p_col = _column(
+        sample_column_dict, (P_VALUE_EXACT_RAW_KEY,), df
+    )
 
     qc_info = {
         "chromosome": str(chromosome),
@@ -879,6 +936,21 @@ def final_completeness_check(
                 )
 
             mask = _missing_mask(df, column, field, treat_as_missing)
+            if (
+                field == "pval"
+                and mask is not None
+                and log_p_col is not None
+                and exact_raw_p_col is not None
+            ):
+                exact_probability = (
+                    pl.col(log_p_col).cast(pl.Float64, strict=False).is_finite()
+                    & (
+                        pl.col(log_p_col).cast(pl.Float64, strict=False)
+                        <= 0.0
+                    )
+                    & pl.col(exact_raw_p_col).is_not_null()
+                ).fill_null(False)
+                mask = mask & ~exact_probability
             if mask is None:
                 qc_info["fields_skipped"][field] = "nothing_treated_as_missing"
                 ctx.skip(

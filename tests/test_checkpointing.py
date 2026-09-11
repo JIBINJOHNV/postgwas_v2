@@ -1,13 +1,16 @@
 """Regression tests for global direct and pipeline execution checkpoints."""
 
 from argparse import Namespace
+import errno
 from io import StringIO
 from pathlib import Path
 
 import pytest
 from rich.console import Console
+import yaml
 
 from postgwas.config import load_configuration
+from postgwas.core import checkpointing
 from postgwas.core.checkpointing import (
     CheckpointAuditLogger,
     ExecutionCheckpoint,
@@ -16,6 +19,7 @@ from postgwas.core.checkpointing import (
     discover_input_files,
     encode_checkpoint_value,
     restore_checkpoint_namespace,
+    software_identity,
 )
 from postgwas.core.contracts import Artifact, ModuleResult
 
@@ -39,6 +43,7 @@ def _manager(
     upstream=None,
     logger=None,
     software=None,
+    resume=True,
     overwrite=False,
 ) -> ExecutionCheckpoint:
     policy = load_configuration().run.resume_policy
@@ -50,7 +55,7 @@ def _manager(
         configuration=configuration or {"threshold": 0.05},
         inputs=inputs or {},
         policy=policy,
-        resume=True,
+        resume=resume,
         overwrite=overwrite,
         logger=logger or _logger(root)[0],
         software=software or {"postgwas": "test"},
@@ -206,6 +211,130 @@ def test_changed_upstream_checkpoint_invalidates_downstream_stage(tmp_path):
     assert not output.exists()
 
 
+def test_unchanged_input_reuses_stat_validated_sha256(monkeypatch, tmp_path):
+    input_file = tmp_path / "input.tsv"
+    input_file.write_text("stable\n", encoding="utf-8")
+    output, _ = _completed_checkpoint(
+        tmp_path,
+        inputs={"study": input_file},
+    )
+
+    def unexpected_rehash(*_args, **_kwargs):
+        raise AssertionError("unchanged input was rehashed")
+
+    monkeypatch.setattr(checkpointing, "file_fingerprint", unexpected_rehash)
+
+    decision = _manager(
+        tmp_path,
+        inputs={"study": input_file},
+    ).prepare()
+
+    assert decision.action == "resume"
+    assert output.is_file()
+    assert decision.document["input_fingerprint_cache"]["study"]["sha256"]
+
+
+@pytest.mark.parametrize(
+    ("resume", "overwrite"),
+    ((False, False), (True, True)),
+)
+def test_execution_controls_reuse_unchanged_input_hash(
+    monkeypatch, tmp_path, resume, overwrite,
+):
+    input_file = tmp_path / "input.tsv"
+    input_file.write_text("stable\n", encoding="utf-8")
+    output, _ = _completed_checkpoint(
+        tmp_path,
+        inputs={"study": input_file},
+    )
+
+    def unexpected_rehash(*_args, **_kwargs):
+        raise AssertionError("unchanged input was rehashed")
+
+    monkeypatch.setattr(checkpointing, "file_fingerprint", unexpected_rehash)
+    manager = _manager(
+        tmp_path,
+        inputs={"study": input_file},
+        resume=resume,
+        overwrite=overwrite,
+    )
+
+    assert manager.prepare().action == "run"
+    output.write_text("recomputed\n", encoding="utf-8")
+    manager.write(status="COMPLETED", declared_values={"result": output})
+
+    assert manager.manifest_path.is_file()
+
+
+def test_same_size_input_change_invalidates_cache_and_rehashes(monkeypatch, tmp_path):
+    input_file = tmp_path / "input.tsv"
+    input_file.write_text("old\n", encoding="utf-8")
+    output, _ = _completed_checkpoint(
+        tmp_path,
+        inputs={"study": input_file},
+    )
+    input_file.write_text("new\n", encoding="utf-8")
+    original = checkpointing.file_fingerprint
+    rehashed = []
+
+    def record_rehash(path, **kwargs):
+        rehashed.append(Path(path).resolve())
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(checkpointing, "file_fingerprint", record_rehash)
+
+    decision = _manager(
+        tmp_path,
+        inputs={"study": input_file},
+    ).prepare()
+
+    assert decision.action == "run"
+    assert rehashed == [input_file.resolve()]
+    assert not output.exists()
+
+
+def test_legacy_checkpoint_hash_seeds_stat_validated_cache(monkeypatch, tmp_path):
+    input_file = tmp_path / "input.tsv"
+    input_file.write_text("stable\n", encoding="utf-8")
+    output, _ = _completed_checkpoint(
+        tmp_path,
+        inputs={"study": input_file},
+    )
+    manifest = tmp_path / "run_metadata/checkpoints/01_stage.yaml"
+    document = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    document.pop("input_fingerprint_cache")
+    manifest.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    def unexpected_rehash(*_args, **_kwargs):
+        raise AssertionError("legacy checkpoint input was rehashed")
+
+    monkeypatch.setattr(checkpointing, "file_fingerprint", unexpected_rehash)
+
+    decision = _manager(
+        tmp_path,
+        inputs={"study": input_file},
+    ).prepare()
+
+    assert decision.action == "resume"
+    assert output.is_file()
+
+
+def test_input_change_during_execution_refuses_checkpoint(tmp_path):
+    input_file = tmp_path / "input.tsv"
+    input_file.write_text("old\n", encoding="utf-8")
+    artifact_root = tmp_path / "01_stage"
+    artifact_root.mkdir()
+    manager = _manager(tmp_path, inputs={"study": input_file})
+    input_file.write_text("new\n", encoding="utf-8")
+    output = artifact_root / "result.tsv"
+    output.write_text("result\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="changed while the execution was active"):
+        manager.write(status="COMPLETED", declared_values={"result": output})
+
+    assert not manager.manifest_path.exists()
+
+
 def test_namespace_and_contract_state_round_trip_without_pickle(tmp_path):
     namespace = Namespace(dataset_id="STUDY", path=tmp_path / "input.tsv")
     namespace._step_num = "01"
@@ -229,6 +358,10 @@ def test_input_discovery_tracks_files_directories_and_reference_prefixes(tmp_pat
     directory.mkdir()
     member = directory / "scores.tsv"
     member.write_text("scores\n", encoding="utf-8")
+    generated = directory / "generated"
+    generated.mkdir()
+    generated_member = generated / "runtime.log"
+    generated_member.write_text("runtime\n", encoding="utf-8")
     prefix = tmp_path / "panel"
     bim = tmp_path / "panel.bim"
     bim.write_text("1 rs1 0 1 A G\n", encoding="utf-8")
@@ -243,9 +376,68 @@ def test_input_discovery_tracks_files_directories_and_reference_prefixes(tmp_pat
             "reference_prefix": prefix,
             "output_directory": ignored,
         },
-        excluded_roots=(ignored,),
+        excluded_roots=(ignored, generated),
     )
 
     assert set(discovered.values()) == {
         explicit.resolve(), member.resolve(), bim.resolve(),
     }
+
+
+def test_input_discovery_prunes_output_reached_through_parent_directory(
+    tmp_path, monkeypatch,
+):
+    study_root = tmp_path / "SCZ_2026"
+    module_directory = study_root / "gcta_gene"
+    output = module_directory / "mbat_combo"
+    screen_log = output / "run_metadata/screen.log"
+    screen_log.parent.mkdir(parents=True)
+    screen_log.write_text("live transcript\n", encoding="utf-8")
+    explicit_input = output / "upstream.ma"
+    explicit_input.write_text("SNP A1 A2 freq BETA SE P N\n", encoding="utf-8")
+    monkeypatch.chdir(study_root)
+
+    discovered = discover_input_files(
+        {
+            "modules": ["formatter", "gcta_gene"],
+            "method": "mbat_combo",
+            "gcta_input_file": explicit_input,
+        },
+        excluded_paths=(output,),
+    )
+
+    assert explicit_input.resolve() in discovered.values()
+    assert screen_log.resolve() not in discovered.values()
+
+
+def test_checkpoint_path_scanners_ignore_overlong_non_path_values(tmp_path):
+    output = tmp_path / "01_stage/result.tsv"
+    output.parent.mkdir()
+    output.write_text("result\n", encoding="utf-8")
+    shell_metadata = "rs=0:" + "di=01;34:" * 100
+
+    assert discover_input_files(
+        {"environment": {"LS_COLORS": shell_metadata}}
+    ) == {}
+    assert software_identity(
+        {"environment": {"LS_COLORS": shell_metadata}}
+    )["executables"] == {}
+
+    manager = _manager(tmp_path)
+    manifest = manager.write(
+        status="COMPLETED",
+        declared_values={"result": output, "diagnostic": shell_metadata},
+    )
+
+    assert manifest.is_file()
+
+
+def test_input_discovery_preserves_permission_failures(tmp_path, monkeypatch):
+    source = tmp_path / "reference.tsv"
+
+    def denied(_path):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(Path, "is_symlink", denied)
+    with pytest.raises(PermissionError):
+        discover_input_files({"reference": source})

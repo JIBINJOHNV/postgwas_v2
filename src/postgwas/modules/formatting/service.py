@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 import tempfile
 from typing import get_args
-
-from rich import box
-from rich.console import Console
-from rich.table import Table
-from rich.text import Text
 
 from postgwas.config import (
     load_run_configuration_for_module,
@@ -19,12 +15,17 @@ from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.config.models.modules.formatting import FormattingSampleSizeRole
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
 from postgwas.core.paths import configured_output_path, resolve_executable
+from postgwas.core.preflight import require_unchanged_preflight_files
+from postgwas.core.ui import StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
+from postgwas.core.vcf import vcf_query_field_label
 
 from .contracts import (
     CUSTOM_OUTPUT_TARGET,
+    DUPLICATE_POLICY_DESCRIPTIONS,
     FORMAT_CONTRACTS,
     formatter_result_targets,
+    formatter_target_display_name,
 )
 from .exporters.custom import export_custom
 from .exporters.finemap import export_finemap
@@ -41,8 +42,14 @@ from .ldsc_reference import (
 from .resume import (
     formatter_output_paths,
     formatter_resolved_paths,
+    magma_formatter_content_paths,
     resume_formatter_outputs,
     write_formatter_completion_manifest,
+)
+from .reporting import (
+    ldsc_sample_prevalence_screen_fields as _ldsc_sample_prevalence_screen_fields,
+    render_formatter_screen_summary as _screen_summary,
+    write_formatter_html_report,
 )
 from .table import (
     FormattingError,
@@ -50,6 +57,7 @@ from .table import (
     load_harmonised_vcf,
     resolve_duplicate_identifiers,
     select_variant_identifiers,
+    validate_unique_identifiers,
 )
 
 
@@ -64,120 +72,27 @@ EXPORTERS = {
 }
 
 
-def _ldsc_sample_prevalence_screen_fields(
-    results,
-    case_count_column,
-    control_count_column,
-    label_width,
-):
-    """Render the sample prevalence already calculated by the LDSC exporter."""
-    result = results.get("ldsc")
-    if result is None:
-        return []
-    if result.get("trait_type") != "binary":
-        return [screen_field(
-            "analysis",
-            "LDSC sample prevalence",
-            "not applicable to a quantitative trait",
-            indent=6,
-            label_width=label_width,
-        )]
+def _magma_variant_input_pipeline_progress(args, *, pipeline_mode: bool):
+    """Resolve the shared formatter-to-MAGMA stage from the attached plan."""
+    progress = getattr(args, "_pipeline_stage_progress", None)
+    plan = getattr(args, "_pipeline_progress_plan", {}) or {}
+    stage = (plan.get("magma_stage_numbers") or {}).get("variant_inputs")
+    if not pipeline_mode or progress is None or stage is None:
+        return None
+    return progress, stage
 
-    value = result.get("sample_prev")
-    aggregation = result.get("sample_prevalence_aggregation")
-    variants = result.get("sample_prevalence_variants")
-    minimum = result.get("sample_prevalence_minimum")
-    maximum = result.get("sample_prevalence_maximum")
-    if any(
-        item is None
-        for item in (value, aggregation, variants, minimum, maximum)
-    ):
-        return [screen_field(
-            "warning",
-            "LDSC sample prevalence",
-            "unavailable because the formatter result metadata is incomplete",
-            indent=6,
-            label_width=label_width,
-        )]
 
-    fields = [
-        screen_field(
-            "analysis",
-            "LDSC sample prevalence",
-            "%.10g (%.2f%%)" % (float(value), float(value) * 100.0),
-            indent=6,
-            label_width=label_width,
+def _identifier_selection_settings(module, target: str) -> tuple[str, str]:
+    """Resolve one target's identifier type and duplicate policy."""
+    return (
+        module.variant_identifiers.target_types.get(
+            target, module.variant_identifiers.default_type,
         ),
-        screen_field(
-            "info",
-            "Prevalence calculation",
-            "%s of %s / (%s + %s)"
-            % (
-                aggregation,
-                case_count_column,
-                case_count_column,
-                control_count_column,
-            ),
-            indent=6,
-            label_width=label_width,
+        module.variant_identifiers.target_duplicate_policies.get(
+            target,
+            module.variant_identifiers.default_duplicate_policy,
         ),
-        screen_field(
-            "count",
-            "Prevalence variants",
-            "%s exported variants" % f"{int(variants):,}",
-            indent=6,
-            label_width=label_width,
-        ),
-        screen_field(
-            "info",
-            "Prevalence range",
-            "%.10g to %.10g" % (float(minimum), float(maximum)),
-            indent=6,
-            label_width=label_width,
-        ),
-    ]
-    count_ranges = (
-        result.get("sample_prevalence_case_count_minimum"),
-        result.get("sample_prevalence_case_count_maximum"),
-        result.get("sample_prevalence_control_count_minimum"),
-        result.get("sample_prevalence_control_count_maximum"),
     )
-    if any(value is None for value in count_ranges):
-        fields.append(screen_field(
-            "warning",
-            "%s/%s ranges" % (case_count_column, control_count_column),
-            "unavailable in stored completion metadata; rerun with --overwrite",
-            indent=6,
-            label_width=label_width,
-        ))
-        return fields
-
-    case_minimum, case_maximum, control_minimum, control_maximum = count_ranges
-    fields.extend([
-        screen_field(
-            "count",
-            "%s range" % case_count_column,
-            "%s to %s"
-            % (
-                format(float(case_minimum), ",.10g"),
-                format(float(case_maximum), ",.10g"),
-            ),
-            indent=6,
-            label_width=label_width,
-        ),
-        screen_field(
-            "count",
-            "%s range" % control_count_column,
-            "%s to %s"
-            % (
-                format(float(control_minimum), ",.10g"),
-                format(float(control_maximum), ",.10g"),
-            ),
-            indent=6,
-            label_width=label_width,
-        ),
-    ])
-    return fields
 
 
 def _validate_output_destinations(
@@ -185,27 +100,32 @@ def _validate_output_destinations(
     dataset_id: str,
     selected: list[str],
     module,
+    *,
+    configuration=None,
 ) -> dict[str, str]:
     """Resolve every selected output and reject collisions before extraction."""
     output_paths = formatter_output_paths(
-        output_directory, dataset_id, selected, module,
+        output_directory,
+        dataset_id,
+        selected,
+        module,
+        configuration=configuration,
     )
     destinations: dict[Path, list[str]] = {}
     for label, path in output_paths.items():
         destinations.setdefault(path, []).append(label)
-    if module.custom_output.active:
-        for label, pattern in {
-            "formatter log": module.runtime.log_file,
-            "resolved configuration": module.runtime.resolved_config_file,
-            "completion manifest": module.runtime.completion_manifest_file,
-        }.items():
-            path = configured_output_path(
-                output_directory,
-                pattern,
-                error_type=FormattingError,
-                dataset_id=dataset_id,
-            )
-            destinations.setdefault(path, []).append(label)
+    for label, pattern in {
+        "formatter log": module.runtime.log_file,
+        "resolved configuration": module.runtime.resolved_config_file,
+        "completion manifest": module.runtime.completion_manifest_file,
+    }.items():
+        path = configured_output_path(
+            output_directory,
+            pattern,
+            error_type=FormattingError,
+            dataset_id=dataset_id,
+        )
+        destinations.setdefault(path, []).append(label)
 
     collisions = [
         (path, labels)
@@ -231,6 +151,9 @@ def _resolved_configuration(args):
             "format": "formats",
             "variant_id_type": "variant_identifiers.default_type",
             "variant_id_types": "variant_identifiers.target_types",
+            "variant_id_duplicate_policies": (
+                "variant_identifiers.target_duplicate_policies"
+            ),
             "duplicate_id_policy": (
                 "variant_identifiers.default_duplicate_policy"
             ),
@@ -265,140 +188,6 @@ def _resolved_configuration(args):
         module_overrides=module_overrides,
         global_overrides=global_overrides,
     )
-
-
-def _screen_summary(
-    dataset_id,
-    vcf,
-    study_design,
-    results,
-    log_path,
-    case_count_column,
-    control_count_column,
-    label_width,
-    variant_id_observations,
-):
-    lines = [
-        "",
-        screen_line("analysis", "Formatter completed", indent=2),
-        screen_field(
-            "info", "Dataset", dataset_id, indent=6, label_width=label_width,
-        ),
-        screen_field(
-            "genetic", "Input GWAS-VCF", vcf, indent=6, label_width=label_width,
-        ),
-    ]
-    if study_design is None:
-        lines.append(screen_field(
-            "info",
-            "Study-design inference",
-            "not required for the selected formats",
-            indent=6,
-            label_width=label_width,
-        ))
-    else:
-        lines.append(screen_field(
-            "analysis",
-            "Inferred trait type",
-            "%s (%s present for %s/%s variants; %s present for %s/%s)"
-            % (
-                study_design.trait_type,
-                case_count_column,
-                f"{study_design.case_counts_present:,}",
-                f"{study_design.rows:,}",
-                control_count_column,
-                f"{study_design.control_counts_present:,}",
-                f"{study_design.rows:,}",
-            ),
-            indent=6,
-            label_width=label_width,
-        ))
-    for target, observation in variant_id_observations.items():
-        identifier_label = (
-            "rsIDs"
-            if observation["variant_id_type"] == "rsid"
-            else "configured coordinate-and-allele unique IDs"
-        )
-        lines.append(screen_field(
-            "genetic",
-            "%s reference IDs" % target,
-            "%s (%s BIM variants scanned)"
-            % (identifier_label, f"{observation['variants']:,}"),
-            indent=6,
-            label_width=label_width,
-        ))
-    for target, result in results.items():
-        exclusion_counts = [
-            (
-                int(result.get(
-                    "identifier_missing_rows_excluded",
-                    result.get("identifier_rows_excluded", 0),
-                )),
-                "missing or invalid identifiers",
-            ),
-            (
-                int(result.get("identifier_duplicate_rows_excluded", 0)),
-                "rows with duplicated identifiers",
-            ),
-            (
-                int(result.get("rows_excluded_not_in_reference", 0)),
-                "not in the LDSC merge-alleles reference",
-            ),
-            (
-                int(result.get(
-                    "rows_excluded_reference_allele_mismatch", 0,
-                )),
-                "incompatible with LDSC reference alleles",
-            ),
-            (
-                int(result.get(
-                    "rows_excluded_unconfigured_chromosome", 0,
-                )),
-                "outside configured chromosomes",
-            ),
-            (
-                int(result.get("schema_rows_excluded", 0)),
-                "missing or invalid required values",
-            ),
-        ]
-        exclusion_details = [
-            "%s %s" % (f"{count:,}", reason)
-            for count, reason in exclusion_counts
-            if count
-        ]
-        categorized = sum(count for count, _ in exclusion_counts)
-        uncategorized = int(result["rows_excluded"]) - categorized
-        if uncategorized > 0:
-            exclusion_details.append(
-                "%s other exclusions" % f"{uncategorized:,}"
-            )
-        exclusion_summary = "%s excluded" % f"{result['rows_excluded']:,}"
-        if exclusion_details:
-            exclusion_summary += " (%s)" % "; ".join(exclusion_details)
-        lines.append(screen_field(
-            "success",
-            target,
-            "%s variants exported using %s; duplicate policy %s; %s"
-            % (
-                f"{result['rows_out']:,}",
-                "rsIDs" if result["variant_id_type"] == "rsid" else "unique IDs",
-                result.get("identifier_duplicate_policy", "not recorded"),
-                exclusion_summary,
-            ),
-            indent=6,
-            label_width=label_width,
-        ))
-    lines.extend(_ldsc_sample_prevalence_screen_fields(
-        results,
-        case_count_column,
-        control_count_column,
-        label_width,
-    ))
-    lines.append(screen_field(
-        "info", "Full log", log_path, indent=6, label_width=label_width,
-    ))
-    lines.append("")
-    return "\n".join(lines)
 
 
 def _column_records(mapping, transformations):
@@ -503,18 +292,6 @@ def _render_saved_statistic(
     return "; ".join(rendered) or "not saved"
 
 
-def _vcf_query_label(query):
-    """Render a configured simple FORMAT query without hiding custom queries."""
-    query = str(query).strip()
-    if query.startswith("[%") and query.endswith("]"):
-        tag = query[2:-1]
-        if tag and all(
-            character.isalnum() or character == "_" for character in tag
-        ):
-            return "FORMAT/%s" % tag
-    return query
-
-
 def _render_saved_sample_sizes(outputs, module, target, trait_type):
     """Report resolved source, numerical meaning, destination, and tool use."""
     canonical = module.canonical_columns
@@ -532,7 +309,7 @@ def _render_saved_sample_sizes(outputs, module, target, trait_type):
             if role is None:
                 continue
             meaning = reporting.source_semantics[role].resolve(trait_type)
-            vcf_source = _vcf_query_label(module.vcf_fields.root[source])
+            vcf_source = vcf_query_field_label(module.vcf_fields.root[source])
             transformation = column["transformation"]
             representation = (
                 "copied"
@@ -554,40 +331,50 @@ def _render_saved_sample_sizes(outputs, module, target, trait_type):
     return "; ".join(rendered)
 
 
-def _configured_schema_reports(targets, module, trait_types=None):
+def _configured_schema_reports(
+    targets,
+    module,
+    trait_types=None,
+    variant_id_observations=None,
+):
     """Build screen/log reports solely from resolved formatter configuration."""
     trait_types = trait_types or {}
     reports = {}
     canonical = module.canonical_columns
+    unique_id_label = "coordinate-and-allele ID (%s)" % (
+        module.variant_identifiers.unique_id_template.format(
+            chromosome=canonical.chromosome,
+            position=canonical.position,
+            reference_allele=canonical.reference_allele,
+            alternate_allele=canonical.alternate_allele,
+        )
+    )
     for target in targets:
         outputs = _configured_output_schemas(
             module, target, trait_types.get(target),
         )
-        variant_id_type = module.variant_identifiers.target_types.get(
-            target,
-            module.variant_identifiers.default_type,
+        variant_id_type, duplicate_id_policy = _identifier_selection_settings(
+            module, target,
         )
-        duplicate_id_policy = (
-            module.variant_identifiers.target_duplicate_policies.get(
-                target,
-                module.variant_identifiers.default_duplicate_policy,
-            )
+        name = formatter_target_display_name(
+            target, variant_id_observations,
         )
         if target == CUSTOM_OUTPUT_TARGET:
-            name = "Custom CLI table"
             frequency_interpretation = "custom field semantics"
         else:
             contract = FORMAT_CONTRACTS[target]
-            name = contract.name
             frequency_interpretation = contract.frequency
         reports[target] = {
             "name": name,
             "variant_id_type": variant_id_type,
             "duplicate_id_policy": duplicate_id_policy,
+            "duplicate_id_policy_description": (
+                DUPLICATE_POLICY_DESCRIPTIONS[duplicate_id_policy]
+            ),
             "variant_id_type_label": (
                 "rsID"
                 if variant_id_type == "rsid"
-                else "unique"
+                else unique_id_label
             ),
             "outputs": outputs,
             "column_mappings": _render_column_mappings(outputs),
@@ -626,6 +413,7 @@ def _log_schema_reports(logger, reports):
             "DECIDE",
             "formatter_saved_schema",
             target=target,
+            downstream_consumer=report["name"],
             variant_id_type=report["variant_id_type"],
             duplicate_id_policy=report["duplicate_id_policy"],
             outputs=report["outputs"],
@@ -636,39 +424,76 @@ def _log_schema_reports(logger, reports):
         )
 
 
-def _print_contract_table(reports):
-    """Show exact configured column mappings and statistic representations."""
-    table = Table(
-        title="🔬  Validated downstream input schemas",
-        box=box.SIMPLE_HEAVY,
-        show_lines=True,
-        header_style="bold cyan",
-        padding=(0, 1),
-    )
-    table.add_column("Tool", style="bold", no_wrap=True)
-    table.add_column("Variant ID type / duplicate policy", width=18)
-    table.add_column("Source → saved column", ratio=6)
-    table.add_column("P value saved", ratio=2)
-    table.add_column("Frequency saved", ratio=2)
-    table.add_column("Sample size saved", ratio=3)
+def _print_contract_summary(reports, label_width):
+    """Explain the configured file preparation without implying analysis ran."""
+    lines = [
+        "",
+        screen_line(
+            "analysis",
+            "Formatter plan · prepare files required by downstream analyses",
+            indent=2,
+        ),
+    ]
     for report in reports.values():
-        table.add_row(
-            report["name"],
-            Text(
-                "%s / %s"
-                % (
-                    report["variant_id_type_label"],
-                    report["duplicate_id_policy"],
-                )
+        lines.extend([
+            "",
+            screen_line("analysis", report["name"], indent=6),
+            screen_field(
+                "info",
+                "What this step does",
+                "Create validated PostGWAS intermediate files for this tool; "
+                "the downstream analysis is not run in this step",
+                indent=10,
+                label_width=label_width,
             ),
-            Text(report["column_mappings"]),
-            Text(report["p_value"]),
-            Text(report["frequency"]),
-            Text(report["sample_size"]),
-        )
-    console = Console(width=144)
-    console.print()
-    console.print(table)
+            screen_field(
+                "genetic",
+                "Variant identifiers written",
+                report["variant_id_type_label"],
+                indent=10,
+                label_width=label_width,
+            ),
+            screen_field(
+                "info",
+                "Duplicate-ID handling",
+                "%s — %s"
+                % (
+                    report["duplicate_id_policy"],
+                    report["duplicate_id_policy_description"],
+                ),
+                indent=10,
+                label_width=label_width,
+            ),
+            screen_field(
+                "info",
+                "Columns and transformations",
+                report["column_mappings"],
+                indent=10,
+                label_width=label_width,
+            ),
+            screen_field(
+                "analysis",
+                "P value written",
+                report["p_value"],
+                indent=10,
+                label_width=label_width,
+            ),
+            screen_field(
+                "genetic",
+                "Allele frequency written",
+                report["frequency"],
+                indent=10,
+                label_width=label_width,
+            ),
+            screen_field(
+                "count",
+                "Sample size written",
+                report["sample_size"],
+                indent=10,
+                label_width=label_width,
+            ),
+        ])
+    print("\n".join(lines))
 
 
 def _log_ldsc_sample_prevalence(logger, result, module):
@@ -713,8 +538,15 @@ def _log_ldsc_sample_prevalence(logger, result, module):
     )
 
 
-def run_formatter_direct(args, ctx=None, *, configuration=None):
+def run_formatter_direct(
+    args,
+    ctx=None,
+    *,
+    configuration=None,
+    emit_terminal_summary: bool = True,
+):
     """Create all requested tool inputs from one checked VCF extraction."""
+    pipeline_mode = ctx is not None
     try:
         configuration = configuration or _resolved_configuration(args)
     except BaseException as exc:
@@ -741,6 +573,35 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
         )
         raise
     module = configuration.modules.formatting
+    magma_pipeline_evidence = (
+        ctx.validation("magma")
+        if pipeline_mode and hasattr(ctx, "validation") else None
+    )
+    magma_pipeline_resources = (
+        magma_pipeline_evidence.resources
+        if magma_pipeline_evidence is not None else None
+    )
+    magma_formatter_configuration = (
+        magma_pipeline_resources.configuration
+        if magma_pipeline_resources is not None else None
+    )
+    if pipeline_mode and hasattr(ctx, "validation"):
+        for module_name in ctx.validation_modules():
+            evidence = ctx.validation(module_name)
+            resources = getattr(evidence, "resources", None)
+            identities = getattr(resources, "file_identities", None)
+            if identities is not None:
+                require_unchanged_preflight_files(
+                    identities,
+                    error_type=FormattingError,
+                    label="%s resource" % module_name.replace("_", " "),
+                )
+    if magma_formatter_configuration is not None:
+        configuration.modules.magma = (
+            magma_formatter_configuration.modules.magma.model_copy(
+                update={"enabled": True},
+            )
+        )
     output_directory = Path(configuration.run.output_directory).expanduser().resolve()
     dataset_id = str(configuration.run.dataset_id).strip()
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -759,6 +620,7 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
         log_path=str(log_path),
     )
     work_table = None
+    progress = None
     variant_id_observations = (
         getattr(args, "variant_id_observations", None) or {}
     )
@@ -814,18 +676,54 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             dataset_id,
             selected,
             module,
+            configuration=configuration,
+        )
+        html_report_path = Path(
+            output_destinations["formatter.html_report"]
+        )
+        completion_manifest_path = configured_output_path(
+            output_directory,
+            module.runtime.completion_manifest_file,
+            error_type=FormattingError,
+            dataset_id=dataset_id,
         )
 
-        bcftools = configuration.resources.executables.bcftools
-        try:
-            resolved_bcftools = resolve_executable(
-                str(bcftools), "bcftools executable", error_type=FormattingError,
+        current_vcf_validation = (
+            ctx.validation("current_vcf", {})
+            if pipeline_mode and hasattr(ctx, "validation")
+            else {}
+        )
+        indexed_vcf_validation = (
+            current_vcf_validation.get("indexed")
+            if isinstance(current_vcf_validation, dict)
+            else None
+        )
+        executable_identity = (
+            current_vcf_validation.get("bcftools_identity")
+            if isinstance(current_vcf_validation, dict)
+            else None
+        )
+        if executable_identity is not None:
+            require_unchanged_preflight_files(
+                executable_identity,
+                error_type=FormattingError,
+                label="bcftools executable",
             )
-        except FormattingError as exc:
-            raise FormattingError(
-                "%s. Set resources.executables.bcftools in --run-config or provide "
-                "--bcftools PATH." % exc
-            ) from exc
+        if indexed_vcf_validation is not None:
+            resolved_bcftools = indexed_vcf_validation.bcftools
+        else:
+            bcftools = configuration.resources.executables.bcftools
+            try:
+                resolved_bcftools = resolve_executable(
+                    str(bcftools),
+                    "bcftools executable",
+                    error_type=FormattingError,
+                )
+            except FormattingError as exc:
+                raise FormattingError(
+                    "%s. Install bcftools on PATH or set "
+                    "resources.executables.bcftools in --run-config." % exc
+                ) from exc
 
         logger.record("INPUT", "formatter_run", dataset=dataset_id, vcf=str(vcf))
         logger.record("PARAM", "formats", values=targets)
@@ -836,6 +734,11 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             values=output_destinations,
         )
         logger.record("PARAM", "minimum_p_value", value=module.minimum_p_value)
+        logger.record(
+            "PARAM",
+            "formatter_input_contract",
+            values=module.input_contract.model_dump(mode="json"),
+        )
         logger.record("PARAM", "vcf_fields", values=module.vcf_fields.model_dump())
         logger.record(
             "PARAM",
@@ -901,6 +804,10 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
         resolved_module_paths = {
             "formatting": formatter_resolved_paths(configuration, selected),
         }
+        resolved_modules = ["formatting"]
+        if "magma" in selected and magma_formatter_configuration is not None:
+            resolved_modules.append("magma")
+            resolved_module_paths["magma"] = magma_formatter_content_paths()
         if configuration.run.resume and not configuration.run.overwrite:
             resumed = resume_formatter_outputs(
                 output_directory=output_directory,
@@ -915,7 +822,7 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                 write_resolved_configuration(
                     configuration,
                     resolved_config_path,
-                    modules=("formatting",),
+                    modules=tuple(resolved_modules),
                     resource_paths=("executables.bcftools",),
                     module_paths=resolved_module_paths,
                 )
@@ -927,10 +834,17 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     if result.get("trait_type") is not None
                 }
                 schema_reports = _configured_schema_reports(
-                    targets, module, resumed_trait_types,
+                    targets,
+                    module,
+                    resumed_trait_types,
+                    variant_id_observations,
                 )
                 _log_schema_reports(logger, schema_reports)
-                _print_contract_table(schema_reports)
+                if emit_terminal_summary and not pipeline_mode:
+                    _print_contract_summary(
+                        schema_reports,
+                        configuration.logging.terminal_label_width,
+                    )
                 if "ldsc" in resumed:
                     _log_ldsc_sample_prevalence(
                         logger, resumed["ldsc"], module,
@@ -948,18 +862,60 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     "Formatter outputs validated; continuing from completed step",
                     indent=2,
                 )]
-                resume_lines.extend(_ldsc_sample_prevalence_screen_fields(
-                    resumed,
-                    module.study_design.case_count_column,
-                    module.study_design.control_count_column,
-                    configuration.logging.terminal_label_width,
-                ))
-                print("\n".join(resume_lines))
+                if "ldsc" in resumed:
+                    resume_lines.extend([
+                        "",
+                        screen_line(
+                            "analysis", "GWAS-VCF case fraction", indent=6,
+                        ),
+                    ])
+                    resume_lines.extend(_ldsc_sample_prevalence_screen_fields(
+                        resumed,
+                        module.study_design.case_count_column,
+                        module.study_design.control_count_column,
+                        configuration.logging.terminal_label_width,
+                        indent=10,
+                    ))
+                resume_lines.extend([
+                    "",
+                    screen_line("analysis", "Reports and logs", indent=6),
+                    screen_field(
+                        "success",
+                        "Detailed HTML report",
+                        str(html_report_path),
+                        indent=10,
+                        label_width=(
+                            configuration.logging.terminal_label_width
+                        ),
+                        path_value=True,
+                    ),
+                    screen_field(
+                        "info",
+                        "Full formatter log",
+                        str(log_path),
+                        indent=10,
+                        label_width=(
+                            configuration.logging.terminal_label_width
+                        ),
+                        path_value=True,
+                    ),
+                ])
+                if emit_terminal_summary:
+                    print(
+                        resume_lines[0]
+                        if pipeline_mode else "\n".join(resume_lines)
+                    )
+                magma_progress = _magma_variant_input_pipeline_progress(
+                    args, pipeline_mode=pipeline_mode,
+                )
+                if magma_progress is not None:
+                    pipeline_progress, variant_input_stage = magma_progress
+                    pipeline_progress.start(variant_input_stage)
                 return resumed
         write_resolved_configuration(
             configuration,
             resolved_config_path,
-            modules=("formatting",),
+            modules=tuple(resolved_modules),
             resource_paths=("executables.bcftools",),
             module_paths=resolved_module_paths,
         )
@@ -973,20 +929,84 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
         )
         work_table = Path(handle.name)
         handle.close()
-        with logger.step(
-            1, len(targets) + 1, "Read harmonised GWAS-VCF", "load_harmonised_vcf",
-        ) as step:
-            frame = load_harmonised_vcf(
-                vcf,
-                work_table,
-                dataset_id,
-                resolved_bcftools,
-                module,
-                logger=logger,
+        stage_total = len(targets) + 1
+        pipeline_progress = getattr(args, "_pipeline_stage_progress", None)
+        detailed_pipeline_progress = (
+            pipeline_mode and pipeline_progress is not None
+        )
+        magma_progress = _magma_variant_input_pipeline_progress(
+            args, pipeline_mode=pipeline_mode,
+        )
+        progress = StageProgress(
+            "Formatter preparation progress",
+            enabled=(
+                emit_terminal_summary and configuration.logging.show_progress
+                and not detailed_pipeline_progress
+            ),
+            outcome_label_width=configuration.logging.terminal_label_width,
+        )
+        load_title = "Validate and read the harmonised GWAS-VCF"
+        if magma_progress is not None:
+            pipeline_progress, variant_input_stage = magma_progress
+            pipeline_progress.start(variant_input_stage)
+        progress.start_step(1, stage_total, load_title)
+        try:
+            validated_header_evidence = (
+                current_vcf_validation.get("harmonised")
+                if isinstance(current_vcf_validation, dict)
+                else None
             )
-            step.set_rows(frame.height, removed=0)
-            step.output("canonical_variants", rows=frame.height)
-
+            with logger.step(
+                1, stage_total, load_title, "load_harmonised_vcf",
+            ) as step:
+                loaded = load_harmonised_vcf(
+                    vcf,
+                    work_table,
+                    resolved_bcftools,
+                    module,
+                    logger=logger,
+                    return_header_evidence=True,
+                    validated_header_evidence=validated_header_evidence,
+                    validated_sample=(
+                        indexed_vcf_validation.sample
+                        if indexed_vcf_validation is not None
+                        else None
+                    ),
+                )
+                if isinstance(loaded, tuple):
+                    frame, input_evidence = loaded
+                else:
+                    frame = loaded
+                    input_evidence = {
+                        "genome_build": "not recorded",
+                        "postgwas_dataset_id": dataset_id,
+                        "postgwas_version": "not recorded",
+                        "postgwas_status": "not recorded",
+                    }
+                step.set_rows(frame.height, removed=0)
+                step.output("canonical_variants", rows=frame.height)
+        except BaseException:
+            progress.fail_step(1, stage_total, load_title)
+            raise
+        embedded_dataset = str(input_evidence["postgwas_dataset_id"])
+        if embedded_dataset != dataset_id:
+            logger.warning(
+                "Run dataset ID %s differs from the GWAS-VCF embedded dataset "
+                "and sample ID %s. The run ID controls output naming; verify "
+                "that this is the intended GWAS-VCF."
+                % (dataset_id, embedded_dataset)
+            )
+        progress.complete_step(
+            1,
+            stage_total,
+            load_title,
+            outcome_fields=[
+                ("count", "Total variants in input GWAS-VCF", frame.height),
+                ("genetic", "Genome build", input_evidence["genome_build"]),
+                ("info", "VCF embedded dataset/sample", embedded_dataset),
+                ("success", "VCF structural validation", "passed"),
+            ],
+        )
         study_design_required_by = [
             target for target in selected
             if target in module.study_design.required_formats
@@ -1037,16 +1057,31 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             for target in study_design_required_by
         } if study_design is not None else {}
         schema_reports = _configured_schema_reports(
-            targets, module, trait_types,
+            targets,
+            module,
+            trait_types,
+            variant_id_observations,
         )
         _log_schema_reports(logger, schema_reports)
-        _print_contract_table(schema_reports)
+        if emit_terminal_summary and not pipeline_mode:
+            _print_contract_summary(
+                schema_reports,
+                configuration.logging.terminal_label_width,
+            )
 
         results = {}
         exporters = {**EXPORTERS, CUSTOM_OUTPUT_TARGET: export_custom}
+        identifier_cache_uses = Counter(
+            _identifier_selection_settings(module, target)
+            for target in targets
+            if not (
+                target == "ldsc" and merge_alleles_file is not None
+            )
+        )
+        identifier_cache = {}
         for number, target in enumerate(targets, 2):
-            identifier_type = module.variant_identifiers.target_types.get(
-                target, module.variant_identifiers.default_type,
+            identifier_type, duplicate_policy = _identifier_selection_settings(
+                module, target,
             )
             reference_selection = (
                 target == "ldsc" and merge_alleles_file is not None
@@ -1056,12 +1091,6 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     "LDSC --merge-alleles matching requires rsid identifiers; "
                     "remove --variant-id-type unique or select rsid."
                 )
-            duplicate_policy = (
-                module.variant_identifiers.target_duplicate_policies.get(
-                    target,
-                    module.variant_identifiers.default_duplicate_policy,
-                )
-            )
             if reference_selection:
                 target_frame, identifier_qc = select_variant_identifiers(
                     frame,
@@ -1088,6 +1117,13 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     int(identifier_qc["identifier_missing_rows_excluded"])
                     + int(identifier_qc["identifier_duplicate_rows_excluded"])
                 )
+                identifier_qc.update(validate_unique_identifiers(
+                    target_frame,
+                    module,
+                    identifier_type,
+                    duplicate_policy,
+                ))
+                identifier_selection_reused = False
                 logger.record(
                     "DECIDE",
                     "ldsc_reference_selection",
@@ -1095,27 +1131,82 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     **reference_qc,
                 )
             else:
-                target_frame, identifier_qc = select_variant_identifiers(
-                    frame,
-                    module,
-                    identifier_type,
-                    duplicate_policy=duplicate_policy,
-                )
+                cache_key = (identifier_type, duplicate_policy)
+                cached = identifier_cache.get(cache_key)
+                if cached is None:
+                    target_frame, identifier_qc = select_variant_identifiers(
+                        frame,
+                        module,
+                        identifier_type,
+                        duplicate_policy=duplicate_policy,
+                    )
+                    identifier_qc.update(validate_unique_identifiers(
+                        target_frame,
+                        module,
+                        identifier_type,
+                        duplicate_policy,
+                    ))
+                    if identifier_cache_uses[cache_key] > 1:
+                        identifier_cache[cache_key] = (
+                            target_frame,
+                            dict(identifier_qc),
+                        )
+                    identifier_selection_reused = False
+                else:
+                    target_frame, cached_qc = cached
+                    identifier_qc = dict(cached_qc)
+                    identifier_selection_reused = True
+                identifier_cache_uses[cache_key] -= 1
+                if identifier_cache_uses[cache_key] == 0:
+                    identifier_cache.pop(cache_key, None)
                 reference_frame_rows = target_frame.height
+            identifier_qc["identifier_selection_reused"] = (
+                identifier_selection_reused
+            )
             logger.record(
                 "DECIDE", "formatter_variant_identifiers",
                 target=target, **identifier_qc,
             )
-            with logger.step(
+            logger.record(
+                "VALIDATE",
+                "formatter_unique_identifiers",
+                status="PASSED",
+                target=target,
+                variant_id_type=identifier_type,
+                duplicate_policy=duplicate_policy,
+                variants=target_frame.height,
+                selection_reused=identifier_selection_reused,
+            )
+            target_name = formatter_target_display_name(
+                target, variant_id_observations,
+            )
+            stage_title = "Create and validate %s input files" % target_name
+            progress.start_step(number, stage_total, stage_title)
+            step_context = logger.step(
                 number,
-                len(targets) + 1,
-                "Create %s input" % target,
+                stage_total,
+                stage_title,
                 exporters[target].__name__,
                 rows_in=frame.height,
-            ) as step:
+            )
+            step = None
+            try:
+                step = step_context.__enter__()
                 exporter_kwargs = {
                     "overwrite": configuration.run.overwrite,
                 }
+                if target == "magma" and magma_pipeline_resources is not None:
+                    magma_configuration = magma_pipeline_resources.configuration
+                    exporter_kwargs.update({
+                        "magma_config": magma_configuration.modules.magma,
+                        "ld_reference_prefix": (
+                            magma_pipeline_resources.reference.ld_reference_prefix
+                        ),
+                        "analysis_scope": (
+                            magma_pipeline_resources.reference.analysis_scope
+                        ),
+                        "identifier_qc": identifier_qc,
+                    })
                 if target in study_design_required_by:
                     exporter_kwargs["study_design"] = study_design
                 result = exporters[target](
@@ -1125,6 +1216,18 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     module,
                     **exporter_kwargs,
                 )
+                if result.get("variant_preparation") is not None:
+                    logger.record(
+                        "RESULT",
+                        "magma_variant_preparation",
+                        **result["variant_preparation"]["qc"],
+                    )
+                    step.output(
+                        "excluded_variants",
+                        path=result["variant_preparation"][
+                            "excluded_variants"
+                        ],
+                    )
                 if target == "ldsc":
                     _log_ldsc_sample_prevalence(logger, result, module)
                 excluded = int(result["rows_excluded"])
@@ -1176,31 +1279,9 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     "identifier_duplicate_rows_excluded", 0,
                 ))
                 if duplicate_identifier_excluded:
-                    duplicate_policy_descriptions = {
-                        "exclude_all": (
-                            "Exclude every conflicting record in a duplicated "
-                            "identifier group."
-                        ),
-                        "error": (
-                            "Collapse exact repeated records; stop if any "
-                            "conflicting duplicated-identifier group remains."
-                        ),
-                        "most_significant": (
-                            "Retain only a unique largest configured -log10(P); "
-                            "exclude competing rows and whole tied or missing-rank groups."
-                        ),
-                        "highest_maf": (
-                            "Retain only a unique largest MAF derived from EAF; "
-                            "exclude competing rows and whole tied or missing-rank groups."
-                        ),
-                        "highest_info": (
-                            "Retain only a unique largest imputation INFO value; "
-                            "exclude competing rows and whole tied or missing-rank groups."
-                        ),
-                    }
                     step.qc(
                         "duplicated %s identifiers" % identifier_type,
-                        duplicate_policy_descriptions[duplicate_policy],
+                        DUPLICATE_POLICY_DESCRIPTIONS[duplicate_policy],
                         duplicate_policy_rows_in,
                         target_frame.height,
                         reason="duplicate_variant_identifier",
@@ -1215,7 +1296,7 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     )
                     step.qc(
                         "configured formatter chromosomes",
-                        "Exclude records whose normalized chromosome is not "
+                        "Exclude records whose canonical chromosome is not "
                         "configured for this output.",
                         target_frame.height,
                         rows_on_configured_chromosomes,
@@ -1226,7 +1307,11 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                     "required formatter fields",
                     "Exclude records that cannot be represented correctly in this tool's input.",
                     rows_on_configured_chromosomes,
-                    int(result["rows_out"]),
+                    (
+                        target_frame.height - excluded
+                        if result.get("variant_preparation") is not None
+                        else int(result["rows_out"])
+                    ),
                     reason="missing_or_invalid_required_value",
                     warn=excluded > 0,
                 )
@@ -1252,13 +1337,56 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
                 )
                 result["log_file"] = str(log_path)
                 result.update(identifier_qc)
+                result["input_vcf_metadata"] = dict(input_evidence)
                 result["rows_in"] = frame.height
                 result["schema_rows_excluded"] = excluded
                 result["rows_excluded"] = total_excluded
                 results[target] = result
+            except BaseException as exc:
+                try:
+                    if step is not None:
+                        step_context.__exit__(type(exc), exc, exc.__traceback__)
+                finally:
+                    progress.fail_step(number, stage_total, stage_title)
+                raise
+            else:
+                step_context.__exit__(None, None, None)
+            progress.complete_step(
+                number,
+                stage_total,
+                stage_title,
+                outcome_fields=[
+                    ("success", "Variants written", int(result["rows_out"])),
+                    ("count", "Variants excluded", total_excluded),
+                ],
+            )
 
-        if ctx is not None:
-            ctx["formatter"] = results
+        for result in results.values():
+            result["html_report"] = str(html_report_path)
+        write_formatter_html_report(
+            html_report_path,
+            dataset_id=dataset_id,
+            input_vcf=vcf,
+            output_directory=output_directory,
+            study_design=study_design,
+            results=results,
+            schema_reports=schema_reports,
+            output_destinations=output_destinations,
+            log_path=log_path,
+            resolved_config_path=resolved_config_path,
+            completion_manifest_path=completion_manifest_path,
+            case_count_column=module.study_design.case_count_column,
+            control_count_column=module.study_design.control_count_column,
+            variant_id_observations=variant_id_observations,
+            resolved_bcftools=resolved_bcftools,
+            module=module,
+        )
+        logger.record(
+            "OUTPUT",
+            "formatter_html_report",
+            path=str(html_report_path),
+            evidence_source="validated_formatter_result_metadata",
+        )
         write_formatter_completion_manifest(
             output_directory=output_directory,
             dataset_id=dataset_id,
@@ -1267,27 +1395,36 @@ def run_formatter_direct(args, ctx=None, *, configuration=None):
             configuration=configuration,
             results=results,
         )
+        if ctx is not None:
+            ctx["formatter"] = results
         logger.record(
             "STATUS", "formatter_run", status="COMPLETED",
             formats=targets, input_variants=frame.height,
         )
-        print(_screen_summary(
-            dataset_id,
-            str(vcf),
-            study_design,
-            results,
-            str(log_path),
-            module.study_design.case_count_column,
-            module.study_design.control_count_column,
-            configuration.logging.terminal_label_width,
-            variant_id_observations,
-        ))
+        if emit_terminal_summary and not pipeline_mode:
+            print(_screen_summary(
+                dataset_id,
+                str(vcf),
+                study_design,
+                results,
+                str(log_path),
+                str(html_report_path),
+                module.study_design.case_count_column,
+                module.study_design.control_count_column,
+                configuration.logging.terminal_label_width,
+                variant_id_observations,
+                output_destinations,
+                input_evidence,
+                module.minimum_p_value,
+            ))
         return results
     except BaseException as exc:
         if not logger.summary()["failed"]:
             logger.error("Formatter failed: %s: %s" % (type(exc).__name__, exc))
         raise
     finally:
+        if progress is not None:
+            progress.close()
         if work_table is not None:
             work_table.unlink(missing_ok=True)
         logger.close()

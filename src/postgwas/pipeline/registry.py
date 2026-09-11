@@ -33,6 +33,10 @@ class ModuleSpec:
     parser_factories: tuple[str, ...] = ()
     genome_build_config_path: str | None = None
     pipeline_example_factory: str | None = None
+    pipeline_title_factory: str | None = None
+    pipeline_progress_factory: str | None = None
+    pipeline_dependency_override_factory: str | None = None
+    single_target_help_customizer: str | None = None
     pipeline_supplied_options: tuple[str, ...] = ()
     required_options: tuple[RequiredOption, ...] = ()
     preflight: str | None = None
@@ -55,10 +59,15 @@ def _options(*names: str) -> tuple[RequiredOption, ...]:
         "output_directory": "--output-directory",
         "genome_build": "--genome-build",
     }
+    configuration_paths = {
+        "dataset_id": "run.dataset_id",
+        "output_directory": "run.output_directory",
+    }
     return tuple(
         RequiredOption(
             name.replace("-", "_"),
             preferred_flags.get(name, "--" + name.replace("_", "-")),
+            configuration_paths.get(name),
         )
         for name in names
     )
@@ -71,8 +80,37 @@ COMMON = (
 )
 
 PIPELINE_REQUIRED_OPTIONS = _options("vcf", "dataset_id", "output_directory")
+FINEMAP_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "ld_folder",
+        "--ld-folder",
+        "modules.ld_clumping.reference.directory",
+    ),
+    RequiredOption(
+        "finemap_ld_reference",
+        "--finemap-ld-reference",
+        "modules.fine_mapping.input.ld_reference_prefix",
+    ),
+)
 HERITABILITY_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + _options(
     "merge_alleles", "ref_ld_chr", "w_ld_chr",
+)
+IMPUTATION_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "imputation_ld_reference",
+        "--imputation-ld-reference",
+        "modules.imputation.ld_reference_directory",
+    ),
+    RequiredOption(
+        "resource_directory",
+        "--resource-directory",
+        "resources.root",
+    ),
+    RequiredOption(
+        "genome_build",
+        "--genome-build",
+        "modules.imputation.genome_build",
+    ),
 )
 MAGMA_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
     RequiredOption(
@@ -101,6 +139,71 @@ KPOPS_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
         "kpops_genome_build",
         "--kpops-genome-build",
         "modules.kpops.genome_build",
+    ),
+)
+POPS_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "feature_matrix_prefix",
+        "--feature-matrix-prefix",
+        "modules.pops.feature_matrix_prefix",
+    ),
+    RequiredOption(
+        "pops_gene_location_file",
+        "--pops-gene-location-file",
+        "modules.pops.gene_location_file",
+    ),
+    RequiredOption(
+        "pops_genome_build",
+        "--pops-genome-build",
+        "modules.pops.genome_build",
+    ),
+)
+GCTA_COJO_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "cojo_reference_prefix",
+        "--cojo-reference-prefix",
+        "modules.gcta_cojo.reference.prefix",
+    ),
+    RequiredOption(
+        "genome_build",
+        "--genome-build",
+        "modules.gcta_cojo.genome_build",
+    ),
+    RequiredOption(
+        "cojo_reference_population",
+        "--cojo-reference-population",
+        "modules.gcta_cojo.reference.population",
+    ),
+)
+GCTA_GENE_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "gcta_reference_prefix",
+        "--gcta-reference-prefix",
+        "modules.gcta_gene.reference.prefix",
+    ),
+    RequiredOption(
+        "genome_build",
+        "--genome-build",
+        "modules.gcta_gene.genome_build",
+    ),
+    RequiredOption(
+        "gcta_reference_population",
+        "--gcta-reference-population",
+        "modules.gcta_gene.reference.population",
+    ),
+)
+MAGMACOVAR_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "covariates",
+        "--covariates",
+        "modules.magmacovar.input.covariates_file",
+    ),
+)
+FLAMES_REQUIRED_OPTIONS = PIPELINE_REQUIRED_OPTIONS + (
+    RequiredOption(
+        "annotation_resource_directory",
+        "--flames-annotation-directory",
+        "modules.flames.annotation_resource_directory",
     ),
 )
 
@@ -137,9 +240,9 @@ MODULES = (
         cli_entrypoint="postgwas.modules.filtering.cli:main",
         parser_factories=COMMON + (
             "postgwas.cli.common:get_common_sumstat_filter_parser",
-            "postgwas.cli.common:get_bcftools_binary_parser",
         ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
+        preflight="postgwas.pipeline.preflight:preflight_sumstat_filter",
         runner="postgwas.pipeline.runners:run_sumstat_filter_runner",
         pipeline_output_name="filter_pre_imp",
     ),
@@ -149,9 +252,11 @@ MODULES = (
         dependencies=("imputation",),
         parser_factories=COMMON + (
             "postgwas.cli.common:get_common_sumstat_filter_parser",
-            "postgwas.cli.common:get_bcftools_binary_parser",
         ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
+        preflight=(
+            "postgwas.pipeline.preflight:preflight_post_imputation_filter"
+        ),
         runner="postgwas.pipeline.runners:run_sumstat_filter_runner",
         internal=True,
         pipeline_output_name="filter_post_imp",
@@ -161,22 +266,29 @@ MODULES = (
         "Annotate variants with population-specific LD blocks.",
         cli_entrypoint="postgwas.modules.ld_annotation.cli:main",
         parser_factories=COMMON + (
-            "postgwas.cli.common:get_pipeline_genome_build_parser",
             "postgwas.cli.common:get_annot_ldblock_parser",
         ),
-        genome_build_config_path="modules.ld_annotation.genome_build",
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        required_options=PIPELINE_REQUIRED_OPTIONS + (
+            RequiredOption(
+                "ld_region_dir",
+                "--ld-region-dir",
+                "modules.ld_annotation.inputs.ld_region_dir",
+            ),
+        ),
+        preflight=(
+            "postgwas.modules.ld_annotation.service:preflight_ld_annotation"
+        ),
         runner="postgwas.pipeline.runners:run_annot_ldblock_runner",
     ),
     ModuleSpec(
         "formatter",
-        "Convert GWAS-VCF into validated downstream-tool artifacts.",
+        "Validate the GWAS-VCF and create the input tables required by the selected analyses.",
         cli_entrypoint="postgwas.modules.formatting.cli:main",
         parser_factories=COMMON + (
             "postgwas.cli.common:get_formatter_parser",
-            "postgwas.cli.common:get_bcftools_binary_parser",
         ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
+        preflight="postgwas.pipeline.preflight:preflight_formatter",
         runner="postgwas.pipeline.runners:run_formatter_runner",
     ),
     ModuleSpec(
@@ -187,9 +299,13 @@ MODULES = (
         parser_factories=COMMON + (
             "postgwas.cli.common:get_common_imputation_parser",
             "postgwas.cli.common:get_imputation_population_parser",
-            "postgwas.cli.common:get_bcftools_binary_parser",
+            "postgwas.modules.imputation.cli:get_imputation_genome_build_parser",
         ),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        genome_build_config_path="modules.imputation.genome_build",
+        required_options=IMPUTATION_REQUIRED_OPTIONS,
+        preflight=(
+            "postgwas.modules.imputation.service:preflight_imputation_pipeline"
+        ),
         runner="postgwas.pipeline.runners:run_imputation_runner",
     ),
     ModuleSpec(
@@ -199,12 +315,15 @@ MODULES = (
         dependencies=("annot_ldblock",),
         parser_factories=COMMON + (
             "postgwas.cli.common:get_pipeline_genome_build_parser",
-            "postgwas.cli.common:get_bcftools_binary_parser",
             "postgwas.cli.common:get_tabix_binary_parser",
             "postgwas.cli.common:get_ld_clumping_population_parser",
             "postgwas.cli.common:get_ld_clump_parser",
         ),
         genome_build_config_path="modules.ld_clumping.genome_build",
+        pipeline_dependency_override_factory=(
+            "postgwas.modules.ld_clumping.cli:"
+            "get_ld_clumping_pipeline_dependency_overrides"
+        ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
         preflight="postgwas.modules.ld_clumping.service:preflight_ld_clumping",
         runner="postgwas.pipeline.runners:run_ld_clump_runner",
@@ -218,13 +337,21 @@ MODULES = (
             "postgwas.modules.fine_mapping.arguments:get_finemap_common_parser",
             "postgwas.modules.fine_mapping.arguments:get_common_susie_arguments",
             "postgwas.modules.fine_mapping.arguments:get_common_finemap_finemap_arguments",
-            "postgwas.cli.common:get_bcftools_binary_parser",
+            "postgwas.cli.common:get_plink_binary_parser",
         ),
         pipeline_example_factory=(
             "postgwas.modules.fine_mapping.cli:get_finemap_pipeline_examples"
         ),
+        single_target_help_customizer=(
+            "postgwas.modules.fine_mapping.cli:"
+            "organize_finemap_pipeline_help"
+        ),
         pipeline_supplied_options=("locus_file",),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        required_options=FINEMAP_REQUIRED_OPTIONS,
+        preflight=(
+            "postgwas.modules.fine_mapping.service:"
+            "preflight_fine_mapping_pipeline"
+        ),
         runner="postgwas.pipeline.runners:run_finemap_runner",
     ),
     ModuleSpec(
@@ -234,15 +361,18 @@ MODULES = (
         dependencies=("formatter",),
         parser_factories=COMMON + (
             "postgwas.modules.magma.cli:get_magma_parser",
-            "postgwas.cli.common:get_bcftools_binary_parser",
         ),
         pipeline_example_factory=(
             "postgwas.modules.magma.cli:get_magma_pipeline_examples"
+        ),
+        pipeline_progress_factory=(
+            "postgwas.modules.magma.reporting:magma_pipeline_progress_plan"
         ),
         pipeline_supplied_options=(
             "snp_location_file", "p_value_file", "variant_id_type",
         ),
         required_options=MAGMA_REQUIRED_OPTIONS,
+        preflight="postgwas.modules.magma.service:preflight_magma_pipeline",
         runner="postgwas.pipeline.runners:run_magma_runner",
         direct_checkpoint="native",
     ),
@@ -257,8 +387,16 @@ MODULES = (
         pipeline_example_factory=(
             "postgwas.modules.gcta_cojo.cli:get_gcta_cojo_pipeline_examples"
         ),
+        pipeline_title_factory=(
+            "postgwas.modules.gcta_cojo.service:gcta_cojo_pipeline_title"
+        ),
         pipeline_supplied_options=("gcta_cojo_input_file", "variant_id_type"),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        genome_build_config_path="modules.gcta_cojo.genome_build",
+        required_options=GCTA_COJO_REQUIRED_OPTIONS,
+        preflight=(
+            "postgwas.modules.gcta_cojo.service:"
+            "preflight_gcta_cojo_pipeline"
+        ),
         runner="postgwas.pipeline.runners:run_gcta_cojo_runner",
         direct_checkpoint="native",
     ),
@@ -273,8 +411,19 @@ MODULES = (
         pipeline_example_factory=(
             "postgwas.modules.gcta_gene.cli:get_gcta_gene_pipeline_examples"
         ),
+        pipeline_progress_factory=(
+            "postgwas.modules.gcta_gene.stages:gcta_gene_pipeline_progress_plan"
+        ),
+        single_target_help_customizer=(
+            "postgwas.modules.gcta_gene.cli:organize_gcta_gene_help"
+        ),
         pipeline_supplied_options=("gcta_input_file",),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        genome_build_config_path="modules.gcta_gene.genome_build",
+        required_options=GCTA_GENE_REQUIRED_OPTIONS,
+        preflight=(
+            "postgwas.modules.gcta_gene.service:"
+            "preflight_gcta_gene_pipeline"
+        ),
         runner="postgwas.pipeline.runners:run_gcta_gene_runner",
     ),
     ModuleSpec(
@@ -283,10 +432,22 @@ MODULES = (
         cli_entrypoint="postgwas.modules.magmacovar.cli:main",
         dependencies=("magma",),
         parser_factories=COMMON + (
-            "postgwas.cli.common:get_common_magma_covar_parser",
+            "postgwas.modules.magmacovar.cli:get_magmacovar_pipeline_parser",
+        ),
+        pipeline_example_factory=(
+            "postgwas.modules.magmacovar.cli:"
+            "get_magmacovar_pipeline_examples"
+        ),
+        pipeline_progress_factory=(
+            "postgwas.modules.magmacovar.stages:"
+            "magmacovar_pipeline_progress_plan"
+        ),
+        single_target_help_customizer=(
+            "postgwas.modules.magmacovar.cli:"
+            "customize_magmacovar_only_pipeline_help"
         ),
         pipeline_supplied_options=("magma_gene_results_file",),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        required_options=MAGMACOVAR_REQUIRED_OPTIONS,
         preflight=(
             "postgwas.modules.magmacovar.service:preflight_magmacovar_pipeline"
         ),
@@ -308,6 +469,7 @@ MODULES = (
         ),
         pipeline_supplied_options=(
             "magma_gene_results_file", "scdrs_magma_gene_results_file",
+            "scdrs_gene_set_file", "scdrs_gene_set_source",
             "ldsc_celltype_sumstats_file", "ldsc_celltype_sumstats_source",
         ),
         required_options=PIPELINE_REQUIRED_OPTIONS,
@@ -329,10 +491,17 @@ MODULES = (
         pipeline_example_factory=(
             "postgwas.modules.pops.cli:get_pops_pipeline_examples"
         ),
+        single_target_help_customizer=(
+            "postgwas.modules.pops.cli:organize_pops_help"
+        ),
         pipeline_supplied_options=("magma_association_prefix",),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        required_options=POPS_REQUIRED_OPTIONS,
         preflight="postgwas.modules.pops.service:preflight_pops_pipeline",
+        pipeline_progress_factory=(
+            "postgwas.modules.pops.stages:pops_pipeline_progress_plan"
+        ),
         runner="postgwas.pipeline.runners:run_pops_runner",
+        owns_direct_progress=True,
     ),
     ModuleSpec(
         "kpops",
@@ -340,10 +509,13 @@ MODULES = (
         cli_entrypoint="postgwas.modules.kpops.cli:main",
         dependencies=("magma",),
         parser_factories=COMMON + (
-            "postgwas.modules.kpops.cli:get_kpops_parser",
+            "postgwas.modules.kpops.cli:get_kpops_pipeline_parser",
         ),
         pipeline_example_factory=(
             "postgwas.modules.kpops.cli:get_kpops_pipeline_examples"
+        ),
+        single_target_help_customizer=(
+            "postgwas.modules.kpops.cli:organize_kpops_help"
         ),
         pipeline_supplied_options=("magma_association_prefix",),
         required_options=KPOPS_REQUIRED_OPTIONS,
@@ -363,11 +535,15 @@ MODULES = (
         pipeline_example_factory=(
             "postgwas.modules.caldera.cli:get_caldera_pipeline_examples"
         ),
+        single_target_help_customizer=(
+            "postgwas.modules.caldera.cli:organize_caldera_help"
+        ),
         pipeline_supplied_options=("pops_file", "credible_set_file"),
         required_options=PIPELINE_REQUIRED_OPTIONS,
         preflight="postgwas.modules.caldera.service:preflight_caldera_pipeline",
         runner="postgwas.pipeline.runners:run_caldera_runner",
         direct_checkpoint="native",
+        owns_direct_progress=True,
     ),
     ModuleSpec(
         "flames",
@@ -381,7 +557,7 @@ MODULES = (
         pipeline_example_factory=(
             "postgwas.modules.flames.cli:get_flames_pipeline_examples"
         ),
-        required_options=PIPELINE_REQUIRED_OPTIONS,
+        required_options=FLAMES_REQUIRED_OPTIONS,
         preflight="postgwas.modules.flames.service:preflight_flames_pipeline",
         runner="postgwas.pipeline.runners:run_flames_runner",
         direct_checkpoint="native",
@@ -394,29 +570,32 @@ MODULES = (
         parser_factories=COMMON + (
             "postgwas.cli.common:get_ldsc_pipeline_parser",
         ),
+        pipeline_example_factory=(
+            "postgwas.modules.ldsc.cli:get_ldsc_pipeline_examples"
+        ),
         required_options=HERITABILITY_REQUIRED_OPTIONS,
+        preflight="postgwas.modules.ldsc.service:preflight_ldsc_pipeline",
         runner="postgwas.pipeline.runners:run_heritability_runner",
     ),
     ModuleSpec(
         "manhattan",
-        "Generate Manhattan and QQ plots.",
+        "Generate a Manhattan plot.",
         cli_entrypoint="postgwas.modules.manhattan.cli:main",
         parser_factories=COMMON + ("postgwas.cli.common:get_assoc_plot_parser",),
         required_options=PIPELINE_REQUIRED_OPTIONS,
+        preflight="postgwas.pipeline.preflight:preflight_manhattan",
         runner="postgwas.pipeline.runners:run_manhattan_runner",
     ),
     ModuleSpec(
         "qc_summary",
-        "Generate a GWAS-VCF QC summary.",
+        "Assess the summary-statistics GWAS-VCF and generate QC reports.",
         cli_entrypoint="postgwas.modules.qc_summary.cli:main",
         command_name="qc",
         parser_factories=COMMON + (
-            "postgwas.cli.common:get_pipeline_genome_build_parser",
             "postgwas.cli.common:sumstat_summary_arg_parser",
-            "postgwas.cli.common:get_bcftools_binary_parser",
         ),
-        genome_build_config_path="modules.qc_summary.target_build",
         required_options=PIPELINE_REQUIRED_OPTIONS,
+        preflight="postgwas.pipeline.preflight:preflight_qc_summary",
         runner="postgwas.pipeline.runners:run_qc_summary_runner",
         direct_checkpoint="native",
     ),
@@ -432,6 +611,7 @@ MODULES = (
         genome_build_config_path="modules.mixer.genome_build",
         pipeline_supplied_options=("mixer_input_file",),
         required_options=PIPELINE_REQUIRED_OPTIONS,
+        preflight="postgwas.modules.mixer.service:preflight_mixer_pipeline",
         runner="postgwas.pipeline.runners:run_mixer_runner",
     ),
     ModuleSpec(

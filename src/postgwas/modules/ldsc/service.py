@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -15,11 +17,26 @@ from postgwas.config import (
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.core.paths import configured_output_path, resolve_executable
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
+from postgwas.core.preflight import (
+    PipelinePreflightEvidence,
+    PreflightFileIdentity,
+    capture_preflight_file_identities,
+    pipeline_preflight_evidence,
+    require_pipeline_input_vcf,
+    require_unchanged_preflight_files,
+)
+from postgwas.core.required_arguments import (
+    RequiredArgument,
+    require_resolved_arguments,
+)
+from postgwas.core.ui import print_screen_block
 from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.modules.ldsc.ldsc_runner import (
     LDSCError,
+    LDSCReferenceValidation,
     ldsc_owned_output_paths,
     run_ldsc,
+    validate_ldsc_reference_resources,
 )
 
 
@@ -38,6 +55,9 @@ MODULE_CLI_OVERRIDES = {
     "ldsc_use_m_5_50": "use_m_5_50",
     "ldsc_print_covariance": "print_covariance",
     "ldsc_print_delete_values": "print_delete_values",
+    "ldsc_sample_prevalence_warning_threshold": (
+        "sample_prevalence_comparison.warning_absolute_difference"
+    ),
     "samp_prev": "sample_prevalence",
     "pop_prev": "population_prevalence",
 }
@@ -52,6 +72,17 @@ GLOBAL_CLI_OVERRIDES = {
     "ldsc_executable": "resources.executables.ldsc",
     "munge_sumstats_executable": "resources.executables.munge_sumstats",
 }
+
+
+@dataclass(frozen=True)
+class LDSCPipelineResources:
+    """External LDSC resources validated before formatter table creation."""
+
+    configuration: Any
+    reference: LDSCReferenceValidation
+    ldsc_executable: str
+    munge_executable: str
+    file_identities: tuple[PreflightFileIdentity, ...]
 
 
 def resolve_ldsc_configuration(args: argparse.Namespace):
@@ -74,16 +105,128 @@ def resolve_ldsc_configuration(args: argparse.Namespace):
     )
 
 
-def _formatter_sample_prevalence(ctx: dict[str, Any] | None) -> float:
-    """Read, but never derive, sample prevalence from the formatter result."""
+def _require_ldsc_runtime_arguments(
+    args: argparse.Namespace,
+    *,
+    include_generated_input: bool,
+) -> None:
+    """Report all independently missing LDSC inputs through one contract."""
+    requirements = [
+        RequiredArgument("--merge-alleles", None, getattr(args, "merge_alleles", None)),
+        RequiredArgument("--ref-ld-chr", None, getattr(args, "ref_ld_chr", None)),
+        RequiredArgument("--w-ld-chr", None, getattr(args, "w_ld_chr", None)),
+    ]
+    if include_generated_input:
+        requirements.insert(0, RequiredArgument(
+            "--ldsc-input", None, getattr(args, "ldsc_input", None),
+        ))
+    require_resolved_arguments(requirements)
+
+
+def preflight_ldsc_pipeline(
+    args: argparse.Namespace,
+    *,
+    preflight_evidence=None,
+) -> PipelinePreflightEvidence:
+    """Validate all external LDSC resources before VCF formatting starts."""
+    entry_vcf = require_pipeline_input_vcf(preflight_evidence)
+    configuration = resolve_ldsc_configuration(args)
+    module = configuration.modules.ldsc
+    _require_ldsc_runtime_arguments(args, include_generated_input=False)
+
+    observed_build = str(entry_vcf["harmonised"]["genome_build"])
+    configured_build = (
+        None if module.genome_build is None else module.genome_build.value
+    )
+    if configured_build is not None and configured_build != observed_build:
+        raise LDSCError(
+            "The harmonised GWAS-VCF declares genome build %s, but the LDSC "
+            "reference release is declared as %s. These resources must use "
+            "the same genome build." % (observed_build, configured_build)
+        )
+
+    reference = validate_ldsc_reference_resources(
+        getattr(args, "merge_alleles", None),
+        getattr(args, "ref_ld_chr", None),
+        getattr(args, "w_ld_chr", None),
+        module,
+    )
+    if reference.merge_alleles is None:
+        raise LDSCError("LDSC merge-alleles validation returned no file.")
+    ldsc_executable = resolve_executable(
+        configuration.resources.executables.ldsc,
+        "LDSC executable",
+        error_type=LDSCError,
+    )
+    munge_executable = resolve_executable(
+        configuration.resources.executables.munge_sumstats,
+        "LDSC munge_sumstats executable",
+        error_type=LDSCError,
+    )
+    external_files = [
+        reference.merge_alleles,
+        *reference.required_files,
+        ldsc_executable,
+        munge_executable,
+    ]
+    resources = LDSCPipelineResources(
+        configuration=configuration,
+        reference=reference,
+        ldsc_executable=ldsc_executable,
+        munge_executable=munge_executable,
+        file_identities=capture_preflight_file_identities(
+            external_files,
+            error_type=LDSCError,
+            label="LDSC resource",
+        ),
+    )
+    return pipeline_preflight_evidence(
+        "heritability",
+        preflight_evidence,
+        resources=resources,
+        deferred_checks=(
+            "Validate the formatter-created LDSC summary-statistics table.",
+            "Validate retained HapMap3 SNP and allele compatibility during munging.",
+        ),
+    )
+
+
+def _ldsc_pipeline_execution_configuration(args, resources):
+    """Retain preflight settings while applying the pipeline stage directory."""
+    run = resources.configuration.run.model_copy(update={
+        "output_directory": Path(args.output_directory).expanduser().resolve(),
+    })
+    return resources.configuration.model_copy(update={"run": run}, deep=True)
+
+
+def _formatter_ldsc_result(
+    ctx: dict[str, Any] | None,
+    *,
+    required: bool,
+) -> dict[str, Any] | None:
+    """Return the formatter's LDSC result without reading its output table."""
     try:
         formatter_result = ctx["formatter"]["ldsc"]  # type: ignore[index]
     except (KeyError, TypeError) as exc:
+        if required:
+            raise LDSCError(
+                "Population prevalence requires sample prevalence. Supply --samp-prev "
+                "for direct execution, or run the LDSC formatter first so its returned "
+                "sample_prev artifact is available."
+            ) from exc
+        return None
+    if not isinstance(formatter_result, dict):
         raise LDSCError(
-            "Population prevalence requires sample prevalence. Supply --samp-prev "
-            "for direct execution, or run the LDSC formatter first so its returned "
-            "sample_prev artifact is available."
-        ) from exc
+            "The formatter returned an invalid LDSC result; expected a mapping "
+            "containing sample_prev metadata."
+        )
+    return formatter_result
+
+
+def _formatter_sample_prevalence(ctx: dict[str, Any] | None) -> float:
+    """Read, but never derive, sample prevalence from the formatter result."""
+    formatter_result = _formatter_ldsc_result(ctx, required=True)
+    assert formatter_result is not None
     value = formatter_result.get("sample_prev")
     if value is None:
         trait_type = formatter_result.get("trait_type", "unknown")
@@ -99,19 +242,123 @@ def _formatter_sample_prevalence(ctx: dict[str, Any] | None) -> float:
         ) from exc
 
 
-def _resolve_prevalence(module, ctx: dict[str, Any] | None) -> str:
-    """Resolve sample prevalence only when population prevalence requests liability."""
+def _resolve_prevalence(
+    module,
+    ctx: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Resolve liability prevalence and compare a pipeline override to the data."""
     source = (
         "configuration_or_cli"
         if module.sample_prevalence is not None
         else "unset"
     )
-    if module.population_prevalence is None:
-        return source
     if module.sample_prevalence is None:
+        if module.population_prevalence is None:
+            return source, None
         module.sample_prevalence = _formatter_sample_prevalence(ctx)
-        source = "formatter_return_value"
-    return source
+        source = "gwas_vcf_case_fraction"
+        return source, None
+
+    formatter_result = _formatter_ldsc_result(ctx, required=False)
+    if formatter_result is None or formatter_result.get("sample_prev") is None:
+        return source, None
+    gwas_vcf_case_fraction = _formatter_sample_prevalence(ctx)
+    provided_sample_prevalence = float(module.sample_prevalence)
+    absolute_difference_decimal = abs(
+        Decimal(str(provided_sample_prevalence))
+        - Decimal(str(gwas_vcf_case_fraction))
+    )
+    warning_threshold_decimal = Decimal(str(
+        module.sample_prevalence_comparison.warning_absolute_difference
+    ))
+    absolute_difference = float(absolute_difference_decimal)
+    return source, {
+        "matches": absolute_difference_decimal == 0,
+        "exceeds_warning_threshold": (
+            absolute_difference_decimal > warning_threshold_decimal
+        ),
+        "provided_sample_prevalence": provided_sample_prevalence,
+        "gwas_vcf_case_fraction": gwas_vcf_case_fraction,
+        "absolute_difference": absolute_difference,
+        "warning_absolute_difference": float(warning_threshold_decimal),
+        "liability_scale_requested": module.population_prevalence is not None,
+        "gwas_vcf_aggregation": formatter_result.get(
+            "sample_prevalence_aggregation"
+        ),
+        "gwas_vcf_variant_count": formatter_result.get(
+            "sample_prevalence_variants"
+        ),
+        "gwas_vcf_case_fraction_minimum": formatter_result.get(
+            "sample_prevalence_minimum"
+        ),
+        "gwas_vcf_case_fraction_maximum": formatter_result.get(
+            "sample_prevalence_maximum"
+        ),
+        "gwas_vcf_case_count_minimum": formatter_result.get(
+            "sample_prevalence_case_count_minimum"
+        ),
+        "gwas_vcf_case_count_maximum": formatter_result.get(
+            "sample_prevalence_case_count_maximum"
+        ),
+        "gwas_vcf_control_count_minimum": formatter_result.get(
+            "sample_prevalence_control_count_minimum"
+        ),
+        "gwas_vcf_control_count_maximum": formatter_result.get(
+            "sample_prevalence_control_count_maximum"
+        ),
+    }
+
+
+def _record_prevalence_comparison(
+    logger: PipelineLogger,
+    comparison: dict[str, Any] | None,
+) -> None:
+    """Record the provided prevalence against the GWAS-VCF case fraction."""
+    if comparison is None:
+        return
+    exceeds_threshold = bool(comparison["exceeds_warning_threshold"])
+    logger.record(
+        "WARNING" if exceeds_threshold else "PASS",
+        "ldsc_sample_prevalence_comparison",
+        result=(
+            "warning_threshold_exceeded"
+            if exceeds_threshold
+            else "within_warning_threshold"
+        ),
+        matches=comparison["matches"],
+        provided_sample_prevalence=comparison["provided_sample_prevalence"],
+        gwas_vcf_case_fraction=comparison["gwas_vcf_case_fraction"],
+        absolute_difference=comparison["absolute_difference"],
+        warning_absolute_difference=comparison[
+            "warning_absolute_difference"
+        ],
+        liability_scale_requested=comparison["liability_scale_requested"],
+        gwas_vcf_aggregation=comparison["gwas_vcf_aggregation"],
+        gwas_vcf_variant_count=comparison["gwas_vcf_variant_count"],
+        gwas_vcf_case_fraction_minimum=comparison[
+            "gwas_vcf_case_fraction_minimum"
+        ],
+        gwas_vcf_case_fraction_maximum=comparison[
+            "gwas_vcf_case_fraction_maximum"
+        ],
+        gwas_vcf_case_count_minimum=comparison[
+            "gwas_vcf_case_count_minimum"
+        ],
+        gwas_vcf_case_count_maximum=comparison[
+            "gwas_vcf_case_count_maximum"
+        ],
+        gwas_vcf_control_count_minimum=comparison[
+            "gwas_vcf_control_count_minimum"
+        ],
+        gwas_vcf_control_count_maximum=comparison[
+            "gwas_vcf_control_count_maximum"
+        ],
+        action=(
+            "explicit_cli_or_yaml_value_retained; the run continues; to use the "
+            "GWAS-VCF case fraction stop this run and rerun without --samp-prev "
+            "and with modules.ldsc.sample_prevalence unset"
+        ),
+    )
 
 
 def _publish_staged_result(
@@ -166,8 +413,8 @@ def _record_findings(logger: PipelineLogger, result: dict[str, Any]) -> None:
         logger.record(
             "RESULT", "ldsc_liability_scale",
             h2=liability["h2"],
-            intercept=liability["intercept"],
-            ratio=liability["ratio"],
+            conversion_of="ldsc_observed_scale.h2",
+            regression_metrics="shared_with_observed_scale",
             sample_prevalence=result["sample_prevalence"],
             population_prevalence=result["population_prevalence"],
             sample_prevalence_source=result["sample_prevalence_source"],
@@ -178,10 +425,140 @@ def _prevalence_source_label(source: str) -> str:
     """Render the recorded prevalence provenance in plain language."""
     labels = {
         "configuration_or_cli": "CLI or YAML configuration",
-        "formatter_return_value": "formatter-returned value",
+        "gwas_vcf_case_fraction": "GWAS-VCF case fraction",
         "unset": "not supplied",
     }
     return labels.get(source, source.replace("_", " "))
+
+
+def _reported_range(minimum: Any, maximum: Any) -> str | None:
+    """Render a precomputed scientific range without recalculating it."""
+    if minimum is None or maximum is None:
+        return None
+    return "%s to %s" % (minimum, maximum)
+
+
+def _prevalence_comparison_lines(
+    comparison: dict[str, Any] | None,
+    label_width: int,
+) -> list[str]:
+    """Render the pre-run prevalence comparison and selected LDSC value."""
+    if comparison is None:
+        return []
+    exceeds_threshold = bool(comparison["exceeds_warning_threshold"])
+    emphasis = "warning" if exceeds_threshold else "info"
+    gwas_vcf_description = str(comparison["gwas_vcf_case_fraction"])
+    aggregation = comparison["gwas_vcf_aggregation"]
+    variants = comparison["gwas_vcf_variant_count"]
+    provenance = [
+        value
+        for value in (
+            None if aggregation is None else "%s aggregation" % aggregation,
+            None if variants is None else "%s variants" % variants,
+        )
+        if value is not None
+    ]
+    if provenance:
+        gwas_vcf_description += " (%s)" % ", ".join(provenance)
+    lines = [
+        "",
+        screen_line(
+            emphasis,
+            (
+                "Sample prevalence warning"
+                if exceeds_threshold
+                else "Sample prevalence comparison"
+            ),
+            indent=6,
+        ),
+        screen_field(
+            emphasis, "Provided sample prevalence",
+            comparison["provided_sample_prevalence"],
+            indent=10, label_width=label_width,
+        ),
+        screen_field(
+            "info", "GWAS-VCF case fraction", gwas_vcf_description,
+            indent=10, label_width=label_width,
+        ),
+        screen_field(
+            "info", "Absolute difference", comparison["absolute_difference"],
+            indent=10, label_width=label_width,
+        ),
+        screen_field(
+            "info", "Warning threshold",
+            comparison["warning_absolute_difference"],
+            indent=10, label_width=label_width,
+        ),
+        screen_field(
+            emphasis,
+            "Comparison status",
+            (
+                "WARNING — difference is above the configured threshold"
+                if exceeds_threshold
+                else "difference is at or below the configured threshold"
+            ),
+            indent=10,
+            label_width=label_width,
+        ),
+    ]
+    prevalence_range = _reported_range(
+        comparison["gwas_vcf_case_fraction_minimum"],
+        comparison["gwas_vcf_case_fraction_maximum"],
+    )
+    if prevalence_range is not None:
+        lines.append(screen_field(
+            "info", "GWAS-VCF case-fraction range", prevalence_range,
+            indent=10, label_width=label_width,
+        ))
+    case_count_range = _reported_range(
+        comparison["gwas_vcf_case_count_minimum"],
+        comparison["gwas_vcf_case_count_maximum"],
+    )
+    if case_count_range is not None:
+        lines.append(screen_field(
+            "info", "GWAS-VCF case-count range", case_count_range,
+            indent=10, label_width=label_width,
+        ))
+    control_count_range = _reported_range(
+        comparison["gwas_vcf_control_count_minimum"],
+        comparison["gwas_vcf_control_count_maximum"],
+    )
+    if control_count_range is not None:
+        lines.append(screen_field(
+            "info", "GWAS-VCF control-count range", control_count_range,
+            indent=10, label_width=label_width,
+        ))
+    provided = comparison["provided_sample_prevalence"]
+    gwas_vcf = comparison["gwas_vcf_case_fraction"]
+    if comparison["liability_scale_requested"]:
+        action = (
+            "LDSC WILL USE %s (the provided sample prevalence), NOT %s (the "
+            "GWAS-VCF case fraction), to calculate liability-scale h². "
+            % (provided, gwas_vcf)
+        )
+        action += (
+            "If this is intentional, allow the run to continue. Otherwise, "
+            "stop now and rerun without --samp-prev "
+            "and ensure the YAML sample_prevalence setting is absent or null."
+        )
+    else:
+        action = (
+            "Liability-scale h² WILL NOT RUN because population prevalence was not "
+            "provided. PostGWAS retained %s (the provided sample prevalence) "
+            "and did NOT replace it with %s (the GWAS-VCF case fraction). To "
+            "use the GWAS-VCF value in a future liability-scale run, omit "
+            "--samp-prev and ensure the YAML sample_prevalence setting is "
+            "absent or null."
+            % (provided, gwas_vcf)
+        )
+    lines.append(screen_field(
+        "attention" if exceeds_threshold else "decision",
+        "Important — value selected",
+        action,
+        indent=10,
+        label_width=label_width,
+    ))
+    return lines
 
 
 def _render_summary(
@@ -192,6 +569,11 @@ def _render_summary(
 ) -> str:
     """Render the validated LDSC findings for the default terminal summary."""
     observed = result["observed_metrics"]
+    prevalence_comparison = result["sample_prevalence_comparison"]
+    has_prevalence_warning = bool(
+        prevalence_comparison is not None
+        and prevalence_comparison["exceeds_warning_threshold"]
+    )
     lines = [
         "",
         screen_line("analysis", "LDSC heritability summary", indent=2),
@@ -199,9 +581,17 @@ def _render_summary(
             "info", "Dataset", dataset, indent=6, label_width=label_width,
         ),
         screen_field(
-            "success", "Analysis status", "COMPLETED",
+            "warning" if has_prevalence_warning else "success",
+            "Analysis status",
+            (
+                "COMPLETED WITH SCIENTIFIC WARNINGS"
+                if has_prevalence_warning
+                else "COMPLETED"
+            ),
             indent=6, label_width=label_width,
         ),
+    ]
+    lines.extend([
         "",
         screen_line("genetic", "Main findings", indent=6),
         screen_field(
@@ -217,7 +607,7 @@ def _render_summary(
             indent=10, label_width=label_width,
         ),
         "",
-    ]
+    ])
     liability = result["liability_metrics"]
     if liability is None:
         lines.append(screen_field(
@@ -228,15 +618,12 @@ def _render_summary(
     else:
         lines.extend([
             screen_field(
-                "analysis", "Liability-scale h²", liability["h2"],
+                "analysis", "Liability-scale h² (converted)", liability["h2"],
                 indent=10, label_width=label_width,
             ),
             screen_field(
-                "analysis", "Liability intercept", liability["intercept"],
-                indent=10, label_width=label_width,
-            ),
-            screen_field(
-                "analysis", "Liability ratio", liability["ratio"],
+                "success", "Conversion check",
+                "PASS — intercept and ratio unchanged",
                 indent=10, label_width=label_width,
             ),
             "",
@@ -281,11 +668,20 @@ def run_ldsc_direct(
     ctx: dict[str, Any] | None = None,
     *,
     configuration=None,
+    pipeline_resources: LDSCPipelineResources | None = None,
 ) -> dict[str, Any]:
     """Resolve, validate, run, and atomically publish one LDSC analysis."""
+    if pipeline_resources is not None and configuration is not None:
+        raise LDSCError(
+            "Pass either pipeline_resources or configuration to LDSC, not both."
+        )
     if configuration is None:
         try:
-            configuration = resolve_ldsc_configuration(args)
+            configuration = (
+                _ldsc_pipeline_execution_configuration(args, pipeline_resources)
+                if pipeline_resources is not None
+                else resolve_ldsc_configuration(args)
+            )
         except BaseException as exc:
             fallback = load_configuration()
             output = Path(
@@ -310,6 +706,12 @@ def run_ldsc_direct(
             )
             raise
     module = configuration.modules.ldsc
+    if pipeline_resources is not None:
+        require_unchanged_preflight_files(
+            pipeline_resources.file_identities,
+            error_type=LDSCError,
+            label="LDSC resource",
+        )
     output = Path(configuration.run.output_directory).expanduser().resolve()
     dataset = configuration.run.dataset_id
     output.mkdir(parents=True, exist_ok=True)
@@ -331,28 +733,54 @@ def run_ldsc_direct(
     )
     try:
         try:
-            prevalence_source = _resolve_prevalence(module, ctx)
-            ldsc_executable = resolve_executable(
-                configuration.resources.executables.ldsc,
-                "LDSC executable",
-                error_type=LDSCError,
+            prevalence_source, prevalence_comparison = _resolve_prevalence(
+                module, ctx,
             )
-            munge_executable = resolve_executable(
-                configuration.resources.executables.munge_sumstats,
-                "LDSC munge_sumstats executable",
-                error_type=LDSCError,
+            _record_prevalence_comparison(logger, prevalence_comparison)
+            if prevalence_comparison is not None:
+                print_screen_block("\n".join(_prevalence_comparison_lines(
+                    prevalence_comparison,
+                    configuration.logging.terminal_label_width,
+                )))
+            ldsc_executable = (
+                pipeline_resources.ldsc_executable
+                if pipeline_resources is not None
+                else resolve_executable(
+                    configuration.resources.executables.ldsc,
+                    "LDSC executable",
+                    error_type=LDSCError,
+                )
+            )
+            munge_executable = (
+                pipeline_resources.munge_executable
+                if pipeline_resources is not None
+                else resolve_executable(
+                    configuration.resources.executables.munge_sumstats,
+                    "LDSC munge_sumstats executable",
+                    error_type=LDSCError,
+                )
             )
             ldsc_input = getattr(args, "ldsc_input", None)
-            merge_alleles = getattr(args, "merge_alleles", None)
-            reference = getattr(args, "ref_ld_chr", None)
-            weights = getattr(args, "w_ld_chr", None)
-            if any(
-                value is None
-                for value in (ldsc_input, merge_alleles, reference, weights)
-            ):
-                raise LDSCError(
-                    "LDSC requires ldsc_input, merge_alleles, ref_ld_chr, and w_ld_chr."
-                )
+            _require_ldsc_runtime_arguments(args, include_generated_input=True)
+            reference_validation = (
+                pipeline_resources.reference
+                if pipeline_resources is not None else None
+            )
+            merge_alleles = (
+                reference_validation.merge_alleles
+                if reference_validation is not None
+                else getattr(args, "merge_alleles")
+            )
+            reference = (
+                reference_validation.reference_directory
+                if reference_validation is not None
+                else getattr(args, "ref_ld_chr")
+            )
+            weights = (
+                reference_validation.weights_directory
+                if reference_validation is not None
+                else getattr(args, "w_ld_chr")
+            )
 
             logger.record(
                 "PARAM", "ldsc_run",
@@ -378,6 +806,9 @@ def run_ldsc_direct(
                 sample_prevalence=module.sample_prevalence,
                 population_prevalence=module.population_prevalence,
                 sample_prevalence_source=prevalence_source,
+                sample_prevalence_warning_absolute_difference=(
+                    module.sample_prevalence_comparison.warning_absolute_difference
+                ),
             )
             resolved_path = configured_output_path(
                 output, module.output_layout.resolved_config_file,
@@ -420,6 +851,7 @@ def run_ldsc_direct(
                     ldsc_executable=ldsc_executable,
                     configuration=module,
                     logger=logger,
+                    reference_validation=reference_validation,
                 )
                 if configuration.run.overwrite:
                     for path in owned_final_paths:
@@ -431,6 +863,7 @@ def run_ldsc_direct(
                 "sample_prevalence": module.sample_prevalence,
                 "population_prevalence": module.population_prevalence,
                 "sample_prevalence_source": prevalence_source,
+                "sample_prevalence_comparison": prevalence_comparison,
             })
             for name in (
                 "munged_sumstats", "munge_log", "h2_observed", "h2_liability",
@@ -445,7 +878,7 @@ def run_ldsc_direct(
             )
             if ctx is not None:
                 ctx["heritability"] = result
-            print(_render_summary(
+            print_screen_block(_render_summary(
                 result,
                 dataset,
                 log_path,
@@ -462,4 +895,9 @@ def run_ldsc_direct(
         logger.close()
 
 
-__all__ = ["resolve_ldsc_configuration", "run_ldsc_direct"]
+__all__ = [
+    "LDSCPipelineResources",
+    "preflight_ldsc_pipeline",
+    "resolve_ldsc_configuration",
+    "run_ldsc_direct",
+]

@@ -1,0 +1,90 @@
+name: Validate installation
+
+on:
+  pull_request:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/installation.yml"
+      - "Dockerfile"
+      - "environment.yml"
+      - "pyproject.toml"
+      - "tools/setup/**"
+      - "tools/resource_preparation/prepare_kpops_caldera_resources.sh"
+      - "src/postgwas/modules/enrichment/main.py"
+      - "src/postgwas/modules/enrichment/providers/dsigdb.py"
+      - "tests/test_installation_script.py"
+      - "tests/test_ldsc_runtime.py"
+      - "tests/test_kpops_caldera.py"
+  push:
+    branches:
+      - main
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/installation.yml"
+      - "Dockerfile"
+      - "environment.yml"
+      - "pyproject.toml"
+      - "tools/setup/**"
+      - "tools/resource_preparation/prepare_kpops_caldera_resources.sh"
+      - "src/postgwas/modules/enrichment/main.py"
+      - "src/postgwas/modules/enrichment/providers/dsigdb.py"
+      - "tests/test_installation_script.py"
+      - "tests/test_ldsc_runtime.py"
+      - "tests/test_kpops_caldera.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer-contract:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install test runner
+        run: python -m pip install "pytest>=8,<9"
+
+      - name: Validate installer shell syntax
+        run: >-
+          bash -n
+          tools/setup/install_postgwas.sh
+          tools/setup/install_bcftools_liftover.sh
+          tools/setup/install_external_tools.sh
+          tools/setup/verify_mamba_installation.sh
+          tools/setup/container/ldsc_wrapper.sh
+          tools/setup/verify_all_tools.sh
+
+      - name: Test single-command installer contract
+        run: python -m pytest -q -p no:cacheprovider tests/test_installation_script.py
+
+  complete-linux-mamba:
+    needs: installer-contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Miniforge with Mamba
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: base
+          use-mamba: true
+
+      - name: Install and verify the complete PostGWAS environment
+        run: >-
+          bash tools/setup/install_postgwas.sh
+          --all-tools
+          --name postgwas-ci
+          --jobs 2

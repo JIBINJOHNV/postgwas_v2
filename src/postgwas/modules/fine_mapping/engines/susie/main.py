@@ -1,12 +1,11 @@
 import csv
-import os
 import shlex
 import subprocess
 from pathlib import Path
 
 import pandas as pd
 
-from postgwas.core.paths import resolve_executable
+from postgwas.core.r_runtime import resolve_r_runtime
 
 
 SUSIE_REQUIRED_R_PACKAGES = (
@@ -25,79 +24,9 @@ SUSIE_REQUIRED_R_PACKAGES = (
 
 def resolve_susie_r_runtime(rscript, timeout_seconds):
     """Resolve one R runtime and validate its complete SuSiE package stack."""
-    resolved_rscript = resolve_executable(rscript, "Rscript executable")
-    discovery = subprocess.run(
-        [
-            resolved_rscript,
-            "--vanilla",
-            "-e",
-            (
-                "cat(normalizePath(.Library, mustWork=TRUE), '\\n', sep=''); "
-                "cat(paste(.libPaths(), collapse=.Platform$path.sep), "
-                "'\\n', sep='')"
-            ),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=float(timeout_seconds),
+    return resolve_r_runtime(
+        rscript, timeout_seconds, SUSIE_REQUIRED_R_PACKAGES, label="SuSiE",
     )
-    if discovery.returncode != 0:
-        detail = (discovery.stderr or discovery.stdout).strip()
-        raise RuntimeError(
-            f"Configured Rscript could not report its library paths: "
-            f"{resolved_rscript}; {detail}"
-        )
-    lines = [line.strip() for line in discovery.stdout.splitlines() if line.strip()]
-    if len(lines) < 2:
-        raise RuntimeError(
-            "Configured Rscript returned incomplete library-path metadata: "
-            f"{resolved_rscript}"
-        )
-    standard_library = lines[0]
-    discovered_libraries = lines[1].split(os.pathsep)
-    ordered_libraries = list(
-        dict.fromkeys([standard_library, *discovered_libraries])
-    )
-    environment = os.environ.copy()
-    environment["R_LIBS_USER"] = os.pathsep.join(ordered_libraries)
-    environment["PATH"] = os.pathsep.join(
-        [str(Path(resolved_rscript).parent), environment.get("PATH", "")]
-    ).rstrip(os.pathsep)
-
-    package_vector = ", ".join(repr(package) for package in SUSIE_REQUIRED_R_PACKAGES)
-    validation = subprocess.run(
-        [
-            resolved_rscript,
-            "--vanilla",
-            "-e",
-            (
-                f"required <- c({package_vector}); "
-                "failed <- required[!vapply(required, function(package) "
-                "isTRUE(requireNamespace(package, quietly=TRUE)), logical(1))]; "
-                "if (length(failed)) stop(paste('unavailable packages:', "
-                "paste(failed, collapse=', '))); "
-                "cat(R.version.string, '\\n', sep='')"
-            ),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=float(timeout_seconds),
-        env=environment,
-    )
-    if validation.returncode != 0:
-        detail = (validation.stderr or validation.stdout).strip()
-        raise RuntimeError(
-            "Configured R/SuSiE runtime failed dependency validation: "
-            f"{resolved_rscript}; {detail}"
-        )
-    return {
-        "rscript": resolved_rscript,
-        "version": validation.stdout.strip(),
-        "library_paths": ordered_libraries,
-        "environment": environment,
-    }
 
 
 def validate_locus_file(path, locus_type="range"):

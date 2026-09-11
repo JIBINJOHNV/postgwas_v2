@@ -10,18 +10,19 @@ from typing import get_args, Iterable, Literal
 import polars as pl
 
 from postgwas.config.models.modules.formatting import FormattingDuplicatePolicy
-from postgwas.core.dataframes import chromosome_expression, position_expression
+from postgwas.core.dataframes import position_expression
+from postgwas.core.errors import FormattingError
 from postgwas.core.paths import configured_output_path
 from postgwas.core.statistics import negative_log10_to_raw_p
 from postgwas.core.variant_identifiers import (
     IDENTIFIER_TEMPLATE_FIELDS,
     identifier_template_parts,
 )
-from postgwas.core.vcf import extract_vcf_table
-
-
-class FormattingError(RuntimeError):
-    """A downstream input cannot be produced without corrupting meaning."""
+from postgwas.core.vcf import (
+    extract_vcf_table,
+    read_vcf_header,
+    validate_harmonised_vcf_header,
+)
 
 
 @dataclass(frozen=True)
@@ -47,25 +48,46 @@ class FormattingColumnSpec:
 def load_harmonised_vcf(
     vcf_path: str | Path,
     work_table: str | Path,
-    dataset_id: str,
     bcftools: str,
     config,
     *,
     logger=None,
-) -> pl.DataFrame:
-    """Extract all reusable fields once and return a typed canonical frame."""
+    return_header_evidence: bool = False,
+    validated_header_evidence: dict[str, str | list[str]] | None = None,
+    validated_sample: str | None = None,
+) -> pl.DataFrame | tuple[pl.DataFrame, dict[str, str | list[str]]]:
+    """Validate and parse one PostGWAS-harmonised VCF without re-harmonising."""
     columns = dict(config.vcf_fields.root)
     canonical = config.canonical_columns
+    header_evidence = validated_header_evidence
+    if header_evidence is None:
+        header = read_vcf_header(
+            vcf_path,
+            bcftools,
+            logger=logger,
+            error_type=FormattingError,
+        )
+        header_evidence = validate_harmonised_vcf_header(
+            header, config, vcf_path=vcf_path, logger=logger,
+        )
+    if logger is not None:
+        logger.record(
+            "VALIDATE",
+            "formatter_input_vcf_contract",
+            status="PASSED",
+            **header_evidence,
+        )
     extract_vcf_table(
         vcf_path,
         work_table,
-        dataset_id,
+        str(header_evidence["postgwas_dataset_id"]),
         columns,
         bcftools,
         delimiter=config.runtime.table_delimiter,
         io_buffer_bytes=config.runtime.io_buffer_bytes,
         include_expression=config.vcf_include_expression,
         allow_undefined_tags=True,
+        validated_sample=validated_sample,
         logger=logger,
         error_type=FormattingError,
         purpose="Extracting harmonised GWAS-VCF fields for formatting",
@@ -86,57 +108,75 @@ def load_harmonised_vcf(
         raise FormattingError("The VCF contains no biallelic variants.")
 
     numeric = list(config.numeric_columns)
-    chromosome = chromosome_expression(
-        canonical.chromosome,
-        frame.schema[canonical.chromosome],
-        strip_chr_prefix=False,
-    ).str.replace(config.chromosome_labels.prefix_pattern, "")
-    if config.chromosome_labels.aliases:
-        chromosome = chromosome.replace(config.chromosome_labels.aliases)
     frame = frame.with_columns(
-        chromosome.alias(canonical.chromosome),
         position_expression(canonical.position, frame.schema[canonical.position]),
-        pl.col(canonical.reference_allele)
-        .cast(pl.String).str.to_uppercase().str.strip_chars(),
-        pl.col(canonical.alternate_allele)
-        .cast(pl.String).str.to_uppercase().str.strip_chars(),
         *[pl.col(column).cast(pl.Float64, strict=False) for column in numeric],
     )
-    invalid_coordinates = frame.filter(
-        pl.col(canonical.chromosome).is_null()
-        | pl.col(canonical.position).is_null()
-        | (pl.col(canonical.position) < 1)
-        | pl.col(canonical.reference_allele).is_null()
-        | pl.col(canonical.alternate_allele).is_null()
-        | (pl.col(canonical.reference_allele) == "")
-        | (pl.col(canonical.alternate_allele) == "")
-    ).height
-    if invalid_coordinates:
-        raise FormattingError(
-            "%s biallelic VCF records have invalid coordinates or alleles."
-            % f"{invalid_coordinates:,}"
+    chromosome = pl.col(canonical.chromosome)
+    noncanonical_chromosome = (
+        chromosome.is_null()
+        | (chromosome == "")
+        | (chromosome != chromosome.str.strip_chars())
+        | ~chromosome.str.contains(config.input_contract.chromosome_pattern)
+    )
+
+    def invalid_allele(column: str) -> pl.Expr:
+        allele = pl.col(column)
+        return (
+            allele.is_null()
+            | (allele == "")
+            | (allele != allele.str.strip_chars())
+            | ~allele.str.contains(config.input_contract.allele_pattern)
         )
+
+    invalid_position = (
+        pl.col(canonical.position).is_null()
+        | (pl.col(canonical.position) < 1)
+    )
+    invalid_alleles = invalid_allele(
+        canonical.reference_allele
+    ) | invalid_allele(canonical.alternate_allele)
+    violations = frame.select(
+        noncanonical_chromosome.fill_null(True).sum().alias("chromosome"),
+        invalid_position.fill_null(True).sum().alias("position"),
+        invalid_alleles.fill_null(True).sum().alias("alleles"),
+    ).row(0, named=True)
+    if any(int(value) for value in violations.values()):
+        raise FormattingError(
+            "Input violates the configured PostGWAS-harmonised GWAS-VCF row "
+            "contract: %s noncanonical chromosome labels; %s invalid "
+            "positions; %s noncanonical or invalid REF/ALT allele records. "
+            "Re-run PostGWAS harmonisation; formatter does not repair "
+            "chromosome or allele values."
+            % tuple(f"{int(value):,}" for value in violations.values())
+        )
+    if logger is not None:
+        logger.record(
+            "VALIDATE",
+            "formatter_input_row_contract",
+            status="PASSED",
+            variants=frame.height,
+            chromosome_pattern=config.input_contract.chromosome_pattern,
+            allele_pattern=config.input_contract.allele_pattern,
+            values_rewritten=0,
+        )
+    if return_header_evidence:
+        return frame, header_evidence
     return frame
 
 
-def select_variant_identifiers(
-    frame: pl.DataFrame,
-    config,
-    identifier_type: str,
-    *,
-    duplicate_policy: str | None = None,
-) -> tuple[pl.DataFrame, dict[str, int | str]]:
-    """Select one configured identifier convention for a formatter target."""
+def variant_identifier_expression(config, identifier_type: str) -> pl.Expr:
+    """Build the configured formatter identifier expression for one target."""
     canonical = config.canonical_columns
     policy = config.variant_identifiers
     if identifier_type == "rsid":
-        identifier = (
+        return (
             pl.col(canonical.variant_id)
             .cast(pl.String)
             .str.strip_chars()
             .str.extract(policy.rsid_extraction_pattern, group_index=1)
         )
-    elif identifier_type == "unique":
+    if identifier_type == "unique":
         fields = {
             field: getattr(canonical, field)
             for field in IDENTIFIER_TEMPLATE_FIELDS
@@ -149,8 +189,21 @@ def select_variant_identifiers(
                 identifier += pl.lit(literal)
             if field is not None:
                 identifier += pl.col(fields[field]).cast(pl.String)
-    else:  # Pydantic rejects this; retain a clear boundary error for callers.
-        raise FormattingError("Unknown variant identifier type: %s" % identifier_type)
+        return identifier
+    # Pydantic rejects this; retain a clear boundary error for artifact consumers.
+    raise FormattingError("Unknown variant identifier type: %s" % identifier_type)
+
+
+def select_variant_identifiers(
+    frame: pl.DataFrame,
+    config,
+    identifier_type: str,
+    *,
+    duplicate_policy: str | None = None,
+) -> tuple[pl.DataFrame, dict[str, int | str]]:
+    """Select one configured identifier convention for a formatter target."""
+    canonical = config.canonical_columns
+    identifier = variant_identifier_expression(config, identifier_type)
 
     selected = frame.with_columns(
         identifier.alias(canonical.resolved_variant_id)
@@ -215,7 +268,7 @@ def _temporary_column(columns: Iterable[str], stem: str) -> str:
 def _duplicate_ranking_expression(config, duplicate_policy: str) -> tuple[str, pl.Expr]:
     """Return the configured source and valid score for one ranked policy."""
     canonical = config.canonical_columns
-    if duplicate_policy == "most_significant":
+    if duplicate_policy in {"lowest_p", "most_significant"}:
         source = canonical.negative_log10_p_value
         value = pl.col(source).cast(pl.Float64, strict=False)
         valid = value.is_not_null() & value.is_finite() & (value >= 0)
@@ -342,6 +395,38 @@ def resolve_duplicate_identifiers(
     ranking_column = None
     if not conflict_rows:
         output = collapsed
+    elif duplicate_policy == "lowest_p":
+        ranking_column, score = _duplicate_ranking_expression(
+            config, duplicate_policy,
+        )
+        row_column = _temporary_column(
+            collapsed.columns, "__postgwas_duplicate_row",
+        )
+        score_column = _temporary_column(
+            [*collapsed.columns, row_column], "__postgwas_duplicate_score",
+        )
+        working = collapsed.with_row_index(row_column).with_columns(
+            score.alias(score_column)
+        )
+        nonduplicated = working.filter(~pl.col(identifier).is_duplicated())
+        winners = (
+            working.filter(pl.col(identifier).is_duplicated())
+            .sort(
+                [identifier, score_column, row_column],
+                descending=[False, True, False],
+                nulls_last=True,
+            )
+            .unique(subset=[identifier], keep="first", maintain_order=True)
+        )
+        resolved_groups = int(conflict_groups)
+        ranked_winners = winners.height
+        output = pl.concat(
+            [
+                nonduplicated.select(working.columns),
+                winners.select(working.columns),
+            ],
+            how="vertical",
+        ).sort(row_column).drop(row_column, score_column)
     elif duplicate_policy == "exclude_all":
         output = collapsed.filter(~duplicate_mask)
         unresolved_groups = int(conflict_groups)
@@ -419,6 +504,50 @@ def resolve_duplicate_identifiers(
     if ranking_column is not None:
         metrics["identifier_duplicate_ranking_column"] = ranking_column
     return output, metrics
+
+
+def validate_unique_identifiers(
+    frame: pl.DataFrame,
+    config,
+    identifier_type: str,
+    duplicate_policy: str,
+) -> dict[str, int | bool]:
+    """Prove that a final formatter candidate has one valid row per ID."""
+    identifier = config.canonical_columns.resolved_variant_id
+    if identifier not in frame.columns:
+        raise FormattingError(
+            "Resolved variant identifier column is missing: %s" % identifier
+        )
+    if frame.is_empty():
+        raise FormattingError(
+            "Formatter identifier validation cannot accept an empty candidate table."
+        )
+    observed = frame.select(
+        (
+            pl.col(identifier).is_null()
+            | (pl.col(identifier).cast(pl.String).str.strip_chars() == "")
+        ).sum().alias("invalid"),
+        pl.col(identifier).is_duplicated().sum().alias("duplicated"),
+    ).row(0, named=True)
+    invalid = int(observed["invalid"])
+    duplicated = int(observed["duplicated"])
+    if invalid or duplicated:
+        raise FormattingError(
+            "Formatter identifier validation failed after duplicate policy %s: "
+            "%s invalid and %s duplicated %s candidate rows remain. Refusing "
+            "to write downstream artifacts."
+            % (
+                duplicate_policy,
+                f"{invalid:,}",
+                f"{duplicated:,}",
+                identifier_type,
+            )
+        )
+    return {
+        "identifier_uniqueness_validated": True,
+        "identifier_validation_rows": frame.height,
+        "identifier_unique_values": frame.height,
+    }
 
 
 def complete_rows(
@@ -588,5 +717,8 @@ __all__ = [
     "resolve_duplicate_identifiers",
     "select_variant_identifiers",
     "transformation_source",
+    "validate_harmonised_vcf_header",
+    "validate_unique_identifiers",
     "validation_expression",
+    "variant_identifier_expression",
 ]

@@ -1,9 +1,10 @@
-"""Step 12 - imputation quality (INFO) harmonisation.
+"""Dataset-wide INFO scale resolution and chromosome step 11 harmonisation.
 
-Implements plan v3 section 5.6.  The INFO score is taken from the study's own
-column when it has one, otherwise from a per-chromosome or whole-genome
-reference file, and is then brought inside the configured window in exactly the
-way the effect-allele-frequency step does.
+The INFO score is taken from the study's own column, a per-chromosome or
+whole-genome reference file, or an explicit fixed value. Its numerical type is
+resolved once from the complete selected source before chromosome fan-out.
+Chromosome workers then apply the corresponding configured standard-INFO or
+MaCH-Rsq range without independently re-detecting the type.
 
 There is deliberately no INFO equivalent of ``eaf_degenerate``: an INFO of 0 is
 scientifically poor but not mathematically fatal. Harmonisation applies its
@@ -14,25 +15,37 @@ All messages go through the PipelineLogger supplied by the orchestrator; the
 module never writes to stdout.
 """
 
+import math
 import os
-from typing import Dict, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 import polars as pl
 
-from postgwas.core.dataframes import (
-    chromosome_expression,
-    count_non_null,
-    position_expression,
-    validate_cast_retention,
-)
-from postgwas.core.io.tables import read_delimited_table
+from postgwas.core.io.delimiters import resolve_delimiter
 from postgwas.core.values import optional_text
 
-from .shared.runtime import resolve_policies, step_context
+from .external_reference_staging import (
+    ExternalReferenceStagingError,
+    projected_reference_batches,
+)
+from .shared.runtime import reject_rows, resolve_policies, step_context
 from .shared.allele_join import allele_oriented_left_join
-from .shared.variant_columns import has_canonical_variant_columns
+from .shared.variant_columns import (
+    canonical_chromosome_expression,
+    canonicalize_variant_frame,
+    has_canonical_variant_columns,
+    read_reference_variant_table,
+)
 
-__all__ = ["harmonise_imputation_quality", "ImputationQualityError", "POLICY_KEYS", "STEP_LABEL"]
+__all__ = [
+    "harmonise_imputation_quality",
+    "resolve_dataset_info_score_type",
+    "resolve_info_score_type_from_batches",
+    "ImputationQualityError",
+    "POLICY_KEYS",
+    "STEP_LABEL",
+]
 
 
 # The free-text step label recorded in the reject file.
@@ -42,20 +55,32 @@ STEP_LABEL = "11 info_harmonisation"
 # value and the plain-English explanation of each one.
 POLICY_KEYS = [
     "info.source",
+    "info.score_type",
     "info.out_of_range",
     "info.clip_min",
     "info.clip_max",
     "info.clip_tolerance",
+    "info.mach_rsq_max",
+    "info.auto_mach_rsq_fraction",
+    "info.maximum_invalid_fraction",
     "info.low_quality_threshold",
     "info.on_missing",
     "external_reference.exact_duplicate_action",
     "external_reference.non_identical_duplicate_action",
+    "chromosome.strip_chr_prefix",
+    "chromosome.strip_leading_zero",
+    "chromosome.rename_map",
 ]
 
 _REASON_TEXT = {
     "info_out_of_range": (
         "The imputation quality is outside the configured window and policy "
         "'info.out_of_range' is 'reject'."
+    ),
+    "info_out_of_range_after_null": (
+        "The imputation quality was outside the configured window, was set to "
+        "missing by policy 'info.out_of_range' = 'null', and was subsequently "
+        "removed by policy 'info.on_missing' = 'reject'."
     ),
     "info_missing": (
         "The variant has no imputation quality and policy 'info.on_missing' is "
@@ -70,6 +95,341 @@ class ImputationQualityError(RuntimeError):
     A typed exception rather than sys.exit(), so the dataset-level retry can
     catch it.
     """
+
+
+_DETECTION_VALUE_COLUMN = "__postgwas_info_score_detection_value"
+
+
+def _empty_score_statistics() -> dict[str, Any]:
+    return {
+        "source_rows": 0,
+        "finite_values": 0,
+        "unusable_values": 0,
+        "below_minimum": 0,
+        "standard_range_values": 0,
+        "mach_range_values": 0,
+        "above_mach_maximum": 0,
+        "minimum": None,
+        "maximum": None,
+    }
+
+
+def _summarise_info_score_batches(
+    batches: Iterable[pl.DataFrame],
+    info_column: str,
+    *,
+    policies,
+) -> dict[str, Any]:
+    """Aggregate INFO-scale evidence without materialising source values."""
+    clip_min = float(policies.get("info.clip_min"))
+    tolerance = float(policies.get("info.clip_tolerance"))
+    mach_max = float(policies.get("info.mach_rsq_max"))
+    combined = _empty_score_statistics()
+
+    for batch in batches:
+        if info_column not in batch.columns:
+            raise ImputationQualityError(
+                "The selected INFO source is missing configured score column %r."
+                % info_column
+            )
+        values = batch.select(
+            pl.col(info_column).cast(pl.Float64, strict=False).alias(
+                _DETECTION_VALUE_COLUMN
+            )
+        )
+        value = pl.col(_DETECTION_VALUE_COLUMN)
+        finite = (value.is_not_null() & value.is_finite()).fill_null(False)
+        finite_value = pl.when(finite).then(value).otherwise(
+            pl.lit(None, dtype=pl.Float64)
+        )
+        current = values.select([
+            pl.len().alias("source_rows"),
+            finite.sum().alias("finite_values"),
+            (~finite).sum().alias("unusable_values"),
+            (finite & (value < clip_min)).sum().alias("below_minimum"),
+            (
+                finite & (value >= clip_min) & (value <= tolerance)
+            ).sum().alias("standard_range_values"),
+            (
+                finite & (value > tolerance) & (value <= mach_max)
+            ).sum().alias("mach_range_values"),
+            (finite & (value > mach_max)).sum().alias("above_mach_maximum"),
+            finite_value.min().alias("minimum"),
+            finite_value.max().alias("maximum"),
+        ]).to_dicts()[0]
+        for key in (
+            "source_rows", "finite_values", "unusable_values",
+            "below_minimum", "standard_range_values", "mach_range_values",
+            "above_mach_maximum",
+        ):
+            combined[key] += int(current[key] or 0)
+        if current["minimum"] is not None:
+            combined["minimum"] = (
+                current["minimum"]
+                if combined["minimum"] is None
+                else min(combined["minimum"], current["minimum"])
+            )
+        if current["maximum"] is not None:
+            combined["maximum"] = (
+                current["maximum"]
+                if combined["maximum"] is None
+                else max(combined["maximum"], current["maximum"])
+            )
+    return combined
+
+
+def _resolve_info_score_statistics(
+    statistics: Mapping[str, Any],
+    *,
+    policies,
+    source_description: str,
+) -> dict[str, Any]:
+    """Resolve one dataset-wide INFO type from configured fraction guards."""
+    finite_count = int(statistics["finite_values"])
+    if finite_count == 0:
+        raise ImputationQualityError(
+            "INFO score-type detection found no finite numeric values in %s. "
+            "Verify the selected imputation-quality column and its missing-value "
+            "encoding; no chromosome worker was started."
+            % source_description
+        )
+
+    configured_type = str(policies.get("info.score_type"))
+    mach_count = int(statistics["mach_range_values"])
+    invalid_count = int(statistics["above_mach_maximum"])
+    mach_fraction = mach_count / finite_count
+    invalid_fraction = invalid_count / finite_count
+    auto_fraction = float(policies.get("info.auto_mach_rsq_fraction"))
+    maximum_invalid_fraction = float(
+        policies.get("info.maximum_invalid_fraction")
+    )
+    mach_max = float(policies.get("info.mach_rsq_max"))
+
+    if invalid_fraction > maximum_invalid_fraction:
+        raise ImputationQualityError(
+            "INFO validation stopped before chromosome processing: {:,} of "
+            "{:,} finite values ({:.6%}) in {} exceed "
+            "info.mach_rsq_max={:g}. This is above "
+            "info.maximum_invalid_fraction={:.6%}. Verify "
+            "imputation_info_column/external_info_column and info.score_type; "
+            "the selected field may not be an imputation-quality score."
+            .format(
+                invalid_count,
+                finite_count,
+                invalid_fraction,
+                source_description,
+                mach_max,
+                maximum_invalid_fraction,
+            )
+        )
+
+    if configured_type == "auto":
+        resolved_type = (
+            "mach_rsq" if mach_fraction >= auto_fraction else "standard_info"
+        )
+        decision_source = "automatic_full_dataset"
+    else:
+        resolved_type = configured_type
+        decision_source = "explicit_configuration"
+
+    result = dict(statistics)
+    result.update({
+        "configured_type": configured_type,
+        "resolved_type": resolved_type,
+        "decision_source": decision_source,
+        "source": source_description,
+        "mach_range_fraction": mach_fraction,
+        "invalid_fraction": invalid_fraction,
+        "auto_mach_rsq_fraction": auto_fraction,
+        "maximum_invalid_fraction": maximum_invalid_fraction,
+        "standard_info_maximum": float(policies.get("info.clip_tolerance")),
+        "mach_rsq_maximum": mach_max,
+    })
+    return result
+
+
+def resolve_info_score_type_from_batches(
+    batches: Iterable[pl.DataFrame],
+    info_column: str,
+    *,
+    policies=None,
+    source_description: str = "the selected INFO source",
+) -> dict[str, Any]:
+    """Resolve INFO versus MaCH Rsq once from a bounded dataset-wide scan."""
+    resolved_policies = resolve_policies(policies)
+    statistics = _summarise_info_score_batches(
+        batches, info_column, policies=resolved_policies,
+    )
+    return _resolve_info_score_statistics(
+        statistics,
+        policies=resolved_policies,
+        source_description=source_description,
+    )
+
+
+def _external_info_batches(
+    resource_maps: Mapping[str, Mapping[str, Any]],
+    chromosomes: Sequence[str],
+    *,
+    info_column: str,
+    external_info_colmap: Mapping[str, Any],
+    external_reference_staging: Mapping[str, Any],
+    policies,
+) -> Iterable[pl.DataFrame]:
+    chromosome_column = optional_text(external_info_colmap.get("chr"))
+    configured_delimiter = optional_text(external_info_colmap.get("delimiter"))
+    if chromosome_column is None or configured_delimiter is None:
+        raise ImputationQualityError(
+            "External INFO mapping requires configured 'chr' and 'delimiter' fields."
+        )
+
+    paths: dict[Path, set[str]] = {}
+    for chromosome in chromosomes:
+        path_text = optional_text(
+            (resource_maps.get(str(chromosome)) or {}).get("user_info_file")
+        )
+        if path_text is None:
+            raise ImputationQualityError(
+                "External INFO source has no preflighted file for chromosome %s."
+                % chromosome
+            )
+        path = Path(path_text).expanduser().resolve()
+        paths.setdefault(path, set()).add(str(chromosome))
+
+    selected_columns = tuple(dict.fromkeys([chromosome_column, info_column]))
+    for path, path_chromosomes in paths.items():
+        separator = None
+        if path.suffix.lower() != ".parquet":
+            detected = resolve_delimiter(
+                path,
+                configured_delimiter,
+                candidates=list(policies.get("input.delimiter_candidates")),
+                minimum_columns=int(
+                    policies.get("input.delimiter_min_columns")
+                ),
+                maximum_columns=int(
+                    policies.get("input.delimiter_max_columns")
+                ),
+                sample_lines=int(policies.get("input.delimiter_sample_rows")),
+            )
+            separator = detected.value
+            if separator is None:
+                raise ImputationQualityError(
+                    "Could not resolve the delimiter for external INFO source %s."
+                    % path
+                )
+        try:
+            for batch in projected_reference_batches(
+                path,
+                columns=selected_columns,
+                separator=separator,
+                null_values=list(policies.get("input.null_values")),
+                infer_schema_length=int(
+                    policies.get("input.schema_inference_rows")
+                ),
+                batch_rows=int(external_reference_staging["batch_rows"]),
+                compressed_suffixes=tuple(
+                    external_reference_staging["compressed_suffixes"]
+                ),
+            ):
+                yield batch.filter(
+                    canonical_chromosome_expression(
+                        pl.col(chromosome_column), policies,
+                    ).is_in(sorted(path_chromosomes))
+                )
+        except ExternalReferenceStagingError as exc:
+            raise ImputationQualityError(str(exc)) from exc
+
+
+def resolve_dataset_info_score_type(
+    *,
+    df: pl.DataFrame | None,
+    sample_column_dict: Mapping[str, Any],
+    resource_maps: Mapping[str, Mapping[str, Any]] | None,
+    chromosomes: Sequence[str],
+    external_info_column: str | None,
+    external_info_colmap: Mapping[str, Any],
+    external_reference_staging: Mapping[str, Any],
+    policies=None,
+) -> dict[str, Any]:
+    """Resolve the selected INFO source's score type before chromosome fan-out."""
+    resolved_policies = resolve_policies(policies)
+    source = optional_text(sample_column_dict.get("info_source"))
+    if source == "internal":
+        info_column = optional_text(sample_column_dict.get("imp_info_col"))
+        if df is None or info_column is None or info_column not in df.columns:
+            raise ImputationQualityError(
+                "Dataset-wide INFO detection requires the selected internal "
+                "imputation-quality column before chromosome partitioning."
+            )
+        return resolve_info_score_type_from_batches(
+            (df.select(info_column),),
+            info_column,
+            policies=resolved_policies,
+            source_description="study column %r" % info_column,
+        )
+
+    if source == "fixed_cli":
+        fixed_value = sample_column_dict.get("fixed_info")
+        if fixed_value is None:
+            raise ImputationQualityError(
+                "Dataset-wide INFO detection requires the resolved --fixed-info value."
+            )
+        numeric = float(fixed_value)
+        row_count = int(df.height if df is not None else 1)
+        finite = math.isfinite(numeric)
+        clip_min = float(resolved_policies.get("info.clip_min"))
+        tolerance = float(resolved_policies.get("info.clip_tolerance"))
+        mach_max = float(resolved_policies.get("info.mach_rsq_max"))
+        statistics = {
+            "source_rows": row_count,
+            "finite_values": row_count if finite else 0,
+            "unusable_values": 0 if finite else row_count,
+            "below_minimum": row_count if finite and numeric < clip_min else 0,
+            "standard_range_values": (
+                row_count if finite and clip_min <= numeric <= tolerance else 0
+            ),
+            "mach_range_values": (
+                row_count if finite and tolerance < numeric <= mach_max else 0
+            ),
+            "above_mach_maximum": (
+                row_count if finite and numeric > mach_max else 0
+            ),
+            "minimum": numeric if finite else None,
+            "maximum": numeric if finite else None,
+        }
+        return _resolve_info_score_statistics(
+            statistics,
+            policies=resolved_policies,
+            source_description="the explicit --fixed-info value",
+        )
+
+    if source == "external":
+        info_column = optional_text(external_info_column)
+        if info_column is None or resource_maps is None:
+            raise ImputationQualityError(
+                "Dataset-wide INFO detection requires the preflighted external "
+                "INFO files and configured external_info_column."
+            )
+        batches = _external_info_batches(
+            resource_maps,
+            chromosomes,
+            info_column=info_column,
+            external_info_colmap=external_info_colmap,
+            external_reference_staging=external_reference_staging,
+            policies=resolved_policies,
+        )
+        return resolve_info_score_type_from_batches(
+            batches,
+            info_column,
+            policies=resolved_policies,
+            source_description="external INFO column %r" % info_column,
+        )
+
+    raise ImputationQualityError(
+        "Dataset-wide INFO detection requires a resolved source of 'internal', "
+        "'external', or 'fixed_cli'; received %r." % source
+    )
 
 
 def harmonise_imputation_quality(
@@ -90,8 +450,8 @@ def harmonise_imputation_quality(
 
     logger   : a PipelineLogger.  When given and ``ctx`` is not, this function
                opens its own step on it.
-    policies : a Policies object.  When None the registry defaults are used, so
-               behaviour is unchanged.
+    policies : a Policies object. When None the schema-validated registry
+               defaults are used.
     rejects  : a RejectCollector.  Required for the 'reject' actions to record
                the removed variants.
     ctx      : a StepContext, when the caller opened the step itself.
@@ -100,10 +460,8 @@ def harmonise_imputation_quality(
     out_of_range = policies.get("info.out_of_range")
     clip_min = float(policies.get("info.clip_min"))
     clip_max = float(policies.get("info.clip_max"))
-    clip_tolerance = float(policies.get("info.clip_tolerance"))
-    # The tolerance is expressed as an absolute value ("values up to 1.05 are
-    # rounding error"), so it can never sit below the ceiling itself.
-    tolerance_limit = max(clip_tolerance, clip_max)
+    tolerance_limit = float(policies.get("info.clip_tolerance"))
+    mach_rsq_max = float(policies.get("info.mach_rsq_max"))
     low_quality = float(policies.get("info.low_quality_threshold"))
     on_missing = policies.get("info.on_missing")
     duplicate_exact_action = str(
@@ -139,25 +497,41 @@ def harmonise_imputation_quality(
                 "Unknown resolved INFO source %r on chromosome %s."
                 % (resolved_source, chromosome)
             )
+        configured_score_type = str(policies.get("info.score_type"))
+        resolved_score_type = optional_text(
+            sample_column_dict.get("resolved_info_score_type")
+        )
+        if resolved_score_type is None and configured_score_type != "auto":
+            resolved_score_type = configured_score_type
+        if resolved_score_type is None and (
+            resolved_source == "fixed_cli" or fixed_info is not None
+        ):
+            resolved_score_type = "standard_info"
+        if resolved_score_type not in ("standard_info", "mach_rsq"):
+            raise ImputationQualityError(
+                "INFO score type was not resolved at the complete-dataset level "
+                "before chromosome %s entered the worker. Set info.score_type "
+                "explicitly or run the dataset preparation stage; per-chromosome "
+                "automatic detection is not permitted."
+                % chromosome
+            )
+        upper_limit = (
+            tolerance_limit
+            if resolved_score_type == "standard_info"
+            else mach_rsq_max
+        )
 
         # ------------------------------------------------------------------
         # NORMALISE THE STUDY COORDINATES
         # ------------------------------------------------------------------
         if not has_canonical_variant_columns(df, sample_column_dict):
-            schema = dict(df.schema)
-            pos_before = count_non_null(df, pos_col)
-            df = df.with_columns([
-                chromosome_expression(chr_col, schema[chr_col]),
-                position_expression(pos_col, schema[pos_col]),
-                pl.col(ea_col).cast(pl.String).str.to_uppercase().str.strip_chars(),
-                pl.col(oa_col).cast(pl.String).str.to_uppercase().str.strip_chars(),
-            ])
-            validate_cast_retention(
-                pos_before,
-                count_non_null(df, pos_col),
-                "study position",
+            df, _normalization = canonicalize_variant_frame(
+                df,
+                {"chr": chr_col, "pos": pos_col, "ea": ea_col, "oa": oa_col},
+                policies,
                 error_type=ImputationQualityError,
                 warn=step.warn,
+                label="study",
             )
 
         has_study_column = imp_info_col is not None and imp_info_col in df.columns
@@ -217,32 +591,18 @@ def harmonise_imputation_quality(
                 raise ImputationQualityError(
                     "External imputation-quality column mapping is not configured."
                 )
-            required_mapping = ("chr", "pos", "a1", "a2", "delimiter")
-            missing_mapping = [
-                key for key in required_mapping
-                if not str(external_info_colmap.get(key, "")).strip()
-            ]
-            if missing_mapping:
-                raise ImputationQualityError(
-                    "External imputation-quality mapping is missing: %s"
-                    % ", ".join(missing_mapping)
-                )
+            info_raw, _detected = read_reference_variant_table(
+                info_file_to_use,
+                external_info_colmap,
+                policies,
+                value_columns=[info_col_to_use],
+                error_type=ImputationQualityError,
+                description="external imputation-quality table",
+            )
             ref_chr = external_info_colmap["chr"]
             ref_pos = external_info_colmap["pos"]
             ref_effect = external_info_colmap["a1"]
             ref_other = external_info_colmap["a2"]
-            info_raw, _detected = read_delimited_table(
-                info_file_to_use,
-                external_info_colmap["delimiter"],
-                candidates=list(policies.get("input.delimiter_candidates")),
-                minimum_columns=int(policies.get("input.delimiter_min_columns")),
-                maximum_columns=int(policies.get("input.delimiter_max_columns")),
-                sample_lines=int(policies.get("input.delimiter_sample_rows")),
-                null_values=list(policies.get("input.null_values")),
-                infer_schema_length=int(policies.get("input.schema_inference_rows")),
-                error_type=ImputationQualityError,
-                description="external imputation-quality table",
-            )
             if info_col_to_use in df.columns:
                 step.warn(
                     "The study frame already has a column named %r; it is being "
@@ -259,6 +619,7 @@ def harmonise_imputation_quality(
                     "chr": ref_chr, "pos": ref_pos,
                     "ea": ref_effect, "oa": ref_other,
                 },
+                policies=policies,
                 value_column=info_col_to_use,
                 output_column=info_col_to_use,
                 duplicate_exact_action=duplicate_exact_action,
@@ -325,10 +686,11 @@ def harmonise_imputation_quality(
                     % (chromosome, fixed_info_column)
                 )
             fixed_value = float(fixed_info)
-            if not 0 <= fixed_value <= 1:
+            if not clip_min <= fixed_value <= clip_max:
                 raise ImputationQualityError(
-                    "Fixed INFO must be between 0 and 1; received %r."
-                    % fixed_info
+                    "Fixed INFO must be between info.clip_min={:g} and "
+                    "info.clip_max={:g}; received {!r}."
+                    .format(clip_min, clip_max, fixed_info)
                 )
             df = df.with_columns(
                 pl.lit(fixed_value, dtype=pl.Float64).alias(fixed_info_column)
@@ -354,6 +716,27 @@ def harmonise_imputation_quality(
             )
 
         qc_info["info_column"] = info_col
+        qc_info["info_score_type"] = resolved_score_type
+        qc_info["info_score_type_configured"] = configured_score_type
+        qc_info["info_score_type_source"] = sample_column_dict.get(
+            "info_score_type_source",
+            "explicit_configuration"
+            if configured_score_type != "auto"
+            else "fixed_info",
+        )
+        qc_info["info_valid_maximum"] = upper_limit
+        numeric_info = pl.col(info_col).cast(pl.Float64, strict=False)
+        df = df.with_columns(
+            pl.when(numeric_info.is_finite())
+            .then(numeric_info)
+            .otherwise(pl.lit(None, dtype=pl.Float64))
+            .alias(info_col)
+        )
+        step.info(
+            "The dataset-wide INFO score type is {}; this chromosome uses the "
+            "configured valid window {:g} to {:g}."
+            .format(resolved_score_type, clip_min, upper_limit)
+        )
 
         # ------------------------------------------------------------------
         # QC METRICS - measured before anything is changed
@@ -363,10 +746,14 @@ def harmonise_imputation_quality(
             pl.col(info_col).is_null().sum().alias("missing"),
             (pl.col(info_col) < clip_min).sum().alias("lt_zero"),
             (pl.col(info_col) > clip_max).sum().alias("gt_one"),
-            (pl.col(info_col) > tolerance_limit).sum().alias("gt_tolerance"),
+            (pl.col(info_col) > tolerance_limit).sum().alias(
+                "gt_standard_tolerance"
+            ),
+            (pl.col(info_col) > upper_limit).sum().alias("gt_valid_maximum"),
             (
                 (pl.col(info_col) > clip_max)
                 & (pl.col(info_col) <= tolerance_limit)
+                & pl.lit(resolved_score_type == "standard_info")
             ).sum().alias("within_tolerance"),
             (
                 pl.col(info_col).is_not_null()
@@ -374,7 +761,7 @@ def harmonise_imputation_quality(
             ).sum().alias("low_info"),
             (
                 (pl.col(info_col) > low_quality)
-                & (pl.col(info_col) <= clip_max)
+                & (pl.col(info_col) <= upper_limit)
             ).sum().alias("good_info"),
             pl.col(info_col).min().alias("min"),
             pl.col(info_col).max().alias("max"),
@@ -384,9 +771,10 @@ def harmonise_imputation_quality(
         missing = int(stats["missing"] or 0)
         lt_zero = int(stats["lt_zero"] or 0)
         gt_one = int(stats["gt_one"] or 0)
-        gt_1_05 = int(stats["gt_tolerance"] or 0)
+        gt_standard_tolerance = int(stats["gt_standard_tolerance"] or 0)
+        gt_valid_maximum = int(stats["gt_valid_maximum"] or 0)
         within_tolerance = int(stats["within_tolerance"] or 0)
-        invalid = lt_zero + gt_one
+        invalid = lt_zero + gt_valid_maximum
         low_info = int(stats["low_info"] or 0)
         good_info = int(stats["good_info"] or 0)
 
@@ -394,7 +782,8 @@ def harmonise_imputation_quality(
         qc_info["missing_info"] = missing
         qc_info["lt_zero"] = lt_zero
         qc_info["gt_one"] = gt_one
-        qc_info["gt_1_05"] = gt_1_05
+        qc_info["gt_standard_info_tolerance"] = gt_standard_tolerance
+        qc_info["gt_valid_maximum"] = gt_valid_maximum
         qc_info["invalid"] = invalid
         qc_info["low_info"] = low_info
         qc_info["good_info"] = good_info
@@ -405,6 +794,7 @@ def harmonise_imputation_quality(
         qc_info["info_clip_min"] = clip_min
         qc_info["info_clip_max"] = clip_max
         qc_info["info_clip_tolerance"] = tolerance_limit
+        qc_info["info_mach_rsq_max"] = mach_rsq_max
         qc_info["info_out_of_range_action"] = out_of_range
         qc_info["info_on_missing_action"] = on_missing
 
@@ -420,7 +810,7 @@ def harmonise_imputation_quality(
         # ------------------------------------------------------------------
         # ROUNDING ERROR JUST ABOVE THE CEILING
         # ------------------------------------------------------------------
-        if within_tolerance > 0:
+        if resolved_score_type == "standard_info" and within_tolerance > 0:
             before = df.height
             df = df.with_columns(
                 pl.when(
@@ -445,38 +835,40 @@ def harmonise_imputation_quality(
         # OUT OF RANGE
         # ------------------------------------------------------------------
         out_of_range_mask = (
-            (pl.col(info_col) < clip_min) | (pl.col(info_col) > tolerance_limit)
+            (pl.col(info_col) < clip_min) | (pl.col(info_col) > upper_limit)
         ).fill_null(False)
-        n_out_of_range = lt_zero + gt_1_05
+        n_out_of_range = lt_zero + gt_valid_maximum
+        # Preserve the scientific origin only for the policy combination that
+        # needs it. Otherwise the default direct-rejection path should not pay
+        # for an additional materialised chromosome-length mask.
+        out_of_range_rows = (
+            df.select(out_of_range_mask).to_series()
+            if n_out_of_range > 0
+            and out_of_range == "null"
+            and on_missing == "reject"
+            else None
+        )
         qc_info["out_of_range"] = n_out_of_range
         qc_info["rejected_out_of_range"] = 0
+        qc_info["nullified_out_of_range"] = 0
 
         if n_out_of_range > 0:
             explanation = (
                 "{:,} variants have an imputation quality below {:g} or above "
-                "{:g}.".format(n_out_of_range, clip_min, tolerance_limit)
+                "{:g} for the resolved {} score type."
+                .format(
+                    n_out_of_range,
+                    clip_min,
+                    upper_limit,
+                    resolved_score_type,
+                )
             )
             if out_of_range == "fail":
                 raise ImputationQualityError(
                     explanation
                     + " Policy 'info.out_of_range' is 'fail', so the run stopped."
                 )
-            if out_of_range == "clip":
-                before = df.height
-                df = df.with_columns(
-                    pl.col(info_col).clip(clip_min, clip_max).alias(info_col)
-                )
-                step.qc(
-                    "imputation quality range",
-                    explanation
-                    + " Policy 'info.out_of_range' is 'clip', so they were "
-                      "forced back to between {:g} and {:g}.".format(
-                          clip_min, clip_max
-                      ),
-                    before, df.height, changed=n_out_of_range, warn=True,
-                    step=STEP_LABEL,
-                )
-            elif out_of_range == "null":
+            if out_of_range == "null":
                 before = df.height
                 df = df.with_columns(
                     pl.when(out_of_range_mask)
@@ -492,10 +884,22 @@ def harmonise_imputation_quality(
                     before, df.height, changed=n_out_of_range, warn=True,
                     step=STEP_LABEL,
                 )
+                qc_info["nullified_out_of_range"] = n_out_of_range
             elif out_of_range == "reject":
-                df, removed = _remove(
-                    df, out_of_range_mask, step, rejects, "info_out_of_range",
-                    "quality outside {:g} to {:g}".format(clip_min, tolerance_limit),
+                df, removed = reject_rows(
+                    df,
+                    out_of_range_mask,
+                    step_label=STEP_LABEL,
+                    reason="info_out_of_range",
+                    context=step,
+                    collector=rejects,
+                    detail="quality outside {:g} to {:g}".format(
+                        clip_min, upper_limit
+                    ),
+                    check_name="info out of range",
+                    description=_REASON_TEXT["info_out_of_range"],
+                    warn_on_remove=True,
+                    warn_without_collector=True,
                 )
                 qc_info["rejected_out_of_range"] = removed
 
@@ -508,18 +912,62 @@ def harmonise_imputation_quality(
         qc_info["missing_info_after"] = missing_now
         qc_info["rejected_missing"] = 0
         if missing_now > 0:
-            explanation = (
-                "{:,} variants have no imputation quality.".format(missing_now)
-            )
+            if out_of_range == "null" and n_out_of_range > 0:
+                explanation = (
+                    "{:,} variants have no imputation quality after range "
+                    "handling: {:,} were already missing or non-finite and "
+                    "{:,} were set to missing because their INFO was outside "
+                    "the valid window."
+                    .format(missing_now, missing, n_out_of_range)
+                )
+            else:
+                explanation = (
+                    "{:,} variants have no imputation quality."
+                    .format(missing_now)
+                )
             if on_missing == "fail":
                 raise ImputationQualityError(
                     explanation
                     + " Policy 'info.on_missing' is 'fail', so the run stopped."
                 )
             if on_missing == "reject":
-                df, removed = _remove(
-                    df, pl.col(info_col).is_null(), step, rejects, "info_missing",
-                    None,
+                if out_of_range == "null" and n_out_of_range > 0:
+                    if out_of_range_rows is None:
+                        raise AssertionError(
+                            "The preserved out-of-range INFO mask is missing."
+                        )
+                    df, removed = reject_rows(
+                        df,
+                        out_of_range_rows,
+                        step_label=STEP_LABEL,
+                        reason="info_out_of_range",
+                        context=step,
+                        collector=rejects,
+                        detail=(
+                            "quality outside {:g} to {:g}; set to missing by "
+                            "info.out_of_range='null' and removed by "
+                            "info.on_missing='reject'"
+                        ).format(clip_min, upper_limit),
+                        check_name="nullified out-of-range INFO",
+                        description=_REASON_TEXT[
+                            "info_out_of_range_after_null"
+                        ],
+                        warn_on_remove=True,
+                        warn_without_collector=True,
+                    )
+                    qc_info["rejected_out_of_range"] += removed
+                df, removed = reject_rows(
+                    df,
+                    pl.col(info_col).is_null(),
+                    step_label=STEP_LABEL,
+                    reason="info_missing",
+                    context=step,
+                    collector=rejects,
+                    detail=None,
+                    check_name="info missing",
+                    description=_REASON_TEXT["info_missing"],
+                    warn_on_remove=True,
+                    warn_without_collector=True,
                 )
                 qc_info["rejected_missing"] = removed
             else:
@@ -542,33 +990,3 @@ def harmonise_imputation_quality(
         step.set_rows(df.height, removed=rows_in - df.height)
 
     return df, qc_info, sample_column_dict
-
-
-def _remove(df, mask, step, rejects, reason, detail):
-    """Remove the rows the mask selects, recording them.
-
-    The reject collector logs its own before/after counts, so nothing is
-    logged here on that path.  Without a collector the variants are still
-    removed - the policy asked for it - but the log says they were not written
-    to the rejected-variants file.
-    """
-    mask = mask.fill_null(False)
-    before = df.height
-    if rejects is not None:
-        df = rejects.reject(df, mask, STEP_LABEL, reason, detail=detail)
-        return df, before - df.height
-
-    kept = df.filter(~mask)
-    removed = before - kept.height
-    step.qc(
-        reason.replace("_", " "),
-        _REASON_TEXT[reason],
-        before, kept.height, reason=reason, warn=removed > 0, step=STEP_LABEL,
-    )
-    if removed > 0:
-        step.warn(
-            "No rejected-variant collector was wired in, so these {:,} variants "
-            "were removed without being written to the rejected-variants "
-            "file.".format(removed)
-        )
-    return kept, removed

@@ -1,6 +1,7 @@
 """Scientifically reviewed contracts for downstream formatter outputs."""
 
 from dataclasses import dataclass
+from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,27 @@ FORMAT_CONTRACTS = {
 
 CUSTOM_OUTPUT_TARGET = "custom"
 
+DUPLICATE_POLICY_DESCRIPTIONS = {
+    "exclude_all": (
+        "exclude every conflicting record in a duplicated identifier group"
+    ),
+    "error": (
+        "collapse exact repeats and stop if a conflicting duplicated-ID group remains"
+    ),
+    "lowest_p": (
+        "retain the lowest-p-value record in each duplicated identifier group"
+    ),
+    "most_significant": (
+        "retain only a unique most-significant record; exclude tied or missing ranks"
+    ),
+    "highest_maf": (
+        "retain only a unique highest-MAF record; exclude tied or missing ranks"
+    ),
+    "highest_info": (
+        "retain only a unique highest-INFO record; exclude tied or missing ranks"
+    ),
+}
+
 # Stable Python result keys are internal handoff contracts, not configurable
 # scientific values. Keeping them here prevents exporters and resume recovery
 # from defining parallel interfaces.
@@ -104,6 +126,22 @@ def formatter_result_targets(config, selected: list[str]) -> list[str]:
     return targets
 
 
+def formatter_target_display_name(
+    target: str,
+    variant_id_observations: Mapping[str, Mapping] | None = None,
+) -> str:
+    """Return the resolved downstream consumer label for one formatter target."""
+    if target == CUSTOM_OUTPUT_TARGET:
+        return "Custom CLI table"
+    observation = (variant_id_observations or {}).get(target, {})
+    consumers = [
+        str(consumer).strip()
+        for consumer in observation.get("consumers", ())
+        if str(consumer).strip()
+    ]
+    return " / ".join(consumers) if consumers else FORMAT_CONTRACTS[target].name
+
+
 def required_formats(config, modules=(), requested=()):
     """Return downstream formats once, in stable execution order."""
     selected = set(requested or ())
@@ -115,11 +153,13 @@ def required_formats(config, modules=(), requested=()):
 __all__ = [
     "FORMAT_CONTRACTS",
     "CUSTOM_OUTPUT_TARGET",
+    "DUPLICATE_POLICY_DESCRIPTIONS",
     "GCTA_SAMPLE_SIZE_MODE",
     "NAMED_OUTPUT_RESULT_KEYS",
     "PARTITIONED_OUTPUT_RESULT_KEYS",
     "SINGLE_OUTPUT_RESULT_KEYS",
     "FormatContract",
     "formatter_result_targets",
+    "formatter_target_display_name",
     "required_formats",
 ]

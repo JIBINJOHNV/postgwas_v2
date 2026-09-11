@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from postgwas.config.models.common import StrictModel
+from pydantic import Field
+
+from postgwas.config.models.common import GenomicRegion, StrictModel
 
 
 class ExecutableResources(StrictModel):
@@ -13,6 +15,8 @@ class ExecutableResources(StrictModel):
     scdrs: str
     ldsc: str
     munge_sumstats: str
+    bgenix: str
+    ldstore: str
     finemap: str
     gcta: str
     rscript: str
@@ -40,13 +44,13 @@ class GenomeResources(StrictModel):
     fasta: Path | None = None
     dbsnp: Path | None = None
     gene_locations: Path | None = None
+    regions: dict[str, GenomicRegion] = Field(default_factory=dict)
 
 
 class PopulationResources(StrictModel):
     plink_prefix: Path | None = None
     allele_frequencies: Path | None = None
     ld_scores: Path | None = None
-    ld_blocks: Path | None = None
 
 
 class ResourcesConfig(StrictModel):

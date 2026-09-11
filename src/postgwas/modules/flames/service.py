@@ -1,8 +1,10 @@
-"""Strict PostGWAS service boundary for the unchanged upstream FLAMES program."""
+"""Strict PostGWAS boundary for FLAMES with fail-closed annotation transport."""
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -22,6 +24,8 @@ from postgwas.core.completion import (
     resolve_completion_resume,
     write_completion_manifest,
 )
+from postgwas.core.io.tables import require_table_columns
+from postgwas.core.input_validation import record_file_validation, validate_once
 from postgwas.core.paths import (
     configured_output_path,
     remove_empty_directories,
@@ -30,8 +34,27 @@ from postgwas.core.paths import (
     validate_filename_component,
 )
 from postgwas.core.pipeline_logging import PipelineLogger, write_log_record
+from postgwas.core.preflight import (
+    PipelinePreflightEvidence,
+    PreflightLogBuffer,
+    pipeline_preflight_evidence,
+    replay_preflight_log,
+    require_pipeline_input_vcf,
+)
 from postgwas.core.processes import run_checked_command
+from postgwas.core.reference_resources import (
+    contained_resource_path,
+    read_unique_line_names,
+    validate_resource_directories,
+)
+from postgwas.core.required_arguments import (
+    RequiredArgument,
+    require_resolved_arguments,
+)
+from postgwas.core.ui import StageProgress
+from postgwas.core.validation_reporting import register_file_availability_bundle
 from postgwas.modules.flames.errors import FlamesError
+from postgwas.modules.flames.stages import FLAMES_STAGES
 
 
 def _resolved_configuration(args: argparse.Namespace):
@@ -46,8 +69,10 @@ def _resolved_configuration(args: argparse.Namespace):
         "flames_vep_mode": "vep_mode",
         "vep_command": "vep_command",
         "vep_cache": "vep_cache",
+        "vep_cache_genome_build": "vep_cache_genome_build",
         "flames_cadd_mode": "cadd_mode",
         "cadd_file": "cadd_file",
+        "cadd_genome_build": "cadd_genome_build",
     })
     global_overrides = explicit_overrides(args, {
         "dataset_id": "run.dataset_id",
@@ -89,19 +114,75 @@ def _read_table(
     return table
 
 
-def _require_columns(table: pd.DataFrame, columns, label: str) -> None:
-    missing = [column for column in columns if column not in table.columns]
-    if missing:
-        raise FlamesError(
-            "%s is missing required columns: %s" % (label, ", ".join(missing))
-        )
-
-
 def _module_resource(root: Path, relative: str, label: str) -> Path:
-    candidate = (root / relative).resolve()
-    if root != candidate and root not in candidate.parents:
-        raise FlamesError("%s leaves the FLAMES module directory" % label)
-    return candidate
+    return contained_resource_path(
+        root, relative, label=label, root_label="the FLAMES module directory",
+        error_type=FlamesError,
+    )
+
+
+def _require_flames_arguments(module, *, pipeline: bool) -> None:
+    """Validate YAML-resolved requirements before runtime or data inspection."""
+    requirements = [
+        RequiredArgument(
+            "--flames-annotation-directory",
+            "modules.flames.annotation_resource_directory",
+            module.annotation_resource_directory,
+        ),
+    ]
+    if not pipeline:
+        requirements[:0] = [
+            RequiredArgument(
+                "--credible-sets-directory",
+                "modules.flames.credible_sets_directory",
+                module.credible_sets_directory,
+            ),
+            RequiredArgument(
+                "--magma-gene-results-file",
+                "modules.flames.magma_gene_results_file",
+                module.magma_gene_results_file,
+            ),
+            RequiredArgument(
+                "--magma-covariate-results-file",
+                "modules.flames.magma_covariate_results_file",
+                module.magma_covariate_results_file,
+            ),
+            RequiredArgument(
+                "--pops-scores-file",
+                "modules.flames.pops_scores_file",
+                module.pops_scores_file,
+            ),
+        ]
+    if module.vep_mode == "local":
+        requirements.extend((
+            RequiredArgument(
+                "--vep-command",
+                "modules.flames.vep_command",
+                module.vep_command,
+            ),
+            RequiredArgument(
+                "--vep-cache",
+                "modules.flames.vep_cache",
+                module.vep_cache,
+            ),
+            RequiredArgument(
+                "--vep-cache-genome-build",
+                "modules.flames.vep_cache_genome_build",
+                module.vep_cache_genome_build,
+            ),
+        ))
+    if module.cadd_mode == "local":
+        requirements.append(RequiredArgument(
+            "--cadd-file",
+            "modules.flames.cadd_file",
+            module.cadd_file,
+        ))
+        requirements.append(RequiredArgument(
+            "--cadd-genome-build",
+            "modules.flames.cadd_genome_build",
+            module.cadd_genome_build,
+        ))
+    require_resolved_arguments(requirements)
 
 
 def _validate_runtime(configuration, module, logger=None) -> str:
@@ -111,13 +192,33 @@ def _validate_runtime(configuration, module, logger=None) -> str:
         error_type=FlamesError,
     )
     imports = ",".join(module.upstream.runtime_imports)
-    run_checked_command(
-        [python, "-c", "import %s" % imports],
-        "FLAMES Python dependency preflight",
-        logger=logger,
-        error_type=FlamesError,
-        timeout_seconds=configuration.execution.timeout_seconds,
+    def check():
+        buffered = PreflightLogBuffer()
+        try:
+            run_checked_command(
+                [python, "-c", "import %s" % imports],
+                "FLAMES Python dependency preflight",
+                logger=buffered,
+                error_type=FlamesError,
+                timeout_seconds=configuration.execution.timeout_seconds,
+            )
+        except BaseException:
+            if logger is not None:
+                replay_preflight_log(buffered.events, logger)
+            raise
+        record_file_validation(python, "FLAMES runtime", checks=("configured Python imports",),
+                               metrics={"imports": list(module.upstream.runtime_imports)})
+        return buffered.events
+
+    events = validate_once(
+        (python,),
+        {"validator": "flames_python_runtime", "imports": imports,
+         "timeout": configuration.execution.timeout_seconds, "cwd": str(Path.cwd()),
+         "environment": {key: os.environ.get(key) for key in ("PYTHONPATH", "PYTHONHOME")}},
+        check, error_type=FlamesError,
     )
+    if logger is not None:
+        replay_preflight_log(events, logger)
     return python
 
 
@@ -165,34 +266,12 @@ def _validate_upstream_resources(configuration, logger=None) -> dict:
             "FLAMES annotation resource directory does not exist: %s"
             % annotation_directory
         )
-    missing_directories = []
-    empty_directories = []
-    for relative in module.upstream.required_annotation_directories:
-        required_directory = annotation_directory / relative
-        if not required_directory.is_dir():
-            missing_directories.append(relative)
-        elif next(
-            (entry for entry in required_directory.rglob("*") if entry.is_file()),
-            None,
-        ) is None:
-            empty_directories.append(relative)
-    if missing_directories:
-        raise FlamesError(
-            "FLAMES annotation bundle %s is missing configured directories: %s"
-            % (
-                module.upstream.annotation_bundle_id,
-                ", ".join(missing_directories),
-            )
-        )
-    if empty_directories:
-        raise FlamesError(
-            "FLAMES annotation bundle %s has configured resource directories "
-            "without any files: %s"
-            % (
-                module.upstream.annotation_bundle_id,
-                ", ".join(empty_directories),
-            )
-        )
+    annotation_directories, annotation_inventory = validate_resource_directories(
+        annotation_directory, module.upstream.required_annotation_directories,
+        label="FLAMES annotation resource",
+        bundle="FLAMES annotation bundle %s" % module.upstream.annotation_bundle_id,
+        error_type=FlamesError,
+    )
     annotation_files = {}
     for pattern in module.upstream.required_annotation_file_patterns:
         relative = pattern.format(genome_build=module.genome_build.value.upper())
@@ -201,19 +280,80 @@ def _validate_upstream_resources(configuration, logger=None) -> dict:
             "FLAMES annotation resource",
             error_type=FlamesError,
         )
+    annotation_bundle_files = tuple(dict.fromkeys((
+        *annotation_inventory.values(),
+        *annotation_files.values(),
+    )))
+    register_file_availability_bundle(
+        annotation_bundle_files,
+        "FLAMES annotation resource bundle",
+        (
+            (
+                "success",
+                "flames_annotation_directories",
+                "%d / %d"
+                % (
+                    len(annotation_directories),
+                    len(module.upstream.required_annotation_directories),
+                ),
+            ),
+            (
+                "count",
+                "flames_annotation_inventory_files",
+                len(annotation_inventory),
+            ),
+            (
+                "success",
+                "flames_named_annotation_files",
+                "%d / %d"
+                % (
+                    len(annotation_files),
+                    len(module.upstream.required_annotation_file_patterns),
+                ),
+            ),
+            (
+                "count",
+                "flames_unique_annotation_files",
+                len(annotation_bundle_files),
+            ),
+            ("info", "flames_annotation_root", annotation_directory, True),
+            (
+                "info",
+                "validation_scope",
+                "presence and non-empty files; annotation contents are "
+                "validated when consumed",
+            ),
+        ),
+    )
     vep_command = None
     vep_cache = None
     if module.vep_mode == "local":
+        if module.vep_cache_genome_build != module.genome_build:
+            raise FlamesError(
+                "Local VEP cache genome build %s does not match FLAMES genome "
+                "build %s"
+                % (
+                    module.vep_cache_genome_build.value,
+                    module.genome_build.value,
+                )
+            )
         vep_command = resolve_executable(
             module.vep_command, "VEP", error_type=FlamesError,
         )
         vep_cache = Path(module.vep_cache).expanduser().resolve()
         if not vep_cache.is_dir():
             raise FlamesError("VEP cache directory does not exist: %s" % vep_cache)
+        if next((path for path in vep_cache.rglob("*") if path.is_file()), None) is None:
+            raise FlamesError("VEP cache directory contains no files: %s" % vep_cache)
     cadd_file = None
     tabix = None
     cadd_index = None
     if module.cadd_mode == "local":
+        if module.cadd_genome_build != module.genome_build:
+            raise FlamesError(
+                "Local CADD genome build %s does not match FLAMES genome build %s"
+                % (module.cadd_genome_build.value, module.genome_build.value)
+            )
         cadd_file = require_nonempty_file(
             module.cadd_file, "CADD score file", error_type=FlamesError,
         )
@@ -228,6 +368,7 @@ def _validate_upstream_resources(configuration, logger=None) -> dict:
             error_type=FlamesError,
         )
     python = _validate_runtime(configuration, module, logger=logger)
+    feature_names = _feature_names(features)
     return {
         "python": python,
         "script": script,
@@ -235,12 +376,15 @@ def _validate_upstream_resources(configuration, logger=None) -> dict:
         "model": model,
         "features": features,
         "annotation_directory": annotation_directory,
+        "annotation_directories": annotation_directories,
+        "annotation_inventory": annotation_inventory,
         "annotation_files": annotation_files,
         "vep_command": vep_command,
         "vep_cache": vep_cache,
         "cadd_file": cadd_file,
         "cadd_index": cadd_index,
         "tabix": tabix,
+        "feature_names": feature_names,
     }
 
 
@@ -263,7 +407,7 @@ def validate_fine_mapping_index(fine_mapping_directory, module):
         schema.index_locus_column,
         schema.index_annotation_column,
     ]
-    _require_columns(index, required, "Fine-mapping FLAMES index")
+    require_table_columns(index, required, "Fine-mapping FLAMES index", error_type=FlamesError)
     if index[required].isna().any().any() or any(
         index[column].astype(str).str.strip().eq("").any() for column in required
     ):
@@ -271,12 +415,6 @@ def validate_fine_mapping_index(fine_mapping_directory, module):
     if index[schema.index_filename_column].duplicated().any():
         raise FlamesError(
             "Fine-mapping FLAMES index contains duplicate credible-set files"
-        )
-    if index[schema.index_locus_column].duplicated().any():
-        raise FlamesError(
-            "Fine-mapping FLAMES index must contain one credible set per locus; "
-            "duplicate locus identifiers would make per-locus score normalization "
-            "ambiguous"
         )
     variant_pattern = re.compile(schema.variant_identifier_pattern, re.IGNORECASE)
     credible_paths = []
@@ -299,7 +437,7 @@ def validate_fine_mapping_index(fine_mapping_directory, module):
             schema.credible_set_variant_column,
             schema.credible_set_probability_column,
         ]
-        _require_columns(credible, required_credible, "Credible-set file")
+        require_table_columns(credible, required_credible, "Credible-set file", error_type=FlamesError)
         if credible[required_credible].isna().any().any():
             raise FlamesError(
                 "Credible-set row identifiers, variants, and probabilities cannot "
@@ -361,11 +499,6 @@ def validate_fine_mapping_index(fine_mapping_directory, module):
                 "Credible-set cumulative PIP %.12g is below the configured %.12g: %s"
                 % (mass, module.minimum_credible_set_coverage, source)
             )
-        if mass > 1.0 + module.probability_tolerance:
-            raise FlamesError(
-                "Credible-set cumulative PIP %.12g exceeds one; PostGWAS will not "
-                "permit upstream FLAMES to rescale it silently: %s" % (mass, source)
-            )
         credible_paths.append(source)
         credible_metrics.append({
             "row_number": row_number,
@@ -397,15 +530,6 @@ def _validated_gene_ids(values: pd.Series, pattern: re.Pattern, label: str) -> s
 
 def _validate_scientific_inputs(module, resources: dict) -> dict:
     schema = module.input_schema
-    required_values = {
-        "credible_sets_directory": module.credible_sets_directory,
-        "MAGMA gene results": module.magma_gene_results_file,
-        "MAGMA gene-property results": module.magma_covariate_results_file,
-        "PoPS scores": module.pops_scores_file,
-    }
-    missing = [name for name, value in required_values.items() if value is None]
-    if missing:
-        raise FlamesError("Missing required FLAMES inputs: %s" % ", ".join(missing))
     interchange = validate_fine_mapping_index(module.credible_sets_directory, module)
     paths = {
         "magma": require_nonempty_file(
@@ -425,10 +549,10 @@ def _validate_scientific_inputs(module, resources: dict) -> dict:
     magma = _read_table(
         paths["magma"], "MAGMA gene results", schema.whitespace_delimiter_pattern,
     )
-    _require_columns(
+    require_table_columns(
         magma,
         [schema.magma_gene_column, schema.magma_z_column],
-        "MAGMA gene results",
+        "MAGMA gene results", error_type=FlamesError,
     )
     gene_pattern = re.compile(schema.ensembl_gene_pattern)
     magma_genes = _validated_gene_ids(
@@ -442,7 +566,7 @@ def _validate_scientific_inputs(module, resources: dict) -> dict:
         schema.whitespace_delimiter_pattern, comment="#",
     )
     covariate_columns = [schema.magma_covariate_column, schema.magma_covariate_p_column]
-    _require_columns(covariate, covariate_columns, "MAGMA gene-property results")
+    require_table_columns(covariate, covariate_columns, "MAGMA gene-property results", error_type=FlamesError)
     variables = covariate[schema.magma_covariate_column].astype(str).str.strip()
     p_values = pd.to_numeric(
         covariate[schema.magma_covariate_p_column], errors="coerce"
@@ -458,10 +582,10 @@ def _validate_scientific_inputs(module, resources: dict) -> dict:
             "MAGMA gene-property P values must be finite values in [0, 1]"
         )
     pops = _read_table(paths["pops"], "PoPS scores", schema.table_delimiter)
-    _require_columns(
+    require_table_columns(
         pops,
         [schema.pops_gene_column, schema.pops_score_column],
-        "PoPS scores",
+        "PoPS scores", error_type=FlamesError,
     )
     pops_genes = _validated_gene_ids(
         pops[schema.pops_gene_column], gene_pattern, "PoPS"
@@ -494,17 +618,128 @@ def _validate_scientific_inputs(module, resources: dict) -> dict:
     return resources
 
 
-def _feature_names(path: Path) -> list[str]:
-    names = [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+def _input_validation_fields(resources: dict, module) -> list[tuple]:
+    """Describe every validated FLAMES scientific input without inference."""
+    metrics = resources["input_metrics"]
+    credible_metrics = resources["interchange"]["credible_metrics"]
+    pip_masses = [item["pip_mass"] for item in credible_metrics]
+    chromosomes = sorted({item["chromosome"] for item in credible_metrics})
+    return [
+        ("analysis", "Fine-mapping credible-set evidence"),
+        ("info", "Interchange directory", resources["interchange"]["root"]),
+        ("info", "Credible-set index", resources["interchange"]["index_path"].name),
+        ("count", "Indexed loci / credible sets", metrics["credible_sets"]),
+        ("count", "Credible-set variants", metrics["credible_set_variants"]),
+        (
+            "genetic", "Credible-set chromosomes",
+            ", ".join(map(str, chromosomes)),
+        ),
+        (
+            "success", "Cumulative PIP range",
+            "%.6g–%.6g; required ≥ %.6g and ≤ 1"
+            % (
+                min(pip_masses), max(pip_masses),
+                module.minimum_credible_set_coverage,
+            ),
+        ),
+        ("analysis", "MAGMA gene-association evidence"),
+        ("info", "MAGMA gene-result file", resources["magma"].name),
+        ("count", "MAGMA genes with finite Z", metrics["magma_genes"]),
+        ("success", "MAGMA input validation", "passed"),
+        ("analysis", "MAGMAcovar tissue evidence"),
+        (
+            "info", "MAGMAcovar result file",
+            resources["magma_covariate"].name,
+        ),
+        ("count", "Gene-property variables", metrics["magma_covariates"]),
+        ("success", "Raw P-value validation", "finite values in [0, 1]"),
+        ("analysis", "PoPS gene-prioritization evidence"),
+        ("info", "PoPS score file", resources["pops"].name),
+        ("count", "PoPS genes with finite scores", metrics["pops_genes"]),
+        (
+            "genetic", "Gene IDs shared by MAGMA and PoPS",
+            "%s/%s MAGMA; %s/%s PoPS"
+            % (
+                f"{metrics['shared_magma_pops_genes']:,}",
+                f"{metrics['magma_genes']:,}",
+                f"{metrics['shared_magma_pops_genes']:,}",
+                f"{metrics['pops_genes']:,}",
+            ),
+        ),
+        ("success", "Scientific input validation", "passed"),
     ]
-    if not names or len(names) != len(set(names)):
-        raise FlamesError(
-            "FLAMES feature manifest must contain unique non-empty names: %s" % path
-        )
-    return names
+
+
+def _resource_validation_fields(resources: dict, module) -> list[tuple]:
+    """Describe configured local resources and unpinned remote API modes."""
+    required_files = ", ".join(resources["annotation_files"])
+    fields = [
+        ("analysis", "Published FLAMES implementation and model"),
+        ("info", "Upstream script", resources["script"].name),
+        ("info", "Model file", resources["model"].name),
+        ("info", "Feature manifest", resources["features"].name),
+        ("count", "Configured model features", len(resources["feature_names"])),
+        ("success", "Model window contract", "%s bp" % f"{module.locus_window_bp:,}"),
+        ("analysis", "FLAMES annotation bundle"),
+        ("info", "Bundle identifier", module.upstream.annotation_bundle_id),
+        ("info", "Annotation root", resources["annotation_directory"]),
+        (
+            "success", "Required annotation directories",
+            "%d/%d present with non-empty files"
+            % (
+                len(resources["annotation_directories"]),
+                len(module.upstream.required_annotation_directories),
+            ),
+        ),
+        (
+            "count", "Annotation files inventoried",
+            len(resources["annotation_inventory"]),
+        ),
+        ("success", "Required named annotation files", required_files),
+        ("analysis", "FLAMES runtime"),
+        ("info", "Python executable", resources["python"]),
+        (
+            "success", "Configured Python imports",
+            ", ".join(module.upstream.runtime_imports),
+        ),
+    ]
+    if module.vep_mode == "local":
+        fields.extend((
+            ("success", "VEP mode", "local executable and non-empty cache"),
+            ("info", "VEP executable", resources["vep_command"]),
+            ("info", "VEP cache", resources["vep_cache"]),
+            (
+                "success", "VEP cache genome build",
+                module.vep_cache_genome_build.value,
+            ),
+        ))
+    else:
+        fields.append((
+            "warning", "VEP mode",
+            "live API selected; remote content and availability are not pinned",
+        ))
+    if module.cadd_mode == "local":
+        fields.extend((
+            ("success", "CADD mode", "local non-empty file and tabix index"),
+            ("info", "CADD score file", resources["cadd_file"]),
+            ("info", "CADD tabix index", resources["cadd_index"]),
+            (
+                "success", "CADD genome build",
+                module.cadd_genome_build.value,
+            ),
+            ("info", "tabix executable", resources["tabix"]),
+        ))
+    else:
+        fields.append((
+            "warning", "CADD mode",
+            "live API selected; remote content and availability are not pinned",
+        ))
+    fields.append(("success", "Local resource validation", "passed"))
+    return fields
+
+
+def _feature_names(path: Path) -> list[str]:
+    return list(read_unique_line_names(path, "FLAMES feature manifest", error_type=FlamesError))
 
 
 def _validate_annotations(paths, resources: dict, module) -> dict:
@@ -517,7 +752,7 @@ def _validate_annotations(paths, resources: dict, module) -> dict:
         table = _read_table(
             path, "FLAMES annotated locus", module.input_schema.table_delimiter
         )
-        _require_columns(table, required, "FLAMES annotated locus")
+        require_table_columns(table, required, "FLAMES annotated locus", error_type=FlamesError)
         gene_ids = table[schema.gene_column].astype(str).str.strip()
         symbols = table[schema.symbol_column].astype(str).str.strip()
         if gene_ids.eq("").any() or symbols.eq("").any() or gene_ids.duplicated().any():
@@ -556,7 +791,7 @@ def _validate_scores(raw_path: Path, prediction_path: Path, module) -> dict:
         raw_path, "FLAMES raw scores", module.input_schema.table_delimiter
     )
     required_raw = list(schema.model_dump().values())
-    _require_columns(raw, required_raw, "FLAMES raw scores")
+    require_table_columns(raw, required_raw, "FLAMES raw scores", error_type=FlamesError)
     identity = [schema.locus_column, schema.gene_column]
     text_columns = [
         schema.filename_column,
@@ -626,7 +861,7 @@ def _validate_scores(raw_path: Path, prediction_path: Path, module) -> dict:
         schema.gene_column, schema.scaled_score_column, schema.raw_score_column,
         schema.precision_column,
     ]
-    _require_columns(predictions, prediction_required, "FLAMES prioritized genes")
+    require_table_columns(predictions, prediction_required, "FLAMES prioritized genes", error_type=FlamesError)
     if predictions[prediction_required].isna().any().any() or any(
         predictions[column].astype(str).str.strip().eq("").any()
         for column in (
@@ -718,7 +953,7 @@ def _rewrite_annotation_paths(path: Path, mapping: dict[str, str], module) -> in
         allow_empty=True,
     )
     column = module.result_schema.filename_column
-    _require_columns(table, [column], "FLAMES score output")
+    require_table_columns(table, [column], "FLAMES score output", error_type=FlamesError)
     original = table[column].astype(str)
     rewritten = original.map(mapping)
     if rewritten.isna().any():
@@ -737,6 +972,7 @@ def _build_commands(
     stage_index: Path,
     work: Path,
     score_name: str,
+    api_log: Path,
 ):
     module = configuration.modules.flames
     schema = module.input_schema
@@ -761,6 +997,11 @@ def _build_commands(
         annotation.extend([
             "--tabix", resources["tabix"],
             "--CADD_file", resources["cadd_file"],
+        ])
+    if module.vep_mode == "api" or module.cadd_mode == "api":
+        annotation.extend([
+            "--annotation-api-settings", json.dumps(module.annotation_api.model_dump(mode="json")),
+            "--annotation-api-log", api_log,
         ])
     scoring = [
         resources["python"], resources["script"], "FLAMES",
@@ -790,7 +1031,7 @@ def _completion_inputs(resources: dict) -> dict[str, Path]:
     })
     inputs.update({
         "annotation_resource_%d" % number: path
-        for number, path in enumerate(resources["annotation_files"].values(), 1)
+        for number, path in enumerate(resources["annotation_inventory"].values(), 1)
     })
     if resources["cadd_file"] is not None:
         inputs["cadd_scores"] = resources["cadd_file"]
@@ -806,9 +1047,15 @@ def _completion_configuration(configuration) -> str:
     })
 
 
-def preflight_flames_pipeline(args: argparse.Namespace) -> None:
+def preflight_flames_pipeline(
+    args: argparse.Namespace,
+    *,
+    preflight_evidence=None,
+) -> PipelinePreflightEvidence:
+    require_pipeline_input_vcf(preflight_evidence)
     configuration = _resolved_configuration(args)
     module = configuration.modules.flames
+    _require_flames_arguments(module, pipeline=True)
     configured_builds = {
         "fine_mapping": configuration.modules.fine_mapping.genome_build,
         "magma": configuration.modules.magma.genome_build,
@@ -829,7 +1076,15 @@ def preflight_flames_pipeline(args: argparse.Namespace) -> None:
             "must match exactly: FLAMES=%s; %s"
             % (module.genome_build.value, details)
         )
-    _validate_upstream_resources(configuration)
+    resources = _validate_upstream_resources(configuration)
+    return pipeline_preflight_evidence(
+        "flames",
+        preflight_evidence,
+        resources=(configuration, resources),
+        deferred_checks=(
+            "Validate pipeline-generated fine-mapping, MAGMA, MAGMAcovar, and PoPS inputs.",
+        ),
+    )
 
 
 def run_flames_direct(args: argparse.Namespace, ctx=None):
@@ -879,14 +1134,55 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
         level=configuration.logging.file_level,
         screen_level=configuration.logging.console_level,
         log_path=str(log_path),
+        stage_progress=StageProgress(
+            "FLAMES analysis progress",
+            enabled=getattr(args, "_pipeline_stage_progress", None) is None,
+            outcome_label_width=configuration.logging.terminal_label_width,
+        ),
     )
     staging_root = configured_output_path(
         output, module.output_layout.staging_directory,
         error_type=FlamesError, dataset_id=dataset,
     )
     try:
-        resources = _validate_upstream_resources(configuration, logger=logger)
-        resources = _validate_scientific_inputs(module, resources)
+        total_stages = len(FLAMES_STAGES)
+        with logger.step(
+            1,
+            total_stages,
+            FLAMES_STAGES[0],
+            "validate_flames_scientific_inputs",
+        ) as step:
+            _require_flames_arguments(module, pipeline=False)
+            scientific_inputs = _validate_scientific_inputs(module, {})
+            input_fields = _input_validation_fields(scientific_inputs, module)
+            step.set_rows(scientific_inputs["input_metrics"]["credible_set_variants"])
+            step.outcome(
+                "All direct FLAMES evidence inputs passed structural and numerical validation.",
+                fields=input_fields,
+                **scientific_inputs["input_metrics"],
+            )
+        with logger.step(
+            2,
+            total_stages,
+            FLAMES_STAGES[1],
+            "validate_flames_reference_resources",
+        ) as step:
+            # Recheck availability and bundle membership. Static file parsers
+            # and runtime probes reuse exact, identity-checked session evidence.
+            resources = _validate_upstream_resources(configuration, logger=logger)
+            resources.update(scientific_inputs)
+            resource_fields = _resource_validation_fields(resources, module)
+            step.set_rows(len(resources["annotation_inventory"]))
+            step.outcome(
+                "The configured model, annotation bundle, local resources, "
+                "and runtime passed preflight.",
+                fields=resource_fields,
+                annotation_directories=len(resources["annotation_directories"]),
+                annotation_files=len(resources["annotation_inventory"]),
+                model_features=len(resources["feature_names"]),
+                vep_mode=module.vep_mode,
+                cadd_mode=module.cadd_mode,
+            )
         logger.record(
             "PARAM", "flames_run",
             genome_build=module.genome_build.value,
@@ -903,6 +1199,17 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
         )
         write_resolved_configuration(configuration, resolved_path, modules="flames")
         logger.record("OUTPUT", "resolved_configuration", path=str(resolved_path))
+        api_log = configured_output_path(
+            output, module.output_layout.annotation_api_log_file,
+            error_type=FlamesError, dataset_id=dataset,
+        )
+        if module.vep_mode == "api" or module.cadd_mode == "api":
+            logger.record(
+                "PARAM", "flames_annotation_api",
+                settings=module.annotation_api.model_dump(mode="json"),
+                request_provenance=str(api_log),
+                failure_policy="abort; no missing response or score imputation",
+            )
         interchange = resources["interchange"]
         score_base = configured_output_path(
             output, module.output_layout.score_basename,
@@ -932,6 +1239,8 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
             "prioritized_genes": prediction_path,
             "flames_index": final_index,
         }
+        if module.vep_mode == "api" or module.cadd_mode == "api":
+            expected["annotation_api_provenance"] = api_log
         expected.update({
             "annotation_%d" % number: path
             for number, path in enumerate(final_annotations, 1)
@@ -955,10 +1264,68 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                 error_type=FlamesError,
             )
             if decision.action == "resume":
-                annotation_metrics = _validate_annotations(
-                    final_annotations, resources, module,
-                )
-                score_metrics = _validate_scores(raw_path, prediction_path, module)
+                with logger.step(
+                    3, total_stages, FLAMES_STAGES[2],
+                    "validate_resumed_flames_annotations",
+                ) as step:
+                    annotation_metrics = _validate_annotations(
+                        final_annotations, resources, module,
+                    )
+                    annotation_fields = [
+                        ("analysis", "FLAMES locus annotations"),
+                        (
+                            "count", "Validated annotation files",
+                            annotation_metrics["annotation_files"],
+                        ),
+                        (
+                            "count", "Annotated locus-gene rows",
+                            annotation_metrics["annotated_genes"],
+                        ),
+                        (
+                            "count", "Model features per row",
+                            annotation_metrics["features"],
+                        ),
+                        (
+                            "success", "Checkpoint fingerprints",
+                            "validated and unchanged",
+                        ),
+                    ]
+                    step.set_rows(annotation_metrics["annotated_genes"])
+                    step.outcome(
+                        "Reused checksum-validated FLAMES annotation outputs.",
+                        fields=annotation_fields,
+                        **annotation_metrics,
+                    )
+                with logger.step(
+                    4, total_stages, FLAMES_STAGES[3],
+                    "validate_resumed_flames_scores",
+                ) as step:
+                    score_metrics = _validate_scores(
+                        raw_path, prediction_path, module,
+                    )
+                    score_fields = [
+                        ("analysis", "FLAMES gene-prioritization scores"),
+                        (
+                            "count", "Scored locus-gene rows",
+                            score_metrics["scored_genes"],
+                        ),
+                        ("count", "Scored loci", score_metrics["loci"]),
+                        (
+                            "count", "Prioritized genes",
+                            score_metrics["prioritized_genes"],
+                        ),
+                        ("success", "Within-locus score normalization", "validated"),
+                        (
+                            "success", "Checkpoint fingerprints",
+                            "validated and unchanged",
+                        ),
+                    ]
+                    step.set_rows(score_metrics["scored_genes"])
+                    step.outcome(
+                        "Reused checksum-validated FLAMES score outputs.",
+                        fields=score_fields,
+                        **score_metrics,
+                    )
                 result = {
                     "status": "success",
                     "flames_raw_file": str(raw_path),
@@ -970,6 +1337,23 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                     "metrics": {"annotations": annotation_metrics, "scores": score_metrics},
                 }
                 logger.record("SKIP", "flames_run", reason="validated_complete_outputs")
+                with logger.step(
+                    5, total_stages, FLAMES_STAGES[4],
+                    "validate_resumed_flames_publication",
+                ) as step:
+                    publication_fields = [
+                        ("success", "Published output files", len(expected)),
+                        ("success", "Completion manifest", "validated and unchanged"),
+                        ("info", "Raw FLAMES scores", raw_path),
+                        ("info", "Prioritized genes", prediction_path),
+                    ]
+                    step.set_rows(len(expected))
+                    step.outcome(
+                        "All published FLAMES outputs were validated for reuse.",
+                        fields=publication_fields,
+                        outputs=len(expected),
+                        resume_mode="validated_checkpoint",
+                    )
                 if ctx is not None:
                     ctx["flames"] = result
                 return result
@@ -981,7 +1365,7 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                 operation="flames_resume",
                 error_type=FlamesError,
             )
-        existing = [path for path in expected.values() if path.exists()]
+        existing = [path for path in expected.values() if path != api_log and path.exists()]
         if existing and not configuration.run.overwrite:
             raise FlamesError(
                 "Existing FLAMES outputs require --overwrite or a valid resumable "
@@ -1006,121 +1390,260 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
             )
             score_name = score_base.name
             annotation_command, scoring_command = _build_commands(
-                configuration, resources, staged_index, work, score_name,
+                configuration, resources, staged_index, work, score_name, api_log,
             )
             dry_run = bool(getattr(args, "dry_run", False))
-            run_checked_command(
-                annotation_command,
-                "FLAMES annotation",
-                logger=logger,
-                error_type=FlamesError,
-                timeout_seconds=configuration.execution.timeout_seconds,
-                expected_outputs=staged_annotations,
-                dry_run=dry_run,
-            )
-            if dry_run:
+            with logger.step(
+                3, total_stages, FLAMES_STAGES[2],
+                "run_and_validate_flames_annotations",
+            ) as step:
                 run_checked_command(
-                    scoring_command,
-                    "FLAMES scoring",
+                    annotation_command,
+                    "FLAMES annotation",
                     logger=logger,
                     error_type=FlamesError,
                     timeout_seconds=configuration.execution.timeout_seconds,
-                    dry_run=True,
+                    expected_outputs=staged_annotations,
+                    dry_run=dry_run,
                 )
-                logger.record("STATUS", "flames_run", status="DRY_RUN_VALIDATED")
-                return {
-                    "status": "dry_run",
-                    "resolved_configuration": str(resolved_path),
-                    "log": str(log_path),
-                }
-            annotation_metrics = _validate_annotations(
-                staged_annotations, resources, module,
-            )
+                if dry_run:
+                    annotation_metrics = None
+                    annotation_fields = [
+                        ("analysis", "FLAMES locus annotation"),
+                        ("success", "Annotation command", "validated; not executed"),
+                        ("count", "Expected locus outputs", len(staged_annotations)),
+                    ]
+                    step.set_rows(len(staged_annotations))
+                    step.outcome(
+                        "The FLAMES annotation command and expected outputs were "
+                        "validated for dry-run mode.",
+                        fields=annotation_fields,
+                        dry_run=True,
+                        expected_annotations=len(staged_annotations),
+                    )
+                else:
+                    annotation_metrics = _validate_annotations(
+                        staged_annotations, resources, module,
+                    )
+                    annotation_fields = [
+                        ("analysis", "FLAMES locus annotations"),
+                        (
+                            "count", "Validated annotation files",
+                            annotation_metrics["annotation_files"],
+                        ),
+                        (
+                            "count", "Annotated locus-gene rows",
+                            annotation_metrics["annotated_genes"],
+                        ),
+                        (
+                            "count", "Finite model features per row",
+                            annotation_metrics["features"],
+                        ),
+                        (
+                            (
+                                "warning"
+                                if annotation_metrics["features_zero_in_every_locus"]
+                                else "success"
+                            ),
+                            "Features zero in every locus",
+                            (
+                                ", ".join(
+                                    annotation_metrics[
+                                        "features_zero_in_every_locus"
+                                    ]
+                                )
+                                if annotation_metrics["features_zero_in_every_locus"]
+                                else "none"
+                            ),
+                        ),
+                        ("success", "Annotation output validation", "passed"),
+                    ]
+                    step.set_rows(annotation_metrics["annotated_genes"])
+                    step.outcome(
+                        "Every expected locus annotation passed schema, "
+                        "gene-universe, and finite-feature validation.",
+                        fields=annotation_fields,
+                        **annotation_metrics,
+                    )
             staged_raw = work / (
                 score_name + module.output_layout.raw_score_suffix
             )
             staged_prediction = work / (
                 score_name + module.output_layout.prediction_suffix
             )
-            run_checked_command(
-                scoring_command,
-                "FLAMES scoring",
-                logger=logger,
-                error_type=FlamesError,
-                timeout_seconds=configuration.execution.timeout_seconds,
-                expected_outputs=[staged_raw, staged_prediction],
+            staged_score_outputs = (staged_raw, staged_prediction)
+            with logger.step(
+                4, total_stages, FLAMES_STAGES[3],
+                "run_and_validate_flames_scores",
+            ) as step:
+                run_checked_command(
+                    scoring_command,
+                    "FLAMES scoring",
+                    logger=logger,
+                    error_type=FlamesError,
+                    timeout_seconds=configuration.execution.timeout_seconds,
+                    expected_outputs=() if dry_run else staged_score_outputs,
+                    dry_run=dry_run,
+                )
+                if dry_run:
+                    score_metrics = None
+                    score_fields = [
+                        ("analysis", "FLAMES gene scoring"),
+                        ("success", "Scoring command", "validated; not executed"),
+                        (
+                            "count", "Expected score outputs",
+                            len(staged_score_outputs),
+                        ),
+                    ]
+                    step.set_rows(len(staged_score_outputs))
+                    step.outcome(
+                        "The FLAMES scoring command and expected outputs were "
+                        "validated for dry-run mode.",
+                        fields=score_fields,
+                        dry_run=True,
+                        expected_score_outputs=len(staged_score_outputs),
+                    )
+                else:
+                    score_metrics = _validate_scores(
+                        staged_raw, staged_prediction, module,
+                    )
+                    score_fields = [
+                        ("analysis", "FLAMES gene-prioritization scores"),
+                        (
+                            "count", "Scored locus-gene rows",
+                            score_metrics["scored_genes"],
+                        ),
+                        ("count", "Scored loci", score_metrics["loci"]),
+                        (
+                            "count", "Prioritized genes",
+                            score_metrics["prioritized_genes"],
+                        ),
+                        ("success", "Within-locus score normalization", "validated"),
+                        ("success", "Prioritized/raw score agreement", "validated"),
+                    ]
+                    step.set_rows(score_metrics["scored_genes"])
+                    step.outcome(
+                        "FLAMES raw and prioritized scores passed numerical and "
+                        "cross-file validation.",
+                        fields=score_fields,
+                        **score_metrics,
+                    )
+            if dry_run:
+                with logger.step(
+                    5, total_stages, FLAMES_STAGES[4],
+                    "complete_flames_dry_run",
+                ) as step:
+                    dry_run_fields = [
+                        ("success", "Configuration", "resolved and validated"),
+                        ("success", "Inputs and resources", "validated"),
+                        ("success", "Upstream commands", "validated; not executed"),
+                        ("info", "Published scientific outputs", "none in dry-run mode"),
+                    ]
+                    step.set_rows(0)
+                    step.outcome(
+                        "FLAMES dry-run validation completed without creating scientific outputs.",
+                        fields=dry_run_fields,
+                        published_outputs=0,
+                    )
+                logger.record("STATUS", "flames_run", status="DRY_RUN_VALIDATED")
+                return {
+                    "status": "dry_run",
+                    "resolved_configuration": str(resolved_path),
+                    "log": str(log_path),
+                }
+            with logger.step(
+                5, total_stages, FLAMES_STAGES[4],
+                "validate_and_publish_flames_outputs",
+            ) as step:
+                path_mapping = {
+                    str(staged): str(final)
+                    for staged, final in zip(staged_annotations, final_annotations)
+                }
+                rewritten_rows = _rewrite_annotation_paths(
+                    staged_raw, path_mapping, module,
+                ) + _rewrite_annotation_paths(
+                    staged_prediction, path_mapping, module,
+                )
+                published_index = index.copy()
+                published_index[module.input_schema.index_annotation_column] = [
+                    str(path) for path in final_annotations
+                ]
+                staged_published_index = work / final_index.name
+                published_index.to_csv(
+                    staged_published_index,
+                    sep=module.input_schema.table_delimiter,
+                    index=False,
+                )
+                if configuration.run.overwrite:
+                    completion.unlink(missing_ok=True)
+                    for path in expected.values():
+                        if path != api_log:
+                            path.unlink(missing_ok=True)
+                for staged, final in zip(staged_annotations, final_annotations):
+                    final.parent.mkdir(parents=True, exist_ok=True)
+                    staged.replace(final)
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                staged_raw.replace(raw_path)
+                prediction_path.parent.mkdir(parents=True, exist_ok=True)
+                staged_prediction.replace(prediction_path)
+                final_index.parent.mkdir(parents=True, exist_ok=True)
+                staged_published_index.replace(final_index)
+                result = {
+                    "status": "success",
+                    "flames_raw_file": str(raw_path),
+                    "flames_predictions_file": str(prediction_path),
+                    "flames_index": str(final_index),
+                    "annotations": [str(path) for path in final_annotations],
+                    "published_files": [str(path) for path in expected.values()],
+                    "metrics": {
+                        "annotations": annotation_metrics,
+                        "scores": score_metrics,
+                    },
+                }
+                write_completion_manifest(
+                    completion,
+                    dataset_id=dataset,
+                    module="flames",
+                    genome_build=module.genome_build.value,
+                    configuration_sha256=digest,
+                    inputs=completion_inputs,
+                    outputs=expected,
+                    metrics={
+                        "inputs": resources["input_metrics"],
+                        "credible_sets": interchange["credible_metrics"],
+                        "annotations": annotation_metrics,
+                        "scores": score_metrics,
+                        "rewritten_provenance_rows": rewritten_rows,
+                    },
+                    error_type=FlamesError,
+                )
+                result["completion_manifest"] = str(completion)
+                publication_fields = [
+                    ("success", "Published output files", len(expected)),
+                    ("count", "Published annotation files", len(final_annotations)),
+                    ("info", "Raw FLAMES scores", raw_path),
+                    ("info", "Prioritized genes", prediction_path),
+                    ("success", "Completion manifest", completion),
+                ]
+                step.set_rows(len(expected))
+                step.outcome(
+                    "All FLAMES outputs were published only after validation, "
+                    "and the completion manifest was written last.",
+                    fields=publication_fields,
+                    outputs=len(expected),
+                    rewritten_provenance_rows=rewritten_rows,
+                )
+            logger.record(
+                "STATUS", "flames_run", status="COMPLETED",
+                loci=score_metrics["loci"],
+                scored_genes=score_metrics["scored_genes"],
+                prioritized_genes=score_metrics["prioritized_genes"],
+                annotation_files=annotation_metrics["annotation_files"],
+                zero_features=annotation_metrics["features_zero_in_every_locus"],
             )
-            score_metrics = _validate_scores(
-                staged_raw, staged_prediction, module,
-            )
-            path_mapping = {
-                str(staged): str(final)
-                for staged, final in zip(staged_annotations, final_annotations)
-            }
-            rewritten_rows = _rewrite_annotation_paths(
-                staged_raw, path_mapping, module,
-            ) + _rewrite_annotation_paths(staged_prediction, path_mapping, module)
-            published_index = index.copy()
-            published_index[module.input_schema.index_annotation_column] = [
-                str(path) for path in final_annotations
-            ]
-            staged_published_index = work / final_index.name
-            published_index.to_csv(
-                staged_published_index,
-                sep=module.input_schema.table_delimiter,
-                index=False,
-            )
-            if configuration.run.overwrite:
-                completion.unlink(missing_ok=True)
-                for path in expected.values():
-                    path.unlink(missing_ok=True)
-            for staged, final in zip(staged_annotations, final_annotations):
-                final.parent.mkdir(parents=True, exist_ok=True)
-                staged.replace(final)
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            staged_raw.replace(raw_path)
-            prediction_path.parent.mkdir(parents=True, exist_ok=True)
-            staged_prediction.replace(prediction_path)
-            final_index.parent.mkdir(parents=True, exist_ok=True)
-            staged_published_index.replace(final_index)
-        result = {
-            "status": "success",
-            "flames_raw_file": str(raw_path),
-            "flames_predictions_file": str(prediction_path),
-            "flames_index": str(final_index),
-            "annotations": [str(path) for path in final_annotations],
-            "published_files": [str(path) for path in expected.values()],
-            "metrics": {"annotations": annotation_metrics, "scores": score_metrics},
-        }
-        write_completion_manifest(
-            completion,
-            dataset_id=dataset,
-            module="flames",
-            genome_build=module.genome_build.value,
-            configuration_sha256=digest,
-            inputs=completion_inputs,
-            outputs=expected,
-            metrics={
-                "inputs": resources["input_metrics"],
-                "credible_sets": interchange["credible_metrics"],
-                "annotations": annotation_metrics,
-                "scores": score_metrics,
-                "rewritten_provenance_rows": rewritten_rows,
-            },
-            error_type=FlamesError,
-        )
-        result["completion_manifest"] = str(completion)
-        logger.record(
-            "STATUS", "flames_run", status="COMPLETED",
-            loci=score_metrics["loci"],
-            scored_genes=score_metrics["scored_genes"],
-            prioritized_genes=score_metrics["prioritized_genes"],
-            annotation_files=annotation_metrics["annotation_files"],
-            zero_features=annotation_metrics["features_zero_in_every_locus"],
-        )
-        if ctx is not None:
-            ctx["flames"] = result
-        return result
+            if ctx is not None:
+                ctx["flames"] = result
+            return result
     except BaseException as exc:
         logger.error("FLAMES analysis failed: %s: %s" % (type(exc).__name__, exc))
         raise

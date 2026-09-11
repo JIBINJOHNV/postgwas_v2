@@ -19,11 +19,12 @@ from postgwas.config.models.modules.formatting import FormattingTarget
 from postgwas.core.errors import ConfigurationError
 from postgwas.config.exporter import (
     EXPORT_STYLES,
+    EXPORT_SCOPES,
     render_module_configuration,
     render_pipeline_configuration,
 )
 from postgwas.pipeline.registry import REGISTRY
-from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples
+from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples, help_with_default
 
 
 PIPELINE_TARGETS = tuple(
@@ -39,6 +40,11 @@ def _choice_lines(values: tuple[str, ...], size: int = 4) -> str:
 
 
 EXPORT_EXAMPLES = format_cli_examples(
+    (
+        "Export common harmonisation settings with run controls:",
+        "postgwas config export",
+        ("--module harmonisation", "--scope common", "--output harmonisation.yaml"),
+    ),
     (
         "Export one fully annotated module configuration:",
         "postgwas config export",
@@ -122,16 +128,29 @@ def _add_export_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
-    format_group = parser.add_argument_group("Choose the amount of explanation")
+    format_group = parser.add_argument_group("Choose settings and explanation")
+    format_group.add_argument(
+        "--scope",
+        choices=EXPORT_SCOPES,
+        default=argparse.SUPPRESS,
+        metavar="SCOPE",
+        help=help_with_default(
+            "all exports every module setting. common, available with --module "
+            "harmonisation, exports a short run configuration and preserves "
+            "non-default values from --run-config. "
+            "--style controls comments independently of scope.",
+            "all",
+        ),
+    )
     format_group.add_argument(
         "--style",
         choices=EXPORT_STYLES,
         default="minimal",
         metavar="STYLE",
-        help=(
-            "full     Detailed explanation for every setting.\n"
-            "minimal  Short comments beside settings (default).\n"
-            "values   Key-value pairs only; analysis values remain identical."
+        help=help_with_default(
+            "full: detailed explanations. minimal: short comments. "
+            "values: key-value pairs only. Settings remain identical across styles.",
+            "minimal",
         ),
     )
 
@@ -223,6 +242,9 @@ def main() -> int:
         args.action = "export"
     try:
         if args.action == "export":
+            scope = getattr(args, "scope", "all")
+            if scope == "common" and args.module != "harmonisation":
+                raise ConfigurationError("--scope common requires --module harmonisation")
             formatter_formats = getattr(args, "formatter_formats", None)
             if formatter_formats is not None and args.module != "formatting":
                 raise ConfigurationError(
@@ -234,6 +256,7 @@ def main() -> int:
                     config_file=args.config,
                     style=args.style,
                     formats=formatter_formats,
+                    scope=scope,
                 )
             else:
                 rendered = render_pipeline_configuration(

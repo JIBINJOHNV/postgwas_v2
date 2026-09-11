@@ -2,6 +2,9 @@ name: postgwas
 variables:
   # Prevent an unrelated per-user R library from shadowing this environment.
   R_LIBS_USER: /dev/null
+  # Keep sibling checkouts and per-user packages out of Python import resolution.
+  PYTHONNOUSERSITE: "1"
+  PYTHONPATH: ""
 channels:
   - conda-forge
   - bioconda
@@ -15,10 +18,13 @@ dependencies:
   - git
   # Source-build tools used by the pinned bcftools liftover plugin installer.
   - c-compiler
+  - cxx-compiler
+  - cmake
   - make
   - curl
   - tar
   - bzip2
+  - unzip
 
   # PostGWAS core and analysis runtime.
   - pydantic>=2.7,<3
@@ -39,15 +45,27 @@ dependencies:
   - pytorch>=2.1,<3
 
   # Native command-line tools available through Conda on the target platform.
-  - bcftools=1.23.1
-  - htslib>=1.21
+  # bcftools itself is checksum-verified and built from the pinned upstream
+  # release by tools/setup/install_bcftools_liftover.sh.
+  - htslib=1.23.1
   - bedtools>=2.31
   - pigz
-  - plink
+  - plink=1.90b7.7
   # These Bioconda packages are unavailable on native Apple Silicon.
-  - sel(linux): plink2
-  - sel(linux): gcta
-  - sel(linux): bgenix
+  - sel(linux): plink2=2.0.0a.6.9
+  - sel(linux): gcta=1.94.1
+  - sel(linux): bgenix=1.1.7
+  # Native MiXeR build/runtime dependencies. MiXeR source is installed from
+  # its immutable upstream commit by the complete installer.
+  - sel(linux): mkl
+  - sel(linux): mkl-include
+  - sel(linux): sysroot_linux-64
+  - sel(linux): gcc_linux-64
+  - sel(linux): gxx_linux-64
+  - sel(linux): intervaltree
+  - sel(linux): matplotlib-venn
+  - sel(linux): numdifftools
+  - sel(linux): six
 
   # R runtime used by SuSiE, plotting, CALDERA, and related adapters.
   - r-base=4.3.*
@@ -66,6 +84,8 @@ dependencies:
   - r-r.utils
   - r-rcolorbrewer
   - r-susier
+  - r-survey
+  - r-xml2
 
   # Packages unavailable or intentionally fixed through PyPI.
   - pip:

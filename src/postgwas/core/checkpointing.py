@@ -6,13 +6,16 @@ from argparse import Namespace
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import errno
 from importlib.metadata import PackageNotFoundError, version
+from importlib.machinery import BYTECODE_SUFFIXES
 import json
 from pathlib import Path
 import platform
 import shutil
+import stat
 import sys
-from typing import Any, Literal, Mapping, Sequence, Type
+from typing import Any, Iterator, Literal, Mapping, Sequence, Type
 
 from rich.console import Console
 import yaml
@@ -26,12 +29,14 @@ from postgwas.core.completion import (
 from postgwas.core.contracts import Artifact, ModuleResult
 from postgwas.core.io.reports import write_yaml_report
 from postgwas.core.resource_preparation import sha256
+from postgwas.core.ui import print_screen_message
 
 
 EXECUTION_CHECKPOINT_SCHEMA_VERSION = 1
 _TYPE_KEY = "__postgwas_type__"
+_INPUT_FINGERPRINT_CACHE_KEY = "input_fingerprint_cache"
 _RUN_CONTROL_DESTINATIONS = frozenset({"resume", "overwrite"})
-_RUN_CONTROL_OPTIONS = frozenset({"--resume", "--no-resume", "--overwrite"})
+_RUN_CONTROL_OPTIONS = frozenset({"--resume", "--overwrite"})
 
 
 class NoOwnedCheckpointOutputs(RuntimeError):
@@ -67,7 +72,7 @@ class CheckpointAuditLogger:
 
     def warning(self, message: str) -> None:
         self._write("WARNING", "checkpoint_restart", {"message": message})
-        self.console.print("\n[bold yellow]WARNING:[/bold yellow] %s" % message)
+        print_screen_message("warning", "WARNING: %s" % message, console=self.console)
 
     warn = warning
 
@@ -210,17 +215,23 @@ def restore_checkpoint_namespace(namespace: Namespace, values: Mapping[str, Any]
         setattr(namespace, key, value)
 
 
-def _iter_scalars(value: Any, *, key: str = ""):
+def _iter_scalars(
+    value: Any, *, key: str = "", excluded_key_suffixes: tuple[str, ...] = (),
+):
+    if any(key == name or key.endswith("_" + name) for name in excluded_key_suffixes):
+        return
     if hasattr(value, "model_dump"):
         value = value.model_dump(mode="python")
     if isinstance(value, Namespace):
         value = checkpoint_namespace(value)
     if isinstance(value, Mapping):
         for child_key, child in value.items():
-            yield from _iter_scalars(child, key=str(child_key))
+            yield from _iter_scalars(
+                child, key=str(child_key), excluded_key_suffixes=excluded_key_suffixes,
+            )
     elif isinstance(value, (list, tuple, set)):
         for child in value:
-            yield from _iter_scalars(child, key=key)
+            yield from _iter_scalars(child, key=key, excluded_key_suffixes=excluded_key_suffixes)
     elif isinstance(value, (str, Path)):
         yield key, value
 
@@ -229,50 +240,175 @@ def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _optional_input_signature(path: str | Path) -> dict[str, Any] | None:
+    """Return the filesystem identity used to validate a cached content hash."""
+    resolved = Path(path).expanduser().resolve()
+    try:
+        metadata = resolved.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
+        return None
+    return {
+        "path": str(resolved),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
+    }
+
+
+def _required_input_signature(
+    path: str | Path,
+    *,
+    error_type: Type[Exception],
+) -> dict[str, Any]:
+    signature = _optional_input_signature(path)
+    if signature is None:
+        raise error_type(
+            "Completion file is missing or empty: %s"
+            % Path(path).expanduser().resolve()
+        )
+    return signature
+
+
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _cache_matches_signature(
+    entry: Any,
+    signature: Mapping[str, Any],
+) -> bool:
+    return (
+        isinstance(entry, Mapping)
+        and _valid_sha256(entry.get("sha256"))
+        and all(entry.get(field) == value for field, value in signature.items())
+    )
+
+
+def _scientific_fingerprint(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep checkpoint comparison based on canonical path, size, and SHA-256."""
+    return {
+        "path": entry["path"],
+        "size": entry["size"],
+        "sha256": entry["sha256"],
+    }
+
+
 def discover_input_files(
     *values: Any,
     excluded_paths: Sequence[str | Path] = (),
     excluded_roots: Sequence[str | Path] = (),
 ) -> dict[str, Path]:
-    """Discover explicit files, directory contents, and reference-prefix files."""
+    """Discover explicit files, directory contents, and reference-prefix files.
+
+    An excluded directory is never entered while expanding a parent directory.
+    A file below it remains discoverable when that file is supplied explicitly;
+    this preserves legitimate upstream inputs located below an output root while
+    preventing accidental categorical-value matches from tracking live outputs.
+    """
     ignored_paths = {Path(value).expanduser().resolve() for value in excluded_paths}
     ignored_roots = tuple(
         Path(value).expanduser().resolve() for value in excluded_roots
     )
+    ignored_expansion_roots = tuple(
+        path for path in ignored_paths if path.is_dir()
+    )
+
+    def excluded(path: Path) -> bool:
+        return path in ignored_paths or any(
+            _inside(path, root) for root in ignored_roots
+        )
+
+    def excluded_from_expansion(path: Path, source: Path) -> bool:
+        return excluded(path) or any(
+            _inside(path, root) and not _inside(source, root)
+            for root in ignored_expansion_roots
+        )
+
+    def expanded_files(source: Path) -> Iterator[Path]:
+        pending = [source]
+        while pending:
+            directory = pending.pop()
+            for child in directory.iterdir():
+                if child.is_symlink():
+                    continue
+                resolved_child = child.resolve()
+                if excluded_from_expansion(resolved_child, source):
+                    continue
+                if child.is_dir():
+                    pending.append(child)
+                elif child.is_file():
+                    yield resolved_child
+
     discovered: set[Path] = set()
-    for key, raw_value in _iter_scalars(values):
-        if key in {"output_directory", "output_layout"}:
-            continue
+    # Output-layout mappings contain relative names, not input resources. Prune
+    # the entire subtree before its parent key is lost, including namespaced
+    # resolved copies in a pipeline Namespace. Explicit upstream artifact paths
+    # outside these settings remain inputs and retain checksum validation.
+    for _, raw_value in _iter_scalars(
+        values, excluded_key_suffixes=("output_directory", "output_layout"),
+    ):
         text = str(raw_value).strip()
         if not text or text in {".", ".."} or "{" in text or "}" in text:
             continue
         candidate = Path(text).expanduser()
         try:
             resolved = candidate.resolve()
-        except OSError:
+            if excluded(resolved) or candidate.is_symlink():
+                continue
+            if resolved.is_file():
+                discovered.add(resolved)
+                continue
+            if resolved.is_dir():
+                discovered.update(expanded_files(resolved))
+                continue
+            if not (candidate.is_absolute() or candidate.parent != Path(".")):
+                continue
+            parent = resolved.parent
+            if parent.is_dir():
+                for child in parent.glob(resolved.name + "*"):
+                    resolved_child = child.resolve()
+                    if (
+                        not excluded_from_expansion(resolved_child, resolved)
+                        and child.is_file()
+                        and not child.is_symlink()
+                    ):
+                        discovered.add(resolved_child)
+        except OSError as exc:
+            # Configuration and runtime state also contain ordinary strings.
+            # A value that the operating system cannot even probe as a path
+            # (for example the long LS_COLORS shell setting) is not an input.
+            if exc.errno != errno.ENAMETOOLONG:
+                raise
             continue
-        if resolved in ignored_paths or any(
-            _inside(resolved, root) for root in ignored_roots
-        ):
-            continue
-        if candidate.is_symlink():
-            continue
-        if resolved.is_file():
-            discovered.add(resolved)
-            continue
-        if resolved.is_dir():
-            for child in resolved.rglob("*"):
-                if child.is_file() and not child.is_symlink():
-                    discovered.add(child.resolve())
-            continue
-        if not (candidate.is_absolute() or candidate.parent != Path(".")):
-            continue
-        parent = resolved.parent
-        if parent.is_dir():
-            for child in parent.glob(resolved.name + "*"):
-                if child.is_file() and not child.is_symlink():
-                    discovered.add(child.resolve())
     return {str(path): path for path in sorted(discovered)}
+
+
+def _package_content_identity(root: Path) -> dict[str, Any]:
+    """Identify installed source and resources, including editable installs.
+
+    Python's regenerable bytecode cache is excluded by protocol; all other
+    package files (including R scripts and bundled resources) determine identity.
+    Relative names make this independent of installation-directory spelling.
+    Do not memoize: developers can change source without changing its version.
+    """
+    fingerprints = {
+        path.relative_to(root).as_posix(): sha256(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+        and "__pycache__" not in path.relative_to(root).parts
+        and path.suffix not in BYTECODE_SUFFIXES
+    }
+    if not fingerprints:
+        raise RuntimeError("Cannot fingerprint PostGWAS package content: %s" % root)
+    return {"files": len(fingerprints), "sha256": configuration_digest(fingerprints)}
 
 
 def software_identity(*values: Any) -> dict[str, Any]:
@@ -286,17 +422,23 @@ def software_identity(*values: Any) -> dict[str, Any]:
         text = str(raw_value).strip()
         if not text or any(character.isspace() for character in text):
             continue
-        resolved = shutil.which(text)
-        if not resolved:
+        try:
+            resolved = shutil.which(text)
+            if not resolved:
+                continue
+            path = Path(resolved).resolve()
+            if path.is_file() and not path.is_symlink():
+                executables[str(path)] = {
+                    "size": path.stat().st_size,
+                    "sha256": sha256(path),
+                }
+        except OSError as exc:
+            if exc.errno != errno.ENAMETOOLONG:
+                raise
             continue
-        path = Path(resolved).resolve()
-        if path.is_file() and not path.is_symlink():
-            executables[str(path)] = {
-                "size": path.stat().st_size,
-                "sha256": sha256(path),
-            }
     return {
         "postgwas": package_version,
+        "postgwas_content": _package_content_identity(Path(__file__).resolve().parents[1]),
         "python": platform.python_version(),
         "python_implementation": platform.python_implementation(),
         "platform": platform.platform(),
@@ -321,18 +463,23 @@ def _declared_files(value: Any, root: Path) -> set[Path]:
     files: set[Path] = set()
     for _, raw_value in _iter_scalars(value):
         candidate = Path(str(raw_value)).expanduser()
-        if candidate.is_symlink():
+        try:
+            if candidate.is_symlink():
+                continue
+            resolved = candidate.resolve()
+            if not _inside(resolved, root):
+                continue
+            if resolved.is_file():
+                files.add(resolved)
+            elif resolved.is_dir():
+                files.update(
+                    child.resolve() for child in resolved.rglob("*")
+                    if child.is_file() and not child.is_symlink()
+                )
+        except OSError as exc:
+            if exc.errno != errno.ENAMETOOLONG:
+                raise
             continue
-        resolved = candidate.resolve()
-        if not _inside(resolved, root):
-            continue
-        if resolved.is_file():
-            files.add(resolved)
-        elif resolved.is_dir():
-            files.update(
-                child.resolve() for child in resolved.rglob("*")
-                if child.is_file() and not child.is_symlink()
-            )
     return files
 
 
@@ -391,6 +538,11 @@ class ExecutionCheckpoint:
         self.error_type = error_type
         self._manifest_existed_before = self.manifest_path.is_file()
         self._restart_applied = False
+        self._input_start_signatures = {
+            name: _optional_input_signature(path)
+            for name, path in self.input_paths.items()
+        }
+        self._input_fingerprint_cache: dict[str, dict[str, Any]] = {}
         self._before = _snapshot_files(self.artifact_root)
 
     @property
@@ -402,11 +554,103 @@ class ExecutionCheckpoint:
             or self._restart_applied
         )
 
+    def _hydrate_input_fingerprint_cache(
+        self,
+        document: Mapping[str, Any],
+    ) -> None:
+        """Reuse trusted prior hashes only while the complete file identity matches."""
+        stored_cache = document.get(_INPUT_FINGERPRINT_CACHE_KEY)
+        recorded_inputs = document.get("inputs")
+        try:
+            manifest_mtime_ns = self.manifest_path.stat().st_mtime_ns
+        except OSError:
+            manifest_mtime_ns = -1
+        reused = 0
+        migrated = 0
+        for name in self.input_paths:
+            signature = self._input_start_signatures.get(name)
+            if signature is None:
+                continue
+            entry = (
+                stored_cache.get(name)
+                if isinstance(stored_cache, Mapping)
+                else None
+            )
+            if _cache_matches_signature(entry, signature):
+                self._input_fingerprint_cache[name] = dict(entry)
+                reused += 1
+                continue
+
+            # Older checkpoints contain a SHA-256 calculated immediately before
+            # the atomic manifest write. Migrate it only when both filesystem
+            # change clocks predate that manifest and path and size still match.
+            recorded = (
+                recorded_inputs.get(name)
+                if isinstance(recorded_inputs, Mapping)
+                else None
+            )
+            if (
+                isinstance(recorded, Mapping)
+                and recorded.get("path") == signature["path"]
+                and recorded.get("size") == signature["size"]
+                and _valid_sha256(recorded.get("sha256"))
+                and signature["mtime_ns"] <= manifest_mtime_ns
+                and signature["ctime_ns"] <= manifest_mtime_ns
+            ):
+                self._input_fingerprint_cache[name] = {
+                    **signature,
+                    "sha256": recorded["sha256"],
+                }
+                migrated += 1
+        if reused or migrated:
+            self.logger.record(
+                "CACHE",
+                str(self.identity.get("stage", "execution")),
+                action="hydrate_input_fingerprints",
+                reused=reused,
+                migrated=migrated,
+            )
+
     def _input_fingerprints(self) -> dict[str, dict[str, Any]]:
-        return {
-            name: file_fingerprint(path, error_type=self.error_type)
-            for name, path in self.input_paths.items()
-        }
+        fingerprints: dict[str, dict[str, Any]] = {}
+        reused = 0
+        calculated = 0
+        for name, path in self.input_paths.items():
+            signature = _required_input_signature(
+                path, error_type=self.error_type,
+            )
+            if signature != self._input_start_signatures.get(name):
+                raise self.error_type(
+                    "Tracked input changed while the execution was active: %s"
+                    % signature["path"]
+                )
+            cached = self._input_fingerprint_cache.get(name)
+            if _cache_matches_signature(cached, signature):
+                fingerprints[name] = _scientific_fingerprint(cached)
+                reused += 1
+                continue
+
+            before = signature
+            fingerprint = file_fingerprint(path, error_type=self.error_type)
+            after = _required_input_signature(path, error_type=self.error_type)
+            if after != before:
+                raise self.error_type(
+                    "Tracked input changed while its SHA-256 was calculated: %s"
+                    % after["path"]
+                )
+            cached = {**after, "sha256": fingerprint["sha256"]}
+            self._input_fingerprint_cache[name] = cached
+            fingerprints[name] = _scientific_fingerprint(cached)
+            calculated += 1
+        if reused or calculated:
+            self.logger.record(
+                "CHECKSUM",
+                str(self.identity.get("stage", "execution")),
+                action="fingerprint_inputs",
+                reused=reused,
+                calculated=calculated,
+            )
+        return fingerprints
 
     def _upstream_fingerprints(self) -> dict[str, dict[str, Any]]:
         return {
@@ -473,6 +717,15 @@ class ExecutionCheckpoint:
 
     def prepare(self) -> CheckpointDecision:
         """Return a validated reuse decision, applying safe restart when needed."""
+        document = None
+        if self.manifest_path.is_file():
+            try:
+                document = self._load()
+            except self.error_type:
+                if self.resume and not self.overwrite:
+                    raise
+            if document is not None:
+                self._hydrate_input_fingerprint_cache(document)
         if self.overwrite:
             self.logger.record(
                 "ACTION", str(self.identity.get("stage", "execution")),
@@ -488,7 +741,8 @@ class ExecutionCheckpoint:
         if not self.manifest_path.is_file():
             return CheckpointDecision(action="run")
 
-        document = self._load()
+        if document is None:
+            document = self._load()
         expected_identity = {
             "schema_version": EXECUTION_CHECKPOINT_SCHEMA_VERSION,
             **self.identity,
@@ -689,6 +943,10 @@ class ExecutionCheckpoint:
             ),
             "configuration_sha256": self.configuration_sha256,
             "inputs": self._input_fingerprints(),
+            _INPUT_FINGERPRINT_CACHE_KEY: {
+                name: self._input_fingerprint_cache[name]
+                for name in sorted(self._input_fingerprint_cache)
+            },
             "software": self.software,
             "upstream_checkpoints": self._upstream_fingerprints(),
             "outputs": outputs,

@@ -6,7 +6,7 @@ execution modes from constructing different dependency orders.
 """
 
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from rich.console import Console
 
@@ -26,8 +26,9 @@ from postgwas.core.checkpointing import (
 )
 from postgwas.core.contracts import RunContext
 from postgwas.core.errors import ModuleExecutionError
+from postgwas.core.input_validation import validation_scope
 from postgwas.core.paths import configured_output_path
-from postgwas.core.ui import StageProgress
+from postgwas.core.ui import PipelineStageController, StageProgress, print_screen_block, screen_line
 from postgwas.pipeline.planner import PipelinePlan
 from postgwas.pipeline.registry import REGISTRY, resolve_reference
 
@@ -98,11 +99,15 @@ def _pipeline_checkpoint(
         "arguments_before": encode_checkpoint_value(content_arguments),
         "context_before": encode_checkpoint_value(context_before),
     }
+    # A categorical CLI value can equal an output directory or one of its
+    # parents. Prune the output subtree during implicit directory expansion while
+    # retaining explicitly referenced upstream files below it.
     tracked_inputs = discover_input_files(
         arguments_before,
         context_before,
         module_configuration,
         configuration.resources,
+        excluded_paths=(output_root,),
         excluded_roots=(stage_root, checkpoint_root),
     )
     return (
@@ -132,11 +137,20 @@ def _pipeline_checkpoint(
     )
 
 
-def execute_pipeline(args, plan: PipelinePlan, configuration) -> RunContext:
+def execute_pipeline(
+    args,
+    plan: PipelinePlan,
+    configuration,
+    *,
+    preflight_evidence: Mapping[str, object] | None = None,
+    finalize_validation: Callable[[], None] | None = None,
+) -> RunContext:
     """Execute each planned step once and return its run context.
 
     A module name may occur more than once in a plan when it represents a real
     data transition, such as formatting before and after imputation.
+    When supplied, final validation evidence must be published before the last
+    stage can be reported complete, including when resuming that stage.
     """
 
     if not isinstance(plan, PipelinePlan):
@@ -155,21 +169,42 @@ def execute_pipeline(args, plan: PipelinePlan, configuration) -> RunContext:
         error_type=ValueError,
     )
     checkpoint_logger = CheckpointAuditLogger(audit_path, console=console)
-    context = RunContext()
+    context = RunContext(validations=preflight_evidence)
     validated_checkpoints: dict[str, Path] = {}
-    console.print("\n🚀 [bold green]Starting Execution Chain[/bold green]")
-    total = len(plan.steps)
-    progress = StageProgress(
-        "Pipeline execution progress",
-        enabled=True,
-        console=console,
-    )
+    print_screen_block("\n" + screen_line("run", "Starting execution chain"), console=console)
+    progress_plan = None
+    if len(plan.requested_modules) == 1:
+        target = REGISTRY.require_pipeline_enabled(plan.requested_modules[0])
+        factory = getattr(target, "pipeline_progress_factory", None)
+        if factory is not None:
+            progress_plan = resolve_reference(factory)(args)
+    if progress_plan is None:
+        total = len(plan.steps)
+        progress = StageProgress(
+            "Pipeline execution progress", enabled=True, console=console,
+        )
+        detailed_progress = None
+    else:
+        total = len(progress_plan["stages"])
+        progress = None
+        detailed_progress = PipelineStageController(
+            progress_plan["label"],
+            progress_plan["stages"],
+            console=console,
+            outcome_label_width=configuration.logging.terminal_label_width,
+        )
+        args._pipeline_stage_progress = detailed_progress
+        args._pipeline_progress_plan = progress_plan
 
     try:
         for number, module_name in enumerate(plan.steps, 1):
             spec = REGISTRY.require_pipeline_enabled(module_name)
             title = spec.description
-            progress.start_step(number, total, title)
+            title_factory = getattr(spec, "pipeline_title_factory", None)
+            if title_factory is not None:
+                title = resolve_reference(title_factory)(args)
+            if progress is not None:
+                progress.start_step(number, total, title)
 
             # Expose the planned step number to module output-directory builders.
             args._step_num = f"{number:02d}"
@@ -194,17 +229,47 @@ def execute_pipeline(args, plan: PipelinePlan, configuration) -> RunContext:
                 if decision.action == "resume":
                     _restore_stage_state(args, context, decision.document)
                     args._step_num = f"{number:02d}"
+                    if number == len(plan.steps) and finalize_validation is not None:
+                        finalize_validation()
                     validated_checkpoints[
                         "%s_%s" % (args._step_num, module_name)
                     ] = manifest
-                    progress.complete_step(
-                        number, total, title,
-                        outcome="Resumed checksum-validated checkpoint",
-                    )
+                    if progress is not None:
+                        progress.complete_step(
+                            number, total, title,
+                            outcome="Resumed checksum-validated checkpoint",
+                        )
+                    else:
+                        start, end = progress_plan["modules"][module_name]
+                        deferred_stage = (
+                            progress_plan.get("deferred_completion_modules", {})
+                            .get(module_name)
+                        )
+                        for stage in range(start, end + 1):
+                            if detailed_progress.current != stage:
+                                detailed_progress.start(stage)
+                            if stage == deferred_stage:
+                                break
+                            detailed_progress.complete(
+                                stage,
+                                outcome="Resumed checksum-validated checkpoint",
+                            )
                     continue
                 runner_started = True
                 runner = resolve_reference(spec.runner)
-                result = runner(args, context)
+                with validation_scope(module_name):
+                    result = runner(args, context)
+                if detailed_progress is not None:
+                    _start, expected_end = progress_plan["modules"][module_name]
+                    if not (
+                        detailed_progress.completed == expected_end
+                        or detailed_progress.current == expected_end
+                    ):
+                        raise RuntimeError(
+                            "%s completed without reporting every configured "
+                            "pipeline stage through %d"
+                            % (module_name, expected_end)
+                        )
                 state = _stage_state(args, context)
                 checkpoint.write(
                     status="COMPLETED",
@@ -212,7 +277,33 @@ def execute_pipeline(args, plan: PipelinePlan, configuration) -> RunContext:
                     state=state,
                     metrics={"result_type": type(result).__name__},
                 )
-            except Exception as exc:
+                if number == len(plan.steps) and finalize_validation is not None:
+                    finalize_validation()
+                if (
+                    detailed_progress is not None
+                    and detailed_progress.current
+                ):
+                    deferred_stage = (
+                        progress_plan.get("deferred_completion_modules", {})
+                        .get(module_name)
+                    )
+                    if detailed_progress.current != deferred_stage:
+                        completion = getattr(
+                            args, "_pipeline_stage_completion", {},
+                        )
+                        completion_callback = getattr(
+                            args, "_pipeline_progress_completion", None,
+                        )
+                        if completion_callback is not None:
+                            completion_callback()
+                        detailed_progress.complete(
+                            detailed_progress.current,
+                            outcome=completion.get("outcome"),
+                            outcome_fields=completion.get("outcome_fields"),
+                        )
+                        if hasattr(args, "_pipeline_stage_completion"):
+                            delattr(args, "_pipeline_stage_completion")
+            except BaseException as exc:
                 if (
                     runner_started
                     and checkpoint is not None
@@ -236,17 +327,44 @@ def execute_pipeline(args, plan: PipelinePlan, configuration) -> RunContext:
                             error="%s: %s"
                             % (type(checkpoint_exc).__name__, checkpoint_exc),
                         )
-                progress.fail_step(number, total, title)
-                console.print(
-                    f"\n❌ [bold red]Pipeline Failed at step: {module_name}[/bold red]"
-                )
+                if progress is not None:
+                    progress.fail_step(number, total, title)
+                else:
+                    failure_callback = getattr(
+                        args, "_pipeline_progress_failure", None,
+                    )
+                    if failure_callback is not None:
+                        try:
+                            failure_callback(exc)
+                        except Exception as logging_exc:
+                            checkpoint_logger.record(
+                                "FAILED",
+                                "%s_%s" % (args._step_num, module_name),
+                                action="record_detailed_progress_failure",
+                                error="%s: %s"
+                                % (type(logging_exc).__name__, logging_exc),
+                            )
+                    detailed_progress.fail_active()
+                print_screen_block(screen_line("error", f"Pipeline Failed at step: {module_name}"), console=console)
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
                 raise ModuleExecutionError(module_name, str(exc)) from exc
             validated_checkpoints[
                 "%s_%s" % (args._step_num, module_name)
             ] = manifest
-            progress.complete_step(number, total, title)
+            if progress is not None:
+                progress.complete_step(number, total, title)
     finally:
-        progress.close()
+        if progress is not None:
+            progress.close()
+        else:
+            detailed_progress.close()
+        if hasattr(args, "_pipeline_progress_failure"):
+            delattr(args, "_pipeline_progress_failure")
+        if hasattr(args, "_pipeline_progress_completion"):
+            delattr(args, "_pipeline_progress_completion")
+        if hasattr(args, "_pipeline_stage_completion"):
+            delattr(args, "_pipeline_stage_completion")
 
-    console.print("\n✅ [bold green]All tasks completed successfully.[/bold green]\n")
+    print_screen_block("\n" + screen_line("success", "All tasks completed successfully.") + "\n", console=console)
     return context

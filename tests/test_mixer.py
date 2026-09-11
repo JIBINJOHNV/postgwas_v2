@@ -11,10 +11,21 @@ import pytest
 import yaml
 
 from postgwas.cli.common import get_genome_build_parser
-from postgwas.config import load_module_configuration
+from postgwas.config import load_configuration, load_module_configuration
+from postgwas.core.contracts import RunContext
 from postgwas.core.errors import ConfigurationError
+from postgwas.core.input_validation import InputValidationSession
+from postgwas.core.validation_reporting import FileValidationDisplay
 from postgwas.modules.mixer.cli import build_parser
-from postgwas.modules.mixer.service import MixerError, run_mixer_direct
+from postgwas.modules.mixer.service import (
+    MixerError,
+    MixerPipelineResources,
+    preflight_mixer_pipeline,
+    run_mixer_direct,
+    validate_reference_pattern,
+)
+from postgwas.pipeline.runners import run_mixer_runner
+from preflight_support import pipeline_input_vcf_evidence
 
 
 def _module_config(tmp_path, *, analysis="univariate", extra=""):
@@ -35,6 +46,31 @@ def _mixer_input(tmp_path):
     with gzip.open(path, "wt", encoding="utf-8") as handle:
         handle.write("SNP\tCHR\tBP\tA1\tA2\tN\tZ\nrs1\t1\t1\tA\tG\t1000\t2\n")
     return path
+
+
+def test_mixer_chromosome_resources_have_one_compact_validation_card(
+    tmp_path, capsys,
+):
+    pattern = str(tmp_path / "reference_chr@.bim")
+    paths = []
+    for chromosome in ("1", "2", "3"):
+        path = Path(pattern.replace("@", chromosome))
+        path.write_text("reference\n", encoding="utf-8")
+        paths.append(path.resolve())
+
+    with InputValidationSession() as session:
+        display = FileValidationDisplay(session, load_configuration())
+        observed = validate_reference_pattern(
+            pattern, "BIM", ("1", "2", "3"), "@",
+        )
+        display.flush()
+
+    assert observed == tuple(paths)
+    screen = capsys.readouterr().out
+    assert "MiXeR chromosome resources — AVAILABLE — availability only" in screen
+    assert "Resource type" in screen and "BIM" in screen
+    assert "Chromosome files" in screen and "3 / 3" in screen
+    assert all(path.name not in screen for path in paths)
 
 
 def _references(tmp_path, *, loadlib=False):
@@ -138,14 +174,44 @@ def _write_fake_mixer(path):
         "if command == 'test1':\n"
         " result['qqplot'] = {'n_snps': 1, 'data_logpvec': [float('inf')], 'model_logpvec': [1.0]}\n"
         "Path(prefix + '.json').write_text(json.dumps(result))\n"
+        "ld_pattern = sys.argv[sys.argv.index('--ld-file') + 1]\n"
+        "ld_file = ld_pattern.replace('@', '1')\n"
         "with open(prefix + '.log', 'w') as handle:\n"
         " handle.write('MiXeR v2.2.1 software\\n')\n"
+        " handle.write('<init(...); elapsed time 1ms\\n')\n"
+        " handle.write('>load_ld_matrix(filename=%s)\\n' % ld_file)\n"
+        " handle.write(\"--fit-sequence: ['diffevo-fast', 'neldermead']\\n\")\n"
+        " handle.write('fit_type==diffevo-fast...\\n')\n"
+        " handle.write('<calc_unified_univariate_cost_gaussian(...), cost=1, elapsed time 1ms\\n')\n"
+        " handle.write('fit_type==diffevo-fast done (success=True)\\n')\n"
+        " handle.write('Done\\n')\n"
         " if command == 'fit1':\n"
         "  handle.write('1 lines matched via CHR:BP:A1:A2 code (not SNP rs#)\\n')\n"
         "  handle.write('0 lines were ignored as RS# did not match reference file.\\n')\n"
         "  handle.write('0 variants were are strand-ambiguous, removing them from analysis\\n')\n"
         "  handle.write('0 variants had flipped A1/A2 alleles; sign of z-score was flipped.\\n')\n"
         "  handle.write('Found 1 variants with well-defined Z and N\\n')\n",
+        encoding="utf-8",
+    )
+
+
+def _write_failing_mixer(path):
+    path.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "prefix = sys.argv[sys.argv.index('--out') + 1]\n"
+        "ld_pattern = sys.argv[sys.argv.index('--ld-file') + 1]\n"
+        "log = Path(prefix + '.log')\n"
+        "log.parent.mkdir(parents=True, exist_ok=True)\n"
+        "log.write_text(\n"
+        " '<init(...); elapsed time 1ms\\n'\n"
+        " + '>load_ld_matrix(filename=%s)\\n' % ld_pattern.replace('@', '1')\n"
+        " + \"--fit-sequence: ['diffevo-fast', 'neldermead']\\n\"\n"
+        " + 'fit_type==diffevo-fast...\\n'\n"
+        " + '<calc_unified_univariate_cost_gaussian(...), cost=1, elapsed time 1ms\\n',\n"
+        " encoding='utf-8',\n"
+        ")\n"
+        "sys.exit(2)\n",
         encoding="utf-8",
     )
 
@@ -179,7 +245,7 @@ def test_mixer_help_is_single_trait_and_exposes_gsa_resources():
     assert "Set analysis: all in mixer.yaml" in help_text
     assert "GSA-MiXeR reference inputs:" in help_text
     description_markers = (
-        "Maximum number of tasks",
+        "Total CPU-thread budget",
         "Per-chromosome SNP annotation",
         "GSA-MiXeR baseline annotation",
         "Single-trait analysis to run",
@@ -219,7 +285,7 @@ def test_pipeline_mixer_help_hides_only_formatter_created_input():
     ):
         assert external_resource in help_text
     description_markers = (
-        "Maximum number of tasks",
+        "Total CPU-thread budget",
         "Required: Harmonised GWAS-VCF file",
         "Required: Short, unique name",
         "YAML file containing settings",
@@ -261,7 +327,91 @@ def test_shared_genome_build_parser_uses_configured_names():
         suppress_default=True,
     )
     assert parser.parse_args(["--genome-build", "ReferenceA"]).genome_build == "ReferenceA"
-    assert "default: ReferenceB" in parser.format_help()
+    assert "Default: ReferenceB" in parser.format_help()
+
+
+def test_pipeline_preflight_validates_mixer_resources_and_runner_reuses_them(
+    tmp_path, monkeypatch,
+):
+    references = _references(tmp_path)
+    output = tmp_path / "out"
+    fake_mixer = tmp_path / "fake_mixer.py"
+    _write_fake_mixer(fake_mixer)
+    args = _base_args(
+        tmp_path,
+        output,
+        _module_config(tmp_path),
+        references,
+        dry_run=True,
+        mixer=str(fake_mixer),
+        mixer_backend="native",
+    )
+    evidence = preflight_mixer_pipeline(
+        args,
+        preflight_evidence=pipeline_input_vcf_evidence(),
+    )
+
+    assert isinstance(evidence.resources, MixerPipelineResources)
+    assert evidence.resources.backend == "native"
+    assert {identity.path for identity in evidence.resources.file_identities} == {
+        Path(references["bim"].replace("@", "1")).resolve(),
+        Path(references["ld"].replace("@", "1")).resolve(),
+        fake_mixer.resolve(),
+        Path(sys.executable).resolve(),
+    }
+
+    captured = {}
+
+    def fake_service(current_args, ctx, **kwargs):
+        captured["input"] = current_args.mixer_input_file
+        captured["resources"] = kwargs["pipeline_resources"]
+        return {"analysis": "univariate"}
+
+    monkeypatch.setattr(
+        "postgwas.modules.mixer.service.run_mixer_direct",
+        fake_service,
+    )
+    args._step_num = "04"
+    ctx = RunContext(
+        {"formatter": {"mixer": {"mixer_input": "formatted.sumstats.gz"}}},
+        validations={"mixer": evidence},
+    )
+
+    assert run_mixer_runner(args, ctx) == {"analysis": "univariate"}
+    assert captured == {
+        "input": "formatted.sumstats.gz",
+        "resources": evidence.resources,
+    }
+    assert args.output_directory == str(output)
+
+
+def test_pipeline_mixer_rejects_reference_changed_after_preflight(tmp_path):
+    references = _references(tmp_path)
+    output = tmp_path / "out"
+    args = _base_args(
+        tmp_path,
+        output,
+        _module_config(tmp_path),
+        references,
+        dry_run=True,
+        mixer_backend="docker",
+    )
+    evidence = preflight_mixer_pipeline(
+        args,
+        preflight_evidence=pipeline_input_vcf_evidence(),
+    )
+    Path(references["bim"].replace("@", "1")).write_text(
+        "reference changed after validation\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MixerError, match="changed after pipeline preflight"):
+        run_mixer_direct(args, pipeline_resources=evidence.resources)
+
+    assert not (output / "results").exists()
+    assert "changed after pipeline preflight" in _canonical_log(output).read_text(
+        encoding="utf-8",
+    )
 
 
 def test_univariate_dry_run_logs_exactly_fit1_and_test1(tmp_path):
@@ -269,7 +419,7 @@ def test_univariate_dry_run_logs_exactly_fit1_and_test1(tmp_path):
     output = tmp_path / "out"
     args = _base_args(
         tmp_path, output, _module_config(tmp_path), references,
-        dry_run=True, threads=2, seed=17,
+        dry_run=True, threads=2, seed=17, mixer_backend="docker",
     )
 
     result = run_mixer_direct(args)
@@ -296,7 +446,9 @@ def test_univariate_dry_run_logs_exactly_fit1_and_test1(tmp_path):
     }
 
 
-def test_univariate_runner_writes_compact_results_and_official_figures(tmp_path):
+def test_univariate_runner_writes_compact_results_and_official_figures(
+    tmp_path, capsys,
+):
     references = _references(tmp_path)
     fake_mixer = tmp_path / "fake_mixer.py"
     fake_figures = tmp_path / "fake_mixer_figures.py"
@@ -326,9 +478,54 @@ def test_univariate_runner_writes_compact_results_and_official_figures(tmp_path)
     assert Path(univariate["summary_tsv"]).is_file()
     assert len(univariate["figures"]) == 4
     assert "--statistic point_estimate" in (output / "plots" / "STUDY.csv").read_text()
+    screen = capsys.readouterr().out
+    for milestone in (
+        "Completed 1/4 · Validate the MiXeR input and resolved resources",
+        "Completed 2/4 · Fit the single-trait MiXeR model",
+        "Completed 3/4 · Evaluate the fitted single-trait MiXeR model",
+        "Completed 4/4 · Validate and report the selected MiXeR results",
+        "MiXeR fit1 execution progress",
+        "MiXeR chromosome LD-loading progress",
+        "Completed 1/1 · Load chromosome LD references",
+        "MiXeR optimizer activity",
+        "Completed 1/1 · Observed MiXeR cost-function evaluations",
+    ):
+        assert milestone in screen
+    canonical_log = _canonical_log(output).read_text(encoding="utf-8")
+    assert "mixer_optimizer_progress" in canonical_log
+    assert "total_cost_evaluations=unknown_until_convergence" in canonical_log
+    assert "mixer_native_progress_complete" in canonical_log
 
 
-def test_gsa_runner_uses_official_three_stage_single_trait_contract(tmp_path):
+def test_univariate_native_failure_stops_progress_below_completion(
+    tmp_path, capsys,
+):
+    references = _references(tmp_path)
+    fake_mixer = tmp_path / "failing_mixer.py"
+    _write_failing_mixer(fake_mixer)
+    output = tmp_path / "out"
+    args = _base_args(
+        tmp_path,
+        output,
+        _module_config(tmp_path),
+        references,
+        mixer=str(fake_mixer),
+    )
+
+    with pytest.raises(MixerError, match="MiXeR fit1 failed with exit status 2"):
+        run_mixer_direct(args)
+
+    screen = capsys.readouterr().out
+    assert "Failed 1/? · Observed MiXeR cost-function evaluations" in screen
+    assert "Failed 3/3 · Optimize and validate the MiXeR model" in screen
+    assert "Failed 2/4 · Fit the single-trait MiXeR model" in screen
+    assert "Completed 2/4 · Fit the single-trait MiXeR model" not in screen
+    assert "All 4 stages completed" not in screen
+
+
+def test_gsa_runner_uses_official_three_stage_single_trait_contract(
+    tmp_path, capsys,
+):
     references = _references(tmp_path)
     go = _go_files(tmp_path)
     fake_mixer = tmp_path / "fake_mixer.py"
@@ -377,6 +574,15 @@ def test_gsa_runner_uses_official_three_stage_single_trait_contract(tmp_path):
     ):
         assert token in log_text
     assert "trait2" not in log_text and "fit2" not in log_text and "test2" not in log_text
+    screen = capsys.readouterr().out
+    for milestone in (
+        "Completed 1/5 · Validate the MiXeR input and resolved resources",
+        "Completed 2/5 · Split summary statistics by chromosome for GSA-MiXeR",
+        "Completed 3/5 · Fit the GSA-MiXeR baseline model",
+        "Completed 4/5 · Fit the GSA-MiXeR enrichment model",
+        "Completed 5/5 · Validate and report the selected MiXeR results",
+    ):
+        assert milestone in screen
 
 
 def test_gsa_precomputed_load_library_does_not_require_ld_files(tmp_path):

@@ -39,14 +39,18 @@ from typing import Any, Dict, Optional
 import polars as pl
 
 from postgwas.core.dataframes import numeric_column
-from postgwas.core.values import format_count, format_percentage, optional_text
+from postgwas.core.values import (
+    format_count, format_number, format_percentage, optional_text,
+)
 
 from .shared.runtime import (
     NullLogger,
     configured_column,
     emit_high_visibility_warning,
+    format_inference_warning,
     resolve_policies,
 )
+from .shared.statistics import valid_frequency_mask
 
 __all__ = [
     "resolve_study_properties",
@@ -67,9 +71,6 @@ PVALUE_COLUMN_KEYS = ("pval_col",)
 #: sample_column_dict keys that may hold the study's own frequency column.
 EAF_COLUMN_KEYS = ("eaf_col",)
 
-#: Median of a p-value column under the null, on each scale.  A GWAS is
-#: overwhelmingly null variants, so the median is the cleanest discriminator:
-#: raw p ~ 0.5, -log10 p ~ 0.301, -ln p ~ 0.693  (plan 5.1).
 _DATASET_STEP_LABEL = "07 resolve_study_properties"
 
 _POLICY_KEYS = [
@@ -77,6 +78,8 @@ _POLICY_KEYS = [
     "effect.or_detection_max_non_positive_fraction",
     "effect.or_detection_require_median_range",
     "effect.verify_per_chromosome",
+    "effect_from_z.beta_z_sign_mismatch",
+    "effect_from_z.max_beta_z_sign_mismatch_fraction",
     "effect.se_scale",
     "effect.se_scale_min_variants",
     "effect.se_scale_min_agreement_fraction",
@@ -84,6 +87,10 @@ _POLICY_KEYS = [
     "pvalue.type",
     "pvalue.mlogp_detect_threshold",
     "pvalue.mlogp_detect_proportion",
+    "pvalue.mlogp_detect_min_count",
+    "pvalue.mlogp_expected_median",
+    "pvalue.mlogp_median_tolerance",
+    "pvalue.max_negative_fraction",
     "pvalue.verify_per_chromosome",
     "eaf.maf_decision_cutoff",
     "validation.beta_se_z_absolute_tolerance",
@@ -172,8 +179,7 @@ def _pvalue_evidence(df, column, detect_threshold, statistics=None):
         "detect_threshold": float(detect_threshold),
         "above_threshold": above,
         "above_threshold_fraction_of_non_null": (float(above) / non_null) if non_null else 0.0,
-        "above_two": int(row["above_two"] or 0),
-        "non_positive": int(row["non_positive"] or 0),
+        "negative": int(row["negative"] or 0),
         "min": _clean(row["min"]),
         "max": _clean(row["max"]),
         "mean": _clean(row["mean"]),
@@ -184,28 +190,32 @@ def _pvalue_evidence(df, column, detect_threshold, statistics=None):
 
 def _eaf_evidence(df, column, statistics=None):
     # type: (pl.DataFrame, str) -> Dict[str, Any]
-    """Statistics for the frequency column, all denominators non-null.
+    """Statistics for the frequency column using only usable probabilities.
 
-    ``low_fraction_of_non_null`` is the share of values at or below 0.5 among
-    the non-null values - the correct denominator.  Dividing by the row count
-    instead is why a true minor-allele-frequency column with 10% nulls scores
-    0.90, slips under the 0.95 cutoff and is exported as an effect allele
-    frequency (plan 5.1, defect table; allele_frequency.summarise_allele_frequency already
-    computes it this way as ``le_0_5_fraction_among_non_null``).
+    The MAF-like fraction is ``usable values <= 0.5 / usable values``. Missing,
+    unparseable, non-finite and finite out-of-range values are excluded from
+    both sides of that scientific comparison and reported separately.
     """
     row = statistics or df.select(_eaf_evidence_expressions(column)).to_dicts()[0]
 
+    rows = int(row["rows"] or 0)
+    raw_non_null = int(row["non_null_before_cast"] or 0)
     non_null = int(row["non_null"] or 0)
+    usable = int(row["usable"] or 0)
     low = int(row["le_0_5"] or 0)
     evidence = {
         "column": column,
-        "rows": int(row["rows"] or 0),
+        "rows": rows,
+        "input_missing": rows - raw_non_null,
         "non_null": non_null,
-        "null": int(row["rows"] or 0) - non_null,
-        "unparseable": int(row["non_null_before_cast"] or 0) - non_null,
-        "at_or_below_0_5": low,
-        "low_fraction_of_non_null": (float(low) / non_null) if non_null else 0.0,
+        "null": rows - non_null,
+        "unparseable": raw_non_null - non_null,
+        "usable": usable,
+        "unusable": rows - usable,
+        "non_finite": int(row["non_finite"] or 0),
         "out_of_range": int(row["out_of_range"] or 0),
+        "at_or_below_0_5": low,
+        "low_fraction_of_usable": (float(low) / usable) if usable else 0.0,
         "exactly_zero": int(row["eq_0"] or 0),
         "exactly_one": int(row["eq_1"] or 0),
         "min": _clean(row["min"]),
@@ -239,8 +249,7 @@ def _pvalue_evidence_expressions(column, detect_threshold, prefix=""):
         pl.col(column).is_not_null().sum().alias(prefix + "non_null_before_cast"),
         value.is_not_null().sum().alias(prefix + "non_null"),
         (value > float(detect_threshold)).sum().alias(prefix + "above_threshold"),
-        (value > 2.0).sum().alias(prefix + "above_two"),
-        (value <= 0.0).sum().alias(prefix + "non_positive"),
+        (value < 0.0).sum().alias(prefix + "negative"),
         value.min().alias(prefix + "min"),
         value.max().alias(prefix + "max"),
         value.mean().alias(prefix + "mean"),
@@ -250,18 +259,25 @@ def _pvalue_evidence_expressions(column, detect_threshold, prefix=""):
 
 def _eaf_evidence_expressions(column, prefix=""):
     value = pl.col(column).cast(pl.Float64, strict=False)
+    usable = valid_frequency_mask(value)
     return [
         pl.len().alias(prefix + "rows"),
         pl.col(column).is_not_null().sum().alias(prefix + "non_null_before_cast"),
         value.is_not_null().sum().alias(prefix + "non_null"),
-        (value <= 0.5).sum().alias(prefix + "le_0_5"),
-        ((value < 0.0) | (value > 1.05)).sum().alias(prefix + "out_of_range"),
-        (value == 0.0).sum().alias(prefix + "eq_0"),
-        (value == 1.0).sum().alias(prefix + "eq_1"),
-        value.min().alias(prefix + "min"),
-        value.max().alias(prefix + "max"),
-        value.mean().alias(prefix + "mean"),
-        value.median().alias(prefix + "median"),
+        usable.sum().alias(prefix + "usable"),
+        (value.is_not_null() & ~value.is_finite()).sum().alias(prefix + "non_finite"),
+        (
+            value.is_not_null()
+            & value.is_finite()
+            & ~value.is_between(0.0, 1.0)
+        ).sum().alias(prefix + "out_of_range"),
+        (usable & (value <= 0.5)).sum().alias(prefix + "le_0_5"),
+        (usable & (value == 0.0)).sum().alias(prefix + "eq_0"),
+        (usable & (value == 1.0)).sum().alias(prefix + "eq_1"),
+        pl.when(usable).then(value).min().alias(prefix + "min"),
+        pl.when(usable).then(value).max().alias(prefix + "max"),
+        pl.when(usable).then(value).mean().alias(prefix + "mean"),
+        pl.when(usable).then(value).median().alias(prefix + "median"),
     ]
 
 
@@ -276,11 +292,14 @@ def _prefixed_statistics(row, prefix):
 def _collect_study_statistics(df, sample_column_dict, pol):
     """Collect all study-property evidence in one full-frame aggregation."""
     from .effect_type import _effect_type_statistic_expressions
+    from .effect_from_z import _beta_z_sign_statistic_expressions
     from .p_values import _pvalue_type_statistic_expressions
 
     effect_col = _column(sample_column_dict, EFFECT_COLUMN_KEYS, df)
     pvalue_col = _column(sample_column_dict, PVALUE_COLUMN_KEYS, df)
     eaf_col = _column(sample_column_dict, EAF_COLUMN_KEYS, df)
+    z_col = _column(sample_column_dict, ("imp_z_col", "z_col"), df)
+    se_col = _column(sample_column_dict, ("se_col",), df)
     threshold = float(pol.get("pvalue.mlogp_detect_threshold"))
     expressions = []
     if effect_col is not None:
@@ -290,6 +309,15 @@ def _collect_study_statistics(df, sample_column_dict, pol):
         expressions.extend(
             _effect_type_statistic_expressions(effect_col, "effect_detector__")
         )
+        if z_col is not None:
+            expressions.extend(
+                _beta_z_sign_statistic_expressions(
+                    effect_col,
+                    z_col,
+                    se_col,
+                    "beta_z_sign__",
+                )
+            )
     if pvalue_col is not None:
         expressions.extend(
             _pvalue_evidence_expressions(pvalue_col, threshold, "pvalue_evidence__")
@@ -310,6 +338,7 @@ def _collect_study_statistics(df, sample_column_dict, pol):
         "pvalue_evidence": _prefixed_statistics(row, "pvalue_evidence__"),
         "pvalue_detector": _prefixed_statistics(row, "pvalue_detector__"),
         "eaf_evidence": _prefixed_statistics(row, "eaf_evidence__"),
+        "beta_z_sign": _prefixed_statistics(row, "beta_z_sign__"),
     }
 
 
@@ -417,7 +446,10 @@ def _decide_effect_type(
         decisions["effect_type_source"] = "detector"
         warning = _automatic_inference_warning(verdict, detector_evidence)
         decisions["effect_type_inference_warning"] = warning
-        emit_high_visibility_warning(logger, warning)
+        emit_high_visibility_warning(
+            logger, warning,
+            screen_message=_automatic_inference_warning(verdict, detector_evidence, screen=True),
+        )
 
     ctx.decide(
         "Effect column '%s'" % column,
@@ -450,19 +482,144 @@ def _detector_stats(extra):
     return kept
 
 
+def _decide_beta_z_sign_consistency(
+    df, sample_column_dict, pol, ctx, decisions, statistics, logger=None,
+):
+    """Validate signed BETA/Z agreement once across the complete study."""
+    effect_col = _column(sample_column_dict, EFFECT_COLUMN_KEYS, df)
+    z_col = _column(sample_column_dict, ("imp_z_col", "z_col"), df)
+    se_col = _column(sample_column_dict, ("se_col",), df)
+    if effect_col is None or z_col is None:
+        decisions["beta_z_sign_consistency"] = {
+            "applies": False,
+            "reason": "effect or signed Z column is not supplied",
+        }
+        return
+
+    from .effect_from_z import (
+        BetaZSignMismatchError,
+        assess_beta_z_sign_discordance,
+    )
+
+    try:
+        assessment = assess_beta_z_sign_discordance(
+            statistics.get("beta_z_sign") or {},
+            effect_type=decisions["effect_type"],
+            effect_col=effect_col,
+            z_col=z_col,
+            se_col=se_col,
+            policies=pol,
+        )
+    except BetaZSignMismatchError as exc:
+        message = "BETA/Z SIGN DISCORDANCE LIMIT EXCEEDED: {}".format(exc)
+        emit_high_visibility_warning(logger, message)
+        raise StudyPropertyError(str(exc)) from exc
+
+    decisions["beta_z_sign_consistency"] = assessment
+    discordant = assessment["discordant_rows"]
+    comparable = assessment["comparable_missing_se_rows"]
+    ctx.decide(
+        "BETA/Z direction for missing-SE recovery",
+        {
+            "comparable missing-SE rows": _count(comparable),
+            "discordant rows": "%s (%s)" % (
+                _count(discordant),
+                _percent(discordant, comparable),
+            ),
+            "maximum discordant fraction": "{:.2%}".format(
+                assessment["maximum_fraction"]
+            ),
+            "row action": assessment["row_action"],
+        },
+        (
+            "continue; discordant rows are rejected and reported per chromosome"
+            if discordant
+            else "continue; no directionally incompatible pair was found"
+        ),
+    )
+    if discordant:
+        message = (
+            "BETA/Z SIGN DISCORDANCE: {:,} of {:,} comparable missing-SE "
+            "rows ({:.4%}) have incompatible directions. This does not exceed "
+            "effect_from_z.max_beta_z_sign_mismatch_fraction={:g} ({:.2%}), "
+            "so the run will continue. Every affected variant that reaches "
+            "chromosome step 06 will be removed and reported with reject reason "
+            "beta_z_sign_discordant; the configured rejected-variant output "
+            "records it when that audit is enabled."
+            .format(
+                discordant,
+                comparable,
+                assessment["discordant_fraction"],
+                assessment["maximum_fraction"],
+                assessment["maximum_fraction"],
+            )
+        )
+        decisions["beta_z_sign_warning"] = message
+        emit_high_visibility_warning(logger, message)
+
+
 def _decide_pvalue_type(
     df, sample_column_dict, pol, ctx, decisions, statistics, logger=None,
 ):
     configured = pol.get("pvalue.type")
     declared = optional_text(sample_column_dict.get("declared_pvalue_type"))
     declared = str(declared).lower() if declared is not None else None
-    declared = declared if declared in ("raw", "neglog10", "negln") else None
+    declared = declared if declared in ("raw", "neglog10") else None
     column = _column(sample_column_dict, PVALUE_COLUMN_KEYS, df)
     threshold = pol.get("pvalue.mlogp_detect_threshold")
 
     decisions["pvalue_column"] = column
 
-    if configured in ("raw", "neglog10", "negln") and declared is None:
+    from .p_values import (
+        ExcessiveNegativePValueError,
+        assess_negative_pvalues,
+        detect_p_value_type,
+    )
+
+    detector_statistics = statistics.get("pvalue_detector") or {}
+
+    def validate_negative_fraction():
+        if column is None:
+            return {}
+        try:
+            result = assess_negative_pvalues(detector_statistics, column, pol)
+        except ExcessiveNegativePValueError as exc:
+            raise StudyPropertyError(str(exc)) from exc
+        if result["n_negative"]:
+            value_word = "value" if result["n_negative"] == 1 else "values"
+            action = str(pol.get("pvalue.out_of_range"))
+            handling = (
+                "Any such rows that reach chromosome p-value harmonisation will "
+                "have their p-values set to missing under pvalue.out_of_range=null; "
+                "later completeness checks still apply."
+                if action == "null" else
+                "Any such rows that reach chromosome p-value harmonisation will "
+                "stop that chromosome under pvalue.out_of_range=fail."
+                if action == "fail" else
+                "Any such rows that reach chromosome p-value harmonisation will "
+                "be rejected with reason pval_out_of_range."
+            )
+            message = (
+                "NEGATIVE P-VALUES: column %r contains %s negative usable %s "
+                "out of %s (%s). This does not exceed "
+                "pvalue.max_negative_fraction=%.6g (%s), so harmonisation will "
+                "continue. %s They will never be converted to p=1."
+                % (
+                    column,
+                    _count(result["n_negative"]),
+                    value_word,
+                    _count(detector_statistics.get("n_usable") or 0),
+                    "%.4f%%" % (result["negative_fraction"] * 100.0),
+                    result["max_negative_fraction"],
+                    "%.2f%%" % (result["max_negative_fraction"] * 100.0),
+                    handling,
+                )
+            )
+            decisions["pvalue_negative_warning"] = message
+            emit_high_visibility_warning(logger, message)
+        return result
+
+    if configured in ("raw", "neglog10") and declared is None:
         decisions["pvalue_type"] = configured
         decisions["pvalue_type_source"] = "policy"
         decisions["pvalue_evidence"] = (
@@ -470,6 +627,7 @@ def _decide_pvalue_type(
                 df, column, threshold, statistics.get("pvalue_evidence"),
             ) if column is not None else {}
         )
+        decisions["pvalue_evidence"].update(validate_negative_fraction())
         ctx.decide(
             "P-value scale",
             "policy pvalue.type is set explicitly, so no detection was run",
@@ -496,11 +654,11 @@ def _decide_pvalue_type(
         raise StudyPropertyError(
             "The p-value column '%s' has no usable numeric value in any of its %s rows, "
             "so its scale cannot be determined. Check the column name in the config, or "
-            "set pvalue.type to 'raw', 'neglog10' or 'negln' explicitly."
+            "set pvalue.type to 'raw' or 'neglog10' explicitly."
             % (column, _count(evidence["rows"]))
         )
 
-    from .p_values import detect_p_value_type
+    evidence.update(validate_negative_fraction())
 
     detector_policies = (
         pol.with_overrides({"pvalue.type": "auto"}) if declared is not None else pol
@@ -508,7 +666,7 @@ def _decide_pvalue_type(
     try:
         verdict, detector_evidence = detect_p_value_type(
             df, column, detector_policies,
-            statistics=statistics.get("pvalue_detector"),
+            statistics=detector_statistics,
         )
     except ValueError as exc:
         if declared is not None:
@@ -549,6 +707,14 @@ def _decide_pvalue_type(
     else:
         decisions["pvalue_type"] = verdict
         decisions["pvalue_type_source"] = "detector"
+        warning = _automatic_pvalue_inference_warning(verdict, detector_evidence)
+        decisions["pvalue_type_inference_warning"] = warning
+        emit_high_visibility_warning(
+            logger, warning,
+            screen_message=_automatic_pvalue_inference_warning(
+                verdict, detector_evidence, screen=True,
+            ),
+        )
 
     ctx.decide(
         "P-value column '%s'" % column,
@@ -572,8 +738,74 @@ def _pvalue_words(kind):
     return {
         "raw": "raw p-values",
         "neglog10": "-log10 p-values",
-        "negln": "natural-log p-values (-ln p)",
     }.get(kind, str(kind))
+
+
+def _automatic_pvalue_inference_warning(kind, evidence, *, screen=False):
+    """Explain the applied scale using detector evidence, without another scan."""
+    usable = int(evidence["n_usable"])
+    above = int(evidence["n_above_threshold"])
+    threshold = format_number(evidence["detect_threshold"])
+    median = format_number(evidence["median"])
+    if kind == "neglog10":
+        low, high = evidence["median_acceptance_range"]
+        median += "; -log10 rule: %s to %s inclusive" % (
+            format_number(low), format_number(high),
+        )
+        processing = (
+            "Convert -log10(P) back to raw P using P = 10^(-input value); "
+            "chromosome QC still applies."
+        )
+        explanation = "The count, percentage and median requirements for -log10(P) were met"
+    else:
+        median += "; not used to select raw scale"
+        processing = "Keep values on the raw probability scale; chromosome QC still applies."
+        explanation = "The count and percentage requirements for -log10(P) were not both met"
+    fields = [
+        ("Usable values", _count(usable) + " finite numeric values"),
+        ("Excluded values", _count(int(evidence["n_rows"]) - usable)
+         + " missing, non-numeric or non-finite values; excluded from inference, not removed here"),
+        ("Observed range", "%s to %s" % (
+            format_number(evidence["min"]), format_number(evidence["max"]),
+        )),
+        ("Above threshold", "%s / %s (%s) exceed %s" % (
+            _count(above), _count(usable), _percent(above, usable, places=4), threshold,
+        )),
+        ("-log10 rule", "At least %s values AND at least %s%% must exceed %s" % (
+            _count(evidence["detect_min_count"]),
+            format_number(float(evidence["detect_proportion"]) * 100.0), threshold,
+        )),
+        ("Median value", median),
+        ("Why inferred", explanation),
+    ]
+    if evidence["n_negative"]:
+        fields.append(("Negative values", "%s / %s (%s); maximum %s%%; handled separately by chromosome QC" % (
+            _count(evidence["n_negative"]), _count(usable),
+            _percent(evidence["n_negative"], usable, places=4),
+            format_number(float(evidence["max_negative_fraction"]) * 100.0),
+        )))
+    reason = (
+        "A value-based rule cannot confirm the column's meaning or that every "
+        "value is valid. It does not determine whether tests are one- or two-sided."
+    )
+    recommendation = (
+        "Check the study documentation. If confirmed, set p_value_type = %s "
+        "in the sample sheet, or pvalue.type in YAML." % kind
+    )
+    if screen:
+        return format_inference_warning(
+            "P-value type automatically inferred",
+            input_column=evidence["pval_col"],
+            inferred_type="Raw p-values" if kind == "raw" else "-log10(P)",
+            evidence=fields, planned_action=processing,
+            reason=reason, recommendation=recommendation,
+        )
+    return ("AUTOMATIC P-VALUE-TYPE INFERENCE: column %r was inferred as %r. "
+            "%s %s %s %s Continuing with the inferred type.") % (
+        evidence["pval_col"], kind,
+        "; ".join("%s: %s" % field for field in fields) + ".",
+        processing, reason, recommendation,
+    )
 
 
 def _decide_or_se_scale(df, sample_column_dict, pol, ctx, decisions, logger=None):
@@ -731,15 +963,17 @@ def _decide_eaf_is_maf(df, sample_column_dict, pol, ctx, decisions, statistics):
     evidence = _eaf_evidence(df, column, statistics.get("eaf_evidence"))
     decisions["eaf_evidence"] = evidence
 
-    if evidence["non_null"] == 0:
+    if evidence["usable"] == 0:
         raise StudyPropertyError(
-            "The frequency column '%s' has no usable numeric value in any of its %s "
-            "rows, so it cannot be judged. Check the column name in the config, or set "
-            "eaf.source to 'reference' to take frequencies from the panel instead."
+            "The frequency column '%s' has no usable finite numeric frequency between "
+            "0 and 1 in any of its %s rows, so PostGWAS cannot decide whether it is MAF "
+            "or EAF. Missing, unparseable, NaN, infinite and out-of-range values do not "
+            "provide frequency evidence. Check the configured column or use a valid "
+            "external EAF source."
             % (column, _count(evidence["rows"]))
         )
 
-    low_fraction = evidence["low_fraction_of_non_null"]
+    low_fraction = evidence["low_fraction_of_usable"]
     suspected = low_fraction > cutoff
     decisions["eaf_is_maf"] = bool(suspected)
     decisions["eaf_is_maf_source"] = "study_level_statistic"
@@ -748,10 +982,11 @@ def _decide_eaf_is_maf(df, sample_column_dict, pol, ctx, decisions, statistics):
     ctx.decide(
         "Frequency column '%s'" % column,
         {
-            "non-null values": _count(evidence["non_null"]),
+            "usable frequencies": _count(evidence["usable"]),
+            "excluded from MAF screen": _count(evidence["unusable"]),
             "at or below 0.5": "%s (%s)" % (
                 _count(evidence["at_or_below_0_5"]),
-                _percent(evidence["at_or_below_0_5"], evidence["non_null"]),
+                _percent(evidence["at_or_below_0_5"], evidence["usable"]),
             ),
             "decision cutoff": cutoff,
             "median": evidence["median"],
@@ -788,10 +1023,11 @@ def resolve_study_properties(
           "effect_type": "odds_ratio" | "beta" | None,
           "effect_type_source": "policy" | "detector" | "no_effect_column",
           "effect_evidence": {...},          # every denominator non-null
+          "beta_z_sign_consistency": {...},  # complete-study missing-SE guard
           "se_scale": "log_odds" | "as_given" | None,
           "se_scale_source": ...,
           "se_scale_evidence": {...},
-          "pvalue_type": "raw" | "neglog10" | "negln" | None,
+          "pvalue_type": "raw" | "neglog10" | None,
           "pvalue_type_source": ...,
           "pvalue_evidence": {...},
           "eaf_is_maf": True | False | None,
@@ -849,6 +1085,9 @@ def resolve_study_properties(
         _decide_effect_type(
             df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
         )
+        _decide_beta_z_sign_consistency(
+            df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
+        )
         _decide_pvalue_type(
             df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
         )
@@ -862,6 +1101,9 @@ def resolve_study_properties(
         ctx.set_rows(df.height, removed=0)
         ctx.extra["study_properties"] = {
             "effect_type": decisions.get("effect_type"),
+            "beta_z_sign_consistency": decisions.get(
+                "beta_z_sign_consistency"
+            ),
             "se_scale": decisions.get("se_scale"),
             "pvalue_type": decisions.get("pvalue_type"),
             "eaf_is_maf": decisions.get("eaf_is_maf"),
@@ -905,6 +1147,22 @@ def finalise_eaf_decision_from_chromosomes(
         completed = list(completed_chromosomes)
 
     counts = {"eaf": 0, "maf": 0, "inconclusive": 0, "missing": 0}
+    provenance_counts = {
+        "study_supplied": 0,
+        "reference_imputed": 0,
+        "missing": 0,
+    }
+    for chromosome in completed:
+        summary = summaries.get(chromosome, summaries.get(str(chromosome), {}))
+        stage_qc = summary.get("stage_qc", {}) if isinstance(summary, dict) else {}
+        eaf_qc = stage_qc.get("eaf_qc", {}) if isinstance(stage_qc, dict) else {}
+        provenance = (
+            eaf_qc.get("eaf_provenance") if isinstance(eaf_qc, dict) else None
+        )
+        if provenance in ("study_supplied", "reference_imputed"):
+            provenance_counts[provenance] += 1
+        else:
+            provenance_counts["missing"] += 1
     if initial is True:
         for chromosome in completed:
             summary = summaries.get(chromosome, summaries.get(str(chromosome), {}))
@@ -945,6 +1203,20 @@ def finalise_eaf_decision_from_chromosomes(
     result["eaf_is_maf"] = final
     result["eaf_is_maf_source"] = source
     result["eaf_reference_decisions"] = counts
+    observed_provenance = [
+        name
+        for name in ("study_supplied", "reference_imputed")
+        if provenance_counts[name]
+    ]
+    result["eaf_provenance"] = (
+        observed_provenance[0]
+        if len(observed_provenance) == 1
+        and provenance_counts["missing"] == 0
+        else "mixed"
+        if len(observed_provenance) > 1
+        else "unavailable"
+    )
+    result["eaf_provenance_counts"] = provenance_counts
     result["frequency_type"] = (
         "minor_allele_frequency"
         if final is True

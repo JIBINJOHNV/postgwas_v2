@@ -1,0 +1,28 @@
+variables:
+  R_LIBS_USER: /dev/null
+  PYTHONNOUSERSITE: "1"
+  PYTHONPATH: ""
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python=3.10
+  - pip
+  - gprofiler-official
+  - gseapy
+  - matplotlib
+  - networkx
+  - numpy<2
+  - omnipath
+  - pandas
+  - pydantic>=2.7,<3
+  - pyyaml>=6
+  - requests
+  - rich>=13
+  - rich-argparse>=1.6
+  - rpy2
+  - scipy
+  - zeep
+  - zip
+  - r-webgestaltr

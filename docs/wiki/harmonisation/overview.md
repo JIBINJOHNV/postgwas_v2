@@ -65,12 +65,15 @@ postgwas harmonisation \
   --threads 8 \
   --memory-gb 32 \
   --seed 10 \
+  --keep_gwas2vcf_intermediate \
   --validate
 ```
 
 Replace the comparison population, build resources, paths, and compute limits
 with values appropriate to the dataset. `--validate` is optional and is off
-unless requested in CLI or YAML.
+unless requested in CLI or YAML. `--keep_gwas2vcf_intermediate` is also
+optional; without it, a successful run deletes the raw merged adapter VCF after
+final validation while retaining both annotated build-specific VCFs.
 
 ## Parameters
 
@@ -108,10 +111,12 @@ before interpreting a harmonisation log or QC report.
 
 ## Outputs
 
-Each dataset receives raw same-build GWAS-to-VCF output, merged VCFs in both
-configured builds, indexes and intermediate evidence, rejection reports, QC
-reports, a run manifest, and dataset/chromosome logs. All three promised primary
-VCFs must exist and be non-empty before the command returns success. See
+Each dataset receives merged VCFs in both configured builds, indexes,
+intermediate evidence, rejection reports, QC reports, a run manifest, and
+dataset/chromosome logs. The raw same-build GWAS-to-VCF merge is validated as a
+required intermediate, then deleted after successful finalization unless
+`--keep_gwas2vcf_intermediate` (or the corresponding YAML policy) is enabled.
+See
 [Harmonisation Outputs and QC](outputs-and-qc.md).
 
 ## QC and logs

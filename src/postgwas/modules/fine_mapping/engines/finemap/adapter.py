@@ -3,9 +3,7 @@
 import logging
 import math
 import multiprocessing as mp
-import os
 import shutil
-import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from time import time
@@ -14,6 +12,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from postgwas.cli.compute import resolve_compute_args
+from postgwas.core.execution.runtime import safe_thread_count
 from postgwas.modules.fine_mapping.defaults import (
     DEFAULT_BASES_PER_KILOBASE,
     DEFAULT_BGEN_BITS,
@@ -33,8 +33,6 @@ from postgwas.modules.fine_mapping.defaults import (
     DEFAULT_MIN_POSITION,
     DEFAULT_PLINK_MEMORY_MB,
     DEFAULT_SCHEMA_INFERENCE_LENGTH,
-    DEFAULT_SOFTWARE_VERSION_TIMEOUT_SECONDS,
-    DEFAULT_TOOL_VERSION_TIMEOUT_SECONDS,
     SUPPORTED_GENOME_BUILDS,
     get_finemap_defaults,
 )
@@ -62,6 +60,7 @@ from postgwas.modules.fine_mapping.engines.finemap.runner import (
 from postgwas.modules.fine_mapping.progress import ProgressRecorder, write_run_configuration
 from postgwas.modules.fine_mapping.logging_utils import detailed_file_logging
 from postgwas.modules.fine_mapping.output_layout import resolve_output_paths
+from postgwas.modules.fine_mapping.preflight import _validate_runtime_tools
 from postgwas.modules.fine_mapping.resource_guard import (
     VARIANT_LIMIT_FAILURE_REASON,
     combine_reasons,
@@ -71,42 +70,6 @@ from postgwas.modules.fine_mapping.resource_guard import (
 
 
 logger = logging.getLogger("postgwas.modules.fine_mapping")
-
-
-def _resolve_plink2(args, version_timeout_seconds=DEFAULT_TOOL_VERSION_TIMEOUT_SECONDS):
-    """Resolve PLINK 2 and document the exact version used."""
-    supplied = getattr(args, "plink", None)
-    candidate = str(Path(supplied).resolve()) if supplied and Path(supplied).is_file() else None
-    candidate = candidate or shutil.which("plink2")
-    if not candidate:
-        raise EnvironmentError(
-            "PLINK 2 was not found. Provide a PLINK 2 executable with --plink "
-            "or place plink2 on PATH."
-        )
-    probe = subprocess.run(
-        [candidate, "--version"], capture_output=True, text=True,
-        timeout=float(version_timeout_seconds), check=False,
-    )
-    version_text = (probe.stdout or probe.stderr).strip()
-    if probe.returncode != 0 or "PLINK v2" not in version_text:
-        raise EnvironmentError(
-            f"FINEMAP BGEN generation requires PLINK 2; '{candidate}' did not report PLINK v2."
-        )
-    return candidate, version_text.splitlines()[0]
-
-
-def check_dependencies(plink_binary=None):
-    """Ensure required external binaries are available."""
-    required_tools = ["bgenix", "ldstore", "finemap"]
-    missing = [tool for tool in required_tools if shutil.which(tool) is None]
-    if plink_binary is None and shutil.which("plink2") is None:
-        missing.append("plink2")
-    elif plink_binary is not None and not Path(plink_binary).is_file():
-        missing.append(str(plink_binary))
-    if missing:
-        raise EnvironmentError(
-            f"Missing required tools: {', '.join(missing)}. Install them and ensure they are on PATH."
-        )
 
 
 def _normalise_chromosome(values):
@@ -563,6 +526,9 @@ def generate_tasks(
             "finemap_timeout_seconds": args.finemap_timeout_seconds,
             "termination_grace_seconds": args.termination_grace_seconds,
             "plink": args.plink,
+            "bgenix": args.bgenix,
+            "ldstore": args.ldstore,
+            "finemap_executable": args.finemap_executable,
             "genomic_locus": str(row["GenomicLocus"]),
             **locus_coordinates,
             "runtime_defaults": runtime_defaults,
@@ -769,7 +735,7 @@ def _process_single_locus(task):
         )
         logger.info("[STAGE] locus=%s stage=bgen_conversion status=completed", locus_id)
         logger.info("[STAGE] locus=%s stage=bgen_indexing status=started", locus_id)
-        run_bgen_indexing(bgen_file)
+        run_bgen_indexing(bgen_file, bgenix_binary=task["bgenix"])
         logger.info("[STAGE] locus=%s stage=bgen_indexing status=completed", locus_id)
 
         extracted_fam = plink_out.with_suffix(".fam")
@@ -790,6 +756,7 @@ def _process_single_locus(task):
         run_ldstore(
             ldstore_master,
             threads=int(runtime_defaults["external_tool_threads"]),
+            ldstore_binary=task["ldstore"],
             timeout_seconds=task["ldstore_timeout_seconds"],
             termination_grace_seconds=task["termination_grace_seconds"],
         )
@@ -839,6 +806,7 @@ def _process_single_locus(task):
             master_file,
             local_config,
             threads=int(runtime_defaults["external_tool_threads"]),
+            finemap_binary=task["finemap_executable"],
             timeout_seconds=task["finemap_timeout_seconds"],
             termination_grace_seconds=task["termination_grace_seconds"],
         )
@@ -1007,22 +975,6 @@ def process_single_locus(task):
         return _process_single_locus(task)
 
 
-def _software_version(
-    binary,
-    args=("--version",),
-    timeout_seconds=DEFAULT_SOFTWARE_VERSION_TIMEOUT_SECONDS,
-):
-    try:
-        result = subprocess.run(
-            [binary, *args], capture_output=True, text=True,
-            timeout=float(timeout_seconds), check=False,
-        )
-        text = (result.stdout or result.stderr).strip().splitlines()
-        return text[0] if text else "unknown"
-    except Exception:
-        return "unknown"
-
-
 def _finemap_run_configuration(
     args, dirs, ld_ref_prefix, genome_build, plink_version,
     runtime_defaults, resource_parameters,
@@ -1071,6 +1023,9 @@ def _finemap_run_configuration(
         "software": {
             "plink_path": args.plink,
             "plink_version": plink_version,
+            "bgenix_path": args.bgenix,
+            "ldstore_path": args.ldstore,
+            "finemap_path": args.finemap_executable,
         },
         "defaults": runtime_defaults,
     }
@@ -1078,6 +1033,7 @@ def _finemap_run_configuration(
 
 def _run_finemap_pipeline(args, progress, screen=None):
     """Implement the validated FINEMAP workflow with structured progress."""
+    resolve_compute_args(args)
     outdir = Path(args.output_directory).resolve()
     start_time = time()
     pipeline_total = DEFAULT_FINEMAP_PIPELINE_STAGE_TOTAL
@@ -1087,7 +1043,8 @@ def _run_finemap_pipeline(args, progress, screen=None):
         "pipeline", "initialization", 1, pipeline_total, "completed",
         f"output_dir={outdir}",
     )
-    if screen:
+    preflight = getattr(args, "_fine_mapping_preflight", None)
+    if screen and preflight is None:
         screen.complete(1, [
             ("analysis", "Engine", "FINEMAP"),
             ("info", "Dataset", args.dataset_id),
@@ -1098,11 +1055,15 @@ def _run_finemap_pipeline(args, progress, screen=None):
         raise ValueError("genome_build must be GRCh37 or GRCh38")
 
     logger.info("[STAGE] stage=dependency_validation status=started")
-    args.plink, plink_version = _resolve_plink2(
-        args,
-        version_timeout_seconds=runtime_defaults["tool_version_timeout_seconds"],
-    )
-    check_dependencies(args.plink)
+    if preflight is not None:
+        runtime_tools = preflight.tools
+        logger.info(
+            "[STAGE] stage=dependency_validation status=reused_preflight"
+        )
+    else:
+        runtime_tools, _ = _validate_runtime_tools(args)
+    tool_versions = {tool.name: tool.version for tool in runtime_tools}
+    plink_version = tool_versions["PLINK"]
     logger.info(
         "[STAGE] stage=dependency_validation status=completed plink=%s version=%s",
         args.plink,
@@ -1112,7 +1073,7 @@ def _run_finemap_pipeline(args, progress, screen=None):
         "pipeline", "dependency_validation", 2, pipeline_total, "completed",
         f"PLINK={plink_version}",
     )
-    if screen:
+    if screen and preflight is None:
         screen.complete(2, [
             ("success", "External tools", "validated"),
             ("info", "PLINK", plink_version),
@@ -1166,9 +1127,7 @@ def _run_finemap_pipeline(args, progress, screen=None):
                 args, dirs, ld_ref_prefix, genome_build, plink_version,
                 runtime_defaults,
                 {
-                    "requested_threads": getattr(
-                        args, "threads", os.cpu_count() or 1
-                    ) or 1,
+                    "requested_threads": args.threads,
                     "selected_workers": 0,
                     "minimum_memory_per_worker_gb": (
                         args.minimum_memory_per_worker_gb
@@ -1205,17 +1164,7 @@ def _run_finemap_pipeline(args, progress, screen=None):
             % dirs["finemap_locus_status_file"]
         )
 
-    try:
-        import psutil
-        mem_gb = psutil.virtual_memory().total / (1024.0 ** 3)
-    except ImportError:
-        try:
-            mem_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024.0 ** 3)
-        except (AttributeError, ValueError):
-            mem_gb = float(runtime_defaults["fallback_memory_gb"])
-    requested_threads = getattr(
-        args, "threads", os.cpu_count() or 1
-    ) or 1
+    requested_threads = args.threads
     ram_per_worker_gb = max(
         float(runtime_defaults["finemap_ram_per_worker_gb"]),
         float(
@@ -1232,20 +1181,19 @@ def _run_finemap_pipeline(args, progress, screen=None):
     )
     if ram_per_worker_gb <= 0:
         raise ValueError("minimum_memory_per_worker_gb must be greater than zero")
-    max_workers = max(
-        1,
-        min(
-            int(requested_threads),
-            len(tasks),
-            max(1, int(mem_gb // ram_per_worker_gb)),
-        ),
+    max_workers = safe_thread_count(
+        min(int(requested_threads), len(tasks)),
+        ram_per_worker_gb,
+        available_ram_gb=args.memory_gb,
+        enforce_memory_budget=True,
+        reporter=None,
     )
     logger.info(
         "[STAGE] stage=task_generation status=completed tasks=%d workers=%d "
-        "detected_memory_gb=%.3f ram_per_worker_gb=%.3f",
+        "memory_budget_gb=%.3f ram_per_worker_gb=%.3f",
         len(tasks),
         max_workers,
-        mem_gb,
+        args.memory_gb,
         ram_per_worker_gb,
     )
     write_run_configuration(
@@ -1256,7 +1204,7 @@ def _run_finemap_pipeline(args, progress, screen=None):
             {
                 "requested_threads": requested_threads,
                 "selected_workers": max_workers,
-                "detected_memory_gb": mem_gb,
+                "memory_budget_gb": args.memory_gb,
                 "ram_per_worker_gb": ram_per_worker_gb,
             },
         ),
@@ -1461,9 +1409,21 @@ def _run_finemap_pipeline(args, progress, screen=None):
         ])
     pd.DataFrame([
         {"software": "PLINK", "version": plink_version, "path": args.plink},
-        {"software": "bgenix", "version": _software_version("bgenix"), "path": shutil.which("bgenix")},
-        {"software": "LDstore", "version": _software_version("ldstore"), "path": shutil.which("ldstore")},
-        {"software": "FINEMAP", "version": _software_version("finemap"), "path": shutil.which("finemap")},
+        {
+            "software": "bgenix",
+            "version": tool_versions["BGENIX"],
+            "path": args.bgenix,
+        },
+        {
+            "software": "LDstore",
+            "version": tool_versions["LDstore"],
+            "path": args.ldstore,
+        },
+        {
+            "software": "FINEMAP",
+            "version": tool_versions["FINEMAP"],
+            "path": args.finemap_executable,
+        },
         {"software": "genome_build", "version": genome_build, "path": ""},
         {
             "software": "credible_set_coverage",
@@ -1571,6 +1531,7 @@ def run_finemap_pipeline(args, screen=None):
         "postgwas.modules.fine_mapping",
         output_paths["pipeline_log_file"],
         args.fine_mapping_logging["file_level"],
+        mode="a",
     ):
         progress = ProgressRecorder(
             output_paths["pipeline_progress_file"], logger=logger

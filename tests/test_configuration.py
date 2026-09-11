@@ -38,7 +38,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(direct.modules.fine_mapping.locus_window_kb, 0)
         self.assertEqual(
             pipeline.pipeline.modules,
-            ["ld_annotation", "formatting", "ld_clumping", "fine_mapping"],
+            ["ld_clumping", "formatting", "fine_mapping"],
+        )
+        self.assertEqual(
+            pipeline.modules.ld_clumping.methods,
+            ["standard"],
         )
         self.assertTrue(pipeline.modules.fine_mapping.enabled)
         self.assertEqual(pipeline.modules.fine_mapping.genome_build.value, "GRCh37")
@@ -144,6 +148,16 @@ class ConfigurationTests(unittest.TestCase):
             "gcta_gene", cli_overrides={"method": "fastbat_set"},
         )
         self.assertEqual(module.method, "fastbat_set")
+
+    def test_imputation_configuration_exposes_only_the_implemented_engine(self):
+        module = load_configuration().modules.imputation
+
+        self.assertEqual(module.engine, "pred_ld")
+        self.assertEqual(list(module.engines.model_dump()), ["pred_ld"])
+        with self.assertRaisesRegex(ConfigurationError, "engine"):
+            load_configuration(
+                cli_overrides={"modules.imputation.engine": "raiss"},
+            )
 
     def test_module_loader_preserves_explicit_root_override(self):
         module = load_module_configuration(
@@ -349,13 +363,32 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(
             list(document["modules"]),
-            ["ld_annotation", "formatting", "ld_clumping", "fine_mapping"],
+            ["ld_annotation", "ld_clumping", "formatting", "fine_mapping"],
         )
         self.assertEqual(
             document["pipeline"]["modules"],
-            ["ld_annotation", "formatting", "ld_clumping", "fine_mapping"],
+            ["ld_annotation", "ld_clumping", "formatting", "fine_mapping"],
         )
         self.assertTrue(all(module["enabled"] for module in document["modules"].values()))
+
+    def test_standard_finemap_export_omits_unused_ld_annotation(self):
+        config_file = (
+            Path(__file__).parents[1]
+            / "examples"
+            / "fine_mapping"
+            / "pipeline_susie.yaml"
+        )
+        document = yaml.safe_load(
+            render_pipeline_configuration(
+                ["finemap"], config_file=config_file, style="values",
+            )
+        )
+
+        self.assertEqual(
+            document["pipeline"]["modules"],
+            ["ld_clumping", "formatting", "fine_mapping"],
+        )
+        self.assertNotIn("ld_annotation", document["modules"])
 
     def test_flames_pipeline_export_retains_documented_magmacovar_defaults(self):
         rendered = render_pipeline_configuration(["flames"], style="values")
@@ -475,7 +508,7 @@ class ConfigurationTests(unittest.TestCase):
         document = yaml.safe_load(output.getvalue())
         self.assertEqual(
             document["pipeline"]["modules"],
-            ["ld_annotation", "formatting", "ld_clumping", "fine_mapping"],
+            ["ld_annotation", "ld_clumping", "formatting", "fine_mapping"],
         )
 
     def test_config_cli_does_not_advertise_profiles(self):
@@ -494,6 +527,115 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(config.config_version, 1)
         self.assertEqual(config.modules.filtering.maf_min, 0.01)
         self.assertEqual(config.modules.fine_mapping.engine, "susie")
+        self.assertEqual(
+            config.modules.ld_annotation.bed_filename_template,
+            "{genome_build}_{population}_ldetect.bed.gz",
+        )
+        self.assertEqual(
+            config.modules.ld_annotation.info_field_template,
+            "{population}_LDblock",
+        )
+        self.assertEqual(
+            config.modules.ld_annotation.output_filename_template,
+            "{dataset_id}_ldblock.vcf.gz",
+        )
+        self.assertEqual(
+            config.modules.ld_annotation.summary_filename_template,
+            "{dataset_id}_ldblock_summary.csv",
+        )
+        self.assertEqual(
+            config.modules.ld_annotation.html_report_filename_template,
+            "{dataset_id}_ldblock_report.html",
+        )
+        self.assertEqual(
+            config.modules.ld_annotation.canonical_log_filename_template,
+            "{dataset_id}_ldblock.log",
+        )
+        self.assertIsNone(config.modules.ld_annotation.inputs.vcf)
+        self.assertIsNone(config.modules.ld_annotation.inputs.ld_region_dir)
+        self.assertIsNone(config.modules.ld_annotation.inputs.dataset_id)
+        self.assertIsNone(config.modules.ld_annotation.output_directory)
+        self.assertNotIn(
+            "ld_blocks",
+            type(config.resources.populations["EUR"]).model_fields,
+        )
+        with self.assertRaises(ConfigurationError):
+            load_configuration(
+                cli_overrides={
+                    "resources.populations.EUR.ld_blocks": "blocks.bed.gz",
+                }
+            )
+
+    def test_ld_annotation_bed_filename_template_is_schema_validated(self):
+        invalid = (
+            "ldetect.bed.gz",
+            "{genome_build}_{population}_{unexpected}.bed.gz",
+            "../{genome_build}_{population}_ldetect.bed.gz",
+            "{genome_build}_{population}_ldetect.txt.gz",
+        )
+        for template in invalid:
+            with self.subTest(template=template), self.assertRaises(
+                ConfigurationError
+            ):
+                load_configuration(
+                    cli_overrides={
+                        "modules.ld_annotation.bed_filename_template": template,
+                    },
+                )
+
+    def test_ld_annotation_output_and_info_templates_are_schema_validated(self):
+        invalid = {
+            "modules.ld_annotation.info_field_template": (
+                "LDblock",
+                "{population}_{unexpected}",
+                "{population} LDblock",
+            ),
+            "modules.ld_annotation.info_description_template": (
+                "LD block for {population}",
+                'LD "block" for {population} {genome_build}',
+                "LD block for {population} {genome_build} {unexpected}",
+            ),
+            "modules.ld_annotation.output_filename_template": (
+                "ldblock.vcf.gz",
+                "../{dataset_id}_ldblock.vcf.gz",
+                "{dataset_id}_ldblock.vcf",
+            ),
+            "modules.ld_annotation.summary_filename_template": (
+                "ldblock_summary.csv",
+                "../{dataset_id}_ldblock_summary.csv",
+                "{dataset_id}_ldblock_summary.tsv",
+            ),
+            "modules.ld_annotation.html_report_filename_template": (
+                "ldblock_report.html",
+                "../{dataset_id}_ldblock_report.html",
+                "{dataset_id}_ldblock_report.htm",
+            ),
+            "modules.ld_annotation.canonical_log_filename_template": (
+                "ldblock.log",
+                "../{dataset_id}_ldblock.log",
+                "{dataset_id}_ldblock.txt",
+            ),
+        }
+        for key, values in invalid.items():
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaises(
+                    ConfigurationError
+                ):
+                    load_configuration(cli_overrides={key: value})
+
+    def test_annotation_and_clumping_info_fields_match_in_one_pipeline(self):
+        with self.assertRaisesRegex(
+            ConfigurationError,
+            "info_field_template.*vcf_fields.ld_block",
+        ):
+            load_configuration(
+                cli_overrides={
+                    "pipeline.modules": ["ld_annotation", "ld_clumping"],
+                    "modules.ld_annotation.info_field_template": (
+                        "{population}_CUSTOM_BLOCK"
+                    ),
+                },
+            )
 
     def test_precedence_is_cli_user_profile_defaults(self):
         with tempfile.TemporaryDirectory() as directory:

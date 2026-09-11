@@ -139,7 +139,11 @@ class Vcf:
             header.add_line(f"##SAMPLE=<ID={trait_id}{meta_string}>")
 
         # CONTIG
-        assert len(fasta.references) == len(fasta.lengths)
+        if len(fasta.references) != len(fasta.lengths):
+            raise RuntimeError(
+                "Reference FASTA metadata is inconsistent: contig names and lengths "
+                "have different counts"
+            )
         for n, contig in enumerate(fasta.references):
             header.add_line(
                 f"##contig=<ID={contig},length={fasta.lengths[n]}, assembly={build}>"
@@ -195,11 +199,18 @@ class Vcf:
                         f"Imputation INFO field cannot fit into float32. Expect loss of precision for: {result.imp_info}"
                     )
 
+                if " " in result.chrom:
+                    raise ValueError(
+                        "Invalid VCF chromosome label containing whitespace: "
+                        f"{result.chrom!r}"
+                    )
+                if result.pos <= 0:
+                    raise ValueError(
+                        f"Invalid VCF position {result.pos} for chromosome {result.chrom}"
+                    )
                 record = vcf.new_record()
                 record.chrom = result.chrom
-                assert " " not in record.chrom
                 record.pos = result.pos
-                assert record.pos > 0
                 study_id = Vcf.remove_illegal_chars(result.study_id)
                 record.id = study_id
                 record.alleles = (result.ref, result.alt)

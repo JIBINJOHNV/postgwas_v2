@@ -1,3 +1,5 @@
+import copy
+import json
 import os
 import re
 import sys
@@ -8,13 +10,18 @@ from pathlib import Path
 import polars as pl
 
 from postgwas.core.paths import configured_output_path
-from postgwas.core.io.delimiters import open_text, resolve_delimiter
+from postgwas.core.io.delimiters import open_binary, open_text, resolve_delimiter
 
-from postgwas.core.ui.screen import screen_field
-from postgwas.core.values import optional_text
+from postgwas.core.values import missing_tokens, optional_text
 
 from .coordinates import harmonise_coordinates_and_alleles
-from .rejects import RejectCollector, SOURCE_INPUT_ROW_COLUMN
+from .policies import FIELD_LIFECYCLE
+from .p_values import preserve_pvalue_source_text
+from .rejects import (
+    RejectCollector,
+    ReconciliationError,
+    SOURCE_INPUT_ROW_COLUMN,
+)
 from .sample_size import (
     effective_sample_size_expression,
     sample_count_expression,
@@ -22,6 +29,7 @@ from .sample_size import (
 from .shared.runtime import emit_message, reject_rows, resolve_policies
 from .shared.variant_columns import (
     mark_canonical_variant_columns,
+    minimal_allele_representation_series,
     study_string_schema,
 )
 
@@ -117,7 +125,11 @@ def count_data_lines(path: str, skip_hash: bool = True) -> int:
 
 def load_summary_statistics_table(file_path: str, sample_column_dict: dict, policies=None, logger=None):
     policies = resolve_policies(policies)
-    null_values = list(policies.get("input.null_values"))
+    null_values = list(missing_tokens(
+        policies.get("input.null_values"),
+        include_standard=False,
+        exact=True,
+    ))
     infer_rows = int(policies.get("input.schema_inference_rows"))
     comment_prefix = "##" if bool(policies.get("input.strip_double_hash_lines")) else None
     delimiter = resolve_delimiter(
@@ -130,10 +142,16 @@ def load_summary_statistics_table(file_path: str, sample_column_dict: dict, poli
     )
     sep = delimiter.value
     string_schema = study_string_schema(sample_column_dict)
+    pvalue_column = optional_text(sample_column_dict.get("pval_col"))
+    if pvalue_column:
+        # The source token is required to distinguish a literal zero from a
+        # positive probability below Float64 (for example 1e-400).
+        string_schema[pvalue_column] = pl.String
     if string_schema:
         _emit(
             logger,
-            "Variant identity columns read as text to preserve labels exactly: %s."
+            "Variant identity and p-value source columns read as text to "
+            "preserve their exact tokens: %s."
             % ", ".join(string_schema),
         )
     _emit(
@@ -272,6 +290,7 @@ def normalise_summary_statistics_values(
     numeric_columns=None,
     sample_count_columns=None,
     compound_numeric_columns=None,
+    conversion_counts=None,
 ) -> pl.DataFrame:
     """
     Normalize configured scientific numeric columns after the first read.
@@ -283,16 +302,20 @@ def normalise_summary_statistics_values(
     Scalar numeric values that cannot be parsed become null and are reported;
     the immutable source snapshot retains their original text for rejection
     provenance. Sample-count columns reuse their whole-number parser, while
-    configured compound numeric columns such as comma-separated INFO remain
+    configured compound numeric columns such as delimited INFO lists remain
     text for their field-specific parser.
+
+    When supplied, conversion_counts receives existing per-column conversion
+    counters without another data scan or any change to the returned values.
     """
     if df.height == 0:
         return df
-    resolve_policies(policies)
+    policies = resolve_policies(policies)
     preserved = set(preserved_columns or ())
     numeric = set(numeric_columns or ())
     sample_counts = set(sample_count_columns or ())
     compound_numeric = set(compound_numeric_columns or ())
+    compound_delimiter = str(policies.get("info.multi_value_delimiter"))
     # 1. Clean Headers
     df = df.rename({c: c.strip() for c in df.columns})
     # 2. Clean String Values — one pass over every string column, not one
@@ -310,8 +333,14 @@ def normalise_summary_statistics_values(
         if (
             col in compound_numeric
             and original.dtype == pl.String
-            and bool(original.str.contains(",", literal=True).any())
+            and bool(
+                original.str.contains(
+                    compound_delimiter, literal=True,
+                ).any()
+            )
         ):
+            if conversion_counts is not None:
+                conversion_counts[col] = {"status": "compound_values_deferred", "rows": df.height}
             valid_cols.append(pl.col(col))
             continue
         numeric_series = (
@@ -320,6 +349,12 @@ def normalise_summary_statistics_values(
             else original.cast(pl.Float64, strict=False)
         )
         new_nulls = numeric_series.null_count() - original.null_count()
+        if conversion_counts is not None:
+            conversion_counts[col] = {
+                "status": "assessed", "rows": df.height,
+                "non_missing": original.len() - original.null_count(),
+                "invalid": new_nulls,
+            }
         valid_cols.append(numeric_series)
         if new_nulls > 0:
             non_null = original.len() - original.null_count()
@@ -350,94 +385,191 @@ def normalise_summary_statistics_values(
 def normalise_imputation_quality_column(
     df: pl.DataFrame,
     sample_column_dict: dict,
-    policies,
+    policies=None,
+    logger=None,
 ):
+    """Reduce a delimited study INFO list under the resolved YAML policy.
+
+    A scalar study INFO column is returned unchanged. When at least one row
+    contains multiple values separated by ``info.multi_value_delimiter``, every
+    row is parsed to the
+    collision-checked working column configured by
+    ``info.multi_value_output_column``. Finite non-missing values are reduced
+    by the unweighted row-wise median or mean, or the dataset stops when the
+    policy is ``fail``. The original input text remains in the frame and in the
+    immutable source snapshot; the column mapping is updated so all later
+    scientific operations consume the scalar value.
+
+    Sample-size weighting is deliberately unavailable here: the input contract
+    has no ordered cohort-level sample-size vector that can be paired safely
+    with the ordered INFO values.
     """
-    Process IMPINFO column:
-    - If imp_info_col is missing/NA -> do nothing
-    - If IMPINFO is single-valued -> do nothing
-    - If multi-valued and external infofile+infocolumn are provided -> do nothing
-    - Otherwise compute row-wise median and update sample_column_dict['imp_info_col']
-    """
+    policies = resolve_policies(policies)
 
     imp_col = optional_text(sample_column_dict.get("imp_info_col"))
     infofile = optional_text(sample_column_dict.get("infofile"))
     infocolumn = optional_text(sample_column_dict.get("infocolumn"))
+    info_source = optional_text(sample_column_dict.get("info_source"))
 
     if not imp_col or imp_col not in df.columns:
         if infofile and infocolumn:
-            print(screen_field(
-                "info", "Imputation quality",
-                "study column not provided; external file %s, column %s will be used"
-                % (infofile, infocolumn),
-                indent=4, label_width=20,
-            ))
-        return df, sample_column_dict
-
-    # detect whether any row has comma-separated multi-values
-    has_multi = df.select(
-        pl.col(imp_col)
-        .cast(pl.Utf8, strict=False)
-        .str.contains(",")
-        .any()
-    ).item()
-
-    if not has_multi:
-        return df, sample_column_dict
-
-    # if external info resource is provided, prefer that
-    if infofile and infocolumn:
-        print(screen_field(
-            "info", "Imputation quality",
-            "column %s contains multiple values; external file %s, column %s will be used"
-            % (imp_col, infofile, infocolumn),
-            indent=4, label_width=20,
-        ))
-        return df, sample_column_dict
-
-    print(screen_field(
-        "analysis", "Imputation quality",
-        "column %s contains multiple values; calculating one row-wise median"
-        % imp_col,
-        indent=4, label_width=20,
-    ))
-    new_col = f"{imp_col}_median"
-
-    missing_tokens = [
-        str(value).strip().upper()
-        for value in policies.get("input.null_values")
-    ]
-    df = df.with_columns(
-        pl.col(imp_col)
-        .cast(pl.Utf8, strict=False)
-        .str.split(",")
-        .list.eval(
-            pl.when(
-                pl.element()
-                .cast(pl.Utf8, strict=False)
-                .str.strip_chars()
-                .str.to_uppercase()
-                .is_in(missing_tokens)
+            _emit(
+                logger,
+                "Study INFO column was not selected; external file %s, column "
+                "%s will be used." % (infofile, infocolumn),
             )
+        return df, sample_column_dict
+
+    # The validated sample-sheet contract gives the internal source priority
+    # and clears infofile/infocolumn in that case. Direct engine callers may
+    # explicitly select the external source while retaining an unused study
+    # column, so source selection—not mere file presence—controls this branch.
+    if info_source == "external":
+        _emit(
+            logger,
+            "Study INFO column %s was not aggregated because the resolved "
+            "INFO source is the external file %s, column %s."
+            % (imp_col, infofile or "not recorded", infocolumn or "not recorded"),
+        )
+        return df, sample_column_dict
+
+    multi_value_delimiter = str(policies.get("info.multi_value_delimiter"))
+    multi_mask = (
+        pl.col(imp_col)
+        .cast(pl.String, strict=False)
+        .str.contains(multi_value_delimiter, literal=True)
+        .fill_null(False)
+    )
+    multi_value_rows = int(df.select(multi_mask.sum()).item() or 0)
+
+    if not multi_value_rows:
+        return df, sample_column_dict
+
+    aggregation = str(policies.get("info.multi_value_aggregation"))
+    if aggregation == "fail":
+        raise ValueError(
+            "Study INFO column %r contains values separated by %r in %d row(s), "
+            "and info.multi_value_aggregation is 'fail'. Supply one scalar INFO "
+            "value per variant, or explicitly select the unweighted 'median' or "
+            "'mean' policy in the run configuration."
+            % (imp_col, multi_value_delimiter, multi_value_rows)
+        )
+
+    output_col = str(policies.get("info.multi_value_output_column"))
+    if output_col in df.columns:
+        raise ValueError(
+            "Configured INFO aggregation output column %r already exists in the "
+            "study table. Rename the input column or change "
+            "info.multi_value_output_column; PostGWAS will not overwrite it."
+            % output_col
+        )
+
+    normalized_missing_tokens = missing_tokens(
+        policies.get("input.null_values"),
+        include_standard=True,
+    )
+    used_names = set(df.columns)
+    invalid_count_col = _temporary_column(
+        used_names, "__postgwas_info_invalid_token_count",
+    )
+    token = pl.element().cast(pl.String, strict=False).str.strip_chars()
+    numeric = token.cast(pl.Float64, strict=False)
+    token_is_missing = token.str.to_uppercase().is_in(
+        normalized_missing_tokens
+    )
+    numeric_is_finite = numeric.is_finite().fill_null(False)
+    token_lists = (
+        pl.col(imp_col)
+        .cast(pl.String, strict=False)
+        .str.split(multi_value_delimiter)
+    )
+    finite_values = (
+        token_lists.list.eval(
+            pl.when(token_is_missing)
             .then(None)
-            .otherwise(pl.element().cast(pl.Float64, strict=False))
+            .when(numeric_is_finite)
+            .then(numeric)
+            .otherwise(None)
         )
         .list.drop_nulls()
-        .list.median()
-        .alias(new_col)
     )
+    aggregate_expression = (
+        finite_values.list.median()
+        if aggregation == "median"
+        else finite_values.list.mean()
+    )
+    df = df.with_columns([
+        aggregate_expression.cast(pl.Float64).alias(output_col),
+        token_lists.list.eval(
+            pl.when(token_is_missing | numeric_is_finite)
+            .then(pl.lit(0, dtype=pl.UInt32))
+            .otherwise(pl.lit(1, dtype=pl.UInt32))
+        )
+        .list.sum()
+        .alias(invalid_count_col),
+    ])
 
-    sample_column_dict["imp_info_col"] = new_col
+    statistics = df.select([
+        pl.col(invalid_count_col).fill_null(0).sum().alias("invalid_tokens"),
+        (pl.col(invalid_count_col).fill_null(0) > 0)
+        .sum()
+        .alias("rows_with_invalid_tokens"),
+        pl.col(output_col).is_null().sum().alias("missing_aggregates"),
+    ]).row(0, named=True)
+    invalid_tokens = int(statistics["invalid_tokens"] or 0)
+    invalid_rows = int(statistics["rows_with_invalid_tokens"] or 0)
+    invalid_token_action = str(
+        policies.get("info.multi_value_invalid_token_action")
+    )
+    if invalid_tokens and invalid_token_action == "fail":
+        raise ValueError(
+            "Study INFO column %r contains %d non-missing token(s) that are not "
+            "finite numbers across %d row(s), and "
+            "info.multi_value_invalid_token_action is 'fail'. Correct those "
+            "tokens or explicitly select 'ignore' in the run configuration."
+            % (imp_col, invalid_tokens, invalid_rows)
+        )
+    df = df.drop(invalid_count_col)
 
-    missing_count = df.select(pl.col(new_col).is_null().sum()).item()
-    print(screen_field(
-        "success", "INFO column", "%s created" % new_col,
-        indent=4, label_width=20,
-    ))
-    print(screen_field(
-        "warning" if missing_count else "info", "Missing INFO medians",
-        "{:,}".format(missing_count), indent=4, label_width=20,
-    ))
+    sample_column_dict["info_multi_value_source_column"] = imp_col
+    sample_column_dict["info_multi_value_aggregation"] = aggregation
+    sample_column_dict["info_multi_value_output_column"] = output_col
+    sample_column_dict["imp_info_col"] = output_col
+
+    _emit(
+        logger,
+        "INFO aggregation decision: %d row(s) in source column %r contained "
+        "values separated by %r; info.multi_value_aggregation=%r created "
+        "scalar column %r before duplicate validation. The aggregation is "
+        "unweighted because no aligned cohort-level sample-size vector was "
+        "provided."
+        % (
+            multi_value_rows,
+            imp_col,
+            multi_value_delimiter,
+            aggregation,
+            output_col,
+        ),
+    )
+    if invalid_tokens:
+        _emit(
+            logger,
+            "INFO aggregation applied "
+            "info.multi_value_invalid_token_action='ignore' to %d non-missing "
+            "token(s) that were not "
+            "finite numbers across %d row(s); valid finite tokens in those rows "
+            "were still aggregated."
+            % (invalid_tokens, invalid_rows),
+            warn=True,
+        )
+    missing_aggregates = int(statistics["missing_aggregates"] or 0)
+    _emit(
+        logger,
+        "INFO aggregation produced %d missing scalar value(s) among %d study "
+        "row(s); chromosome INFO missing-value policy will handle them."
+        % (missing_aggregates, df.height),
+        warn=bool(missing_aggregates),
+    )
     return df, sample_column_dict
 
 
@@ -449,7 +581,7 @@ class AmbiguousColumnMappingError(ValueError):
     """
 
 
-def _resolve_required_columns(sample_column_dict, df_columns, policies, logger):
+def _resolve_mapped_columns(sample_column_dict, df_columns, policies, logger):
     """The configured columns present in the frame, each exactly once.
 
     ``required_cols`` used to be built from 13 config keys with no
@@ -490,18 +622,449 @@ def _resolve_required_columns(sample_column_dict, df_columns, policies, logger):
     return [c for c in order if c in df_columns]
 
 
+def _effective_field_requirements(policies):
+    """Return effective read requirements from ``columns.mandatory``.
+
+    Plain fields are independently mandatory. Nested lists are alternative
+    groups for which at least one member must be present on each row.
+    """
+    plain = []
+    alternatives = []
+    for entry in policies.get("columns.mandatory") or []:
+        if isinstance(entry, (list, tuple)):
+            alternatives.append([
+                str(field).strip().lower() for field in entry
+            ])
+        else:
+            plain.append(str(entry).strip().lower())
+    return plain, alternatives
+
+
+def _selected_required_input_alternative(field, sample_column_dict, policies):
+    """Find the configured source alternative associated with one field.
+
+    The canonical registry owns the input alternatives. This function searches
+    that resolved registry rather than encoding special cases for EAF, INFO,
+    effect estimates, or sample size in reporting code.
+    """
+    config_key = FIELD_TO_CONFIG_KEY.get(field)
+    if config_key is None:
+        return None, []
+    for group, specification in policies.required_inputs.items():
+        alternatives = specification.get("any_of") or []
+        if not any(config_key in alternative for alternative in alternatives):
+            continue
+        for alternative in alternatives:
+            if all(
+                optional_text(sample_column_dict.get(key)) is not None
+                for key in alternative
+            ):
+                return str(group), [str(key) for key in alternative]
+    return None, []
+
+
+def _input_field_completeness(df, sample_column_dict, policies):
+    """Build the structured post-parse completeness and recovery plan.
+
+    These counts are intentionally measured immediately after parsing and
+    before numeric normalization. A later unparseable numeric token is reported
+    by numeric normalization and is not mislabelled here as an input null.
+    """
+    plain, alternatives = _effective_field_requirements(policies)
+    alternative_by_field = {}
+    for group in alternatives:
+        for field in group:
+            alternative_by_field[field] = list(group)
+
+    configured_columns = {}
+    for field in FIELD_LIFECYCLE:
+        config_key = FIELD_TO_CONFIG_KEY.get(field)
+        column = optional_text(sample_column_dict.get(config_key)) if config_key else None
+        if column is not None and column in df.columns:
+            configured_columns[field] = column
+
+    unique_columns = list(dict.fromkeys(
+        column
+        for key in COLUMN_CONFIG_KEYS
+        if (
+            (column := optional_text(sample_column_dict.get(key))) is not None
+            and column in df.columns
+        )
+    ))
+    missing_by_column = {}
+    if unique_columns:
+        counts = df.select([
+            pl.col(column).is_null().sum().alias("__missing_%d" % index)
+            for index, column in enumerate(unique_columns)
+        ]).row(0)
+        missing_by_column = dict(zip(unique_columns, (int(value) for value in counts)))
+
+    effective_fields = list(FIELD_LIFECYCLE)
+    for field in plain + [member for group in alternatives for member in group]:
+        if field not in effective_fields:
+            effective_fields.append(field)
+    for field in policies.get("final_check.require") or []:
+        field = str(field).strip().lower()
+        if field not in effective_fields:
+            effective_fields.append(field)
+
+    final_order = {
+        str(field).strip().lower(): index
+        for index, field in enumerate(
+            policies.get("final_check.require") or [],
+            start=1,
+        )
+    }
+    final_required = set(final_order)
+    fields = []
+    for field in effective_fields:
+        lifecycle = dict(FIELD_LIFECYCLE.get(field) or {})
+        config_key = FIELD_TO_CONFIG_KEY.get(field)
+        configured_column = (
+            optional_text(sample_column_dict.get(config_key))
+            if config_key else None
+        )
+        direct_input_column = configured_columns.get(field)
+        source_group, source_keys = _selected_required_input_alternative(
+            field, sample_column_dict, policies,
+        )
+        source_input_columns = [
+            str(sample_column_dict[key])
+            for key in source_keys
+            if (
+                key in COLUMN_CONFIG_KEYS
+                and optional_text(sample_column_dict.get(key)) in df.columns
+            )
+        ]
+        input_column = direct_input_column
+        if input_column is None and source_group == "coordinates" and len(source_input_columns) == 1:
+            input_column = source_input_columns[0]
+        input_missing = (
+            missing_by_column[input_column]
+            if input_column in missing_by_column else None
+        )
+        recovery = optional_text(lifecycle.get("recovered"))
+
+        if direct_input_column is not None:
+            source_kind = "study_column"
+            source_label = "study column %s" % direct_input_column
+            source_keys = [config_key] if config_key else []
+            source_input_columns = [direct_input_column]
+        elif configured_column is not None:
+            source_kind = "configured_column_absent"
+            source_label = "configured column %s is absent" % configured_column
+        elif source_keys:
+            source_kind = "configured_alternative"
+            source_label = "configured %s" % " + ".join(source_keys)
+        elif recovery is not None:
+            source_kind = "recovery_step"
+            source_label = "not supplied; recover at %s" % recovery
+        else:
+            source_kind = "not_configured"
+            source_label = "not configured"
+
+        alternative_group = alternative_by_field.get(field)
+        if (
+            field in plain
+            and configured_column is None
+            and direct_input_column is None
+            and source_keys
+        ):
+            read_requirement = "required_via_configured_alternative"
+            read_action = "validate_configured_alternative_during_normalisation"
+        elif field in plain:
+            read_requirement = "required"
+            read_action = "reject_row_if_missing"
+        elif alternative_group is not None:
+            read_requirement = "alternative"
+            read_action = "reject_row_if_all_alternatives_missing"
+        elif recovery is not None and direct_input_column is not None:
+            read_requirement = "downstream_validated"
+            read_action = "retain_for_field_specific_downstream_policy"
+        elif recovery is not None:
+            read_requirement = "recoverable"
+            read_action = "retain_for_configured_recovery_and_downstream_policy"
+        else:
+            read_requirement = "optional"
+            read_action = "not_required_at_read"
+
+        is_final_required = field in final_required
+        fields.append({
+            "field": field,
+            "configured_column": configured_column,
+            "input_column": input_column,
+            "source_kind": source_kind,
+            "source_label": source_label,
+            "source_requirement_group": source_group,
+            "source_config_keys": source_keys,
+            "source_values": {key: sample_column_dict[key] for key in source_keys},
+            "source_input_columns": source_input_columns,
+            "read_requirement": read_requirement,
+            "read_alternative_group": alternative_group or [],
+            "read_action": read_action,
+            "recovery_step": recovery,
+            "input_rows": int(df.height),
+            "post_parse_missing": input_missing,
+            "post_parse_missing_fraction": (
+                float(input_missing) / float(df.height)
+                if input_missing is not None and df.height else None
+            ),
+            "final_required": is_final_required,
+            "final_order": final_order.get(field),
+            "final_missing": None,
+            "final_action": (
+                str(policies.get("final_check.on_missing"))
+                if is_final_required else "not_checked_by_final_gate"
+            ),
+            "final_status": "pending" if is_final_required else "not_required",
+            "lifecycle_note": optional_text(lifecycle.get("note")),
+        })
+
+    alternative_groups = []
+    for group in alternatives:
+        columns = [
+            configured_columns[field]
+            for field in group
+            if field in configured_columns
+        ]
+        missing_all = None
+        if columns:
+            missing_all = int(df.select(
+                pl.all_horizontal([
+                    pl.col(column).is_null() for column in columns
+                ]).sum().alias("missing_all")
+            ).item() or 0)
+        alternative_groups.append({
+            "fields": list(group),
+            "input_columns": columns,
+            "input_rows": int(df.height),
+            "post_parse_missing_all": missing_all,
+            "post_parse_missing_all_fraction": (
+                float(missing_all) / float(df.height)
+                if missing_all is not None and df.height else None
+            ),
+            "read_action": "reject_row_if_all_alternatives_missing",
+        })
+
+    return {
+        "input_measurement_stage": "post_parse_before_numeric_normalisation",
+        "input_rows": int(df.height),
+        "numeric_conversion_by_column": {},
+        "info_missing_action": str(policies.get("info.on_missing")),
+        "post_parse_missing_by_column": missing_by_column,
+        "read_mandatory_policy": copy.deepcopy(
+            policies.get("columns.mandatory")
+        ),
+        "rows_removed_at_read_mandatory_gate": 0,
+        "fields": fields,
+        "read_alternative_groups": alternative_groups,
+        "final_check": {
+            "required_fields": list(policies.get("final_check.require")),
+            "on_missing": str(policies.get("final_check.on_missing")),
+            "measurement": "pending post-recovery assessment",
+            "expected_chromosomes": [],
+            "completed_chromosomes": [],
+            "unassessed_chromosomes": [],
+            "rows_entering_gate": None,
+            "rows_retained_after_gate": None,
+            "status": "pending",
+        },
+    }
+
+
+def finalise_field_completeness_report(
+    report, chromosome_summaries, completed_chromosomes,
+    expected_chromosomes=None,
+):
+    """Add post-recovery final-gate counts from completed chromosomes."""
+    completed = [str(chromosome) for chromosome in completed_chromosomes or []]
+    expected = [
+        str(chromosome)
+        for chromosome in (expected_chromosomes or completed)
+    ]
+    final = copy.deepcopy(report)
+    required = set(final["final_check"]["required_fields"])
+    action = str(final["final_check"].get("on_missing") or "")
+    if action == "reject":
+        measurement = "sequential rule attribution in final_check.require order"
+    elif action == "keep":
+        measurement = "independent per-field matches; rows may appear in multiple counts"
+    else:
+        measurement = "fail-fast field assessment in final_check.require order"
+    final_qc_by_chromosome = {}
+    for chromosome in completed:
+        summary = chromosome_summaries.get(chromosome) or {}
+        final_qc = (
+            (summary.get("stage_qc") or {}).get("final_completeness_qc")
+            or {}
+        )
+        if final_qc:
+            final_qc_by_chromosome[chromosome] = final_qc
+
+    for field_report in final["fields"]:
+        field = field_report["field"]
+        if field not in required:
+            continue
+        counts = []
+        skipped = []
+        complete = bool(completed)
+        for chromosome in completed:
+            final_qc = final_qc_by_chromosome.get(chromosome)
+            if final_qc is None:
+                complete = False
+                break
+            missing_by_field = final_qc.get("missing_by_field") or {}
+            if field in missing_by_field:
+                counts.append(int(missing_by_field[field]))
+            elif field in (final_qc.get("fields_skipped") or {}):
+                skipped.append(chromosome)
+            else:
+                complete = False
+                break
+        chromosome_scope_complete = set(completed) == set(expected) and bool(expected)
+        if complete and counts and not skipped:
+            field_report["final_missing"] = sum(counts)
+            field_report["final_status"] = (
+                "assessed" if chromosome_scope_complete
+                else "partial_chromosome_coverage"
+            )
+        elif complete and skipped and not counts:
+            field_report["final_missing"] = None
+            field_report["final_status"] = "not_assessed_by_missing_value_policy"
+        else:
+            field_report["final_missing"] = None
+            field_report["final_status"] = "incomplete"
+
+    assessed = [
+        chromosome for chromosome in completed
+        if chromosome in final_qc_by_chromosome
+    ]
+    unassessed = [
+        chromosome for chromosome in expected
+        if chromosome not in final_qc_by_chromosome
+    ]
+    complete_qc = not unassessed and bool(expected)
+    final["final_check"].update({
+        "measurement": measurement,
+        "expected_chromosomes": expected,
+        "completed_chromosomes": assessed,
+        "unassessed_chromosomes": unassessed,
+        "rows_entering_gate": (
+            sum(
+                int(final_qc_by_chromosome[chromosome].get("initial_variants") or 0)
+                for chromosome in assessed
+            )
+            if assessed else None
+        ),
+        "rows_retained_after_gate": (
+            sum(
+                int(final_qc_by_chromosome[chromosome].get("final_variants") or 0)
+                for chromosome in assessed
+            )
+            if assessed else None
+        ),
+        "status": (
+            "complete" if complete_qc
+            else "partial" if assessed
+            else "incomplete"
+        ),
+    })
+    return final
+
+
+def write_field_completeness_report(path, report, delimiter):
+    """Write the manifest's field-completeness evidence as a flat QC table."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    removed = report.get("rows_removed_at_read_mandatory_gate")
+    final_check = report.get("final_check") or {}
+    shared = {
+        "input_measurement_stage": report.get("input_measurement_stage"),
+        "read_gate_rows_rejected_total": removed,
+        "final_measurement": final_check.get("measurement"),
+        "final_expected_chromosomes": json.dumps(
+            final_check.get("expected_chromosomes") or []
+        ),
+        "final_assessed_chromosomes": json.dumps(
+            final_check.get("completed_chromosomes") or []
+        ),
+        "final_unassessed_chromosomes": json.dumps(
+            final_check.get("unassessed_chromosomes") or []
+        ),
+        "final_report_status": final_check.get("status"),
+    }
+    for field in report.get("fields") or []:
+        rows.append({
+            **shared,
+            "record_type": "field",
+            "field": field["field"],
+            "configured_column": field.get("configured_column"),
+            "source": field.get("source_label"),
+            "source_config_keys": json.dumps(
+                field.get("source_config_keys") or []
+            ),
+            "source_input_columns": json.dumps(
+                field.get("source_input_columns") or []
+            ),
+            "read_requirement": field.get("read_requirement"),
+            "read_action": field.get("read_action"),
+            "read_alternative_group": json.dumps(
+                field.get("read_alternative_group") or []
+            ),
+            "recovery_step": field.get("recovery_step"),
+            "input_rows": field.get("input_rows"),
+            "post_parse_missing": field.get("post_parse_missing"),
+            "post_parse_missing_fraction": field.get(
+                "post_parse_missing_fraction"
+            ),
+            "numeric_conversion": json.dumps(
+                (report.get("numeric_conversion_by_column") or {}).get(field.get("input_column"))
+            ),
+            "final_required": field.get("final_required"),
+            "final_order": field.get("final_order"),
+            "final_missing": field.get("final_missing"),
+            "final_action": field.get("final_action"),
+            "final_status": field.get("final_status"),
+            "lifecycle_note": field.get("lifecycle_note"),
+        })
+    for group in report.get("read_alternative_groups") or []:
+        rows.append({
+            **shared,
+            "record_type": "read_alternative_group",
+            "field": json.dumps(group["fields"]),
+            "configured_column": json.dumps(group["input_columns"]),
+            "source": "at least one alternative is required",
+            "source_config_keys": None,
+            "source_input_columns": json.dumps(group["input_columns"]),
+            "read_requirement": "alternative_group",
+            "read_action": group.get("read_action"),
+            "read_alternative_group": json.dumps(group["fields"]),
+            "recovery_step": None,
+            "input_rows": group.get("input_rows"),
+            "post_parse_missing": group.get("post_parse_missing_all"),
+            "post_parse_missing_fraction": group.get(
+                "post_parse_missing_all_fraction"
+            ),
+            "final_required": None,
+            "final_order": None,
+            "final_missing": None,
+            "final_action": group.get("read_action"),
+            "final_status": "read_gate_assessed",
+            "lifecycle_note": None,
+        })
+    pl.DataFrame(rows).write_csv(path, separator=delimiter)
+    report["report_path"] = str(path)
+    return str(path)
+
+
 def _missing_data_mask(df, sample_column_dict, policies, logger):
     """Return the mask for variants missing a scientifically required field."""
     # A nested entry is an alternative: the variant needs at least ONE of its
     # members. That is how the effect estimate is expressed as [beta, zscore]:
     # either value is sufficient because the downstream steps derive the other.
     spec = policies.get("columns.mandatory")
-    plain, alternatives = [], []
-    for entry in spec or []:
-        if isinstance(entry, (list, tuple)):
-            alternatives.append(list(entry))
-        else:
-            plain.append(entry)
+    plain, alternatives = _effective_field_requirements(policies)
     mandatory = _fields_to_columns(plain, sample_column_dict, set(df.columns))
     alt_columns = [
         _fields_to_columns(group, sample_column_dict, set(df.columns))
@@ -565,14 +1128,38 @@ def resolve_duplicate_variants(
     policies=None,
     logger=None,
     rejects=None,
+    *,
+    step_label="02 fix_chr_pos_allele",
+    reference_aligned=False,
 ):
     """Validate duplicate groups and retain one scientifically consistent row.
 
-    Rows are grouped by ``duplicates.key``. Within a group, non-null values in
-    every available ``duplicates.consistency_fields`` column must agree exactly.
-    Conflicting groups are removed in full. Consistent groups retain one row by
-    the configured quality ranking, ending with original input order so the
-    result is reproducible. The original row order is restored before return.
+    Rows are grouped by ``duplicates.key``. When position, effect allele and
+    other allele participate in that key, shared VCF padding is minimally
+    trimmed in private key columns before the upper-case lexicographically
+    normalized allele pair is formed. Original study coordinates and alleles
+    are never changed, and no reference-based left-alignment occurs. Thus A/G
+    and G/A, as well as equivalent padded indel representations, identify the
+    same physical allele pair. A group that contains both ordered
+    representations is removed in full because effect, Z, and frequency values
+    cannot be reconciled before their semantics and reference orientation are
+    resolved. Among same-orientation rows, non-null values in every available
+    ``duplicates.consistency_fields`` column must agree. Dataset-stage values
+    use exact equality; the reference-aligned pass permits only the configured
+    relative floating-point roundoff. Conflicting groups are removed in full.
+    Consistent groups retain one row by the configured quality ranking, ending
+    with original input order so the result is reproducible. The original row
+    order is restored before return.
+
+    ``reference_aligned=True`` identifies the second, chromosome-level pass:
+    strand step 04 has already placed REF in the other-allele column and ALT in
+    the effect-allele column, transformed allele-dependent statistics, and
+    finished any reference-backed effect-frequency alignment. This lets
+    reverse-complement input representations such as A/G and T/C converge on
+    one physical variant before the same conservative consistency and ranking
+    rules are applied. With the canonical key, both alleles remain key
+    components, so distinct alternate alleles at a multiallelic coordinate are
+    never collapsed merely because their chromosome and position agree.
 
     Returns ``(retained_frame, duplicate_report, statistics)``.
     """
@@ -617,12 +1204,71 @@ def resolve_duplicate_variants(
     input_order_col = _temporary_column(used_names, "__postgwas_duplicate_input_order")
     key_columns = []
     key_expressions = []
+    key_columns_by_field = dict(key_pairs)
+    unordered_allele_key = {"ea", "oa"}.issubset(key_columns_by_field)
+    minimally_trimmed_key = {"pos", "ea", "oa"}.issubset(
+        key_columns_by_field
+    )
+    ordered_allele_col = None
+    allele_key_expressions = {}
+    working = df.with_row_index(input_order_col)
+    if unordered_allele_key:
+        if minimally_trimmed_key:
+            minimal_position_col = _temporary_column(
+                used_names, "__postgwas_duplicate_minimal_position",
+            )
+            minimal_effect_col = _temporary_column(
+                used_names, "__postgwas_duplicate_minimal_effect_allele",
+            )
+            minimal_other_col = _temporary_column(
+                used_names, "__postgwas_duplicate_minimal_other_allele",
+            )
+            working = working.with_columns(
+                minimal_allele_representation_series(
+                    df,
+                    key_columns_by_field["pos"],
+                    key_columns_by_field["ea"],
+                    key_columns_by_field["oa"],
+                    position_output=minimal_position_col,
+                    first_allele_output=minimal_effect_col,
+                    second_allele_output=minimal_other_col,
+                )
+            )
+            effect_allele = pl.col(minimal_effect_col)
+            other_allele = pl.col(minimal_other_col)
+        else:
+            effect_allele = (
+                pl.col(key_columns_by_field["ea"])
+                .cast(pl.String, strict=False)
+                .str.strip_chars()
+                .str.to_uppercase()
+            )
+            other_allele = (
+                pl.col(key_columns_by_field["oa"])
+                .cast(pl.String, strict=False)
+                .str.strip_chars()
+                .str.to_uppercase()
+            )
+        effect_first = effect_allele <= other_allele
+        allele_key_expressions = {
+            "ea": pl.when(effect_first).then(effect_allele).otherwise(other_allele),
+            "oa": pl.when(effect_first).then(other_allele).otherwise(effect_allele),
+        }
+        if minimally_trimmed_key:
+            allele_key_expressions["pos"] = pl.col(minimal_position_col)
+        ordered_allele_col = _temporary_column(
+            used_names, "__postgwas_duplicate_ordered_alleles",
+        )
+        key_expressions.append(
+            pl.concat_str([effect_allele, other_allele], separator=">")
+            .alias(ordered_allele_col)
+        )
     for index, (field, column) in enumerate(key_pairs):
         key_column = _temporary_column(
             used_names, "__postgwas_duplicate_key_%d" % index,
         )
-        expression = pl.col(column)
-        if field in {"chr", "ea", "oa"}:
+        expression = allele_key_expressions.get(field, pl.col(column))
+        if field == "chr" or (field in {"ea", "oa"} and not unordered_allele_key):
             expression = (
                 expression.cast(pl.String, strict=False)
                 .str.strip_chars()
@@ -632,12 +1278,19 @@ def resolve_duplicate_variants(
         key_expressions.append(expression.alias(key_column))
 
     duplicate_col = _temporary_column(used_names, "__postgwas_is_duplicate")
+    swapped_orientation_col = _temporary_column(
+        used_names, "__postgwas_duplicate_swapped_orientation",
+    )
     working = (
-        df.with_row_index(input_order_col)
-        .with_columns(key_expressions)
-        .with_columns(
-            pl.struct(key_columns).is_duplicated().alias(duplicate_col)
-        )
+        working.with_columns(key_expressions)
+        .with_columns([
+            pl.struct(key_columns).is_duplicated().alias(duplicate_col),
+            (
+                pl.col(ordered_allele_col).n_unique().over(key_columns) > 1
+                if ordered_allele_col is not None
+                else pl.lit(False)
+            ).alias(swapped_orientation_col),
+        ])
     )
     duplicate_rows = working.filter(pl.col(duplicate_col))
     if duplicate_rows.is_empty():
@@ -646,8 +1299,11 @@ def resolve_duplicate_variants(
             "duplicate_rows": 0,
             "consistent_groups": 0,
             "conflicting_groups": 0,
+            "swapped_orientation_groups": 0,
+            "swapped_orientation_rows": 0,
             "consistent_rows_removed": 0,
             "conflicting_rows_removed": 0,
+            "swapped_orientation_rows_removed": 0,
             "rows_removed": 0,
         }
         return (
@@ -660,6 +1316,11 @@ def resolve_duplicate_variants(
         str(field).strip().lower()
         for field in policies.get("duplicates.consistency_fields")
     ]
+    post_orientation_relative_tolerance = (
+        float(policies.get("duplicates.post_orientation_relative_tolerance"))
+        if reference_aligned
+        else 0.0
+    )
     consistency_pairs = _field_column_pairs(
         consistency_fields, sample_column_dict, set(df.columns),
     )
@@ -685,11 +1346,32 @@ def resolve_duplicate_variants(
             used_names, "__postgwas_duplicate_conflict_%d" % index,
         )
         conflict_columns.append(conflict_column)
-        conflict_expressions.append(
-            (
-                pl.col(column).drop_nulls().n_unique().over(key_columns) > 1
-            ).alias(conflict_column)
+        exact_conflict = (
+            pl.col(column).drop_nulls().n_unique().over(key_columns) > 1
         )
+        if (
+            post_orientation_relative_tolerance > 0.0
+            and field in {"beta", "se", "zscore", "pval", "eaf", "info"}
+        ):
+            numeric = pl.col(column).cast(pl.Float64, strict=False)
+            non_null_count = numeric.is_not_null().sum().over(key_columns)
+            all_finite = numeric.drop_nulls().is_finite().all().over(key_columns)
+            group_min = numeric.drop_nulls().min().over(key_columns)
+            group_max = numeric.drop_nulls().max().over(key_columns)
+            scale = pl.max_horizontal(group_min.abs(), group_max.abs())
+            conflict = (
+                pl.when(non_null_count <= 1)
+                .then(pl.lit(False))
+                .when(all_finite)
+                .then(
+                    (group_max - group_min).abs()
+                    > post_orientation_relative_tolerance * scale
+                )
+                .otherwise(exact_conflict)
+            )
+        else:
+            conflict = exact_conflict
+        conflict_expressions.append(conflict.alias(conflict_column))
 
     conflict_col = _temporary_column(used_names, "__postgwas_duplicate_conflicting")
     duplicate_rows = (
@@ -796,12 +1478,16 @@ def resolve_duplicate_variants(
                 if SOURCE_INPUT_ROW_COLUMN in ordered.columns
                 else pl.col(input_order_col) + 1
             ).alias("duplicate_input_row"),
-            pl.when(pl.col(conflict_col))
+            pl.when(pl.col(swapped_orientation_col))
+            .then(pl.lit("swapped_orientation"))
+            .when(pl.col(conflict_col))
             .then(pl.lit("conflicting"))
             .otherwise(pl.lit("consistent"))
             .alias("duplicate_class"),
             conflict_fields_expression.alias("duplicate_conflicting_fields"),
-            pl.when(pl.col(conflict_col))
+            pl.when(pl.col(swapped_orientation_col))
+            .then(pl.lit(conflict_action))
+            .when(pl.col(conflict_col))
             .then(pl.lit(conflict_action))
             .when(pl.col(group_head_col))
             .then(pl.lit("kept"))
@@ -813,29 +1499,64 @@ def resolve_duplicate_variants(
     )
 
     group_heads = ordered.filter(pl.col(group_head_col))
-    conflicting_groups = group_heads.filter(pl.col(conflict_col)).height
-    consistent_groups = group_heads.height - conflicting_groups
+    swapped_orientation_groups = group_heads.filter(
+        pl.col(swapped_orientation_col)
+    ).height
+    swapped_orientation_rows = ordered.filter(
+        pl.col(swapped_orientation_col)
+    ).height
+    conflicting_groups = group_heads.filter(
+        pl.col(conflict_col) & ~pl.col(swapped_orientation_col)
+    ).height
+    consistent_groups = (
+        group_heads.height - conflicting_groups - swapped_orientation_groups
+    )
+
+    retained_duplicates, swapped_orientation_removed = reject_rows(
+        ordered,
+        pl.col(swapped_orientation_col),
+        step_label=step_label,
+        reason="swapped_orientation_duplicate",
+        collector=rejects,
+        detail=(
+            "effect and other allele order differs within the reference-aligned "
+            "allele-pair group"
+            if reference_aligned else
+            "effect and other allele order differs within the normalized "
+            "allele-pair group"
+        ),
+    )
 
     retained_duplicates, conflicting_removed = reject_rows(
-        ordered,
+        retained_duplicates,
         pl.col(conflict_col),
-        step_label="02 fix_chr_pos_allele",
+        step_label=step_label,
         reason="conflicting_duplicate",
         collector=rejects,
-        detail="non-empty values disagree in one or more of %s"
-        % ",".join(resolved_consistency_fields),
+        detail=(
+            "%snon-empty values disagree in one or more of %s"
+            % (
+                "reference-aligned " if reference_aligned else "",
+                ",".join(resolved_consistency_fields),
+            )
+        ),
     )
     retained_duplicates, consistent_removed = reject_rows(
         retained_duplicates,
         ~pl.col(group_head_col),
-        step_label="02 fix_chr_pos_allele",
+        step_label=step_label,
         reason="duplicate_variant",
         collector=rejects,
-        detail="scientific values agree; selected by %s"
-        % ",".join(selection_order),
+        detail=(
+            "%sscientific values agree; selected by %s"
+            % (
+                "reference-aligned " if reference_aligned else "",
+                ",".join(selection_order),
+            )
+        ),
     )
 
-    selected_input_rows = retained_duplicates.get_column(input_order_col).implode()
+    selected_input_rows = retained_duplicates.get_column(input_order_col).to_list()
     retained = working.filter(
         ~pl.col(duplicate_col)
         | pl.col(input_order_col).is_in(selected_input_rows)
@@ -847,23 +1568,34 @@ def resolve_duplicate_variants(
         "duplicate_rows": ordered.height,
         "consistent_groups": consistent_groups,
         "conflicting_groups": conflicting_groups,
+        "swapped_orientation_groups": swapped_orientation_groups,
+        "swapped_orientation_rows": swapped_orientation_rows,
         "consistent_rows_removed": consistent_removed,
         "conflicting_rows_removed": conflicting_removed,
-        "rows_removed": consistent_removed + conflicting_removed,
+        "swapped_orientation_rows_removed": swapped_orientation_removed,
+        "rows_removed": (
+            consistent_removed
+            + conflicting_removed
+            + swapped_orientation_removed
+        ),
     }
     _emit(
         logger,
-        "Duplicate validation: %d groups (%d consistent, %d conflicting); "
-        "%d rows removed. Consistency fields: %s. Selection order: %s."
+        "%sduplicate validation: %d groups (%d consistent, %d conflicting, "
+        "%d swapped orientation); %d rows removed (%d swapped orientation). "
+        "Consistency fields: %s. Selection order: %s."
         % (
+            "Post-orientation " if reference_aligned else "",
             statistics["duplicate_groups"],
             consistent_groups,
             conflicting_groups,
+            swapped_orientation_groups,
             statistics["rows_removed"],
+            swapped_orientation_removed,
             ", ".join(resolved_consistency_fields),
             ", ".join(selection_order),
         ),
-        warn=bool(conflicting_groups),
+        warn=bool(conflicting_groups or swapped_orientation_groups),
     )
     return retained, report, statistics
 
@@ -882,9 +1614,11 @@ def read_summary_statistics(
     """Read the study file and apply the input-stage QC.
 
     Returns the retained frame, its immutable pre-harmonisation source snapshot,
-    row counts, the resolved column mapping, and input-stage QC counts needed by
-    the orchestrator. Removed variants are recorded through the supplied reject
-    collector.
+    row counts, the resolved column mapping, and disjoint input-stage QC counts
+    for invalid coordinates, unsupported chromosomes, unusable alleles,
+    duplicates, and missing mandatory values, followed by the structured
+    field-completeness and recovery plan. Removed variants are recorded through
+    the supplied reject collector.
     """
     policies = resolve_policies(policies)
     os.makedirs(output_dir, exist_ok=True)
@@ -897,6 +1631,7 @@ def read_summary_statistics(
     python_read_count = df.height
 
     removed_coords = 0
+    removed_unsupported_chromosomes = 0
     non_standard_allele_count = 0
     removed_duplicates_count = 0
     removed_missing_count = 0
@@ -914,6 +1649,9 @@ def read_summary_statistics(
         )
     df = df.with_row_index(SOURCE_INPUT_ROW_COLUMN, offset=1)
     source_snapshot = df.clone()
+    df, sample_column_dict = preserve_pvalue_source_text(
+        df, sample_column_dict
+    )
     own_collector = False
     if rejects is None and bool(policies.get("rejects.enabled")):
         reject_dir = configured_output_path(
@@ -932,6 +1670,7 @@ def read_summary_statistics(
             compress=bool(policies.get("rejects.compress")),
         )
         own_collector = True
+    reject_counts_before = rejects.counts() if rejects is not None else {}
 
     try:
         _emit(
@@ -943,20 +1682,26 @@ def read_summary_statistics(
         # =========================================================
         # EARLY MISSINGNESS FILTER
         # =========================================================
-        required_cols = _resolve_required_columns(
+        mapped_cols = _resolve_mapped_columns(
             sample_column_dict, set(df.columns), policies, logger
         )
+        field_completeness = _input_field_completeness(
+            df, sample_column_dict, policies,
+        )
 
-        if required_cols:
+        if mapped_cols:
             total_rows = df.height
+            missing_by_column = field_completeness[
+                "post_parse_missing_by_column"
+            ]
 
-            missing_stats = df.select([
-                pl.col(c).is_null().sum().alias(c) for c in required_cols
-            ])
-
-            _emit(logger, "Missing values per configured column (early QC):")
-            for c in required_cols:
-                missing_count = missing_stats[c][0]
+            _emit(
+                logger,
+                "Post-parse missing values by configured study column "
+                "(before numeric normalization):",
+            )
+            for c in mapped_cols:
+                missing_count = missing_by_column[c]
                 missing_pct = (missing_count / total_rows) * 100 if total_rows else 0.0
                 _emit(logger, "   %s: %d (%.2f%%)" % (c, missing_count, missing_pct))
 
@@ -970,16 +1715,22 @@ def read_summary_statistics(
                 df,
                 remove_mask,
                 step_label="01 read_summary_statistics",
-                reason="missing_required_columns",
+                reason="missing_read_mandatory_value",
                 collector=rejects,
-                detail="missing one or more mandatory fields across %d column(s)"
-                % len(rule_cols),
+                detail=(
+                    "missing a read-stage mandatory field, or every member of "
+                    "one mandatory alternative group, across %d mapped column(s)"
+                    % len(rule_cols)
+                ),
             )
 
             after_rows = df.height
             removed_missing_count = before_rows - after_rows
+            field_completeness[
+                "rows_removed_at_read_mandatory_gate"
+            ] = removed_missing_count
 
-            _emit(logger, "Mandatory-field validation:")
+            _emit(logger, "Read-stage mandatory-field validation:")
             _emit(logger, "   Before : %d" % before_rows)
             _emit(logger, "   After  : %d" % after_rows)
             _emit(logger, "   Removed: %d" % removed_missing_count)
@@ -996,7 +1747,7 @@ def read_summary_statistics(
         # position.min_value the SAME way the per-chromosome steps do; with the
         # registry defaults used here and the user's values used there, one run
         # would otherwise resolve the same policy two different ways.
-        df, sample_column_dict = harmonise_coordinates_and_alleles(
+        df, sample_column_dict, coordinate_qc = harmonise_coordinates_and_alleles(
             chromosome="All_Chrs",
             df=df,
             sample_column_dict=sample_column_dict,
@@ -1004,6 +1755,35 @@ def read_summary_statistics(
             policies=policies,
             logger=logger,
             rejects=rejects,
+            return_qc_info=True,
+        )
+        coordinate_reasons = coordinate_qc["removed_by_reason"]
+        removed_coords = int(
+            coordinate_reasons.get("invalid_chromosome", 0)
+            + coordinate_reasons.get("invalid_position", 0)
+        )
+        removed_unsupported_chromosomes = int(
+            coordinate_reasons.get("unsupported_chromosome", 0)
+        )
+        if (
+            removed_coords + removed_unsupported_chromosomes
+            != int(coordinate_qc["removed_total"])
+        ):
+            raise ReconciliationError(
+                "Coordinate validation counts do not balance: %d invalid "
+                "coordinate row(s) + %d unsupported-chromosome row(s) != %d "
+                "total coordinate-step removal(s)."
+                % (
+                    removed_coords,
+                    removed_unsupported_chromosomes,
+                    int(coordinate_qc["removed_total"]),
+                )
+            )
+        _emit(logger, "Removed %d invalid coordinate rows" % removed_coords)
+        _emit(
+            logger,
+            "Removed %d rows outside the configured chromosome scope"
+            % removed_unsupported_chromosomes,
         )
 
         chr_col = sample_column_dict.get("chr_col")
@@ -1044,39 +1824,10 @@ def read_summary_statistics(
             numeric_columns=numeric_columns,
             sample_count_columns=sample_count_columns,
             compound_numeric_columns=compound_numeric_columns,
+            conversion_counts=field_completeness["numeric_conversion_by_column"],
         )
 
         _emit(logger, "Recovery successful: %d rows loaded." % df.height)
-
-        # =========================================================
-        # CHR FIX
-        # =========================================================
-        valid_chr = [str(c).upper() for c in policies.get("chromosome.allowed")]
-
-        if chr_col in df.columns:
-            before_chr = df.height
-
-            # Same rows removed as before, but each one now carries the reason
-            # that explains it rather than a single "invalid coordinate" count.
-            df, _ = reject_rows(
-                df,
-                ~pl.col(chr_col).is_in(valid_chr),
-                step_label="02 fix_chr_pos_allele",
-                reason="invalid_chromosome",
-                collector=rejects,
-                detail="not one of %s" % ",".join(valid_chr),
-            )
-            if pos_col in df.columns:
-                df, _ = reject_rows(
-                    df,
-                    pl.col(pos_col).is_null(),
-                    step_label="02 fix_chr_pos_allele",
-                    reason="invalid_position",
-                    collector=rejects,
-                )
-
-            removed_coords = before_chr - df.height
-            _emit(logger, "Removed %d invalid coordinate rows" % removed_coords)
 
         # =========================================================
         # ALLELE FILTER
@@ -1123,6 +1874,17 @@ def read_summary_statistics(
         mark_canonical_variant_columns(sample_column_dict)
 
         # =========================================================
+        # MULTI-VALUE STUDY INFO
+        # =========================================================
+        # Scalarise a configured delimited study INFO column before
+        # duplicate validation. This makes the configured INFO tie-breaker
+        # operational and ensures every later dataset/chromosome step sees the
+        # same schema-validated aggregation decision.
+        df, sample_column_dict = normalise_imputation_quality_column(
+            df, sample_column_dict, policies, logger=logger,
+        )
+
+        # =========================================================
         # DUPLICATES
         # =========================================================
         df, dup_df, duplicate_statistics = resolve_duplicate_variants(
@@ -1143,24 +1905,101 @@ def read_summary_statistics(
             dup_df.write_csv(dup_file, separator=table_delimiter)
             _emit(logger, "Duplicate assessment saved to %s" % dup_file)
 
-        if (
+        unsafe_duplicate_groups = (
             duplicate_statistics["conflicting_groups"]
+            + duplicate_statistics["swapped_orientation_groups"]
+        )
+        if (
+            unsafe_duplicate_groups
             and policies.get("duplicates.conflicting_action") == "fail_dataset"
         ):
+            categories = []
+            if duplicate_statistics["conflicting_groups"]:
+                categories.append(
+                    "%d conflicting duplicate group(s)"
+                    % duplicate_statistics["conflicting_groups"]
+                )
+            if duplicate_statistics["swapped_orientation_groups"]:
+                categories.append(
+                    "%d swapped-orientation duplicate group(s)"
+                    % duplicate_statistics["swapped_orientation_groups"]
+                )
             raise ValueError(
-                "%d conflicting duplicate group(s) were found. Their rows were "
-                "recorded as conflicting_duplicate in %s and the dataset stopped "
-                "because duplicates.conflicting_action is 'fail_dataset'."
-                % (duplicate_statistics["conflicting_groups"], dup_file)
+                "%s were found. Their rows were recorded with distinct duplicate "
+                "reasons in %s and the dataset stopped because "
+                "duplicates.conflicting_action is 'fail_dataset'."
+                % (" and ".join(categories), dup_file)
             )
 
         _emit(logger, "Removed %d duplicate variants" % removed_duplicates_count)
+        measured_ledger = {
+            "missing_read_mandatory_value": int(removed_missing_count),
+            "invalid_coordinates": int(removed_coords),
+            "unsupported_chromosomes": int(removed_unsupported_chromosomes),
+            "non_standard_alleles": int(non_standard_allele_count),
+            "duplicate_variants": int(removed_duplicates_count),
+        }
+        if rejects is not None:
+            reject_counts_after = rejects.counts()
+            stage_reject_counts = {
+                reason: int(count) - int(reject_counts_before.get(reason, 0))
+                for reason, count in reject_counts_after.items()
+                if int(count) - int(reject_counts_before.get(reason, 0))
+            }
+            collector_ledger = {
+                "missing_read_mandatory_value": int(
+                    stage_reject_counts.get("missing_read_mandatory_value", 0)
+                ),
+                "invalid_coordinates": int(
+                    stage_reject_counts.get("invalid_chromosome", 0)
+                    + stage_reject_counts.get("invalid_position", 0)
+                ),
+                "unsupported_chromosomes": int(
+                    stage_reject_counts.get("unsupported_chromosome", 0)
+                ),
+                "non_standard_alleles": int(
+                    stage_reject_counts.get("null_allele", 0)
+                    + stage_reject_counts.get("non_standard_allele", 0)
+                ),
+                "duplicate_variants": int(
+                    stage_reject_counts.get("duplicate_variant", 0)
+                    + stage_reject_counts.get("conflicting_duplicate", 0)
+                    + stage_reject_counts.get(
+                        "swapped_orientation_duplicate", 0,
+                    )
+                ),
+            }
+            if sum(stage_reject_counts.values()) != sum(
+                collector_ledger.values()
+            ):
+                raise ReconciliationError(
+                    "Input validation produced a rejected-variant reason that "
+                    "is not assigned to the input ledger: %r."
+                    % stage_reject_counts
+                )
+            if collector_ledger != measured_ledger:
+                raise ReconciliationError(
+                    "Input validation counts disagree with rejected-variant "
+                    "provenance. Measured=%r; rejected-file counts=%r."
+                    % (measured_ledger, collector_ledger)
+                )
 
-        # =========================================================
-        # IMPINFO PROCESSING
-        # =========================================================
-        df, sample_column_dict = normalise_imputation_quality_column(
-            df, sample_column_dict, policies,
+        accounted_rows = df.height + sum(measured_ledger.values())
+        if accounted_rows != python_read_count:
+            raise ReconciliationError(
+                "Input validation counts do not balance: %d variants read, "
+                "%d retained, and %d attributed to input rejection categories."
+                % (
+                    python_read_count,
+                    df.height,
+                    sum(measured_ledger.values()),
+                )
+            )
+        _emit(
+            logger,
+            "Input validation accounting balanced: %d read = %d rejected + "
+            "%d ready for harmonisation."
+            % (python_read_count, sum(measured_ledger.values()), df.height),
         )
 
         if abs(input_line_count - python_read_count) > 1:
@@ -1184,9 +2023,11 @@ def read_summary_statistics(
             python_read_count,
             sample_column_dict,
             removed_coords,
+            removed_unsupported_chromosomes,
             non_standard_allele_count,
             removed_duplicates_count,
             removed_missing_count,
+            field_completeness,
         )
     finally:
         # Flushed from a finally, so a failure half way through still leaves
@@ -1202,19 +2043,102 @@ def read_summary_statistics(
                     raise
 
 
-def _inspect_text_file(file_path):
-    """Validate one text stream while retaining its last line and record count."""
-    last_line = ""
-    record_count = 0
-    with open_text(file_path) as handle:
-        for line in handle:
-            last_line = line
-            if not line.startswith("##"):
-                record_count += 1
-    return last_line.strip(), record_count
+def _previous_line_break(data, end):
+    """Return the preceding universal-newline span in ``data[:end]``."""
+    lf_index = data.rfind(b"\n", 0, end)
+    cr_index = data.rfind(b"\r", 0, end)
+    index = max(lf_index, cr_index)
+    if index < 0:
+        return None
+    if data[index] == 10 and index > 0 and data[index - 1] == 13:
+        return index - 1, index + 1
+    return index, index + 1
 
 
-def inspect_summary_statistics_file(file_path, policies=None, logger=None):
+def _last_two_line_suffix(data):
+    """Retain enough bytes to reconstruct the final logical text line."""
+    last_break = _previous_line_break(data, len(data))
+    if last_break is None:
+        return data
+    previous_break = _previous_line_break(data, last_break[0])
+    if previous_break is None:
+        return data
+    return data[previous_break[1]:]
+
+
+def _final_text_line(data):
+    """Decode the final universal-newline-delimited line like ``open_text``."""
+    normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    if normalized.endswith(b"\n"):
+        normalized = normalized[:-1]
+    line = normalized.rsplit(b"\n", 1)[-1]
+    return line.decode("utf-8", errors="replace").strip()
+
+
+def _inspect_text_file(file_path, *, io_buffer_bytes):
+    """Validate and count a text stream in bounded binary chunks.
+
+    Counting newline bytes in C avoids one Python iteration per GWAS row. The
+    bookkeeping preserves ``open_text`` semantics: CR, LF and CRLF are logical
+    line endings, ``##`` metadata lines are excluded, an unterminated final
+    line is counted, and only the final logical line is decoded.
+    """
+    if io_buffer_bytes <= 0:
+        raise ValueError("io_buffer_bytes must be greater than zero")
+
+    line_terminators = 0
+    metadata_lines = 0
+    first_bytes = b""
+    pattern_overlap = b""
+    final_lines = b""
+    previous_byte = b""
+    last_byte = b""
+    has_bytes = False
+
+    with open_binary(file_path) as handle:
+        while chunk := handle.read(io_buffer_bytes):
+            has_bytes = True
+            if len(first_bytes) < 2:
+                first_bytes += chunk[:2 - len(first_bytes)]
+
+            # TextIOWrapper's universal-newline mode treats CRLF as one line
+            # ending. A pair crossing a chunk boundary therefore needs the
+            # same one-count adjustment as a pair contained in the chunk.
+            line_terminators += (
+                chunk.count(b"\n")
+                + chunk.count(b"\r")
+                - chunk.count(b"\r\n")
+            )
+            if previous_byte == b"\r" and chunk.startswith(b"\n"):
+                line_terminators -= 1
+
+            # The two-byte overlap is shorter than either search pattern, so
+            # it detects chunk-boundary line starts without double counting.
+            metadata_window = pattern_overlap + chunk
+            metadata_lines += metadata_window.count(b"\n##")
+            metadata_lines += metadata_window.count(b"\r##")
+            pattern_overlap = metadata_window[-2:]
+
+            final_lines = _last_two_line_suffix(final_lines + chunk)
+            previous_byte = chunk[-1:]
+            last_byte = previous_byte
+
+    if first_bytes.startswith(b"##"):
+        metadata_lines += 1
+    physical_lines = line_terminators + int(
+        has_bytes and last_byte not in (b"\r", b"\n")
+    )
+    record_count = physical_lines - metadata_lines
+    return _final_text_line(final_lines), record_count
+
+
+def inspect_summary_statistics_file(
+    file_path,
+    *,
+    io_buffer_bytes,
+    policies=None,
+    logger=None,
+):
     """Inspect the input stream once for truncation and physical data-line count.
 
     The count follows :func:`count_data_lines` exactly: double-hash metadata
@@ -1232,7 +2156,10 @@ def inspect_summary_statistics_file(file_path, policies=None, logger=None):
     warnings = []
     record_count = None
     try:
-        last_line, record_count = _inspect_text_file(source)
+        last_line, record_count = _inspect_text_file(
+            source,
+            io_buffer_bytes=io_buffer_bytes,
+        )
     except (OSError, EOFError, ValueError, zipfile.BadZipFile) as exc:
         if bool(policies.get("input.check_truncation")):
             warnings.append("The file could not be read completely: %s" % exc)
@@ -1254,9 +2181,18 @@ def inspect_summary_statistics_file(file_path, policies=None, logger=None):
     return warnings, data_line_count
 
 
-def check_file_truncation(file_path, policies=None, logger=None):
+def check_file_truncation(
+    file_path,
+    *,
+    io_buffer_bytes,
+    policies=None,
+    logger=None,
+):
     """Compatibility wrapper returning only truncation warnings."""
     warnings, _line_count = inspect_summary_statistics_file(
-        file_path, policies=policies, logger=logger,
+        file_path,
+        io_buffer_bytes=io_buffer_bytes,
+        policies=policies,
+        logger=logger,
     )
     return warnings

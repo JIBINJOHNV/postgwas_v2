@@ -112,6 +112,24 @@ Before starting an expensive run, PostGWAS:
 4. records the resolved configuration, selected backend, commands, inputs,
    outputs, failures, and completion status in the canonical log.
 
+## Progress interpretation
+
+Pipeline progress and MiXeR progress use separate counters. For example,
+`1/2 · 50%` on the outer pipeline means that one of two pipeline modules has
+completed; it does not mean that the active MiXeR optimization is 50% complete.
+The univariate MiXeR workflow reports four validated stages: input/resource
+validation, `fit1`, `test1`, and result validation/reporting.
+
+Within `fit1` and `test1`, PostGWAS follows events written by the pinned native
+MiXeR log. Chromosome LD loading has an exact denominator from the configured
+chromosome list. Optimization instead displays the number of observed completed
+cost-function evaluations with an unknown denominator (`?`), because the
+upstream differential-evolution and Nelder-Mead optimizers stop according to
+convergence and do not expose a trustworthy total in advance. PostGWAS therefore
+does not convert elapsed time or configured repeats into a speculative percent.
+The command reaches 100% only after its exit status and declared outputs pass
+validation; a failed command remains below completion.
+
 The GSA settings explicitly pass the configured exclusion ranges, MAF and LD
 hard-pruning values, gene-window extension, all-genes label, optional maximum
 Z, log-likelihood method, standard-error samples, seed, threads, and optional

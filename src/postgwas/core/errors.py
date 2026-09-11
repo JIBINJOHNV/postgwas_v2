@@ -23,3 +23,7 @@ class ModuleExecutionError(PostGWASError):
     def __init__(self, module_name, message):
         self.module_name = str(module_name)
         super().__init__("%s: %s" % (self.module_name, message))
+
+
+class FormattingError(RuntimeError):
+    """The shared harmonised-VCF contract or its downstream representation is invalid."""

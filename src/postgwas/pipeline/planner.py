@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Sequence
 
 from postgwas.core.errors import PipelinePlanningError
-from postgwas.pipeline.registry import ModuleRegistry, REGISTRY
+from postgwas.pipeline.registry import ModuleRegistry, REGISTRY, resolve_reference
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,36 @@ class PipelinePlan:
 
 def _unique(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
+
+
+def resolve_pipeline_dependency_overrides(
+    arguments: Sequence[str],
+    configuration,
+    *,
+    registry: ModuleRegistry = REGISTRY,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve registered method-aware dependencies for planning and export."""
+    overrides = {}
+    references = {
+        spec.pipeline_dependency_override_factory
+        for spec in (
+            registry.get(name)
+            for name in registry.names(include_internal=True)
+        )
+        if spec.pipeline_dependency_override_factory is not None
+    }
+    for reference in sorted(references):
+        resolved = resolve_reference(reference)(arguments, configuration)
+        for module_name, dependencies in resolved.items():
+            value = tuple(dependencies)
+            previous = overrides.get(module_name)
+            if previous is not None and previous != value:
+                raise PipelinePlanningError(
+                    "Conflicting dynamic dependencies for module '%s': %s "
+                    "and %s" % (module_name, previous, value)
+                )
+            overrides[module_name] = value
+    return overrides
 
 
 def _dependency_order(
@@ -104,14 +134,35 @@ def build_pipeline_plan(
         "caldera", "flames",
         "heritability", "mixer", "gcta_cojo", "gcta_gene",
     )
-    needs_analysis_format = any(name in active_set for name in downstream)
+    active_positions = {name: index for index, name in enumerate(active)}
+    ld_clump_before_formatter = (
+        "ld_clump" in active_positions
+        and "formatter" in active_positions
+        and active_positions["ld_clump"] < active_positions["formatter"]
+    )
+    formatter_before_ld_clump = (
+        "ld_clump" in active_positions
+        and "formatter" in active_positions
+        and active_positions["formatter"] < active_positions["ld_clump"]
+    )
+    if ld_clump_before_formatter:
+        steps.append("ld_clump")
+
+    analysis_format_consumers = tuple(
+        name for name in downstream if name != "ld_clump"
+    )
+    needs_analysis_format = any(
+        name in active_set for name in analysis_format_consumers
+    ) or formatter_before_ld_clump
     formatter_requested = "formatter" in requested
     if needs_analysis_format or formatter_requested:
         if not imputing or needs_analysis_format or formatter_requested:
             steps.append("formatter")
 
     for name in downstream:
-        if name in active_set:
+        if name in active_set and not (
+            name == "ld_clump" and ld_clump_before_formatter
+        ):
             steps.append(name)
 
     if "manhattan" in active_set:

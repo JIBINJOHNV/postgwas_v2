@@ -72,6 +72,14 @@ Validate input schema/chromosomes and `@` patterns; resolve backend; run selecte
 official stages; validate output identity, convergence, finite estimates, seed
 and log evidence; generate diagnostics; write compact summaries.
 
+The outer pipeline counter reports completed pipeline modules. MiXeR also shows
+its own validation, `fit1`, `test1`, and reporting stages. During `fit1` and
+`test1`, chromosome LD loading uses the exact configured chromosome count. The
+optimizer shows observed completed cost-function evaluations as `count/?`, not
+a percentage, because the upstream convergence-dependent optimizers do not
+provide a trustworthy total in advance. A command reaches 100% only after its
+exit status and outputs validate successfully.
+
 ## Outputs
 
 Univariate raw fit/test JSON and logs are under `results/raw/univariate/`;

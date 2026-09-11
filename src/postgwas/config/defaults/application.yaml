@@ -31,7 +31,144 @@ logging:
   show_progress: true
   progress_refresh_seconds: 1.0
   terminal_label_width: 42
+  # Shared by every direct command, pipeline, progress bar and screen message.
+  # Values and file paths remain in the terminal's foreground colour. NO_COLOR
+  # is respected; redirected output and durable logs never receive colours.
+  terminal_style:
+    color: auto
+    heading_indent: 2
+    field_indent: 6
+    indent_step: 4
+    styles:
+      genetic: default
+      count: default
+      analysis: bold cyan
+      decision: bold magenta
+      attention: bold red
+      info: default
+      loss: bold yellow
+      success: bold green
+      warning: bold yellow
+      error: bold red
+      run: bold cyan
+      retry: bold yellow
+      text: default
   filename: postgwas.log
   screen_log_file: run_metadata/screen.log
   capture_external_tools: true
   include_timestamps: true
+  file_validation:
+    # Limit ordinary successful file sections on screen. Problems are never
+    # hidden, and every file/check remains in the canonical validation audit.
+    max_screen_files: 20
+    max_checks_per_file: 3
+    max_list_items: 6
+    direct_report_file: 'run_metadata/{command}_input_validation.yaml'
+    # Presentation equivalents only. These labels never select or skip checks.
+    # Matching is restricted to explicitly identified files in an outcome.
+    outcome_metric_aliases:
+      Genome build: declared_genome_build
+      Genome build inferred from VCF: declared_genome_build
+      Total variants: [variants_from_index, total_variants]
+      VCF variants validated: variants_from_index
+      VCF sample columns: sample_count
+      VCF sample: sample
+      Sample: sample
+      Declared contigs: contigs
+      Reference contigs: contigs
+      LD blocks: rows
+      Reference genes: genes
+      Annotation genes: genes
+      Kernel genes: genes
+      Covariate-table genes: genes
+      Gene properties: properties
+      Total BIM variants: variants
+      Reference variants: variants
+      Reference samples: samples
+      BIM identifier type: identifier_type
+      genome_build: declared_genome_build
+      total_variants: [variants_from_index, total_variants]
+      declared_contigs: contigs
+      sample_columns: sample_count
+    # Display labels only: raw metric keys and every check remain in the audit.
+    metric_labels:
+      declared_genome_build: Declared genome build
+      genome_build: Declared genome build
+      population: Declared population
+      variants_from_index: Variants (from index)
+      variants: Variants
+      total_variants: Variants
+      total_rows: Rows
+      rows: Rows
+      sample_count: VCF sample columns
+      sample: VCF sample ID
+      samples: Samples
+      contigs: Contigs
+      chromosomes: Chromosomes
+      chromosome: Chromosome
+      identifier_type: Variant ID type
+      rsids: rsIDs
+      unique_ids: Coordinate IDs
+      missing_ids: Missing IDs
+      other_ids: Unsupported IDs
+      duplicate_ids: Duplicate IDs
+      duplicate_rows: Duplicate rows
+      unique_labels: Unique labels
+      duplicate_labels: Duplicate labels
+      genes: Genes
+      gene_count: Genes
+      gene_sets: Gene sets
+      sets: Sets
+      memberships: Memberships
+      features: Features
+      properties: Properties
+      columns: Columns
+      dtype: Numeric type
+      cells: Cells
+      cell_types: Cell types
+      names: Names
+      declared_fields: Declared fields
+      ldsc_reference_ld_files: Reference LD-score files
+      ldsc_reference_snp_count_files: Reference SNP-count files
+      ldsc_weight_ld_files: Weight LD-score files
+      ldsc_snp_count_suffix: SNP-count file type
+      ldsc_unique_bundle_files: Physical files checked
+      ldsc_shared_reference_directory: Reference/weight directory
+      ldsc_reference_directory: Reference LD-score directory
+      ldsc_weight_directory: Weight LD-score directory
+      ldsc_celltype_prefixes: Reference prefixes
+      ldsc_celltype_ld_files: LD-score files
+      ldsc_celltype_snp_count_files: SNP-count files
+      ldsc_celltype_roles: Reference roles
+      validation_scope: Validation scope
+      pred_ld_reference_files: Chromosome reference files
+      pred_ld_reference_file_kinds: Reference file types
+      pred_ld_reference_mode: Reference mode
+      pred_ld_reference_directory: Reference directory
+      mixer_resource_type: Resource type
+      mixer_chromosome_files: Chromosome files
+      mixer_pattern: Configured file pattern
+      flames_annotation_directories: Annotation directories
+      flames_annotation_inventory_files: Inventoried annotation files
+      flames_named_annotation_files: Required named annotation files
+      flames_unique_annotation_files: Physical files checked
+      flames_annotation_root: Annotation root
+      pops_feature_chunks: Matrix chunks
+      pops_feature_column_files: Column companion files
+      pops_feature_matrix_files: Matrix companion files
+      pops_matrix_dtypes: Matrix numeric types
+      pops_matrix_validation: Matrix validation
+      pops_unique_bundle_files: Physical files checked
+    role_labels:
+      LDSC chromosome reference bundle: LDSC chromosome reference resources
+      LDSC cell-type reference bundle: LDSC cell-type reference resources
+      PRED-LD chromosome reference bundle: PRED-LD chromosome reference resources
+      MiXeR chromosome resource bundle: MiXeR chromosome resources
+      FLAMES annotation resource bundle: FLAMES annotation resources
+      PoPS feature matrix bundle: PoPS feature-matrix resources
+      LD block BED file missing or empty: LD-block intervals
+      LD block BED: LD-block intervals
+      Reading VCF header: VCF
+      Counting indexed VCF records: VCF
+      Reading VCF sample names: VCF
+      input VCF: VCF

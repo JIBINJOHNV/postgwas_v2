@@ -3,21 +3,42 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import Field, field_validator, model_validator
 
-from postgwas.config.models.common import GenomeBuild, ModuleConfig, Population, StrictModel
+from postgwas.config.models.common import (
+    ChromosomeAnalysisScopeConfig,
+    GenomeBuild,
+    MHCAnalysisScopeConfig,
+    MHCPolicy,
+    MHC_POLICIES,
+    ModuleConfig,
+    PValueCorrectionMethod,
+    Population,
+    StrictModel,
+)
 
 
-MagmaDuplicatePolicy = Literal["lowest_p"]
-MagmaCorrectionMethod = Literal["bonferroni", "sidak", "holm", "fdr_bh"]
+MagmaDuplicatePolicy = Literal["err", "lowest_p", "remove"]
+MAGMA_DUPLICATE_POLICIES = get_args(MagmaDuplicatePolicy)
+MagmaMHCPolicy = MHCPolicy
+MAGMA_MHC_POLICIES = MHC_POLICIES
+MagmaCorrectionMethod = PValueCorrectionMethod
 MagmaMappingMethod = Literal[
     "positional", "emagma", "h_magma", "n_magma", "chrom_magma",
 ]
 MagmaGeneIdentifierType = Literal["entrez", "ensembl", "symbol", "mixed"]
+MAGMA_GENE_IDENTIFIER_TYPES = get_args(MagmaGeneIdentifierType)
 MagmaGeneSetInputFormat = Literal["auto", "gmt", "magma", "membership"]
+MagmaGeneSetMismatchAction = Literal["skip", "error"]
+MAGMA_GENE_SET_MISMATCH_ACTIONS = get_args(MagmaGeneSetMismatchAction)
+MagmaAlternateGeneIdDuplicatePolicy = Literal["longest_interval", "error"]
+MAGMA_ALTERNATE_GENE_ID_DUPLICATE_POLICIES = get_args(
+    MagmaAlternateGeneIdDuplicatePolicy
+)
 MagmaResultStatisticType = Literal[
     "calibrated_gene_p_value", "minimum_regulatory_element_p_value",
 ]
@@ -33,6 +54,19 @@ def _safe_relative_pattern(value: str) -> str:
     return value
 
 
+def _validated_delimiter_pattern(value: str) -> str:
+    """Require a regex separator that consumes at least one character."""
+    if not value:
+        raise ValueError("must not be empty")
+    try:
+        compiled = re.compile(value)
+    except re.error as exc:
+        raise ValueError("must be a valid regular expression") from exc
+    if compiled.match("") is not None:
+        raise ValueError("must not match empty text")
+    return value
+
+
 class MagmaInputConfig(StrictModel):
     snp_location_file: str | None = None
     p_value_file: str | None = None
@@ -41,6 +75,7 @@ class MagmaInputConfig(StrictModel):
     gene_set_file: str | None = None
     sample_size_column: str
     table_delimiter_pattern: str
+    bim_delimiter: Literal["\t", " "]
     output_table_delimiter: Literal["\t", " "]
     chromosome_prefix_pattern: str
     chromosome_aliases: dict[str, str]
@@ -57,6 +92,7 @@ class MagmaInputConfig(StrictModel):
     bim_columns: list[str]
     gene_location_has_header: bool
     gene_location_columns: list[str]
+    alternate_gene_id_type: MagmaGeneIdentifierType
 
     @field_validator(
         "snp_location_file", "p_value_file", "ld_reference_prefix",
@@ -79,9 +115,14 @@ class MagmaInputConfig(StrictModel):
             raise ValueError("must not be empty")
         return value
 
-    @field_validator("table_delimiter_pattern", "chromosome_prefix_pattern")
+    @field_validator("table_delimiter_pattern")
     @classmethod
     def valid_delimiter_pattern(cls, value: str) -> str:
+        return _validated_delimiter_pattern(value)
+
+    @field_validator("chromosome_prefix_pattern")
+    @classmethod
+    def valid_chromosome_prefix_pattern(cls, value: str) -> str:
         try:
             re.compile(value)
         except re.error as exc:
@@ -164,11 +205,47 @@ class MagmaSnpHarmonisationConfig(StrictModel):
     duplicate_policy: MagmaDuplicatePolicy
 
 
+class MagmaMHCConfig(MHCAnalysisScopeConfig):
+    """MAGMA specialization of the shared MHC analysis-scope schema."""
+
+
+class MagmaChromosomeConfig(ChromosomeAnalysisScopeConfig):
+    """MAGMA specialization of the shared chromosome-scope schema."""
+
+
+class MagmaExclusionReportingConfig(StrictModel):
+    chromosome_reason: str
+    mhc_reason: str
+    annotated_units_scope: str
+    reason_column: str
+    scope_column: str
+    excluded_count_column: str
+    input_count_column: str
+    retained_count_column: str
+    start_column: str
+    end_column: str
+
+    @field_validator("*")
+    @classmethod
+    def nonempty_values(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @model_validator(mode="after")
+    def distinct_reasons(self):
+        if self.chromosome_reason == self.mhc_reason:
+            raise ValueError("chromosome_reason and mhc_reason must differ")
+        return self
+
+
 class MagmaGeneSetConfig(StrictModel):
     input_format: MagmaGeneSetInputFormat
     minimum_gene_id_overlap_fraction: float = Field(
         gt=0, le=1, allow_inf_nan=False,
     )
+    identifier_mismatch_action: MagmaGeneSetMismatchAction
+    alternate_id_duplicate_policy: MagmaAlternateGeneIdDuplicatePolicy
     membership_delimiter_pattern: str
     membership_has_header: bool
     membership_set_column: int = Field(ge=0)
@@ -177,11 +254,7 @@ class MagmaGeneSetConfig(StrictModel):
     @field_validator("membership_delimiter_pattern")
     @classmethod
     def valid_membership_delimiter(cls, value: str) -> str:
-        try:
-            re.compile(value)
-        except re.error as exc:
-            raise ValueError("must be a valid regular expression") from exc
-        return value
+        return _validated_delimiter_pattern(value)
 
     @model_validator(mode="after")
     def distinct_membership_columns(self):
@@ -446,11 +519,7 @@ class ChromMagmaMappingSchema(StrictModel):
     @field_validator("mapping_delimiter_pattern", "location_delimiter_pattern")
     @classmethod
     def valid_delimiter(cls, value: str) -> str:
-        try:
-            re.compile(value)
-        except re.error as exc:
-            raise ValueError("must be a valid regular expression") from exc
-        return value
+        return _validated_delimiter_pattern(value)
 
     @field_validator(
         "result_element_column", "result_p_value_column", "report_element_column",
@@ -509,6 +578,7 @@ class MagmaMultipleTestingConfig(StrictModel):
     reporting_significance_threshold: float = Field(
         gt=0, le=1, allow_inf_nan=False,
     )
+    primary_method: MagmaCorrectionMethod
     reporting_method_labels: dict[MagmaCorrectionMethod, str]
     gene_methods: list[MagmaCorrectionMethod]
     global_methods: list[MagmaCorrectionMethod]
@@ -546,6 +616,11 @@ class MagmaMultipleTestingConfig(StrictModel):
                 "reporting_method_labels is missing configured methods: %s"
                 % ", ".join(missing)
             )
+        if self.primary_method not in self.global_methods:
+            raise ValueError(
+                "primary_method must occur in global_methods because the primary "
+                "gene-set decision is calculated across all tested gene sets"
+            )
         return self
 
 
@@ -556,8 +631,16 @@ class MagmaResultSchema(StrictModel):
     gene_set_full_name_column: str
     gene_id_column: str
     gene_p_value_column: str
+    gene_reference_chromosome_column: str
+    gene_reference_start_column: str
+    gene_reference_end_column: str
+    gene_reference_strand_column: str
+    gene_reference_alternate_id_column: str
     global_correction_column_pattern: str
     family_correction_column_pattern: str
+    primary_correction_method_column: str
+    primary_adjusted_p_value_column: str
+    primary_significant_column: str
     report_dataset_column: str
     report_gene_set_description_column: str
     report_source_input_genes_column: str
@@ -566,6 +649,8 @@ class MagmaResultSchema(StrictModel):
     report_common_gene_p_values_column: str
     report_total_genes_column: str
     report_common_gene_count_column: str
+    report_untested_genes_column: str
+    report_untested_gene_count_column: str
     report_mapping_name_column: str
     report_mapping_method_column: str
     report_mapping_context_column: str
@@ -574,36 +659,79 @@ class MagmaResultSchema(StrictModel):
     report_source_version_column: str
     report_statistic_type_column: str
     report_statistic_interpretation_column: str
+    report_mhc_policy_column: str
+    report_mhc_region_column: str
+    report_excluded_chromosomes_column: str
+    report_excluded_units_column: str
+    report_gene_set_status_column: str
+    report_gene_set_reason_column: str
     report_delimiter: str
     report_null_value: str
 
     @field_validator("table_delimiter_pattern")
     @classmethod
     def valid_table_delimiter_pattern(cls, value: str) -> str:
-        try:
-            re.compile(value)
-        except re.error as exc:
-            raise ValueError("must be a valid regular expression") from exc
-        return value
+        return _validated_delimiter_pattern(value)
 
     @field_validator(
         "gene_set_name_column", "gene_set_p_value_column",
         "gene_set_full_name_column", "gene_id_column", "gene_p_value_column",
+        "gene_reference_chromosome_column", "gene_reference_start_column",
+        "gene_reference_end_column", "gene_reference_strand_column",
+        "gene_reference_alternate_id_column",
+        "primary_correction_method_column", "primary_adjusted_p_value_column",
+        "primary_significant_column",
         "report_dataset_column", "report_gene_set_description_column",
         "report_source_input_genes_column",
         "report_input_genes_column", "report_common_genes_column",
         "report_common_gene_p_values_column", "report_total_genes_column",
         "report_common_gene_count_column", "report_null_value",
+        "report_untested_genes_column", "report_untested_gene_count_column",
         "report_mapping_name_column", "report_mapping_method_column",
         "report_mapping_context_column", "report_gene_id_type_column",
         "report_source_name_column", "report_source_version_column",
         "report_statistic_type_column", "report_statistic_interpretation_column",
+        "report_mhc_policy_column", "report_mhc_region_column",
+        "report_excluded_chromosomes_column", "report_excluded_units_column",
+        "report_gene_set_status_column", "report_gene_set_reason_column",
     )
     @classmethod
     def nonempty_name(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("must not be empty")
         return value
+
+    @model_validator(mode="after")
+    def distinct_primary_result_columns(self):
+        columns = [
+            self.primary_correction_method_column,
+            self.primary_adjusted_p_value_column,
+            self.primary_significant_column,
+        ]
+        if len(columns) != len(set(columns)):
+            raise ValueError("primary result columns must be distinct")
+        non_column_fields = {
+            "table_delimiter_pattern",
+            "global_correction_column_pattern",
+            "family_correction_column_pattern",
+            "primary_correction_method_column",
+            "primary_adjusted_p_value_column",
+            "primary_significant_column",
+            "report_delimiter",
+            "report_null_value",
+        }
+        other_columns = {
+            value
+            for name, value in self.model_dump().items()
+            if name not in non_column_fields
+        }
+        collisions = sorted(set(columns) & other_columns)
+        if collisions:
+            raise ValueError(
+                "primary result columns conflict with other configured result "
+                "columns: %s" % ", ".join(collisions)
+            )
+        return self
 
     @field_validator("global_correction_column_pattern")
     @classmethod
@@ -641,7 +769,9 @@ class MagmaOutputLayout(StrictModel):
     staging_directory: str
     harmonised_p_values: str
     harmonised_snp_locations: str
+    excluded_variants: str
     annotation_prefix: str
+    scoped_annotation: str
     component_annotation_prefix: str
     gene_result_prefix: str
     gene_batch_prefix: str
@@ -649,9 +779,13 @@ class MagmaOutputLayout(StrictModel):
     corrected_genes: str
     corrected_gene_sets: str
     annotated_gene_sets: str
-    prepared_gene_sets: str
+    pathway_compatible_gene_locations: str
     chrom_magma_genes: str
+    excluded_genes: str
+    exclusion_summary: str
     mapping_comparison: str
+    pipeline_summary_csv: str
+    pipeline_summary_html: str
 
     @field_validator("*")
     @classmethod
@@ -662,6 +796,7 @@ class MagmaOutputLayout(StrictModel):
     def required_dataset_tokens(self):
         mapping_fields = {
             "annotation_prefix",
+            "scoped_annotation",
             "component_annotation_prefix",
             "gene_result_prefix",
             "gene_batch_prefix",
@@ -669,8 +804,10 @@ class MagmaOutputLayout(StrictModel):
             "corrected_genes",
             "corrected_gene_sets",
             "annotated_gene_sets",
-            "prepared_gene_sets",
+            "pathway_compatible_gene_locations",
             "chrom_magma_genes",
+            "excluded_genes",
+            "exclusion_summary",
         }
         for field, value in self.model_dump().items():
             if field == "resolved_config_file":
@@ -682,6 +819,82 @@ class MagmaOutputLayout(StrictModel):
         return self
 
 
+class MagmaPipelineSummarySchema(StrictModel):
+    """Configured machine-readable columns for the ordered pipeline summary."""
+
+    version: int = Field(gt=0)
+    step_column: str
+    stage_column: str
+    status_column: str
+    summary_column: str
+    details_column: str
+    output_column: str
+    csv_delimiter: str
+    null_value: str
+
+    @field_validator(
+        "step_column", "stage_column", "status_column", "summary_column",
+        "details_column", "output_column",
+    )
+    @classmethod
+    def nonempty_column(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("csv_delimiter")
+    @classmethod
+    def one_character_delimiter(cls, value: str) -> str:
+        if len(value) != 1:
+            raise ValueError("must contain exactly one character")
+        return value
+
+    @model_validator(mode="after")
+    def unique_columns(self):
+        columns = [
+            self.step_column,
+            self.stage_column,
+            self.status_column,
+            self.summary_column,
+            self.details_column,
+            self.output_column,
+        ]
+        duplicates = sorted(
+            name for name, count in Counter(columns).items() if count > 1
+        )
+        if duplicates:
+            raise ValueError(
+                "pipeline summary columns must be unique: %s"
+                % ", ".join(duplicates)
+            )
+        return self
+
+
+class MagmaHtmlReportConfig(StrictModel):
+    """Pagination and columns for the complete scientific HTML result tables."""
+
+    page_size: int = Field(gt=0)
+    gene_columns: list[str]
+    pathway_columns: list[str]
+
+    @field_validator("gene_columns", "pathway_columns")
+    @classmethod
+    def unique_nonempty_columns(cls, values: list[str]) -> list[str]:
+        if not values or any(not value.strip() for value in values):
+            raise ValueError("must contain one or more non-empty column names")
+        if len(values) != len(set(values)):
+            raise ValueError("must contain unique column names")
+        return values
+
+
+class MagmaScreenSummaryConfig(StrictModel):
+    """Presentation settings for ranked associations shown after a MAGMA run."""
+
+    top_gene_rows: int = Field(gt=0)
+    top_pathway_rows: int = Field(gt=0)
+    p_value_significant_digits: int = Field(ge=2, le=10)
+
+
 class MagmaConfig(ModuleConfig):
     genome_build: GenomeBuild
     population: Population
@@ -690,6 +903,9 @@ class MagmaConfig(ModuleConfig):
     gene_model: str
     input: MagmaInputConfig
     snp_harmonisation: MagmaSnpHarmonisationConfig
+    mhc: MagmaMHCConfig
+    chromosomes: MagmaChromosomeConfig
+    exclusion_reporting: MagmaExclusionReportingConfig
     gene_sets: MagmaGeneSetConfig
     annotation_validation: MagmaAnnotationValidationConfig
     mapping: MagmaMappingConfig
@@ -697,6 +913,9 @@ class MagmaConfig(ModuleConfig):
     batching: MagmaBatchingConfig
     multiple_testing: MagmaMultipleTestingConfig
     result_schema: MagmaResultSchema
+    pipeline_summary_schema: MagmaPipelineSummarySchema
+    html_report: MagmaHtmlReportConfig
+    screen_summary: MagmaScreenSummaryConfig
     minimum_magma_version: str
     version_arguments: list[str]
     version_pattern: str
@@ -766,9 +985,54 @@ class MagmaConfig(ModuleConfig):
                     "mapping definition %s uses %s but modules.magma.population is %s"
                     % (name, definition.population.value, self.population.value)
                 )
+        if (
+            self.mhc.region_override is not None
+            and self.mhc.region_override.start < 1
+        ):
+            raise ValueError("mhc.region_override.start must be one-based")
+        correction_columns = [
+            self.result_schema.global_correction_column_pattern.format(method=method)
+            for method in self.multiple_testing.global_methods
+        ]
+        correction_columns.extend(
+            self.result_schema.family_correction_column_pattern.format(
+                family=family_name, method=method,
+            )
+            for family_name, family in self.multiple_testing.families.items()
+            for method in family.methods
+        )
+        correction_columns.extend((
+            self.result_schema.primary_correction_method_column,
+            self.result_schema.primary_adjusted_p_value_column,
+            self.result_schema.primary_significant_column,
+        ))
+        counts = Counter(correction_columns)
+        duplicates = sorted(
+            column for column, count in counts.items() if count > 1
+        )
+        if duplicates:
+            raise ValueError(
+                "configured correction result columns must be unique: %s"
+                % ", ".join(duplicates)
+            )
+        source_columns = {
+            self.result_schema.gene_set_name_column,
+            self.result_schema.gene_set_p_value_column,
+            self.result_schema.gene_set_full_name_column,
+            self.result_schema.gene_id_column,
+            self.result_schema.gene_p_value_column,
+        }
+        collisions = sorted(source_columns & set(correction_columns))
+        if collisions:
+            raise ValueError(
+                "configured correction result columns conflict with MAGMA source "
+                "columns: %s" % ", ".join(collisions)
+            )
         return self
 
 
 __all__ = [
-    "MagmaConfig", "MagmaCorrectionMethod", "MagmaMappingMethod",
+    "MAGMA_DUPLICATE_POLICIES", "MAGMA_GENE_SET_MISMATCH_ACTIONS",
+    "MAGMA_MHC_POLICIES", "MagmaConfig",
+    "MagmaCorrectionMethod", "MagmaDuplicatePolicy", "MagmaMappingMethod",
 ]

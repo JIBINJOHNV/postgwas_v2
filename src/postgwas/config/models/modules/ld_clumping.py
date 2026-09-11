@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -15,10 +15,69 @@ from postgwas.config.models.common import (
     Population,
     StrictModel,
 )
+from postgwas.config.models.modules.gcta_cojo import (
+    GctaCojoParallelOutputContract,
+)
 from postgwas.core.paths import validate_filename_component
 
 
-LDClumpingMethod = Literal["region", "standard"]
+LDClumpingMethod = Literal["region", "standard", "cojo-slct"]
+
+
+class LDClumpingCojoConfig(StrictModel):
+    """Post-COJO physical-locus definition; GCTA model settings stay canonical."""
+
+    merge_distance_bp: int = Field(ge=0)
+    index_pvalue: Literal["marginal", "joint"]
+    parallel_output_contract: GctaCojoParallelOutputContract
+    subordinate_dataset_id: str
+    formatter_resolved_config_file: str
+    formatter_completion_manifest_file: str
+    gcta_resolved_config_file: str
+
+    @field_validator("subordinate_dataset_id")
+    @classmethod
+    def valid_subordinate_dataset_id(cls, value: str) -> str:
+        value = value.strip()
+        required = ("{dataset_id}", "{population}")
+        if any(value.count(token) != 1 for token in required):
+            raise ValueError(
+                "must contain {dataset_id} and {population} exactly once"
+            )
+        try:
+            rendered = value.format(dataset_id="dataset", population="EUR")
+        except (KeyError, ValueError) as exc:
+            raise ValueError("contains an unsupported placeholder: %s" % exc) from exc
+        validate_filename_component(
+            rendered, "modules.ld_clumping.cojo.subordinate_dataset_id"
+        )
+        return value
+
+    @field_validator(
+        "formatter_resolved_config_file",
+        "formatter_completion_manifest_file",
+        "gcta_resolved_config_file",
+    )
+    @classmethod
+    def valid_subordinate_metadata_path(cls, value: str, info) -> str:
+        value = value.strip()
+        required = ["{dataset_id}"]
+        if info.field_name == "gcta_resolved_config_file":
+            required.append("{mode}")
+        if any(value.count(token) != 1 for token in required):
+            raise ValueError(
+                "must contain %s exactly once"
+                % " and ".join(required)
+            )
+        try:
+            rendered = Path(value.format(dataset_id="dataset_EUR", mode="slct"))
+        except (KeyError, ValueError) as exc:
+            raise ValueError("contains an unsupported placeholder: %s" % exc) from exc
+        if rendered.is_absolute() or ".." in rendered.parts:
+            raise ValueError("must stay inside the subordinate output directory")
+        if rendered.suffix != ".yaml":
+            raise ValueError("must render a .yaml file")
+        return value
 
 
 class LDClumpingInputsConfig(StrictModel):
@@ -39,10 +98,15 @@ class LDClumpingReferenceConfig(StrictModel):
     directory: Path | None = None
     manifest_filename: str
     file_pattern: str
+    reverse_file_pattern: str
+    variant_inventory_pattern: str
     index_suffix: str
     format_version: int = Field(ge=1)
-    orientation: Literal["symmetric_first_endpoint"]
+    orientation: Literal[
+        "symmetric_first_endpoint", "upper_triangle_dual_index"
+    ]
     columns: list[str]
+    variant_inventory_columns: list[str]
 
     @field_validator("manifest_filename")
     @classmethod
@@ -51,9 +115,11 @@ class LDClumpingReferenceConfig(StrictModel):
             value, "modules.ld_clumping.reference.manifest_filename"
         )
 
-    @field_validator("file_pattern")
+    @field_validator(
+        "file_pattern", "reverse_file_pattern", "variant_inventory_pattern"
+    )
     @classmethod
-    def valid_file_pattern(cls, value: str) -> str:
+    def valid_file_pattern(cls, value: str, info) -> str:
         value = value.strip()
         required = ("{population}", "{chromosome}")
         if any(value.count(token) != 1 for token in required):
@@ -66,8 +132,13 @@ class LDClumpingReferenceConfig(StrictModel):
             raise ValueError("contains an unsupported placeholder: %s" % exc) from exc
         if rendered.is_absolute() or ".." in rendered.parts:
             raise ValueError("must stay inside the configured reference directory")
-        if not str(rendered).endswith(".ld.gz"):
-            raise ValueError("must render a .ld.gz file")
+        suffix = (
+            ".variants.tsv.gz"
+            if info.field_name == "variant_inventory_pattern"
+            else ".ld.gz"
+        )
+        if not str(rendered).endswith(suffix):
+            raise ValueError("must render a %s file" % suffix)
         return value
 
     @field_validator("index_suffix")
@@ -95,6 +166,34 @@ class LDClumpingReferenceConfig(StrictModel):
                 % ", ".join(required)
             )
         return values
+
+    @field_validator("variant_inventory_columns")
+    @classmethod
+    def valid_variant_inventory_columns(cls, values: list[str]) -> list[str]:
+        required = [
+            "chromosome",
+            "position",
+            "reference_id",
+            "canonical_id",
+            "allele_1",
+            "allele_2",
+            "minor_allele_frequency",
+        ]
+        if values != required:
+            raise ValueError(
+                "must describe the seven-column variant inventory contract in "
+                "order: %s" % ", ".join(required)
+            )
+        return values
+
+    @model_validator(mode="after")
+    def orientation_files(self):
+        if self.orientation == "upper_triangle_dual_index":
+            if self.reverse_file_pattern == self.file_pattern:
+                raise ValueError(
+                    "reverse_file_pattern must differ from file_pattern"
+                )
+        return self
 
 
 class LDClumpingVcfFieldsConfig(StrictModel):
@@ -137,6 +236,17 @@ class LDClumpingTableConfig(StrictModel):
     infer_schema_length: int = Field(ge=1)
     io_buffer_bytes: int = Field(ge=1)
     biallelic_include_expression: str
+    compressor: str | None = None
+
+    @field_validator("compressor")
+    @classmethod
+    def executable_name(cls, value: str | None) -> str | None:
+        """Name a parallel gzip-compatible compressor, or null for Python gzip."""
+        if value is None or not str(value).strip():
+            return None
+        return validate_filename_component(
+            value, "modules.ld_clumping.table.compressor"
+        )
 
     @field_validator("delimiter")
     @classmethod
@@ -166,11 +276,111 @@ class LDClumpingComputeConfig(StrictModel):
     input_memory_multiplier: float = Field(ge=1, allow_inf_nan=False)
 
 
+LDClumpingResultTable = Literal[
+    "genomic_risk_loci",
+    "lead_snps",
+    "independent_significant_snps",
+    "cojo_loci",
+    "cojo_selected_signals",
+]
+
+
+# Stable columns produced by the standard and COJO result frames. Keeping this
+# contract in the schema makes an invalid HTML-column override fail during
+# configuration validation, before VCF extraction or chromosome processing.
+_LD_CLUMPING_RESULT_COLUMNS = {
+    "genomic_risk_loci": {
+        "Genomic_locus", "Locus_Length_kb", "Merged_by_Distance",
+        "Lead_uniqID", "Lead_rsID", "CHR", "POS", "START", "END", "ea",
+        "nea", "eaf", "LP", "P_value", "Beta", "SE", "n_refsnps",
+        "n_members", "n_5e_8", "n_5e_5", "n_0_05", "nIndSigSNPs",
+        "nLeadSNPs", "IndSig_LD_Groups", "Lead_LD_Groups",
+    },
+    "lead_snps": {
+        "lead_SNP_id", "chr", "start", "end", "p", "lp", "l_pos",
+        "l_beta", "l_se", "l_rsid", "l_ea", "l_nea", "l_eaf", "is_list",
+        "is_groups", "candidate_list", "gwas_candidate_list", "l_ld_list",
+        "sum_refsnps", "sum_members", "Lead_Group", "Genomic_locus",
+    },
+    "independent_significant_snps": {
+        "ind_sig_SNP_id", "chr", "start", "end", "pos", "candidate_list",
+        "gwas_candidate_list", "p", "lp", "beta", "se", "rsID", "ea",
+        "nea", "eaf", "ld_list", "n_refsnps", "n_members", "IndSig_Group",
+        "Genomic_locus", "lead_SNP_id", "r2_with_Lead",
+    },
+    "cojo_loci": {
+        "COJO_locus", "Chr", "start", "end", "span_bp", "index_SNP",
+        "index_bp", "index_p", "index_pJ", "selected_signals",
+        "selected_signal_ids",
+    },
+    "cojo_selected_signals": {
+        "COJO_locus", "is_locus_index", "locus_start", "locus_end",
+        "distance_to_previous_signal_bp", "Chr", "SNP", "bp", "freq",
+        "refA", "b", "se", "p", "n", "freq_geno", "bJ", "bJ_se",
+        "pJ", "LD_r", "estimation_status",
+    },
+}
+
+
+class LDClumpingReportingConfig(StrictModel):
+    result_table_columns: dict[LDClumpingResultTable, list[str]]
+
+    @field_validator("result_table_columns")
+    @classmethod
+    def complete_unique_result_columns(
+        cls,
+        values: dict[LDClumpingResultTable, list[str]],
+    ) -> dict[LDClumpingResultTable, list[str]]:
+        required = {
+            "genomic_risk_loci",
+            "lead_snps",
+            "independent_significant_snps",
+            "cojo_loci",
+            "cojo_selected_signals",
+        }
+        if set(values) != required:
+            raise ValueError(
+                "must define exactly these result tables: %s"
+                % ", ".join(sorted(required))
+            )
+        for table_name, columns in values.items():
+            if not columns or len(columns) != len(set(columns)):
+                raise ValueError(
+                    "%s must contain one or more unique column names"
+                    % table_name
+                )
+            if any(
+                not isinstance(column, str)
+                or not column.strip()
+                or "\t" in column
+                or "\n" in column
+                for column in columns
+            ):
+                raise ValueError(
+                    "%s contains an invalid result column name" % table_name
+                )
+            unknown = sorted(
+                set(columns) - _LD_CLUMPING_RESULT_COLUMNS[table_name]
+            )
+            if unknown:
+                raise ValueError(
+                    "%s contains columns not produced by that result "
+                    "table: %s" % (table_name, ", ".join(unknown))
+                )
+        return values
+
+
 class LDClumpingOutputLayoutConfig(StrictModel):
+    shared_cojo_directory_fields: ClassVar[frozenset[str]] = frozenset({
+        "cojo_formatter_directory",
+        "cojo_root_directory",
+    })
+
     region_working_table: str
     region_raw_table: str
     region_pruned_table: str
     region_significant_table: str
+    region_significant_outside_ld_regions: str
     region_log: str
     standard_working_table: str
     standard_formatted_table: str
@@ -179,14 +389,25 @@ class LDClumpingOutputLayoutConfig(StrictModel):
     standard_hierarchy: str
     standard_independent_clusters: str
     standard_lead_clusters: str
+    standard_reference_exclusions: str
+    cojo_formatter_directory: str
+    cojo_root_directory: str
+    cojo_selected_signals: str
+    cojo_loci: str
+    cojo_excluded_variants: str
+    summary_csv: str
+    html_report: str
     canonical_log: str
     resolved_configuration: str
 
     @field_validator("*")
     @classmethod
-    def safe_output_pattern(cls, value: str) -> str:
+    def safe_output_pattern(cls, value: str, info) -> str:
         value = value.strip()
-        if "{dataset_id}" not in value:
+        if (
+            info.field_name not in cls.shared_cojo_directory_fields
+            and "{dataset_id}" not in value
+        ):
             raise ValueError("must contain {dataset_id}")
         try:
             rendered = Path(value.format(dataset_id="dataset", population="EUR"))
@@ -198,15 +419,37 @@ class LDClumpingOutputLayoutConfig(StrictModel):
 
     @model_validator(mode="after")
     def unique_destinations(self):
-        values = list(self.model_dump().values())
-        if len(values) != len(set(values)):
+        values = self.model_dump()
+        if len(values) != len(set(values.values())):
             raise ValueError("LD-clumping output path patterns must be unique")
-        population_specific = (
-            self.region_pruned_table,
-            self.region_significant_table,
+        # Shared COJO containers are safe because the validated subordinate
+        # dataset ID is applied to every formatter and GCTA artifact filename.
+        # Every direct scientific result and report remains population-specific.
+        missing = sorted(
+            name
+            for name, pattern in values.items()
+            if name not in self.shared_cojo_directory_fields
+            and "{population}" not in pattern
         )
-        if any("{population}" not in value for value in population_specific):
-            raise ValueError("region output tables must contain {population}")
+        if missing:
+            raise ValueError(
+                "scientific output patterns must contain {population}: %s"
+                % ", ".join(missing)
+            )
+        rendered_root = Path(self.cojo_root_directory.format(
+            dataset_id="dataset", population="EUR",
+        ))
+        rendered_formatter = Path(self.cojo_formatter_directory.format(
+            dataset_id="dataset", population="EUR",
+        ))
+        if rendered_root not in rendered_formatter.parents:
+            raise ValueError(
+                "cojo_formatter_directory must be below cojo_root_directory"
+            )
+        if not self.summary_csv.endswith(".csv"):
+            raise ValueError("summary_csv must end with .csv")
+        if not self.html_report.endswith(".html"):
+            raise ValueError("html_report must end with .html")
         return self
 
 
@@ -222,7 +465,9 @@ class LDClumpingConfig(ModuleConfig):
     lead_r2: float = Field(ge=0, le=1, allow_inf_nan=False)
     window_kb: int = Field(gt=0)
     merge_distance_bp: int = Field(ge=0)
-    missing_index_action: Literal["error", "self_only"]
+    missing_index_action: Literal["error", "warning_skip"]
+    minimum_reference_maf: float = Field(ge=0, le=0.5, allow_inf_nan=False)
+    missing_chromosome_action: Literal["error", "warning"]
     remove_mhc: bool
     mhc_regions: dict[GenomeBuild, GenomicRegion]
     summary_pvalue_thresholds: dict[str, float]
@@ -230,6 +475,8 @@ class LDClumpingConfig(ModuleConfig):
     vcf_fields: LDClumpingVcfFieldsConfig
     table: LDClumpingTableConfig
     compute: LDClumpingComputeConfig
+    cojo: LDClumpingCojoConfig
+    reporting: LDClumpingReportingConfig
     output_layout: LDClumpingOutputLayoutConfig
 
     @field_validator("methods")

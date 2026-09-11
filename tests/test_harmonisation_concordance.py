@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,8 @@ from postgwas.modules.harmonisation.concordance.service import (
     _read_external_eaf_partition,
     _screen_summary,
     _stage_external_eaf,
+    _stage_input,
+    _stage_strand_actions,
     _vcf_build,
     run_concordance_validation,
 )
@@ -87,6 +90,94 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         self.assertIn("effect estimates, allele frequencies, standard errors", help_text)
         self.assertIn("Z scores, and p-values", help_text)
         self.assertIn("Unmatched variants are reported without failing", help_text)
+
+    def test_archived_adapter_rows_stage_per_variant_strand_actions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configuration = load_configuration().modules.harmonisation
+            output_layout = dict(configuration.output_layout.root)
+            base = root / "harmonisation"
+            archive = base / output_layout["adapter_input_archive"].format(
+                dataset_id="study"
+            )
+            archive.mkdir(parents=True)
+            adapter = archive / "study_chr1_vcf_input.tsv.gz"
+            adapter_rows = pl.DataFrame({
+                "CHR": ["1", "1"], "POS": [101, 102],
+                "EA": ["A", "T"], "OA": ["T", "A"],
+                "strand_action": [
+                    "forward",
+                    "reference_unmatched_retained_reverse_complement",
+                ],
+            })
+            with gzip.open(adapter, "wt", encoding="utf-8", newline="") as handle:
+                adapter_rows.write_csv(handle, separator="\t")
+            mapping = base / output_layout["adapter_merged_mapping"].format(
+                dataset_id="study"
+            )
+            mapping.parent.mkdir(parents=True, exist_ok=True)
+            mapping.write_text(
+                '{"chr_col": 0, "pos_col": 1, "ea_col": 2, "oa_col": 3}',
+                encoding="utf-8",
+            )
+            destination = root / "strand.parquet"
+            log = SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None)
+
+            staged = _stage_strand_actions(
+                base,
+                destination,
+                "study",
+                output_layout,
+                configuration.vcf_processing.model_dump(),
+                _policies(),
+                log,
+                batch_rows=1,
+                compression="zstd",
+            )
+
+            self.assertEqual(staged, destination)
+            result = pl.read_parquet(destination)
+            self.assertEqual(result[PARTITION_COLUMN].to_list(), ["1", "1"])
+            self.assertEqual(
+                result["strand_action"].to_list(),
+                [
+                    "forward",
+                    "reference_unmatched_retained_reverse_complement",
+                ],
+            )
+
+    def test_gzip_input_staging_decompresses_and_preserves_source_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "input.tsv.gz"
+            destination = root / "input.parquet"
+            with gzip.open(source, "wt", encoding="utf-8", newline="") as handle:
+                handle.write(
+                    "##study metadata\n"
+                    "CHR\tBP\tEA\tOA\tEAF\tBETA\tSE\tZ\tP\n"
+                    "2\t202\tA\tG\t0.2\t0.2\t0.1\t2\t1e-400\n"
+                    "1\t101\tC\tT\t0.3\t-0.3\t0.1\t-3\t0.01\n"
+                    "2\t203\tA\tT\tNA\t0.4\t0.1\t4\t0.001\n"
+                )
+            log = SimpleNamespace(info=lambda *_args, **_kwargs: None)
+
+            rows = _stage_input(
+                _row(input_file=source),
+                destination,
+                _policies(),
+                log,
+                batch_rows=2,
+                compression="zstd",
+            )
+
+            staged = pl.read_parquet(destination)
+            self.assertEqual(rows, 3)
+            self.assertEqual(
+                staged[INPUT_SOURCE_ROW_COLUMN].to_list(), [1, 2, 3]
+            )
+            self.assertEqual(staged[PARTITION_COLUMN].to_list(), ["2", "1", "2"])
+            self.assertEqual(staged["P"].to_list(), ["1e-400", "0.01", "0.001"])
+            self.assertEqual(staged["EAF"].to_list(), ["0.2", "0.3", None])
 
     def test_top_level_validate_flag_dispatches_to_standalone_command(self):
         from postgwas.__main__ import main
@@ -330,6 +421,52 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         self.assertEqual(result.metric_summary["effect"]["checked"], 0)
         self.assertEqual(result.metric_summary["standard_error"]["concordant"], 1)
 
+    def test_per_variant_strand_actions_compare_frequency_resolved_palindromes(self):
+        input_frame = pl.DataFrame({
+            "CHR": [1, 1], "BP": [101, 102], "EA": ["A", "A"],
+            "OA": ["T", "T"], "EAF": [0.2, 0.3],
+            "BETA": [0.2, 0.3], "SE": [0.1, 0.1], "Z": [2.0, 3.0],
+            "P": [0.05, 0.01],
+        })
+        vcf_frame = pl.DataFrame({
+            "CHROM": [1, 1], "POS": [101, 102], "ID": ["v1", "v2"],
+            "REF": ["T", "A"], "ALT": ["A", "T"],
+            "ES": [0.2, -0.3], "SE": [0.1, 0.1], "EZ": [2.0, -3.0],
+            "AF": [0.2, 0.7], "LP": _lp([0.05, 0.01]),
+        })
+        strand_actions = pl.DataFrame({
+            "CHROM": [1, 1], "POS": [101, 102],
+            "REF": ["T", "A"], "ALT": ["A", "T"],
+            "strand_action": ["forward", "forward_swapped"],
+        })
+
+        result = compare_input_to_vcf(
+            input_frame,
+            vcf_frame,
+            _row(),
+            effect_type="beta",
+            p_value_type="raw",
+            eaf_is_maf=False,
+            strand_consensus=None,
+            settings=_settings(),
+            policies=_policies(),
+            strand_action_frame=strand_actions,
+        )
+
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.summary["palindromic_variants_compared"], 2)
+        self.assertEqual(
+            result.summary["palindromic_comparison_basis"],
+            "per_variant_strand_action",
+        )
+        self.assertEqual(result.metric_summary["effect"]["concordant"], 2)
+        self.assertEqual(result.metric_summary["allele_frequency"]["concordant"], 2)
+        self.assertEqual(result.metric_summary["z_score"]["concordant"], 2)
+        self.assertEqual(
+            set(result.matched["match_type"]),
+            {"palindromic_forward", "palindromic_forward_swapped"},
+        )
+
     def test_reports_unmatched_indels_without_failing_value_concordance(self):
         input_frame = pl.DataFrame({
             "CHR": [1, 1], "BP": [101, 200], "EA": ["A", "AA"],
@@ -420,7 +557,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         self.assertEqual(indels["vcf_specific_positions"], 1)
         self.assertEqual(result.status, "WARNING")
 
-    def test_same_position_unmatched_indel_values_are_checked_diagnostically(self):
+    def test_equivalent_padded_indel_is_matched_allele_aware(self):
         input_frame = pl.DataFrame({
             "CHR": [20], "BP": [45796847], "EA": ["GT"], "OA": ["GTT"],
             "EAF": [0.00811], "BETA": [-0.0431], "SE": [0.0261],
@@ -440,32 +577,62 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         )
 
         indels = result.summary["variant_types"]["indels"]
-        self.assertEqual(result.status, "WARNING")
-        self.assertEqual(indels["exact_matched_variants"], 0)
-        self.assertEqual(indels["unambiguous_position_pairs"], 1)
-        self.assertEqual(indels["position_value_checked_pairs"], 1)
-        self.assertEqual(indels["position_value_concordant_pairs"], 1)
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(indels["exact_matched_variants"], 1)
+        self.assertEqual(indels["unambiguous_position_pairs"], 0)
+        self.assertEqual(indels["position_value_checked_pairs"], 0)
+        self.assertEqual(indels["position_value_concordant_pairs"], 0)
         self.assertEqual(indels["position_value_mismatch_pairs"], 0)
-        self.assertEqual(result.position_matches.height, 1)
+        self.assertEqual(result.position_matches.height, 0)
+        self.assertEqual(result.input_only.height, 0)
+        self.assertEqual(result.vcf_only.height, 0)
         self.assertEqual(
-            result.input_only.item(0, "position_comparison"),
-            "one_to_one_same_position",
-        )
-        self.assertEqual(
-            result.position_metric_summary_by_variant_type["indels"]
+            result.metric_summary_by_variant_type["indels"]
             ["standard_error"]["concordant"],
             1,
         )
         self.assertEqual(
-            result.position_metric_summary_by_variant_type["indels"]
+            result.metric_summary_by_variant_type["indels"]
             ["p_value"]["concordant"],
             1,
         )
 
+    def test_distinct_minimal_indels_at_one_position_match_without_collision(self):
+        input_frame = pl.DataFrame({
+            "CHR": [1, 1], "BP": [100, 100],
+            "EA": ["CTT", "CATA"], "OA": ["CTTT", "CATAATA"],
+            "EAF": [0.2, 0.3], "BETA": [0.2, -0.3],
+            "SE": [0.1, 0.1], "Z": [2.0, -3.0], "P": [0.05, 0.01],
+        })
+        vcf_frame = pl.DataFrame({
+            "CHROM": [1, 1], "POS": [100, 100], "ID": ["v1", "v2"],
+            "REF": ["CT", "CATA"], "ALT": ["C", "C"],
+            "ES": [0.2, -0.3], "SE": [0.1, 0.1], "EZ": [2.0, -3.0],
+            "AF": [0.2, 0.3], "LP": _lp([0.05, 0.01]),
+        })
+
+        result = compare_input_to_vcf(
+            input_frame, vcf_frame, _row(), effect_type="beta",
+            p_value_type="raw", eaf_is_maf=False, settings=_settings(),
+            policies=_policies(),
+        )
+
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.summary["matched_variants"], 2)
+        self.assertEqual(result.summary["input_only_variants"], 0)
+        self.assertEqual(result.summary["vcf_only_variants"], 0)
+        self.assertEqual(result.summary["vcf_duplicate_records"], 0)
+        self.assertEqual(
+            result.metric_summary_by_variant_type["indels"]["effect"][
+                "concordant"
+            ],
+            2,
+        )
+
     def test_multiallelic_unmatched_position_is_not_paired_arbitrarily(self):
         input_frame = pl.DataFrame({
-            "CHR": [1, 1], "BP": [100, 100], "EA": ["A", "AT"],
-            "OA": ["AT", "ATT"], "EAF": [0.2, 0.3],
+            "CHR": [1, 1], "BP": [100, 100], "EA": ["A", "A"],
+            "OA": ["AT", "AG"], "EAF": [0.2, 0.3],
             "BETA": [0.1, 0.2], "SE": [0.1, 0.1], "Z": [1.0, 2.0],
             "P": [0.3, 0.05],
         })
@@ -629,7 +796,6 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         cases = (
             ("raw", 0.01, 2.0),
             ("neglog10", 2.0, 2.0),
-            ("negln", -math.log(0.01), 2.0),
             ("raw", 0.0, 300.0),
         )
         for p_value_type, supplied, expected_lp in cases:
@@ -648,6 +814,22 @@ class ConcordanceAnalysisTests(unittest.TestCase):
                 self.assertAlmostEqual(
                     prepared.item(0, "input_lp"), expected_lp, places=10,
                 )
+
+    def test_concordance_preserves_extreme_raw_and_neglog10_magnitude(self):
+        for p_value_type, supplied in (("raw", "1e-400"), ("neglog10", "400")):
+            with self.subTest(p_value_type=p_value_type):
+                frame = pl.DataFrame({
+                    "CHR": [1], "BP": [101], "EA": ["A"], "OA": ["G"],
+                    "EAF": [0.2], "BETA": [0.2], "SE": [0.01],
+                    "Z": [42.826406], "P": [supplied],
+                })
+                prepared = prepare_input_table(
+                    frame, _row(), effect_type="beta",
+                    p_value_type=p_value_type, eaf_is_maf=False,
+                    settings=_settings(), policies=_policies(),
+                )
+
+                self.assertAlmostEqual(prepared.item(0, "input_lp"), 400.0)
 
     def test_p_value_mismatch_is_reported_and_fails_by_default(self):
         input_frame = pl.DataFrame({
@@ -762,7 +944,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         self.assertEqual(result.status, "PASS")
         self.assertEqual(result.metric_summary["allele_frequency"]["concordant"], 2)
 
-    def test_external_frequency_uses_final_vcf_orientation_for_reciprocal_indels(self):
+    def test_external_frequency_uses_full_alleles_in_final_vcf_orientation(self):
         input_frame = pl.DataFrame({
             "CHR": [6], "BP": [135158129], "EA": ["T"], "OA": ["TC"],
             "BETA": [0.2], "SE": [0.1], "Z": [2.0], "P": [0.05],
@@ -821,6 +1003,53 @@ class ConcordanceAnalysisTests(unittest.TestCase):
                     1,
                 )
 
+    def test_external_frequency_avoids_normalized_tandem_repeat_collision(self):
+        input_frame = pl.DataFrame({
+            "CHR": [6], "BP": [905124],
+            "EA": ["ATCTCTCTC"], "OA": ["ATCTCTC"],
+            "BETA": [0.2], "SE": [0.1], "Z": [2.0], "P": [0.05],
+        })
+        external = pl.DataFrame({
+            "CHROM": [6, 6], "POS": [905124, 905124],
+            "REF": ["ATC", "ATCTCTCTC"],
+            "ALT": ["A", "ATCTCTC"],
+            "FREQ": [0.856808, 0.981838],
+        })
+        vcf_frame = pl.DataFrame({
+            "CHROM": [6], "POS": [905124], "ID": ["repeat_indel"],
+            "REF": ["ATC"], "ALT": ["A"], "ES": [-0.2],
+            "SE": [0.1], "EZ": [-2.0], "AF": [0.981838],
+            "LP": _lp([0.05]),
+        })
+        row = _row(
+            effect_allele_frequency_column=None,
+            external_eaf_file=Path("frequencies.tsv"),
+            external_eaf_column="FREQ",
+        )
+        config = load_configuration()
+
+        result = compare_input_to_vcf(
+            input_frame,
+            vcf_frame,
+            row,
+            effect_type="beta",
+            p_value_type="raw",
+            eaf_is_maf=False,
+            settings=config.modules.harmonisation.concordance_validation,
+            policies=load_policies(config.modules.harmonisation.policies),
+            external_eaf_frame=external,
+            external_eaf_mapping=config.modules.harmonisation.external_eaf_mapping,
+        )
+
+        self.assertEqual(result.status, "PASS")
+        self.assertAlmostEqual(result.matched.item(0, "input_af"), 0.018162)
+        self.assertAlmostEqual(
+            result.matched.item(0, "expected_allele_frequency"), 0.981838
+        )
+        self.assertEqual(
+            result.metric_summary["allele_frequency"]["concordant"], 1
+        )
+
     def test_single_external_eaf_file_with_build_template_is_staged_once(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -860,15 +1089,20 @@ class ConcordanceAnalysisTests(unittest.TestCase):
                 ("1", 101, "A", "G", 0.2),
                 ("2", 202, "C", "T", 0.3),
             ):
-                pl.DataFrame({
+                panel = pl.DataFrame({
                     "CHROM": [chromosome],
                     "POS": [position],
                     "ALT": [alt],
                     "REF": [ref],
                     "FREQ": [frequency],
-                }).write_csv(
-                    root / ("panel_chr%s.tsv" % chromosome), separator="\t",
-                )
+                })
+                with gzip.open(
+                    root / ("panel_chr%s.tsv.gz" % chromosome),
+                    "wt",
+                    encoding="utf-8",
+                    newline="",
+                ) as handle:
+                    panel.write_csv(handle, separator="\t")
 
             input_path = root / "input.parquet"
             vcf_path = root / "vcf.parquet"
@@ -903,7 +1137,7 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             configuration = load_configuration()
             row = _row(
                 effect_allele_frequency_column=None,
-                external_eaf_file=root / "panel_chr{chromosome}.tsv",
+                external_eaf_file=root / "panel_chr{chromosome}.tsv.gz",
                 external_eaf_column="FREQ",
             )
             log_messages = []
@@ -945,9 +1179,9 @@ class ConcordanceAnalysisTests(unittest.TestCase):
                 result.metric_summary["allele_frequency"]["concordant"], 2,
             )
             messages = "\n".join(log_messages)
-            self.assertIn("panel_chr1.tsv", messages)
-            self.assertIn("panel_chr2.tsv", messages)
-            self.assertNotIn("chr{chromosome}.tsv with separator", messages)
+            self.assertIn("panel_chr1.tsv.gz", messages)
+            self.assertIn("panel_chr2.tsv.gz", messages)
+            self.assertNotIn("chr{chromosome}.tsv.gz with separator", messages)
 
     def test_missing_chromosome_external_eaf_file_has_actionable_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -971,6 +1205,9 @@ class ConcordanceAnalysisTests(unittest.TestCase):
                     "GRCh37",
                     _policies(),
                     log,
+                    workspace=root,
+                    batch_rows=2,
+                    compression="zstd",
                 )
 
     def test_reference_confirmed_eaf_is_compared_without_maf_folding(self):
@@ -1108,15 +1345,49 @@ class ConcordanceAnalysisTests(unittest.TestCase):
 
         self.assertEqual(result.matched.item(0, "input_row"), 2)
 
+    def test_swapped_orientation_duplicate_group_has_no_arbitrary_survivor(self):
+        input_frame = pl.DataFrame({
+            "CHR": [1, 1, 1], "BP": [101, 101, 202],
+            "EA": ["A", "G", "C"], "OA": ["G", "A", "T"],
+            "EAF": [0.2, 0.8, 0.3], "BETA": [0.2, -0.2, 0.3],
+            "SE": [0.1, 0.1, 0.1], "Z": [2.0, -2.0, 3.0],
+            "P": [0.05, 0.05, 0.01],
+        })
+        duplicate_report = input_frame.head(2).with_columns(
+            pl.Series("duplicate_input_row", [1, 2]),
+            pl.Series("duplicate_action", ["remove_all", "remove_all"]),
+        )
+        vcf_frame = pl.DataFrame({
+            "CHROM": [1, 1], "POS": [101, 202], "ID": ["duplicate", "unique"],
+            "REF": ["G", "T"], "ALT": ["A", "C"],
+            "ES": [0.2, 0.3], "SE": [0.1, 0.1], "EZ": [2.0, 3.0],
+            "AF": [0.2, 0.3], "LP": _lp([0.05, 0.01]),
+        })
+
+        result = compare_input_to_vcf(
+            input_frame, vcf_frame, _row(), effect_type="beta",
+            p_value_type="raw", eaf_is_maf=False, settings=_settings(),
+            policies=_policies(), duplicate_report_frame=duplicate_report,
+        )
+
+        self.assertEqual(result.matched["input_row"].to_list(), [3])
+        self.assertEqual(result.summary["input_duplicate_rows"], 2)
+        self.assertEqual(
+            result.input_only.filter(
+                pl.col("not_retained_reason") == "duplicate_input_variant"
+            )["input_row"].to_list(),
+            [1, 2],
+        )
+
     def test_combined_coordinate_parser_matches_harmonisation(self):
         frame = pl.DataFrame({
             "VARIANT": [
                 "1:100000", "1_100000", "1:100000:C:T",
-                "1:100000.0", "1:100000-100001",
+                "1:100000.0", "1:1e5", "1:100000-100001",
             ],
-            "EA": ["A"] * 5, "OA": ["G"] * 5, "EAF": [0.2] * 5,
-            "BETA": [0.2] * 5, "SE": [0.1] * 5, "Z": [2.0] * 5,
-            "P": [0.05] * 5,
+            "EA": ["A"] * 6, "OA": ["G"] * 6, "EAF": [0.2] * 6,
+            "BETA": [0.2] * 6, "SE": [0.1] * 6, "Z": [2.0] * 6,
+            "P": [0.05] * 6,
         })
         prepared = prepare_input_table(
             frame,
@@ -1129,9 +1400,25 @@ class ConcordanceAnalysisTests(unittest.TestCase):
             settings=_settings(), policies=_policies(),
         )
 
-        self.assertEqual(prepared["input_chrom"].to_list(), ["1"] * 5)
-        self.assertEqual(prepared["input_pos"].to_list(), [100000] * 5)
-        self.assertEqual(prepared["valid_input_variant"].to_list(), [True] * 5)
+        self.assertEqual(prepared["input_chrom"].to_list(), ["1"] * 6)
+        self.assertEqual(prepared["input_pos"].to_list(), [100000] * 6)
+        self.assertEqual(prepared["valid_input_variant"].to_list(), [True] * 6)
+
+    def test_fractional_position_is_invalid_in_concordance_instead_of_truncated(self):
+        frame = pl.DataFrame({
+            "CHR": ["1", "1"], "BP": ["100000.9", "1e5"],
+            "EA": ["A", "A"], "OA": ["G", "G"], "EAF": [0.2, 0.2],
+            "BETA": [0.2, 0.2], "SE": [0.1, 0.1], "Z": [2.0, 2.0],
+            "P": [0.05, 0.05],
+        })
+
+        prepared = prepare_input_table(
+            frame, _row(), effect_type="beta", p_value_type="raw",
+            eaf_is_maf=False, settings=_settings(), policies=_policies(),
+        )
+
+        self.assertEqual(prepared["input_pos"].to_list(), [None, 100000])
+        self.assertEqual(prepared["valid_input_variant"].to_list(), [False, True])
 
     def test_duplicate_vcf_records_fail_at_the_configured_default(self):
         input_frame = pl.DataFrame({
@@ -1158,6 +1445,30 @@ class ConcordanceAnalysisTests(unittest.TestCase):
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.summary["vcf_duplicate_records"], 1)
         self.assertEqual(result.vcf_duplicates.height, 1)
+
+    def test_equivalent_vcf_padding_is_detected_as_a_duplicate_key(self):
+        input_frame = pl.DataFrame({
+            "CHR": [1], "BP": [101], "EA": ["AT"], "OA": ["A"],
+            "EAF": [0.2], "BETA": [0.2], "SE": [0.1], "Z": [2.0],
+            "P": [0.05],
+        })
+        vcf_frame = pl.DataFrame({
+            "CHROM": [1, 1], "POS": [101, 101],
+            "ID": ["minimal", "padded"],
+            "REF": ["A", "AT"], "ALT": ["AT", "ATT"],
+            "ES": [0.2, 0.2], "SE": [0.1, 0.1], "EZ": [2.0, 2.0],
+            "AF": [0.2, 0.2], "LP": _lp([0.05, 0.05]),
+        })
+
+        result = compare_input_to_vcf(
+            input_frame, vcf_frame, _row(), effect_type="beta",
+            p_value_type="raw", eaf_is_maf=False, settings=_settings(),
+            policies=_policies(),
+        )
+
+        self.assertEqual(result.status, "FAIL")
+        self.assertEqual(result.summary["vcf_duplicate_records"], 1)
+        self.assertEqual(result.vcf_duplicates["vcf_id"].to_list(), ["padded"])
 
     def test_service_streams_and_combines_chromosome_partitions(self):
         with tempfile.TemporaryDirectory() as directory:

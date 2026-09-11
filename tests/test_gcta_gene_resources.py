@@ -85,6 +85,10 @@ def _prepare_pathway_resource(
     analysis_variant_source: Path | None = None,
     maximum_set_variants: int | None = None,
     minimum_free_disk_gb: float = 0,
+    minimum_gene_id_overlap_fraction: float | None = None,
+    excluded_gene_ids: set[str] | None = None,
+    analysis_scope: dict | None = None,
+    allowed_chromosomes: list[str] | None = None,
 ):
     configuration = load_configuration()
     set_annotation = configuration.modules.gcta_gene.set_annotation
@@ -100,7 +104,10 @@ def _prepare_pathway_resource(
             resource_name="Test fastBAT pathways",
             genome_build="GRCh37",
             gene_window_kb=0,
-            allowed_chromosomes=["1", "X"],
+            gene_columns=list(
+                configuration.modules.gcta_gene.gene_annotation.columns
+            ),
+            allowed_chromosomes=allowed_chromosomes or ["1", "X"],
             chromosome_label_policy="exact",
             duplicate_gene_policy="deduplicate",
             unmapped_gene_policy="report",
@@ -117,8 +124,15 @@ def _prepare_pathway_resource(
         mapping_workers=1,
         mapping_memory_gb=1,
         worker_memory_multiplier=conversion.parallelism.worker_memory_multiplier,
+        minimum_gene_id_overlap_fraction=(
+            minimum_gene_id_overlap_fraction
+            if minimum_gene_id_overlap_fraction is not None
+            else conversion.minimum_gene_id_overlap_fraction
+        ),
         analyzable_variant_ids=analyzable_variant_ids,
         analysis_variant_source=analysis_variant_source,
+        excluded_gene_ids=excluded_gene_ids,
+        analysis_scope=analysis_scope,
         maximum_set_variants=(
             maximum_set_variants
             if maximum_set_variants is not None
@@ -132,6 +146,184 @@ def _prepare_pathway_resource(
         minimum_free_disk_gb=minimum_free_disk_gb,
         disk_estimation_safety_factor=1,
     )
+
+
+def test_coordinate_reference_threshold_is_inclusive_and_fails_before_mapping(
+    tmp_path,
+):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text(
+        "PATH_A\tdescription\tGENE1\tGENE2\n"
+        "PATH_B\tdescription\tGENE2\n",
+        encoding="utf-8",
+    )
+    genes = tmp_path / "genes.txt"
+    genes.write_text(
+        "1\t100\t200\tGENE1\n1\t300\t400\tGENE_COORDINATE_ONLY\n",
+        encoding="utf-8",
+    )
+    bim = tmp_path / "reference.bim"
+    bim.write_text("1\trs1\t0\t150\tA\tG\n", encoding="utf-8")
+
+    manifest = _prepare_pathway_resource(
+        gmt,
+        genes,
+        bim,
+        tmp_path / "passing",
+        minimum_gene_id_overlap_fraction=0.5,
+    )
+
+    assert manifest["validation"]["input_unique_genes"] == 2
+    assert manifest["validation"]["genes_with_coordinates"] == 1
+    assert manifest["validation"]["gmt_gene_mappability_fraction"] == 0.5
+    assert manifest["validation"]["coordinate_reference_coverage_fraction"] == 0.5
+    assert (
+        manifest["validation"]["coordinate_reference_genes_absent_from_gmt"]
+        == 1
+    )
+    assert manifest["validation"]["unmapped_unique_genes"] == 1
+    assert manifest["validation"]["pathways_with_complete_gene_id_mapping"] == 0
+    assert manifest["validation"]["pathways_with_partial_gene_id_mapping"] == 1
+    assert manifest["validation"]["pathways_without_gene_id_mapping"] == 1
+    mapping = pl.read_csv(
+        tmp_path / "passing" / "pathway_mapping.tsv", separator="\t"
+    )
+    assert mapping["gene_id_mappability_fraction"].to_list() == [0.5, 0.0]
+    assert mapping["analyzable_gene_fraction"].to_list() == [0.5, 0.0]
+
+    failing_output = tmp_path / "failing"
+    with pytest.raises(
+        ResourcePreparationError,
+        match=(
+            "Coordinate-reference coverage is 1/2.*configured minimum of "
+            "50.01%.*GMT gene mappability is 1/2.*reported only"
+        ),
+    ):
+        _prepare_pathway_resource(
+            gmt,
+            genes,
+            bim,
+            failing_output,
+            minimum_gene_id_overlap_fraction=0.5001,
+        )
+    assert not failing_output.exists()
+
+
+def test_focused_gmt_fails_low_coordinate_reference_coverage(
+    tmp_path,
+):
+    gmt = tmp_path / "focused.gmt"
+    gmt.write_text("FOCUSED\tdescription\tGENE1\n", encoding="utf-8")
+    genes = tmp_path / "genes.txt"
+    genes.write_text(
+        "1\t100\t200\tGENE1\n"
+        "1\t300\t400\tGENE2\n"
+        "1\t500\t600\tGENE3\n",
+        encoding="utf-8",
+    )
+    bim = tmp_path / "reference.bim"
+    bim.write_text("1\trs1\t0\t150\tA\tG\n", encoding="utf-8")
+
+    output = tmp_path / "sets"
+    with pytest.raises(
+        ResourcePreparationError,
+        match=(
+            "Coordinate-reference coverage is 1/3.*below the configured "
+            "minimum of 50.00%.*GMT gene mappability is 1/1"
+        ),
+    ):
+        _prepare_pathway_resource(
+            gmt,
+            genes,
+            bim,
+            output,
+            minimum_gene_id_overlap_fraction=0.5,
+        )
+    assert not output.exists()
+
+
+def test_low_gmt_mappability_passes_when_coordinate_reference_coverage_passes(
+    tmp_path,
+):
+    gmt = tmp_path / "broad.gmt"
+    gmt.write_text(
+        "PATH_A\tdescription\tGENE1\tMISSING1\tMISSING2\tMISSING3\n"
+        "PATH_B\tdescription\tGENE2\n",
+        encoding="utf-8",
+    )
+    genes = tmp_path / "genes.txt"
+    genes.write_text(
+        "1\t100\t200\tGENE1\n1\t300\t400\tGENE2\n",
+        encoding="utf-8",
+    )
+    bim = tmp_path / "reference.bim"
+    bim.write_text(
+        "1\trs1\t0\t150\tA\tG\n1\trs2\t0\t350\tC\tT\n",
+        encoding="utf-8",
+    )
+
+    manifest = _prepare_pathway_resource(
+        gmt,
+        genes,
+        bim,
+        tmp_path / "sets",
+        minimum_gene_id_overlap_fraction=0.5,
+    )
+
+    validation = manifest["validation"]
+    assert validation["gmt_gene_mappability_fraction"] == pytest.approx(0.4)
+    assert validation["coordinate_reference_coverage_fraction"] == 1
+    assert validation["coordinate_reference_genes_absent_from_gmt"] == 0
+
+
+def test_pathway_scope_exclusions_are_distinct_from_unmapped_genes(tmp_path):
+    gmt = tmp_path / "pathways.gmt"
+    gmt.write_text(
+        "PATH_A\tdescription\tGENE1\tGENE_MHC\tGENE_MISSING\n",
+        encoding="utf-8",
+    )
+    genes = tmp_path / "genes.txt"
+    genes.write_text(
+        "1\t100\t200\tGENE1\n6\t29000000\t29100000\tGENE_MHC\n",
+        encoding="utf-8",
+    )
+    bim = tmp_path / "reference.bim"
+    bim.write_text(
+        "1\trs1\t0\t150\tA\tG\n6\trs_mhc\t0\t29050000\tA\tG\n",
+        encoding="utf-8",
+    )
+    analysis_scope = {
+        "mhc_policy": "exclude_genes",
+        "exclude_mhc_snps": False,
+        "exclude_mhc_genes": True,
+        "mhc_region": {"chromosome": "6", "start": 28477797, "end": 33448354},
+        "mhc_source": "genome_resources",
+        "exclude_chromosomes": [],
+    }
+
+    manifest = _prepare_pathway_resource(
+        gmt,
+        genes,
+        bim,
+        tmp_path / "sets",
+        minimum_gene_id_overlap_fraction=0.5,
+        excluded_gene_ids={"GENE_MHC"},
+        analysis_scope=analysis_scope,
+        allowed_chromosomes=["1", "6"],
+    )
+
+    assert manifest["schema_version"] == "gcta_fastbat_pathway_resource.v6"
+    assert manifest["validation"]["genes_with_coordinates"] == 2
+    assert manifest["validation"]["genes_eligible_for_analysis"] == 1
+    assert manifest["validation"]["genes_excluded_by_analysis_scope"] == 1
+    assert manifest["validation"]["unmapped_unique_genes"] == 1
+    assert manifest["policies"]["analysis_scope"] == analysis_scope
+    assert (tmp_path / "sets" / "pathways.set").read_text(
+        encoding="utf-8"
+    ) == "PATH_A\nrs1\nEND\n\n"
+    assert (tmp_path / "sets" / "unmapped_genes.tsv").read_text(
+        encoding="utf-8"
+    ).splitlines() == ["pathway\tgene", "PATH_A\tGENE_MISSING"]
 
 
 def test_resource_script_writes_exact_headerless_projection_and_provenance(tmp_path):
@@ -490,6 +682,9 @@ def test_gmt_converter_uses_bounded_parallel_chromosome_caches(
             resource_name="Test fastBAT pathways",
             genome_build="GRCh37",
             gene_window_kb=0,
+            gene_columns=list(
+                defaults.modules.gcta_gene.gene_annotation.columns
+            ),
             allowed_chromosomes=["1", "X"],
             chromosome_label_policy="exact",
             duplicate_gene_policy="deduplicate",
@@ -507,6 +702,9 @@ def test_gmt_converter_uses_bounded_parallel_chromosome_caches(
         mapping_workers=2,
         mapping_memory_gb=1,
         worker_memory_multiplier=8,
+        minimum_gene_id_overlap_fraction=(
+            conversion.minimum_gene_id_overlap_fraction
+        ),
         maximum_set_variants=set_annotation.maximum_set_variants,
         oversized_set_policy=set_annotation.oversized_set_policy,
         audit_level=conversion.audit.level,

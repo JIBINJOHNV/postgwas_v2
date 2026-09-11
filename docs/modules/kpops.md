@@ -24,7 +24,9 @@ After validating the published predictions, PostGWAS prints and logs an analysis
 
 The upstream program defines its HLA interval internally. PostGWAS exposes only the upstream keep/remove switches; it does not redefine or reinterpret that interval.
 
-Direct execution reports four validated progress stages: input and reference validation, compatible MAGMA gene-universe resolution, K-POPS model fitting and scoring, and final output validation and publication. The model-fitting stage remains active with elapsed time while upstream K-POPS runs; PostGWAS does not invent chromosome-level completion percentages that the upstream program does not expose.
+Direct and pipeline execution report six validated K-POPS stages. PostGWAS first validates the two MAGMA gene-association input files, then validates the gene annotation, then the kernel matrix, gene-order file, and installed K-POPS script. Only after those independent checks pass does it validate the cross-resource gene universe, run model fitting, and validate and publish the outputs. Each completed validation stage prints the relevant paths, row or gene counts, declared build, and structural result; the same evidence is retained in the canonical log.
+
+During stage 5, a separate `K-POPS model-fitting progress` counter reports observed upstream model completions when detailed progress is enabled. PostGWAS enables the pinned program's verbose messages internally and captures them rather than printing duplicate native output. Each upstream `Computing PoPS scores.` event occurs after the corresponding coefficient solve and advances the measured counter. LOCO analysis uses the exact number of distinct chromosomes in the validated K-POPS annotation as its total; `all` and explicitly selected training chromosomes each fit one model. This measured counter is distinct from the six-stage PostGWAS bar: for example, `5/6` identifies the active PostGWAS stage, while `4/6 67%` means four stages have completed validation. The measured counter reaches 100% only after the K-POPS process exits successfully and its declared files pass the checked-command output contract. Full scientific result validation remains stage 6. A failed run retains its last observed count below 100%. Enabling verbose capture changes logging only, not the K-POPS scientific arguments or calculations.
 
 ## Inputs
 
@@ -87,7 +89,7 @@ postgwas pipeline \
   --modules kpops \
   --vcf study_GRCh37.vcf.gz \
   --magma-ld-reference /path/to/postgwas-resources/magma/functional_mapping/base/ld_reference/g1000_eur/g1000_eur \
-  --gene-location-file /path/to/postgwas-resources/kpops/software/8acd49ed8c96565b17c2997420f514f24b65e096/data/Ensembl.hg19.gene.loc \
+  --gene-location-file reference/PoPS_GRCh37_strand_aware.loc \
   --kpops-gene-annotation-file /path/to/postgwas-resources/pops/GRCh37_gene_annot_jun10.txt \
   --kernel-matrix-prefix /path/to/postgwas-resources/kpops/kernels/GRCh37/pops_features_standardized_linear \
   --kpops-genome-build GRCh37 \
@@ -96,7 +98,9 @@ postgwas pipeline \
   --run-config kpops_pipeline.yaml
 ```
 
-Pipeline mode runs formatter and MAGMA first, then supplies the validated MAGMA prefix to K-POPS. The displayed `Ensembl.hg19.gene.loc` is the file pinned with K-POPS v1.0.0; it uses Ensembl identifiers and the same GRCh37 gene universe as the installed K-POPS annotation. An NCBI/Entrez MAGMA location file is not compatible with this kernel. Installation provides the pinned `k-pops.py` command. The annotation, kernel prefix, and declared build must be supplied explicitly through the corresponding CLI options or a run configuration; PostGWAS has no machine-specific data-resource defaults.
+Pipeline mode runs formatter and MAGMA first, then supplies the validated MAGMA prefix to K-POPS. The prepared gene-location reference must use the same GRCh37 Ensembl gene universe as the K-POPS annotation, with columns `gene_id chromosome start end strand` and an optional symbol. PostGWAS requires strand to be `+` or `-`; the upstream K-POPS `Ensembl.hg19.gene.loc` instead contains a numeric TSS in column five and is not directly compatible. An explicitly audited preparation may derive `+` when the source TSS equals START and `-` when it equals END, but must reject ambiguous or non-endpoint TSS values and preserve all source genes and coordinates. An NCBI/Entrez location file is not compatible with this kernel. Installation provides the pinned `k-pops.py` command. The annotation, kernel prefix, and declared build must be supplied explicitly through the corresponding CLI options or a run configuration; PostGWAS has no machine-specific data-resource defaults.
+
+Pipeline-only overrides use `--kpops-gene-universe-policy`, `--kpops-training-chromosomes`, and `--kpops-use-magma-covariates` / `--no-kpops-use-magma-covariates`. The corresponding direct-mode names remain unchanged. This keeps K-POPS settings independent when PoPS is selected in the same pipeline: unqualified PoPS flags do not override K-POPS, and omitted options retain each module's canonical YAML values. No configuration keys or model defaults change.
 
 ## Outputs
 
@@ -112,3 +116,4 @@ K-POPS results are staged and published only after validation:
 
 - [K-POPS v1.0.0 README](https://github.com/JasonTan-code/k-pops/tree/8acd49ed8c96565b17c2997420f514f24b65e096)
 - [Pinned K-POPS implementation](https://github.com/JasonTan-code/k-pops/blob/8acd49ed8c96565b17c2997420f514f24b65e096/k-pops.py)
+- [MAGMA documentation and strand-aware annotation format](https://cncr.nl/research/magma/)

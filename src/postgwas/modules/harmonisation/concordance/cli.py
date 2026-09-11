@@ -132,6 +132,9 @@ def run_standalone_validation(args) -> dict:
         file_log_level=config.logging.file_level,
         screen_log_level=config.logging.console_level,
         external_eaf_mapping=config.modules.harmonisation.external_eaf_mapping,
+        provenance_headers=(
+            config.modules.formatting.input_contract.provenance_headers.model_dump()
+        ),
     )
 
 

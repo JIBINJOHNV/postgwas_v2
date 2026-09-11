@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-import codecs
+from contextvars import copy_context
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import select
 import sys
 import threading
 from typing import Any, Iterator, Sequence, TextIO
 
 from rich.console import Console
-from rich.text import Text
+
+from postgwas.core.ui.terminal_text import TerminalTextDecoder
 
 from postgwas.config import load_configuration, load_run_configuration_for_module
 from postgwas.config.loader import canonical_module_name
+from postgwas.core.ui.screen import (
+    default_terminal_settings,
+    style_screen_block,
+    terminal_presentation,
+    terminal_settings,
+)
 
 
 _NON_SCIENTIFIC_COMMANDS = {"config", "resources"}
@@ -23,6 +31,9 @@ _ACTIVE_RECORDERS = 0
 _PROGRESS_DISPLAY_CONSOLE: Console | None = None
 _PROGRESS_DISPLAY_STREAM: TextIO | None = None
 _PROGRESS_SUMMARY_CONSOLE: Console | None = None
+
+# Bounded transport buffer, not an analysis or user-facing compute setting.
+_PIPE_READ_BYTES = 65536
 
 
 @dataclass(frozen=True)
@@ -94,13 +105,7 @@ def _option_value(arguments: Sequence[str], option: str) -> str | None:
 
 
 def _screen_override(arguments: Sequence[str]) -> bool | None:
-    selected = None
-    for argument in arguments:
-        if argument == "--show-screen":
-            selected = True
-        elif argument == "--hide-screen":
-            selected = False
-    return selected
+    return False if "--hide-screen" in arguments else None
 
 
 def resolve_screen_settings(
@@ -162,6 +167,7 @@ def resolve_screen_settings(
 
 def _copy_pipe(
     read_fd: int,
+    stop_fd: int,
     display_fd: int,
     log_fd: int,
     show_screen: bool,
@@ -169,33 +175,77 @@ def _copy_pipe(
     display_console: Console | None,
     display_encoding: str,
 ) -> None:
-    decoder = codecs.getincrementaldecoder(display_encoding)(errors="replace")
+    """Copy one redirected stream until EOF or an explicit recorder stop.
 
-    def display(data: bytes, *, final: bool = False) -> None:
+    Multiprocessing helper processes can inherit file descriptors 1 and 2 and
+    remain alive until their parent exits.  Waiting only for pipe EOF therefore
+    deadlocks recorder shutdown: the parent waits for this worker while the
+    helper waits for the parent.  A private, non-inherited control pipe lets the
+    parent request shutdown after it has flushed and restored the real streams.
+    The worker drains every byte already queued before returning.
+    """
+    decoder = TerminalTextDecoder(display_encoding)
+    pending = ""
+
+    def copy(data: bytes, *, final: bool = False) -> None:
+        nonlocal pending
+        plain = decoder.decode(data, final=final)
+        if plain:
+            with log_lock:
+                _write_all(log_fd, plain.encode("utf-8"))
         if not show_screen:
             return
         if display_console is None:
-            _write_all(display_fd, data)
+            if plain:
+                _write_all(display_fd, plain.encode(display_encoding, errors="replace"))
             return
-        decoded = decoder.decode(data, final=final)
-        if decoded:
-            display_console.print(Text.from_ansi(decoded), end="")
+        pending += plain
+        # Complete lines keep semantic labels and UTF-8 intact across pipe
+        # reads. An unusually long native line is streamed, never accumulated
+        # without a bound or truncated. No word-based severity guessing.
+        boundary = pending.rfind("\n") + 1
+        if final or len(pending) >= _PIPE_READ_BYTES:
+            boundary = len(pending)
+        if boundary:
+            display_console.print(style_screen_block(pending[:boundary]), end="", soft_wrap=True)
+            pending = pending[boundary:]
 
     try:
         while True:
-            block = os.read(read_fd, 65536)
-            if not block:
+            readable, _, _ = select.select((read_fd, stop_fd), (), ())
+            if read_fd in readable:
+                block = os.read(read_fd, _PIPE_READ_BYTES)
+                if not block:
+                    break
+                copy(block)
+            if stop_fd in readable:
+                os.read(stop_fd, 1)
+                while select.select((read_fd,), (), (), 0)[0]:
+                    block = os.read(read_fd, _PIPE_READ_BYTES)
+                    if not block:
+                        break
+                    copy(block)
                 break
-            with log_lock:
-                _write_all(log_fd, block)
-            display(block)
-        display(b"", final=True)
+        copy(b"", final=True)
     finally:
         os.close(read_fd)
+        os.close(stop_fd)
 
 
 @contextmanager
 def record_screen(settings: ScreenSettings | None) -> Iterator[None]:
+    """Apply one resolved presentation to every public direct/pipeline stream."""
+    logging_config = (
+        settings.configuration.logging
+        if settings is not None and settings.configuration is not None
+        else default_terminal_settings()
+    )
+    with terminal_presentation(logging_config), _record_screen_streams(settings):
+        yield
+
+
+@contextmanager
+def _record_screen_streams(settings: ScreenSettings | None) -> Iterator[None]:
     """Tee process stdout/stderr to one append-only screen log."""
     global _ACTIVE_RECORDERS, _PROGRESS_DISPLAY_CONSOLE
     global _PROGRESS_DISPLAY_STREAM, _PROGRESS_SUMMARY_CONSOLE
@@ -217,6 +267,7 @@ def record_screen(settings: ScreenSettings | None) -> Iterator[None]:
 
     original_fds = (os.dup(1), os.dup(2))
     pipes = (os.pipe(), os.pipe())
+    stop_pipes = (os.pipe(), os.pipe())
     log_lock = threading.Lock()
     workers = []
     recording_active = False
@@ -238,21 +289,30 @@ def record_screen(settings: ScreenSettings | None) -> Iterator[None]:
             _PROGRESS_DISPLAY_CONSOLE = Console(
                 file=_PROGRESS_DISPLAY_STREAM,
                 force_terminal=True,
+                color_system=(None if terminal_settings().terminal_style.color == "never" else "auto"),
+                highlight=False,
+                markup=False,
             )
             _PROGRESS_SUMMARY_CONSOLE = Console(
                 file=_LockedTranscriptStream(log_fd, log_lock),
                 force_terminal=False,
                 color_system=None,
             )
-        for target_fd, (read_fd, write_fd), display_fd in zip(
-            (1, 2), pipes, original_fds,
-        ):
+        stream_descriptors = zip((1, 2), pipes, stop_pipes, original_fds)
+        for (
+            target_fd,
+            (read_fd, write_fd),
+            (stop_fd, stop_write_fd),
+            display_fd,
+        ) in stream_descriptors:
             os.dup2(write_fd, target_fd)
             os.close(write_fd)
             worker = threading.Thread(
-                target=_copy_pipe,
+                target=copy_context().run,
                 args=(
+                    _copy_pipe,
                     read_fd,
+                    stop_fd,
                     display_fd,
                     log_fd,
                     settings.show_screen,
@@ -280,6 +340,13 @@ def record_screen(settings: ScreenSettings | None) -> Iterator[None]:
                 pass
         for target_fd, original_fd in zip((1, 2), original_fds):
             os.dup2(original_fd, target_fd)
+        for _, stop_write_fd in stop_pipes:
+            try:
+                _write_all(stop_write_fd, b"\0")
+            except BrokenPipeError:
+                # The copy worker already observed normal EOF and exited.
+                pass
+            os.close(stop_write_fd)
         for worker in workers:
             worker.join()
         active_progress_stream = _PROGRESS_DISPLAY_STREAM

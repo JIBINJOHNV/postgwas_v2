@@ -11,6 +11,8 @@ from pydantic import Field, field_validator, model_validator
 from postgwas.config.models.common import (
     GenomeBuild,
     ModuleConfig,
+    MultipleTestingSelectionConfig,
+    PValueCorrectionMethod,
     Population,
     StrictModel,
 )
@@ -43,7 +45,7 @@ for _tool_mapping in (
             "Every SingleCellTool must define dependencies, formats, and "
             "supporting configuration in canonical tool order"
         )
-SingleCellCorrectionMethod = Literal["bonferroni", "sidak", "holm", "fdr_bh"]
+SingleCellCorrectionMethod = PValueCorrectionMethod
 ScdrsSpecies = Literal["human", "hsapiens", "mouse", "mmusculus"]
 ScdrsMatrixState = Literal["raw_counts", "normalized_log1p"]
 
@@ -490,25 +492,8 @@ class ScdrsConfig(StrictModel):
         return self
 
 
-class SingleCellMultipleTestingConfig(StrictModel):
-    methods: list[SingleCellCorrectionMethod] = Field(min_length=1)
-    primary_method: SingleCellCorrectionMethod
-    significance_threshold: float = Field(gt=0, le=1, allow_inf_nan=False)
-
-    @field_validator("methods")
-    @classmethod
-    def unique_methods(
-        cls, values: list[SingleCellCorrectionMethod],
-    ) -> list[SingleCellCorrectionMethod]:
-        if len(values) != len(set(values)):
-            raise ValueError("must contain unique correction methods")
-        return values
-
-    @model_validator(mode="after")
-    def primary_is_selected(self):
-        if self.primary_method not in self.methods:
-            raise ValueError("primary_method must occur in methods")
-        return self
+class SingleCellMultipleTestingConfig(MultipleTestingSelectionConfig):
+    pass
 
 
 class SingleCellResultSchema(StrictModel):

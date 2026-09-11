@@ -4,8 +4,8 @@
 
 FLAMES prioritizes candidate effector genes at fine-mapped GWAS loci by combining
 variant-to-gene annotations, MAGMA gene association and tissue evidence, and
-PoPS scores. PostGWAS validates and stages the inputs, runs the unchanged
-upstream FLAMES program, validates its outputs, and publishes provenance
+PoPS scores. PostGWAS validates and stages the inputs, runs the published
+FLAMES model with fail-closed annotation transport, validates its outputs, and publishes provenance
 metadata.
 
 ## What the analysis does
@@ -16,11 +16,24 @@ annotation bundle, model file, feature manifest, and runtime dependency before
 annotation. Annotation and scoring use the same generated index and execute as
 argument arrays without shell interpolation.
 
+FLAMES does not consume raw GWAS summary statistics directly. In pipeline mode,
+the GWAS-VCF and the summary-statistic fields extracted from it are validated by
+the formatter and the relevant upstream fine-mapping/MAGMA stages. Standalone
+FLAMES instead validates the four scientific products it actually consumes:
+fine-mapping credible sets, MAGMA gene statistics, raw MAGMAcovar property
+P-values, and PoPS gene scores. Adding a second raw-summary-statistics input to
+FLAMES would not match the published program's interface and would duplicate
+the pipeline's upstream summary-statistics validation.
+
 The bundled published classifier is calibrated for genes within 750 kb of a
 locus. That distance is therefore a fixed model invariant, not an adjustable
 analysis default. PostGWAS also requires each input credible set to contain at
 least 0.95 cumulative posterior inclusion probability, within the configured
-numerical tolerance, and rejects total probability above one.
+numerical tolerance. Every individual PIP must be finite and in `[0, 1]`, but
+their sum may exceed one: SuSiE exports model-wide marginal PIPs, which are not
+mutually exclusive probabilities when the model contains multiple effects.
+Multiple distinct credible sets may therefore share one genomic-locus identifier;
+upstream FLAMES treats each annotation filename as a separate scoring unit.
 
 ## When to use it
 
@@ -45,8 +58,9 @@ exactly and does not strip versions or silently remap genes.
 - The FLAMES annotation bundle identified in YAML and the packaged or explicitly
   configured model and feature manifest.
 - A Python runtime containing every dependency listed in canonical YAML.
-- For local VEP, an executable and build-compatible cache. For local CADD, a
-  build-compatible bgzip/tabix file, its `.tbi` index, and tabix executable.
+- For local VEP, an executable, non-empty cache, and an explicit cache genome
+  build matching `genome_build`. For local CADD, a non-empty bgzip/tabix file,
+  its `.tbi` index, tabix executable, and an explicit matching genome build.
 
 ## Command
 
@@ -97,7 +111,9 @@ postgwas flames \
 ### Pipeline mode
 
 The pipeline creates the fine-mapping, MAGMA, gene-property, and PoPS inputs
-consumed by FLAMES:
+consumed by FLAMES. The `--ld-folder` must use the version-2 manifest, dual
+tabix-indexed pair tables, and allele-aware inventory layout documented in the
+[LD-clumping reference guide](ld-clumping.md#preparing-the-standard-ld-reference):
 
 ```console
 postgwas pipeline \
@@ -121,7 +137,6 @@ postgwas pipeline \
   --flames-annotation-directory reference/FLAMES/Annotation_data \
   --flames-genome-build GRCh37 \
   --plink plink \
-  --bcftools bcftools \
   --dataset-id STUDY \
   --output-directory results
 ```
@@ -150,8 +165,10 @@ Canonical defaults are defined only in
 `config/defaults/modules/flames.yaml` and its typed schema. Omitted CLI options
 do not introduce independent defaults. The CLI can override input paths, genome
 build, model directory, and explicit `api` or `local` VEP/CADD modes. It does
-not expose model distance or weighting controls because changing the published
-calibration would require a separately validated model.
+not infer local VEP/CADD builds from filenames: local mode also requires
+`vep_cache_genome_build` or `cadd_genome_build`, respectively. It does not expose
+model distance or weighting controls because changing the published calibration
+would require a separately validated model.
 
 ## Processing steps
 
@@ -187,13 +204,23 @@ Files without a valid completion manifest are incomplete and are not resumed.
 
 ## QC and logs
 
-Review cumulative PIP per credible set; chromosome and build declarations;
+Review cumulative PIP per credible set (including valid sums above one for
+multi-effect marginal PIPs); chromosome and build declarations;
 MAGMA, PoPS, and shared-gene counts; annotation and feature counts; features
 that are zero across every locus; scored and prioritized gene counts; resolved
 API/local annotation modes; and the completion manifest. A feature that is zero
 for every locus is recorded for review because it may indicate absent evidence
 or an incompatible annotation resource, but is not automatically scientifically
 invalid.
+
+The terminal shows the same shared staged validation account used by MAGMA and
+MAGMAcovar. Before either upstream FLAMES command runs, it displays every input
+class and its observed counts, then the configured model, feature manifest,
+annotation-bundle directory/file inventory, Python imports, and local VEP/CADD
+resources. API mode is reported as unpinned rather than falsely described as a
+validated reference snapshot. A failed stage remains below 100%, and the final
+stage completes only after validated files are published and the completion
+manifest is written.
 
 ## Interpretation
 
@@ -213,12 +240,30 @@ unless `--resume` can validate the complete manifest and all fingerprints.
 
 ## Limitations
 
-API mode uses the live Ensembl VEP and CADD services selected by the unchanged
-upstream program. Service content and availability may change, so API-mode runs
+API mode uses HTTPS Ensembl VEP and CADD v1.6 services selected by the canonical
+`modules.flames.annotation_api` configuration. Service content and availability may change, so API-mode runs
 are not fully reference-pinned even though PostGWAS records the selected mode.
 Use build-compatible local resources when reproducible annotation snapshots are
 required. PostGWAS validates the wrapper contract and outputs but does not alter
 or re-derive the published FLAMES model.
+
+The API boundary fails on network errors, exhausted HTTP 429 retries, non-success
+responses, malformed JSON, missing variant identity, and absent or ambiguous CADD
+allele scores. It never fabricates `MODIFIER` consequences or substitutes zero for
+an unavailable CADD score. A valid VEP intergenic/regulatory response without
+transcript consequences remains valid zero transcript-gene evidence. The published
+impact weights and CADD v1.6 release are unchanged. Requests use configured finite
+timeouts, rate limits and bounded throttling retries; HTTP 400 retains FLAMES'
+alternate-allele retry. Full response bodies, hashes, HTTP status and request URLs
+are saved in `output_layout.annotation_api_log_file`, including failed runs;
+credentials are prohibited in configured endpoints. This provenance log is not
+itself evidence of successful annotation.
+
+VEP transcript impacts retain the published `HIGH=1`, `MODERATE=0.6`, `LOW=0.4`,
+`MODIFIER=0.1` weights. For each gene/variant, the maximum transcript weight is
+multiplied by that variant's PIP. The sum and maximum across variants are then
+computed once per gene; a validated one-to-one merge prevents duplicated gene
+rows when multiple credible variants affect the same gene.
 
 ## Scientific references
 
@@ -231,3 +276,4 @@ or re-derive the published FLAMES model.
 - [FUMA MAGMA tissue-expression model](https://github.com/vufuma/FUMA-webapp/blob/0c0259b7ed5e6d15369e978530b7ba56b5bd0437/scripts/magma/magma.py#L118-L126)
 - [Ensembl VEP REST documentation](https://rest.ensembl.org/documentation/info/vep_region_get)
 - [CADD web service and data releases](https://cadd.gs.washington.edu/)
+- [CADD API response schema and missing-score behavior](https://cadd.bihealth.org/api)
