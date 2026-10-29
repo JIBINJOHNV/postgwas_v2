@@ -343,6 +343,10 @@ Individual findings are saved in the reports instead of printed for every file.
 These counts describe header mappings, not validated study designs or frequency
 types.
 
+If no other control/sample-size mapping is selected, `Weight` is used as a
+fallback for `control_count_column` and flagged for review. Confirm its meaning
+before harmonisation; existing control or eligible N mappings take priority.
+
 Review every generated row against the original study documentation. The
 generator selects the first matching configured alias and retains partial
 mappings; MAF and reference-panel frequency columns can be retained with review

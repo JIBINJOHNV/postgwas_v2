@@ -281,9 +281,20 @@ remain unchanged and can still stop on inconclusive evidence.
 Missing sample size is written as `NA` under `on_missing_sample_size: write_draft`.
 Set this to `fail` to reject that file during generation. Explicit controls take
 priority over total/effective N. If cases and total N are present without a
-control-count column, the draft retains cases and leaves controls unresolved;
-meta-analysis weights are also left unresolved. These choices and missing INFO
-are listed in the review table. Complete the mappings or supply appropriate
+control-count column, that total/effective column is not used for controls.
+If no control/sample-size mapping was selected, `Weight` (case-insensitive)
+is mapped to `control_count_column` as a last-resort draft fallback, including
+when a case-count column exists. Its original header spelling is retained.
+The row remains flagged for attention: confirm whether the values represent
+total N, effective N, or actual controls before harmonisation. This mapping
+does not convert weights into counts or alter numerical sample-size validation.
+
+The alias key is `sample_sheet_generator.column_aliases.fallback_sample_size_column`
+(default `[WEIGHT]`), replacing `invalid_sample_size_column`; update old custom
+YAML overrides to the new key. Explicit controls and eligible total/effective
+N mappings take precedence. If none of these or the fallback is present,
+controls remain unresolved. These choices and missing INFO are listed in the
+review table. Complete the mappings or supply appropriate
 external EAF/INFO sources or `--fixed-info` before harmonisation.
 
 ## Examples

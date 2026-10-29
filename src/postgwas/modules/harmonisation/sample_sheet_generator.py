@@ -285,7 +285,7 @@ def _sample_size(index, aliases, path, warnings, on_missing):
     elif not controls and cases and total:
         warnings.append(
             "%s: %s cannot be assumed to contain controls when case count %s is present; "
-            "control_count_column remains NA." % (path.name, total, cases)
+            "that total/effective column was not used for controls." % (path.name, total, cases)
         )
     elif not controls and not cases:
         controls = total
@@ -295,13 +295,17 @@ def _sample_size(index, aliases, path, warnings, on_missing):
                 % (path.name, total)
             )
     if not controls:
-        weight = _one_match(index, aliases.invalid_sample_size_column, "weight", path, warnings)
-        if weight:
+        controls = _one_match(
+            index, aliases.fallback_sample_size_column, "fallback sample-size", path, warnings,
+        )
+        if controls:
             warnings.append(
-                "%s: %s is a meta-analysis weight, not a confirmed sample size; "
-                "sample size remains NA." % (path.name, weight)
+                "%s: %s was mapped to control_count_column as a fallback; confirm "
+                "whether it represents total N, effective N or actual controls before "
+                "harmonisation. The header alone does not establish its meaning."
+                % (path.name, controls)
             )
-        if on_missing == "fail":
+        if not controls and on_missing == "fail":
             raise ConfigurationError(
                 "%s has no recognized control, total, or effective sample-size column." % path
             )

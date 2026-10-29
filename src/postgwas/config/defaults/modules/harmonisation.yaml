@@ -388,7 +388,7 @@ module:
       effective_sample_size_column:
         - NEFF
         - N_EFF
-      invalid_sample_size_column:
+      fallback_sample_size_column:
         - WEIGHT
       imputation_info_column:
         - INFO

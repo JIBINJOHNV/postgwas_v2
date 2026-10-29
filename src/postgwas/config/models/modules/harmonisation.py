@@ -119,7 +119,7 @@ class SampleSheetColumnAliases(StrictModel):
     case_count_column: list[str]
     total_sample_size_column: list[str]
     effective_sample_size_column: list[str]
-    invalid_sample_size_column: list[str]
+    fallback_sample_size_column: list[str]
     imputation_info_column: list[str]
 
     @field_validator("*")
