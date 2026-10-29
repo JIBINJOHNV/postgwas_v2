@@ -252,9 +252,7 @@ Follow the [full walkthrough](docs/wiki/getting-started/quick-start.md) for the
 connected commands and output paths. Its paths are placeholders for your study
 and references, not a bundled demonstration dataset.
 
-### Harmonise your summary statistics
-
-#### Generate and review the sample sheet
+### Generate and review the sample sheet
 
 A version-2 CSV/TSV sample sheet maps each study's columns and metadata to
 PostGWAS concepts. It is separate from the run-configuration YAML, which
@@ -267,10 +265,28 @@ postgwas sample_sheet_generator \
   --output studies.csv
 ```
 
+Replace `raw_data` with the directory containing your summary-statistics files.
+Run the command separately for each directory; it does not search subdirectories.
+The command produces three files:
+
+| Output | Contents |
+|---|---|
+| `studies.csv` | Version-2 sample-sheet draft with one row per retained study and `NA` for unresolved mappings. |
+| `studies.csv.mapping_review.tsv` | Per-file status and reasons for attention, including missing INFO, sample size, frequency or required mappings, and uncertain frequency interpretation. |
+| `studies.csv.rejected_files.tsv` | Files excluded from the draft and the reason for each rejection. |
+
+The terminal prints aggregate counts: files scanned, rows written, rejected
+files, ready rows and rows needing attention, plus missing INFO/sample-size/
+frequency counts and available frequency, case/control and coordinate mappings.
+Individual findings are saved in the reports instead of printed for every file.
+These counts describe header mappings, not validated study designs or frequency
+types.
+
 Review every generated row against the original study documentation. The
-generator can leave fields unresolved or omit files it cannot map; inspect its
-`studies.csv.mapping_review.tsv` and `studies.csv.rejected_files.tsv` reports.
-Successful draft generation does not mean the studies are ready to run. Alternatively, copy a maintained
+generator selects the first matching configured alias and retains partial
+mappings; MAF and reference-panel frequency columns can be retained with review
+notes. Successful draft generation does not mean the studies are ready to run.
+Alternatively, copy a maintained
 [quantitative template](examples/configs/harmonisation/sample_sheet_quantitative.csv)
 or [case-control template](examples/configs/harmonisation/sample_sheet_case_control.csv)
 and replace all placeholder values.
@@ -294,6 +310,8 @@ filename prefix. Prepare the harmonisation reference tree before running.
 [Sample-sheet requirements](docs/wiki/harmonisation/sample-sheet.md) ·
 [Configuration guide](docs/modules/harmonisation/configuration.md) ·
 [Complete source, step and policy reference](docs/wiki/harmonisation/policies.md)
+
+### Harmonise your summary statistics
 
 #### Run harmonisation
 
