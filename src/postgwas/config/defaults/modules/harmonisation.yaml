@@ -86,6 +86,12 @@ module:
     external_info_file: null
     external_info_column: null
     supported_suffixes:
+      - .tbl.gz
+      - .tbl.bgz
+      - .tbl.bz2
+      - .tbl.xz
+      - .tbl.zip
+      - .tbl
       - .vcf.gz
       - .vcf.bgz
       - .vcf.bz2

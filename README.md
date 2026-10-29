@@ -265,8 +265,43 @@ postgwas sample_sheet_generator \
   --output studies.csv
 ```
 
-To fill missing frequency or INFO mappings from external files, optionally add
-file/column pairs:
+#### Optional: supply external EAF or INFO when an internal mapping is missing
+
+The command above works without any external-source options. Add these options
+only if you want to supply a reference for a missing internal column mapping:
+
+| Optional arguments | When they are used |
+|---|---|
+| `--external-eaf-file PATH --external-eaf-column NAME` | No internal frequency column was mapped. |
+| `--external-info-file PATH --external-info-column NAME` | No internal INFO column was mapped. |
+
+Supply both arguments in each chosen pair, either through CLI or run YAML.
+You can supply EAF only, INFO only, or both. If a source is missing and no
+external pair is configured, its CSV fields remain `NA` and the review report
+flags it for attention. Existing internal mappings are not replaced, and empty
+values inside a mapped column do not trigger this option.
+
+**EAF only:**
+
+```bash
+postgwas sample_sheet_generator \
+  --input-directory raw_data \
+  --output studies.csv \
+  --external-eaf-file /references/GRCh38/frequency.tsv.gz \
+  --external-eaf-column AF
+```
+
+**INFO only:**
+
+```bash
+postgwas sample_sheet_generator \
+  --input-directory raw_data \
+  --output studies.csv \
+  --external-info-file /references/GRCh38/quality.tsv.gz \
+  --external-info-column INFO
+```
+
+**Both, with build/chromosome templates:**
 
 ```bash
 postgwas sample_sheet_generator \
@@ -285,8 +320,14 @@ External assignments are recorded in the review report and summary. They do
 not establish study-measured frequency/INFO or perform liftover. Confirm that
 the references suit each study before analysis.
 
+#### Review the generated files
+
 Replace `raw_data` with the directory containing your summary-statistics files.
 Run the command separately for each directory; it does not search subdirectories.
+Supported inputs include `.tbl`, `.tbl.gz`, `.tbl.zip`, and other supported
+text tables ending in `.gz` or `.zip`. A ZIP archive must contain exactly one
+data file (directories and `__MACOSX/` entries are ignored). The same header
+screening applies regardless of extension.
 The command produces three files:
 
 | Output | Contents |

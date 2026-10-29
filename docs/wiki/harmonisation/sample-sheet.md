@@ -156,6 +156,19 @@ postgwas sample_sheet_generator \
 
 ### Optional external sources for missing mappings
 
+These options are opt-in; the basic generator command needs neither pair.
+
+| What you want to supply | Optional CLI pair |
+|---|---|
+| External EAF only | `--external-eaf-file PATH --external-eaf-column NAME` |
+| External INFO only | `--external-info-file PATH --external-info-column NAME` |
+| Both | Supply both pairs shown below. |
+
+Each chosen pair requires both values after CLI/YAML resolution. Replace the
+column names with the exact headers in your reference tables. Without a
+configured external pair, missing source fields remain `NA` and are reported
+for attention; the generator does not download or invent a replacement.
+
 ```bash
 postgwas sample_sheet_generator \
   --input-directory /path/to/summary-statistics \
@@ -195,6 +208,10 @@ and provenance need confirmation for each study, and reference INFO is not
 study-measured imputation quality. The v2 sample-sheet columns are unchanged.
 
 The generator reads only enough records to determine the delimiter and header.
+Supported inputs include `.tbl`, `.tbl.gz`, `.tbl.zip`, and other supported
+text tables ending in `.gz` or `.zip`. A ZIP archive must contain exactly one
+data file (directories and `__MACOSX/` entries are ignored). The same header
+screening applies regardless of extension.
 Every valid supported input file becomes one row in the same output CSV,
 ordered by filename. Selected column mappings preserve the source header
 spelling exactly, including a leading `#` in names such as `#chr` or `#chrom`.
