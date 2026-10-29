@@ -6,6 +6,8 @@ export PYTHONNOUSERSITE=1
 unset PYTHONPATH
 
 script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/setup/environment_manager.sh
+source "$script_directory/environment_manager.sh"
 repository_root="$(cd "$script_directory/../.." && pwd)"
 # shellcheck source=tools/setup/software_versions.env
 source "$script_directory/software_versions.env"
@@ -281,7 +283,7 @@ create_isolated_environments() {
     fi
 
     mkdir -p "$environments_root" "$(dirname "$ldsc_source")"
-    "$mamba_executable" env create --yes "${environment_platform[@]}" \
+    postgwas_environment "$mamba_executable" create ${environment_platform[@]+"${environment_platform[@]}"} \
         --prefix "$ldsc_environment" \
         --file "$script_directory/environments/ldsc.yml"
     checkout_commit \
@@ -294,14 +296,14 @@ create_isolated_environments() {
         "$ldsc_environment/bin/munge_sumstats.py" \
         "$install_prefix/bin/munge_sumstats.py"
 
-    "$mamba_executable" env create --yes "${environment_platform[@]}" \
+    postgwas_environment "$mamba_executable" create ${environment_platform[@]+"${environment_platform[@]}"} \
         --prefix "$enrichment_environment" \
         --file "$script_directory/environments/enrichment.yml"
     "$mamba_executable" run --prefix "$enrichment_environment" \
         python -m pip install --no-deps --no-build-isolation "$repository_root"
     "$mamba_executable" run --prefix "$enrichment_environment" python -m pip check
 
-    "$mamba_executable" create --yes "${environment_platform[@]}" \
+    "$mamba_executable" create --yes ${environment_platform[@]+"${environment_platform[@]}"} \
         --prefix "$vep_environment" \
         --channel conda-forge --channel bioconda --override-channels \
         "ensembl-vep=$POSTGWAS_VEP_VERSION"
@@ -310,10 +312,10 @@ create_isolated_environments() {
         "$install_prefix/bin/vep"
 
     if [[ "$host_os" == "Darwin" ]]; then
-        "$mamba_executable" env create --yes --platform osx-64 \
+        postgwas_environment "$mamba_executable" create --platform osx-64 \
             --prefix "$intel_tools_environment" \
             --file "$script_directory/environments/intel-tools-macos.yml"
-        "$mamba_executable" env create --yes --platform osx-64 \
+        postgwas_environment "$mamba_executable" create --platform osx-64 \
             --prefix "$mixer_environment" \
             --file "$script_directory/environments/mixer-macos.yml"
         download \

@@ -102,6 +102,16 @@ source build, import, executable, native library, or version check fails. The
 version, URL, commit, and checksum source of truth is
 `tools/setup/software_versions.env`.
 
+Environment creation and updates first try the native `--yes` option. If the
+client exits with an argument-parser error rejecting only `--yes`, the installer
+reports the compatibility retry and runs the same command once without that
+option. It sets `CONDA_ALWAYS_YES=true` and `MAMBA_ALWAYS_YES=true` for that
+retry, following the documented [Conda configuration interface](https://www.anaconda.com/blog/conda-configuration-engine-power-users)
+and [Mamba configuration interface](https://mamba.readthedocs.io/en/latest/user_guide/configuration.html).
+This applies to the main environment and isolated runtimes. Other failures stop
+installation immediately; package selections and environment-file requirements
+remain unchanged, including support for CEP-24 selectors.
+
 FLaMEs 1.1.2-compatible code, its model, and PoPS are packaged PostGWAS
 modules, so they do not require a second external executable. The verifier
 imports both modules and checks the surrounding numerical stack. Analysis

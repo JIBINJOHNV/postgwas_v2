@@ -6,6 +6,8 @@ export PYTHONNOUSERSITE=1
 unset PYTHONPATH
 
 script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/setup/environment_manager.sh
+source "$script_directory/environment_manager.sh"
 repository_root="$(cd "$script_directory/../.." && pwd)"
 environment_file="$repository_root/environment.yml"
 editable=false
@@ -174,13 +176,11 @@ if $environment_exists; then
         printf 'Select a new environment with --name. Portable installs may instead use --update.\n' >&2
         exit 1
     fi
-    "$environment_manager" env update \
-        --yes \
+    postgwas_environment "$environment_manager" update \
         --name "$environment_name" \
         --file "$environment_file"
 else
-    "$environment_manager" env create \
-        --yes \
+    postgwas_environment "$environment_manager" create \
         --name "$environment_name" \
         --file "$environment_file"
 fi
