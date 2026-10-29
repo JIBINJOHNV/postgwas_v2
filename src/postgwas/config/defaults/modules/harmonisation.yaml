@@ -80,6 +80,11 @@ module:
   # select column names only; the harmonisation preflight still validates the
   # selected columns and infers study properties from the complete dataset.
   sample_sheet_generator:
+    # Optional sources used only when the corresponding internal mapping is absent.
+    external_eaf_file: null
+    external_eaf_column: null
+    external_info_file: null
+    external_info_column: null
     supported_suffixes:
       - .vcf.gz
       - .vcf.bgz

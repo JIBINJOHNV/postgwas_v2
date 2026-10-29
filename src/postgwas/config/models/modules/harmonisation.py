@@ -175,6 +175,10 @@ class SampleSheetAlternativeFrequencyAliases(StrictModel):
 class SampleSheetGeneratorConfig(StrictModel):
     """File discovery and header semantics for v2 sample-sheet generation."""
 
+    external_eaf_file: str | None
+    external_eaf_column: str | None
+    external_info_file: str | None
+    external_info_column: str | None
     supported_suffixes: list[str]
     trait_type: Literal["auto"]
     effect_type: Literal["auto"]
@@ -192,6 +196,16 @@ class SampleSheetGeneratorConfig(StrictModel):
     effect_frequency_prefixes: list[str]
     alternative_frequency: SampleSheetAlternativeFrequencyAliases
     column_aliases: SampleSheetColumnAliases
+
+    @field_validator("external_eaf_file", "external_eaf_column", "external_info_file", "external_info_column")
+    @classmethod
+    def nonempty_external_source(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("external source values must be non-empty or null")
+        return value
 
     @model_validator(mode="after")
     def valid_draft_screening(self):

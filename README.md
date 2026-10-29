@@ -265,6 +265,26 @@ postgwas sample_sheet_generator \
   --output studies.csv
 ```
 
+To fill missing frequency or INFO mappings from external files, optionally add
+file/column pairs:
+
+```bash
+postgwas sample_sheet_generator \
+  --input-directory raw_data \
+  --output studies.csv \
+  --external-eaf-file '/references/{build}/eaf_chr{chromosome}.tsv.gz' \
+  --external-eaf-column AF \
+  --external-info-file '/references/{build}/info_chr{chromosome}.tsv.gz' \
+  --external-info-column INFO
+```
+
+Either pair can be used independently. Existing internal mappings, including
+MAF candidates, are preserved. The placeholders remain literal in the CSV;
+harmonisation resolves them using the inferred GWAS build and chromosome.
+External assignments are recorded in the review report and summary. They do
+not establish study-measured frequency/INFO or perform liftover. Confirm that
+the references suit each study before analysis.
+
 Replace `raw_data` with the directory containing your summary-statistics files.
 Run the command separately for each directory; it does not search subdirectories.
 The command produces three files:

@@ -154,6 +154,46 @@ postgwas sample_sheet_generator \
   --output studies.csv
 ```
 
+### Optional external sources for missing mappings
+
+```bash
+postgwas sample_sheet_generator \
+  --input-directory /path/to/summary-statistics \
+  --output studies.csv \
+  --external-eaf-file '/references/{build}/eaf_chr{chromosome}.tsv.gz' \
+  --external-eaf-column AF \
+  --external-info-file '/references/{build}/info_chr{chromosome}.tsv.gz' \
+  --external-info-column INFO
+```
+
+Each optional file/column pair applies to every retained study lacking that
+internal mapping. Either pair can be supplied alone. Internal frequency
+(including MAF/reference-frequency candidates) and INFO mappings are never
+replaced. A mapped column with missing or invalid values is still an internal
+mapping; value validation occurs during harmonisation.
+
+The four corresponding settings are
+`modules.harmonisation.sample_sheet_generator.external_eaf_file`,
+`external_eaf_column`, `external_info_file`, and `external_info_column`, all
+unset by default. CLI values override YAML before pair validation. Relative
+CLI paths resolve from the working directory; relative YAML paths resolve
+from the supplied run-config directory. Absolute paths, retaining template
+placeholders, are written to the CSV.
+
+Generation validates pairs, template syntax, and matching non-empty readable
+files once, and excludes those reference files from study discovery. It does
+not read the complete external tables or infer study builds. Harmonisation
+preflight checks the selected build/chromosome files and configured external
+column mappings. `{build}` and `{chromosome}` select files; they do not lift
+over coordinates or search alternative builds after a failed match.
+
+The review TSV adds `eaf_source` and `info_source` (`internal`, `external`, or
+`missing`). Missing-source flags account for supplied external pairs. The
+terminal separately counts external assignments and rows without internal
+INFO. Assigned external sources receive review notes: their build, population,
+and provenance need confirmation for each study, and reference INFO is not
+study-measured imputation quality. The v2 sample-sheet columns are unchanged.
+
 The generator reads only enough records to determine the delimiter and header.
 Every valid supported input file becomes one row in the same output CSV,
 ordered by filename. Selected column mappings preserve the source header

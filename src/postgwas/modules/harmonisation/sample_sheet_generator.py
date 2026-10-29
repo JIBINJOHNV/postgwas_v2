@@ -24,6 +24,7 @@ from postgwas.core.io.delimiters import (
     open_text,
 )
 
+from .resource_paths import validate_external_resource_spec
 from .policies import load_policies
 from .sample_sheet import (
     HarmonisationSampleSheetRow,
@@ -31,6 +32,13 @@ from .sample_sheet import (
     _validation_error_text,
     load_harmonisation_sample_sheet,
 )
+
+
+# Sample-sheet protocol fields: both sources share file/column pairs.
+_EXTERNAL_SOURCES = {
+    "eaf": "effect_allele_frequency_column",
+    "info": "imputation_info_column",
+}
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,8 @@ class SampleSheetDatasetStatus:
     has_case_control_columns: bool
     has_coordinates: bool
     warnings: tuple[str, ...]
+    eaf_source: str = "missing"
+    info_source: str = "missing"
 
     @property
     def needs_attention(self) -> bool:
@@ -368,10 +378,50 @@ def _has_sample_size(row: dict[str, Any]) -> bool:
     return bool(row.get("control_count_column") or row.get("control_count"))
 
 
-def _has_eaf(row: dict[str, Any]) -> bool:
-    internal = bool(row.get("effect_allele_frequency_column"))
-    external = bool(row.get("external_eaf_file") and row.get("external_eaf_column"))
-    return internal or external
+def _source_kind(row: dict[str, Any], source: str) -> str:
+    if row.get(_EXTERNAL_SOURCES[source]):
+        return "internal"
+    if row.get(f"external_{source}_file") and row.get(f"external_{source}_column"):
+        return "external"
+    return "missing"
+
+
+def _external_defaults(config, *, config_file, overrides):
+    """Validate shared references once; retain templates and exclude actual files."""
+    values = config.model_dump()
+    requirements = []
+    for source in _EXTERNAL_SOURCES:
+        fields = [f"external_{source}_{part}" for part in ("file", "column")]
+        if any(values[field] for field in fields):
+            requirements.extend(RequiredArgument(
+                "--" + field.replace("_", "-"),
+                "modules.harmonisation.sample_sheet_generator." + field,
+                values[field],
+            ) for field in fields)
+    require_resolved_arguments(requirements)
+    defaults, excluded = {}, set()
+    for source in _EXTERNAL_SOURCES:
+        file_field, column_field = f"external_{source}_file", f"external_{source}_column"
+        if not values[file_field]:
+            continue
+        path = Path(values[file_field]).expanduser()
+        # YAML paths are relative to that YAML; CLI paths are relative to cwd.
+        if not path.is_absolute() and config_file and file_field not in overrides:
+            path = Path(config_file).expanduser().resolve().parent / path
+        path = path.resolve()
+        try:
+            matches = validate_external_resource_spec(path)
+            for match in matches:
+                with match.open("rb") as handle:
+                    handle.read(1)
+            excluded.update(matches)
+        except (ValueError, OSError) as exc:
+            raise ConfigurationError("Invalid argument --%s: %s" % (
+                file_field.replace("_", "-"), exc,
+            )) from exc
+        defaults[file_field] = str(path)
+        defaults[column_field] = values[column_field]
+    return defaults, excluded
 
 
 def _write_sample_sheet(
@@ -454,6 +504,8 @@ def _write_generation_reports(dataset_statuses, rejected_files, suffixes, reject
         "missing_info": item.missing_info,
         "missing_sample_size": item.missing_sample_size,
         "missing_frequency": item.missing_eaf,
+        "eaf_source": item.eaf_source,
+        "info_source": item.info_source,
         "review_notes": "; ".join(item.warnings),
     } for item in dataset_statuses]
     review_rows.extend({
@@ -464,7 +516,7 @@ def _write_generation_reports(dataset_statuses, rejected_files, suffixes, reject
     _write_table_report(
         review_rows,
         ("dataset_id", "input_file", "status", "missing_mappings", "missing_info",
-         "missing_sample_size", "missing_frequency", "review_notes"),
+         "missing_sample_size", "missing_frequency", "eaf_source", "info_source", "review_notes"),
         review_report,
     )
 
@@ -474,10 +526,23 @@ def generate_sample_sheet(
     output_file: str | Path,
     *,
     config_file: str | Path | None = None,
+    external_eaf_file: str | Path | None = None,
+    external_eaf_column: str | None = None,
+    external_info_file: str | Path | None = None,
+    external_info_column: str | None = None,
 ) -> SampleSheetGenerationResult:
     """Validate detected mappings and atomically publish a v2 sample-sheet draft."""
-    module_config = load_module_configuration("harmonisation", config_file)
+    overrides = {key: str(value) for key, value in {
+        "external_eaf_file": external_eaf_file, "external_eaf_column": external_eaf_column,
+        "external_info_file": external_info_file, "external_info_column": external_info_column,
+    }.items() if value is not None}
+    module_config = load_module_configuration("harmonisation", config_file, cli_overrides={
+        "sample_sheet_generator." + key: value for key, value in overrides.items()
+    })
     generator_config = module_config.sample_sheet_generator
+    defaults, reference_files = _external_defaults(
+        generator_config, config_file=config_file, overrides=overrides,
+    )
     policies = load_policies(module_config.policies)
     source_directory = Path(input_directory).expanduser().resolve()
     destination = Path(output_file).expanduser().resolve()
@@ -485,9 +550,11 @@ def generate_sample_sheet(
         destination.name + generator_config.rejection_report_suffix
     )
     review_report = destination.with_name(destination.name + generator_config.review_report_suffix)
+    if any(path.resolve() in reference_files for path in (destination, rejection_report, review_report)):
+        raise ConfigurationError("Output paths must not overwrite supplied external reference files.")
     files = _candidate_files(
         source_directory,
-        (destination, rejection_report, review_report),
+        (destination, rejection_report, review_report, *reference_files),
         generator_config.supported_suffixes,
     )
 
@@ -498,15 +565,26 @@ def generate_sample_sheet(
     for path in files:
         try:
             row, row_warnings = _row_for_file(path, generator_config, policies)
+            for source, internal_field in _EXTERNAL_SOURCES.items():
+                if not row.get(internal_field) and defaults.get(f"external_{source}_file"):
+                    row.update({f"external_{source}_{part}": defaults[f"external_{source}_{part}"]
+                                for part in ("file", "column")})
+                    row_warnings.append(
+                        "%s: external %s assigned because no internal mapping was detected; "
+                        "confirm build, population and source provenance before harmonisation."
+                        % (path.name, source.upper())
+                    )
             HarmonisationSampleSheetRow.validate_generated_draft(row)
             rows.append(row)
             warnings.extend(row_warnings)
             dataset_statuses.append(SampleSheetDatasetStatus(
                 dataset_id=str(row["dataset_id"]),
                 input_file=path,
-                missing_eaf=not _has_eaf(row),
+                missing_eaf=_source_kind(row, "eaf") == "missing",
                 missing_sample_size=not _has_sample_size(row),
-                missing_info=row.get("imputation_info_column") is None,
+                missing_info=_source_kind(row, "info") == "missing",
+                eaf_source=_source_kind(row, "eaf"),
+                info_source=_source_kind(row, "info"),
                 missing_mappings=_missing_mappings(row),
                 has_case_control_columns=bool(row.get("case_count_column") and row.get("control_count_column")),
                 has_coordinates=bool(row.get("chromosome_position_column") or
@@ -550,7 +628,7 @@ def generate_sample_sheet(
         dataset_ids[normalized] = str(row["input_file"])
 
     requires_completion = any(
-        not _has_sample_size(row) or not _has_eaf(row) or bool(_missing_mappings(row))
+        not _has_sample_size(row) or _source_kind(row, "eaf") == "missing" or bool(_missing_mappings(row))
         for row in rows
     )
     _write_sample_sheet(rows, destination, allow_incomplete=requires_completion)
@@ -582,6 +660,9 @@ def _generation_summary(result: SampleSheetGenerationResult) -> str:
         "  Ready             : %d" % (result.dataset_count - attention),
         "  Need attention    : %d" % attention,
         "  Missing INFO      : %d" % sum(d.missing_info for d in datasets),
+        "  External EAF      : %d" % sum(d.eaf_source == "external" for d in datasets),
+        "  External INFO     : %d" % sum(d.info_source == "external" for d in datasets),
+        "  No internal INFO  : %d" % sum(d.info_source != "internal" for d in datasets),
         "  Missing sample N  : %d" % sum(d.missing_sample_size for d in datasets),
         "  Missing frequency : %d" % sum(d.missing_eaf for d in datasets),
         "  Frequency mapped  : %d" % sum(not d.missing_eaf for d in datasets),
@@ -606,6 +687,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=format_cli_examples(
             ("Draft a sample sheet and review reports:", "postgwas sample_sheet_generator",
              ("--input-directory /path/to/raw_data", "--output /path/to/studies.csv")),
+            ("Fill missing EAF and INFO mappings:", "postgwas sample_sheet_generator",
+             ("--input-directory /path/to/raw_data", "--output /path/to/studies.csv",
+              "--external-eaf-file '/references/{build}/eaf_chr{chromosome}.tsv.gz'",
+              "--external-eaf-column AF",
+              "--external-info-file '/references/{build}/info_chr{chromosome}.tsv.gz'",
+              "--external-info-column INFO")),
             ("Use custom mapping aliases:", "postgwas sample_sheet_generator",
              ("--input-directory /path/to/raw_data", "--output /path/to/studies.csv",
               "--run-config /path/to/harmonisation.yaml")),
@@ -632,6 +719,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Optional harmonisation or full-run YAML overriding header aliases.",
     )
+    for source in _EXTERNAL_SOURCES:
+        for part in ("file", "column"):
+            parser.add_argument(
+                f"--external-{source}-{part}", default=argparse.SUPPRESS,
+                metavar="PATH" if part == "file" else "NAME",
+                help=(f"External {source.upper()} {part} used only when its internal mapping is missing. "
+                      f"Requires --external-{source}-{'column' if part == 'file' else 'file'}."
+                      + (" Supports {build} and {chromosome}." if part == "file" else "")),
+            )
     mark_cli_required_help(parser, ("input_directory", "output"))
     return parser
 
@@ -648,6 +744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.input_directory,
             args.output,
             config_file=args.run_config,
+            **{key: value for key, value in vars(args).items() if key.startswith("external_")},
         )
     except ConfigurationError as exc:
         parser.error(str(exc))
