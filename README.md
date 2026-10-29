@@ -258,19 +258,19 @@ and references, not a bundled demonstration dataset.
 
 A version-2 CSV/TSV sample sheet maps each study's columns and metadata to
 PostGWAS concepts. It is separate from the run-configuration YAML, which
-controls processing policies and resources. Generate a draft from the headers
-of files in your raw-data directory:
+controls processing policies and resources. Use `postgwas sample_sheet_generator`
+to generate a draft from the headers of files in your raw-data directory:
 
 ```bash
-python -m postgwas.modules.harmonisation.sample_sheet_generator \
+postgwas sample_sheet_generator \
   --input-directory raw_data \
   --output studies.csv
 ```
 
 Review every generated row against the original study documentation. The
 generator can leave fields unresolved or omit files it cannot map; inspect its
-warnings and `studies.csv.rejected_files.tsv` report. Successful draft generation
-does not mean the studies are ready to run. Alternatively, copy a maintained
+`studies.csv.mapping_review.tsv` and `studies.csv.rejected_files.tsv` reports.
+Successful draft generation does not mean the studies are ready to run. Alternatively, copy a maintained
 [quantitative template](examples/configs/harmonisation/sample_sheet_quantitative.csv)
 or [case-control template](examples/configs/harmonisation/sample_sheet_case_control.csv)
 and replace all placeholder values.

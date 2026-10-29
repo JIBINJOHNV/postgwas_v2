@@ -12,8 +12,12 @@ import tempfile
 import unicodedata
 from typing import Any, Sequence
 
+from pydantic import ValidationError
+
 from postgwas.config import load_module_configuration
 from postgwas.core.errors import ConfigurationError
+from postgwas.core.required_arguments import RequiredArgument, require_resolved_arguments
+from postgwas.core.ui import AlignedRichHelpFormatter, format_cli_examples, mark_cli_required_help
 from postgwas.core.io.delimiters import (
     delimiter_character,
     detect_delimiter,
@@ -24,6 +28,7 @@ from .policies import load_policies
 from .sample_sheet import (
     HarmonisationSampleSheetRow,
     SAMPLE_SHEET_VERSION,
+    _validation_error_text,
     load_harmonisation_sample_sheet,
 )
 
@@ -35,6 +40,9 @@ class SampleSheetDatasetStatus:
     missing_eaf: bool
     missing_sample_size: bool
     missing_info: bool
+    missing_mappings: tuple[str, ...]
+    has_case_control_columns: bool
+    has_coordinates: bool
     warnings: tuple[str, ...]
 
     @property
@@ -43,6 +51,7 @@ class SampleSheetDatasetStatus:
             self.missing_eaf
             or self.missing_sample_size
             or self.missing_info
+            or self.missing_mappings
             or self.warnings
         )
 
@@ -57,6 +66,7 @@ class SampleSheetFileRejection:
 class SampleSheetGenerationResult:
     output_file: Path
     rejection_report_file: Path
+    review_report_file: Path
     candidate_count: int
     dataset_count: int
     trait_type: str
@@ -171,28 +181,24 @@ def _matches(index: dict[str, str], aliases: Sequence[str]) -> list[str]:
 
 
 def _one_match(
-    index: dict[str, str],
-    aliases: Sequence[str],
-    label: str,
-    path: Path,
+    index: dict[str, str], aliases: Sequence[str], label: str,
+    path: Path, warnings: list[str],
 ) -> str | None:
+    """Select by canonical alias priority and record alternatives for review."""
     matches = list(dict.fromkeys(_matches(index, aliases)))
     if len(matches) > 1:
-        raise ConfigurationError(
-            "%s has multiple candidate %s columns (%s). Select the intended "
-            "column manually in the sample sheet."
-            % (path, label, ", ".join(matches))
+        warnings.append(
+            "%s: selected %s for %s by configured alias priority; alternatives: %s."
+            % (path.name, matches[0], label, ", ".join(matches[1:]))
         )
     return matches[0] if matches else None
 
 
 def _coordinates(index, aliases, path, warnings):
-    chromosome = _one_match(
-        index, aliases.chromosome_column, "chromosome", path,
-    )
-    position = _one_match(index, aliases.position_column, "position", path)
+    chromosome = _one_match(index, aliases.chromosome_column, "chromosome", path, warnings)
+    position = _one_match(index, aliases.position_column, "position", path, warnings)
     combined = _one_match(
-        index, aliases.chromosome_position_column, "combined-coordinate", path,
+        index, aliases.chromosome_position_column, "combined-coordinate", path, warnings,
     )
     if chromosome and position:
         if combined:
@@ -201,277 +207,160 @@ def _coordinates(index, aliases, path, warnings):
                 "column %s was not used." % (path.name, combined)
             )
         return chromosome, position, None
-    if combined and not chromosome and not position:
+    if combined:
         return None, None, combined
-    raise ConfigurationError(
-        "%s must contain chromosome plus position columns, or one combined-coordinate "
-        "column; detected chromosome=%r, position=%r, combined=%r."
-        % (path, chromosome, position, combined)
-    )
+    return chromosome, position, None
 
 
-def _frequency(
-    index,
-    aliases,
-    prefixes,
-    alternative_frequency,
-    effect_allele,
-    path,
-    warnings,
-):
-    explicit = _one_match(
-        index,
-        aliases.effect_allele_frequency_column,
-        "effect-allele-frequency",
-        path,
+def _frequency(index, aliases, prefixes, alternative_frequency, effect_allele, path, warnings):
+    # Category order retains explicit EAF priority. Within each category the
+    # canonical YAML alias order is authoritative; the selected header is literal.
+    ordered = (
+        aliases.effect_allele_frequency_column
+        + alternative_frequency.frequency_columns
+        + aliases.maf_frequency_column
+        + aliases.ambiguous_frequency_column
+        + aliases.reference_frequency_column
     )
-    prefix_matches = [
-        original
-        for normalized, original in index.items()
-        if any(
-            normalized == prefix or normalized.startswith(prefix + "_")
-            for prefix in prefixes
-        )
-    ]
-    alternative = _one_match(
-        index,
-        alternative_frequency.frequency_columns,
-        "ALT-allele-frequency",
-        path,
-    )
-    direct_matches = list(dict.fromkeys(
-        ([explicit] if explicit else [])
-        + prefix_matches
-        + ([alternative] if alternative else [])
-    ))
-    if len(direct_matches) > 1:
-        raise ConfigurationError(
-            "%s has multiple candidate effect-frequency columns (%s)."
-            % (path, ", ".join(direct_matches))
-        )
-    if direct_matches:
-        if alternative:
-            alternative_alleles = {
-                _normalise_column_name(value)
-                for value in alternative_frequency.allele_columns
-            }
-            if _normalise_column_name(effect_allele) not in alternative_alleles:
-                raise ConfigurationError(
-                    "%s contains ALT-frequency column %s, but the selected effect-"
-                    "allele column is %s rather than an ALT-labelled column. Do not "
-                    "use ALT frequency as EAF unless the reported effect is aligned "
-                    "to ALT; select the correct columns manually."
-                    % (path, alternative, effect_allele)
-                )
-        return direct_matches[0]
-
-    maf = _one_match(index, aliases.maf_frequency_column, "MAF", path)
-    ambiguous = _one_match(
-        index, aliases.ambiguous_frequency_column, "ambiguous frequency", path,
-    )
-    reference = _one_match(
-        index, aliases.reference_frequency_column, "reference frequency", path,
-    )
-    possible = [value for value in (maf, ambiguous) if value]
-    if len(possible) > 1:
-        raise ConfigurationError(
-            "%s has both MAF-like and ambiguous frequency candidates (%s)."
-            % (path, ", ".join(possible))
-        )
-    if maf:
-        warnings.append(
-            "%s: %s is MAF-like, not confirmed EAF. Harmonisation must confirm "
-            "its allele alignment against the configured reference panel."
-            % (path.name, maf)
-        )
-        return maf
-    if ambiguous:
-        warnings.append(
-            "%s: frequency column %s does not state its allele orientation. Review "
-            "the generated mapping before harmonisation." % (path.name, ambiguous)
-        )
-        return ambiguous
-    if reference:
-        warnings.append(
-            "%s: reference-panel frequency column %s was not used as study EAF. "
-            "Set effect_allele_frequency_column to a valid study-frequency column, "
-            "or set both external_eaf_file and external_eaf_column before "
-            "harmonisation."
-            % (path.name, reference)
-        )
-    return None
-
-
-def _effect_column(index, aliases, z_score, path):
-    beta = _one_match(index, aliases.beta_effect_column, "beta", path)
-    odds_ratio = _one_match(
-        index, aliases.odds_ratio_effect_column, "odds-ratio", path,
-    )
-    ambiguous = _one_match(
-        index, aliases.ambiguous_effect_column, "ambiguous effect", path,
-    )
-    categories = [value for value in (beta, odds_ratio, ambiguous) if value]
-    if len(categories) > 1:
-        raise ConfigurationError(
-            "%s has multiple candidate effect columns (%s). Select the intended "
-            "effect column manually." % (path, ", ".join(categories))
-        )
-    if categories:
-        return categories[0]
-    if z_score:
+    selected = _one_match(index, ordered, "frequency", path, warnings)
+    if selected is None:
+        prefix_aliases = [
+            original for normalized, original in index.items()
+            if any(normalized.startswith(prefix) for prefix in prefixes)
+        ]
+        selected = _one_match(index, prefix_aliases, "frequency", path, warnings)
+    if selected is None:
         return None
-    raise ConfigurationError(
-        "%s has neither a recognized effect column nor a Z-score column." % path
-    )
+    normalized = _normalise_column_name(selected)
+    if normalized in {_normalise_column_name(v) for v in aliases.maf_frequency_column}:
+        warnings.append(
+            "%s: %s is MAF-like, not confirmed EAF; allele alignment requires "
+            "harmonisation/reference checks." % (path.name, selected)
+        )
+    elif normalized in {_normalise_column_name(v) for v in aliases.reference_frequency_column}:
+        warnings.append(
+            "%s: %s is a reference-panel frequency candidate retained in the draft; "
+            "its provenance and allele alignment are not established by the header."
+            % (path.name, selected)
+        )
+    elif normalized in {_normalise_column_name(v) for v in aliases.ambiguous_frequency_column}:
+        warnings.append(
+            "%s: frequency column %s does not state its allele orientation."
+            % (path.name, selected)
+        )
+    elif normalized in {_normalise_column_name(v) for v in alternative_frequency.frequency_columns}:
+        if _normalise_column_name(effect_allele) not in {
+            _normalise_column_name(v) for v in alternative_frequency.allele_columns
+        }:
+            warnings.append(
+                "%s: ALT frequency %s was retained, but effect allele %s is not "
+                "ALT-labelled; confirm allele alignment before harmonisation."
+                % (path.name, selected, effect_allele)
+            )
+    return selected
 
 
 def _sample_size(index, aliases, path, warnings, on_missing):
-    controls = _one_match(
-        index, aliases.control_count_column, "control-count", path,
-    )
-    cases = _one_match(index, aliases.case_count_column, "case-count", path)
+    controls = _one_match(index, aliases.control_count_column, "control-count", path, warnings)
+    cases = _one_match(index, aliases.case_count_column, "case-count", path, warnings)
     total = _one_match(
-        index, aliases.total_sample_size_column, "total-sample-size", path,
+        index, aliases.total_sample_size_column + aliases.effective_sample_size_column,
+        "total/effective sample size", path, warnings,
     )
-    effective = _one_match(
-        index, aliases.effective_sample_size_column, "effective-sample-size", path,
-    )
-    invalid = _one_match(
-        index, aliases.invalid_sample_size_column, "unsafe sample-size", path,
-    )
-    if controls:
-        ignored = [value for value in (total, effective) if value]
-        if ignored:
-            warnings.append(
-                "%s: explicit control column %s was selected; %s was not used as a "
-                "control count." % (path.name, controls, ", ".join(ignored))
-            )
-    else:
-        alternatives = [value for value in (total, effective) if value]
-        if len(alternatives) > 1:
-            raise ConfigurationError(
-                "%s has both total and effective sample-size columns (%s); select "
-                "the scientifically appropriate one manually."
-                % (path, ", ".join(alternatives))
-            )
-        if cases and alternatives:
-            raise ConfigurationError(
-                "%s has case count %s but no explicit control count. Column %s cannot "
-                "be assumed to contain controls." % (path, cases, alternatives[0])
-            )
-        controls = alternatives[0] if alternatives else None
-        if effective:
-            warnings.append(
-                "%s: %s is treated as the lone effective/total sample-size input; "
-                "review this mapping before harmonisation." % (path.name, effective)
-            )
-    if cases and not controls:
-        raise ConfigurationError(
-            "%s has a case-count column but no usable control-count column." % path
+    if controls and total:
+        warnings.append(
+            "%s: explicit control column %s was selected; %s was not used as a control count."
+            % (path.name, controls, total)
         )
+    elif not controls and cases and total:
+        warnings.append(
+            "%s: %s cannot be assumed to contain controls when case count %s is present; "
+            "control_count_column remains NA." % (path.name, total, cases)
+        )
+    elif not controls and not cases:
+        controls = total
+        if total in _matches(index, aliases.effective_sample_size_column):
+            warnings.append(
+                "%s: %s is an effective sample-size candidate; confirm its meaning."
+                % (path.name, total)
+            )
     if not controls:
-        if invalid:
-            raise ConfigurationError(
-                "%s contains %s, but a meta-analysis weight is not a sample size."
-                % (path, invalid)
+        weight = _one_match(index, aliases.invalid_sample_size_column, "weight", path, warnings)
+        if weight:
+            warnings.append(
+                "%s: %s is a meta-analysis weight, not a confirmed sample size; "
+                "sample size remains NA." % (path.name, weight)
             )
         if on_missing == "fail":
             raise ConfigurationError(
-                "%s has no recognized control, total, or effective sample-size "
-                "column." % path
+                "%s has no recognized control, total, or effective sample-size column." % path
             )
-        return None, None
     return controls, cases
+
+
+def _missing_mappings(row):
+    """Describe the analysis contract without requiring a draft to satisfy it."""
+    missing = [
+        field for field in ("effect_allele_column", "other_allele_column", "p_value_column")
+        if not row.get(field)
+    ]
+    if not row.get("chromosome_position_column"):
+        missing.extend(
+            field for field in ("chromosome_column", "position_column") if not row.get(field)
+        )
+    if not row.get("effect_column") and not row.get("z_score_column"):
+        missing.append("effect_column or z_score_column")
+    return tuple(missing)
 
 
 def _row_for_file(path: Path, generator_config, policies) -> tuple[dict[str, Any], list[str]]:
     delimiter_name, delimiter = _delimiter_name(path, policies)
-    headers = _read_header(
-        path,
-        delimiter,
-        bool(policies.get("input.strip_double_hash_lines")),
-    )
+    headers = _read_header(path, delimiter, bool(policies.get("input.strip_double_hash_lines")))
     index = _header_index(headers)
     aliases = generator_config.column_aliases
     warnings: list[str] = []
-
     chromosome, position, combined = _coordinates(index, aliases, path, warnings)
-    effect_allele = _one_match(
-        index, aliases.effect_allele_column, "effect-allele", path,
-    )
-    other_allele = _one_match(
-        index, aliases.other_allele_column, "other-allele", path,
-    )
-    if not effect_allele or not other_allele:
-        raise ConfigurationError(
-            "%s must contain recognized effect and other allele columns; detected "
-            "effect=%r, other=%r." % (path, effect_allele, other_allele)
-        )
-
-    variant_id = _one_match(
-        index, aliases.variant_id_column, "variant-identifier", path,
-    )
-    frequency = _frequency(
-        index,
-        aliases,
-        generator_config.effect_frequency_prefixes,
-        generator_config.alternative_frequency,
-        effect_allele,
-        path,
-        warnings,
-    )
-    standard_error = _one_match(
-        index, aliases.standard_error_column, "standard-error", path,
-    )
-    z_score = _one_match(index, aliases.z_score_column, "Z-score", path)
-    effect = _effect_column(index, aliases, z_score, path)
-    p_value = _one_match(index, aliases.p_value_column, "p-value", path)
-    if not p_value:
-        raise ConfigurationError("%s has no recognized p-value column." % path)
-    controls, cases = _sample_size(
-        index,
-        aliases,
-        path,
-        warnings,
-        generator_config.on_missing_sample_size,
-    )
-    info = _one_match(
-        index, aliases.imputation_info_column, "imputation-quality", path,
-    )
-
     row = {
         "config_version": SAMPLE_SHEET_VERSION,
         "dataset_id": _dataset_id(path, generator_config.supported_suffixes),
         "input_file": str(path),
-        # Headers select sample-size fields but cannot establish study design.
-        # Full-dataset harmonisation makes that scientific decision.
         "trait_type": generator_config.trait_type,
+        "effect_type": generator_config.effect_type,
+        "p_value_type": generator_config.p_value_type,
         "chromosome_column": chromosome,
         "position_column": position,
         "chromosome_position_column": combined,
-        "variant_id_column": variant_id,
-        "effect_allele_column": effect_allele,
-        "other_allele_column": other_allele,
-        "effect_allele_frequency_column": frequency,
-        "effect_column": effect,
-        # Header aliases select columns only. Full-dataset harmonisation decides
-        # both statistical scales unless the user edits the generated sheet.
-        "effect_type": generator_config.effect_type,
-        "standard_error_column": standard_error,
-        "z_score_column": z_score,
-        "p_value_column": p_value,
-        "p_value_type": generator_config.p_value_type,
-        "control_count_column": controls,
-        "case_count_column": cases,
-        "control_count": None,
-        "case_count": None,
-        "imputation_info_column": info,
-        "external_info_file": None,
-        "external_info_column": None,
-        "external_eaf_file": None,
-        "external_eaf_column": None,
         "delimiter": delimiter_name,
     }
+    # Equivalent mapping fields share their schema names with configured aliases.
+    for field in (
+        "variant_id_column", "effect_allele_column", "other_allele_column",
+        "standard_error_column", "z_score_column", "p_value_column", "imputation_info_column",
+    ):
+        row[field] = _one_match(index, getattr(aliases, field), field, path, warnings)
+    row["effect_column"] = _one_match(
+        index, aliases.beta_effect_column + aliases.odds_ratio_effect_column
+        + aliases.ambiguous_effect_column, "effect", path, warnings,
+    )
+    row["effect_allele_frequency_column"] = _frequency(
+        index, aliases, generator_config.effect_frequency_prefixes,
+        generator_config.alternative_frequency, row["effect_allele_column"], path, warnings,
+    )
+    row["control_count_column"], row["case_count_column"] = _sample_size(
+        index, aliases, path, warnings, generator_config.on_missing_sample_size,
+    )
+    # Combined coordinates and Z scores satisfy their respective screening roles.
+    screening = dict(row)
+    if combined:
+        screening.update(chromosome_column=combined, position_column=combined)
+    if row["z_score_column"] and not row["effect_column"]:
+        screening["effect_column"] = row["z_score_column"]
+    mapped = sum(bool(screening.get(field)) for field in generator_config.screening_columns)
+    if mapped < generator_config.minimum_mapped_columns:
+        raise ConfigurationError(
+            "%s has only %d/%d screening mappings; at least %d are required for a draft."
+            % (path, mapped, len(generator_config.screening_columns), generator_config.minimum_mapped_columns)
+        )
     return row, warnings
 
 
@@ -523,8 +412,9 @@ def _write_sample_sheet(
         temporary.unlink(missing_ok=True)
 
 
-def _write_rejection_report(
-    rejected_files: Sequence[SampleSheetFileRejection],
+def _write_table_report(
+    rows: Sequence[dict[str, Any]],
+    fields: Sequence[str],
     output_file: Path,
 ) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -541,17 +431,42 @@ def _write_rejection_report(
             writer = csv.DictWriter(
                 handle,
                 delimiter="\t",
-                fieldnames=("input_file", "reason"),
+                fieldnames=fields,
             )
             writer.writeheader()
-            for rejection in rejected_files:
-                writer.writerow({
-                    "input_file": str(rejection.input_file),
-                    "reason": rejection.reason,
-                })
+            writer.writerows(rows)
         os.replace(temporary, output_file)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _write_generation_reports(dataset_statuses, rejected_files, suffixes, rejection_report, review_report):
+    """Persist all findings, including when no sample-sheet draft can be written."""
+    _write_table_report(
+        [{"input_file": str(item.input_file), "reason": item.reason} for item in rejected_files],
+        ("input_file", "reason"), rejection_report,
+    )
+    review_rows = [{
+        "dataset_id": item.dataset_id,
+        "input_file": str(item.input_file),
+        "status": "needs_attention" if item.needs_attention else "ready",
+        "missing_mappings": "; ".join(item.missing_mappings),
+        "missing_info": item.missing_info,
+        "missing_sample_size": item.missing_sample_size,
+        "missing_frequency": item.missing_eaf,
+        "review_notes": "; ".join(item.warnings),
+    } for item in dataset_statuses]
+    review_rows.extend({
+        "dataset_id": _dataset_id(item.input_file, suffixes),
+        "input_file": str(item.input_file), "status": "rejected", "review_notes": item.reason,
+    } for item in rejected_files)
+    review_rows.sort(key=lambda row: (Path(row["input_file"]).name.casefold(), row["input_file"]))
+    _write_table_report(
+        review_rows,
+        ("dataset_id", "input_file", "status", "missing_mappings", "missing_info",
+         "missing_sample_size", "missing_frequency", "review_notes"),
+        review_report,
+    )
 
 
 def generate_sample_sheet(
@@ -569,9 +484,10 @@ def generate_sample_sheet(
     rejection_report = destination.with_name(
         destination.name + generator_config.rejection_report_suffix
     )
+    review_report = destination.with_name(destination.name + generator_config.review_report_suffix)
     files = _candidate_files(
         source_directory,
-        (destination, rejection_report),
+        (destination, rejection_report, review_report),
         generator_config.supported_suffixes,
     )
 
@@ -582,6 +498,7 @@ def generate_sample_sheet(
     for path in files:
         try:
             row, row_warnings = _row_for_file(path, generator_config, policies)
+            HarmonisationSampleSheetRow.validate_generated_draft(row)
             rows.append(row)
             warnings.extend(row_warnings)
             dataset_statuses.append(SampleSheetDatasetStatus(
@@ -590,35 +507,35 @@ def generate_sample_sheet(
                 missing_eaf=not _has_eaf(row),
                 missing_sample_size=not _has_sample_size(row),
                 missing_info=row.get("imputation_info_column") is None,
+                missing_mappings=_missing_mappings(row),
+                has_case_control_columns=bool(row.get("case_count_column") and row.get("control_count_column")),
+                has_coordinates=bool(row.get("chromosome_position_column") or
+                                     (row.get("chromosome_column") and row.get("position_column"))),
                 warnings=tuple(row_warnings),
             ))
         except (ConfigurationError, OSError, ValueError, csv.Error) as exc:
             rejected_files.append(SampleSheetFileRejection(
                 input_file=path,
-                reason=str(exc),
+                reason=(
+                    _validation_error_text(exc)
+                    if isinstance(exc, ValidationError) else str(exc)
+                ),
             ))
+    _write_generation_reports(
+        dataset_statuses, rejected_files, generator_config.supported_suffixes,
+        rejection_report, review_report,
+    )
     if rejected_files and generator_config.failure_policy == "fail_all":
         raise ConfigurationError(
-            "Sample-sheet generation failed for %d file(s); no output was written:\n- %s"
-            % (
-                len(rejected_files),
-                "\n- ".join(
-                    "%s: %s" % (item.input_file.name, item.reason)
-                    for item in rejected_files
-                ),
-            )
+            "Sample-sheet generation rejected %d/%d files; fail_all requested, "
+            "no sample sheet was written. See %s and %s."
+            % (len(rejected_files), len(files), rejection_report, review_report)
         )
     if not rows:
         raise ConfigurationError(
-            "Sample-sheet generation failed because none of the %d candidate "
-            "file(s) could be mapped; no output was written:\n- %s"
-            % (
-                len(rejected_files),
-                "\n- ".join(
-                    "%s: %s" % (item.input_file.name, item.reason)
-                    for item in rejected_files
-                ),
-            )
+            "None of the %d candidate files passed draft screening; no sample sheet "
+            "was written. See %s and %s."
+            % (len(files), rejection_report, review_report)
         )
 
     dataset_ids: dict[str, str] = {}
@@ -633,14 +550,14 @@ def generate_sample_sheet(
         dataset_ids[normalized] = str(row["input_file"])
 
     requires_completion = any(
-        not _has_sample_size(row) or not _has_eaf(row)
+        not _has_sample_size(row) or not _has_eaf(row) or bool(_missing_mappings(row))
         for row in rows
     )
-    _write_rejection_report(rejected_files, rejection_report)
     _write_sample_sheet(rows, destination, allow_incomplete=requires_completion)
     return SampleSheetGenerationResult(
         output_file=destination,
         rejection_report_file=rejection_report,
+        review_report_file=review_report,
         candidate_count=len(files),
         dataset_count=len(rows),
         trait_type=generator_config.trait_type,
@@ -654,93 +571,47 @@ def generate_sample_sheet(
 
 
 def _generation_summary(result: SampleSheetGenerationResult) -> str:
-    attention = [dataset for dataset in result.datasets if dataset.needs_attention]
-    ready = result.dataset_count - len(attention)
-    lines = [
+    """Keep the terminal aggregate-only; individual findings live in TSV reports."""
+    datasets = result.datasets
+    attention = sum(dataset.needs_attention for dataset in datasets)
+    return "\n".join((
         "Sample-sheet generation summary",
         "  Input files       : %d" % result.candidate_count,
         "  Rows written      : %d" % result.dataset_count,
         "  Rejected files    : %d" % len(result.rejected_files),
-        "  Ready             : %d" % ready,
-        "  Need attention    : %d" % len(attention),
-        "  Output            : %s" % result.output_file,
-        "  Rejection report  : %s" % result.rejection_report_file,
+        "  Ready             : %d" % (result.dataset_count - attention),
+        "  Need attention    : %d" % attention,
+        "  Missing INFO      : %d" % sum(d.missing_info for d in datasets),
+        "  Missing sample N  : %d" % sum(d.missing_sample_size for d in datasets),
+        "  Missing frequency : %d" % sum(d.missing_eaf for d in datasets),
+        "  Frequency mapped  : %d" % sum(not d.missing_eaf for d in datasets),
+        "  Case/control cols : %d" % sum(d.has_case_control_columns for d in datasets),
+        "  Coordinates mapped: %d" % sum(d.has_coordinates for d in datasets),
+        "  Missing mappings  : %d" % sum(bool(d.missing_mappings) for d in datasets),
+        "  Mapping review    : %d" % sum(bool(d.warnings) for d in datasets),
         "  Trait type        : %s" % result.trait_type,
         "  Effect type       : %s" % result.effect_type,
         "  P-value type      : %s" % result.p_value_type,
-    ]
-    if result.rejected_files:
-        lines.extend(("", "Rejected input files"))
-        for rejection in result.rejected_files:
-            lines.append(
-                "  %s: %s" % (rejection.input_file.name, rejection.reason)
-            )
-
-    if not attention:
-        return "\n".join(lines)
-
-    lines.extend(("", "Datasets needing attention"))
-    for dataset in attention:
-        issues: list[str] = []
-        if dataset.missing_eaf:
-            issues.append("allele frequency")
-        if dataset.missing_sample_size:
-            issues.append("sample size")
-        if dataset.missing_info:
-            issues.append("imputation INFO")
-        if dataset.warnings:
-            issues.append("mapping review")
-        lines.append(
-            "  %s (%s): %s"
-            % (dataset.dataset_id, dataset.input_file.name, ", ".join(issues))
-        )
-
-    if any(dataset.missing_eaf for dataset in attention):
-        lines.extend((
-            "",
-            "How to provide allele frequency",
-            "  Internal column : set effect_allele_frequency_column to the exact "
-            "study EAF or MAF header.",
-            "  External file   : set external_eaf_file AND external_eaf_column.",
-            "  Required        : complete one of these alternatives before running "
-            "harmonisation; do not invent a fixed frequency.",
-        ))
-    if any(dataset.missing_sample_size for dataset in attention):
-        lines.extend((
-            "",
-            "How to complete sample size",
-            "  Quantitative study",
-            "    Set control_count_column to the total-N column, or set "
-            "control_count to the fixed total N.",
-            "  Case-control study",
-            "    Set control_count_column/control_count AND "
-            "case_count_column/case_count.",
-        ))
-    if any(dataset.missing_info for dataset in attention):
-        lines.extend((
-            "",
-            "How to provide imputation INFO",
-            "  Internal column  : set imputation_info_column",
-            "  External file    : set external_info_file and external_info_column",
-            "  Fixed run value  : use harmonisation --fixed-info VALUE",
-        ))
-
-    review_notes = [
-        (dataset, warning)
-        for dataset in attention
-        for warning in dataset.warnings
-    ]
-    if review_notes:
-        lines.extend(("", "Other mapping review notes"))
-        for dataset, warning in review_notes:
-            prefix = "%s: " % dataset.input_file.name
-            detail = warning.removeprefix(prefix)
-            lines.append("  %s: %s" % (dataset.dataset_id, detail))
-    return "\n".join(lines)
+        "  Output            : %s" % result.output_file,
+        "  Review report     : %s" % result.review_report_file,
+        "  Rejection report  : %s" % result.rejection_report_file,
+        "  Mapping counts describe retained rows, not validated study designs or frequency types.",
+    ))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="postgwas sample_sheet_generator",
+        formatter_class=AlignedRichHelpFormatter,
+        epilog=format_cli_examples(
+            ("Draft a sample sheet and review reports:", "postgwas sample_sheet_generator",
+             ("--input-directory /path/to/raw_data", "--output /path/to/studies.csv")),
+            ("Use custom mapping aliases:", "postgwas sample_sheet_generator",
+             ("--input-directory /path/to/raw_data", "--output /path/to/studies.csv",
+              "--run-config /path/to/harmonisation.yaml")),
+            ("Export harmonisation configuration:", "postgwas config export",
+             ("--module harmonisation", "--style full", "--output harmonisation.yaml")),
+        ),
         description=(
             "Generate a version-2 PostGWAS harmonisation sample-sheet draft "
             "from summary-statistics headers."
@@ -748,13 +619,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--input-directory",
-        required=True,
         metavar="PATH",
         help="Directory containing summary-statistics files.",
     )
     parser.add_argument(
         "--output",
-        required=True,
         metavar="PATH",
         help="CSV sample sheet to create atomically.",
     )
@@ -763,6 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Optional harmonisation or full-run YAML overriding header aliases.",
     )
+    mark_cli_required_help(parser, ("input_directory", "output"))
     return parser
 
 
@@ -770,6 +640,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        require_resolved_arguments((
+            RequiredArgument("--input-directory", None, args.input_directory),
+            RequiredArgument("--output", None, args.output),
+        ))
         result = generate_sample_sheet(
             args.input_directory,
             args.output,

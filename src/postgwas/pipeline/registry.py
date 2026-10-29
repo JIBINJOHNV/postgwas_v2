@@ -228,6 +228,15 @@ MODULES = (
         direct_checkpoint="not_applicable",
     ),
     ModuleSpec(
+        "sample_sheet_generator",
+        "Draft a harmonisation sample sheet and mapping-review reports.",
+        cli_entrypoint="postgwas.modules.harmonisation.sample_sheet_generator:main",
+        pipeline_enabled=False,
+        pipeline_target=False,
+        unavailable_reason="sample-sheet preparation is not an analysis pipeline step",
+        direct_checkpoint="not_applicable",
+    ),
+    ModuleSpec(
         "harmonisation",
         "Standardise raw summary statistics and create GWAS-VCF artifacts.",
         cli_entrypoint="postgwas.modules.harmonisation.cli:main",

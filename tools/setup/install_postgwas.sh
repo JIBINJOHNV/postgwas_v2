@@ -208,13 +208,38 @@ if [[ "$host_os" == "Linux" ]]; then
         "${linux_packages[@]}"
 fi
 
-pip_arguments=(python -m pip install --no-deps --no-build-isolation)
+# Resolve Python only after the requested environment has been activated by
+# Conda/Mamba. Never fall back to a Python found on the caller's PATH.
+run_target_python() {
+    "$environment_runner_path" run -n "$environment_name" \
+        bash -c 'exec "${CONDA_PREFIX:?Target Conda environment was not activated}/bin/python" "$@"' \
+        bash "$@"
+}
+
+run_target_python -I -c '
+import os
+from pathlib import Path
+import sys
+import pip
+prefix = Path(os.environ["CONDA_PREFIX"]).resolve()
+if Path(sys.prefix).resolve() != prefix or not Path(pip.__file__).resolve().is_relative_to(prefix):
+    raise SystemExit("ERROR: Python and pip must both belong to the selected Conda environment.")
+print("  Installation Python: " + sys.executable)
+'
+
+printf 'Installing PostGWAS Python package into %s\n' "$environment_name"
+# Absolute checkout path makes this equivalent to `python -m pip install .`
+# from the repository root, regardless of the caller's current directory.
+pip_arguments=(-I -m pip --isolated install)
 if $editable; then
     pip_arguments+=(-e)
 fi
 pip_arguments+=("$repository_root")
 
-"$environment_manager" run -n "$environment_name" "${pip_arguments[@]}"
+run_target_python "${pip_arguments[@]}"
+# Isolated Python cannot accidentally import a checkout via the working directory.
+# Check the reported failing module before beginning lengthy external builds.
+run_target_python -I -m postgwas sample_sheet_generator --help >/dev/null
 POSTGWAS_INSTALL_JOBS="$build_jobs" \
     "$environment_manager" run -n "$environment_name" \
     bash "$script_directory/install_bcftools_liftover.sh"
@@ -232,7 +257,7 @@ if $all_tools; then
 fi
 
 printf 'Verifying installation\n'
-"$environment_manager" run -n "$environment_name" python -m pip check
+run_target_python -I -m pip --isolated check
 "$environment_manager" run -n "$environment_name" postgwas --help >/dev/null
 "$environment_manager" run -n "$environment_name" \
     bcftools plugin -l | grep -qx liftover

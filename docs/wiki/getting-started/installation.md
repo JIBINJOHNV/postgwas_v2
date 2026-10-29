@@ -187,9 +187,22 @@ The equivalent portable manual commands are:
 ```console
 mamba env create --name postgwas-portable --file environment.yml
 conda activate postgwas-portable
-python -m pip install --no-deps --no-build-isolation .
+python -m pip install .
 bash tools/setup/install_bcftools_liftover.sh
 ```
+
+The bootstrap installs the checkout with the target environment's
+`python -m pip install` (or `-e` with `--editable`), using the absolute repository
+path. Pip resolves declared dependencies and builds the package using its normal
+build isolation. Before native-tool builds, the installer runs the installed
+sample-sheet generator's help through isolated Python (`-I`); a package-install
+or module-import failure stops installation immediately.
+
+The installer invokes `$CONDA_PREFIX/bin/python` inside the named environment,
+checks that Python and pip both belong to that prefix, and prints the interpreter
+path. Python `-I` and pip `--isolated` exclude caller Python settings and
+user-level pip settings/environment overrides from the installation step.
+
 
 The environment isolates its R library from per-user R packages, preventing an
 incompatible package in `~/Library/R` or an equivalent user library from

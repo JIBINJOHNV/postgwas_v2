@@ -115,10 +115,14 @@ module:
     p_value_type: auto
     failure_policy: write_valid
     rejection_report_suffix: .rejected_files.tsv
+    review_report_suffix: .mapping_review.tsv
+    # Match the original mapping script's three-of-six draft inclusion rule.
+    minimum_mapped_columns: 3
+    screening_columns: [chromosome_column, position_column, effect_allele_column, other_allele_column, effect_column, p_value_column]
     on_missing_sample_size: write_draft
     effect_frequency_prefixes: [FRQ_U, FREQ_U]
-    # ALT-labelled frequencies are valid study EAF only when the selected
-    # effect-allele column is itself ALT-labelled.
+    # ALT-labelled candidates are retained; mismatched allele headers are
+    # recorded for review rather than blocking draft generation.
     alternative_frequency:
       allele_columns:
         - ALT

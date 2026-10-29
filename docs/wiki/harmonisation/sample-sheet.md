@@ -10,7 +10,7 @@ during sample-sheet preflight but opened only by later execution preflight.
 | Field | Requirement |
 |---|---|
 | `config_version` | Must be `2`. |
-| `dataset_id` | Unique; letters, numbers, `.`, `_`, and `-`, beginning with a letter or number. |
+| `dataset_id` | Unique; letters, numbers, `.`, `_`, `+`, and `-`, beginning with a letter or number. |
 | `input_file` | Existing, non-empty regular file. Relative paths are resolved from the sample-sheet directory. |
 | `trait_type` | `quantitative`, `case_control`, or `auto`. |
 | `delimiter` | `tab`, `comma`, `semicolon`, `space`, `whitespace`, or `auto`. |
@@ -149,7 +149,7 @@ The configured header aliases can generate a version-2 sample-sheet draft for
 every supported summary-statistics file in one directory:
 
 ```console
-python -m postgwas.modules.harmonisation.sample_sheet_generator \
+postgwas sample_sheet_generator \
   --input-directory /path/to/summary-statistics \
   --output studies.csv
 ```
@@ -158,48 +158,76 @@ The generator reads only enough records to determine the delimiter and header.
 Every valid supported input file becomes one row in the same output CSV,
 ordered by filename. Selected column mappings preserve the source header
 spelling exactly, including a leading `#` in names such as `#chr` or `#chrom`.
-The terminal summary reports the number of ready rows and lists only datasets
-requiring attention. The complete recognized file suffix is removed from
+The terminal prints aggregate counts only: scanned/written/rejected files,
+ready/attention rows, missing INFO/sample size/frequency/mappings, mapped
+frequency/coordinates, and rows with both case/control columns. It lists report
+paths instead of individual datasets or warnings. Counts describe retained
+header mappings; they do not establish study design or frequency type.
+The complete recognized file suffix is removed from
 `dataset_id`; for example, `study.vcf.gz` becomes `study`, not `study.vcf`.
-An unresolved EAF mapping is written as `NA` so the user can add either the
-exact internal frequency column or an external EAF file/column pair. Under the
-default `sample_sheet_generator.failure_policy: write_valid` policy, files with
-unresolved chromosome, position, allele, effect, or p-value mappings are
-omitted from the draft and recorded with their full path and exact reason in
-the companion `<output>.rejected_files.tsv` report. The terminal summary also
-lists every rejected file, so exclusion is never silent. Generation still
-fails when no candidate can be mapped. Set `failure_policy: fail_all` in a run
-configuration to require every candidate file to map before any output is
-published.
+The filename-derived ID must satisfy the same rules as a manually entered ID.
+IDs containing `+`, such as `EVER_SMOKER_GWAS_MA_UKB+TAG`, are preserved.
+An invalid ID, such as a filename stem containing spaces, follows the
+configured per-file rejection policy instead of aborting CSV publication with
+a validation traceback. The generator does not rename source files or silently
+rewrite IDs. To include a rejected study manually, use a valid `dataset_id`
+while retaining its original path in `input_file`.
+The generator follows the draft-first approach of the
+[original mapping script](https://github.com/JIBINJOHNV/postgwas/blob/main/src/postgwas/scripts/create_sumstat_map_pl.py)
+while retaining the version-2 columns. It chooses the first configured alias
+for each field, preserves the exact input header, and records alternatives for
+review. Missing mappings are written as `NA` instead of rejecting an otherwise
+recognizable study. It does not create harmonisation result directories.
 
-It writes the same fields as the validated sample-sheet model and sets
-`trait_type`, `effect_type`, and `p_value_type` to `auto` for every dataset.
-Header aliases select sample-size, effect, and p-value columns only; they do not
-establish the study design or statistical scales. Dataset-level harmonisation
-makes those decisions from the complete data. Edit these fields manually when
-the study documentation provides an authoritative declaration.
+The canonical `sample_sheet_generator.screening_columns` lists six core roles:
+chromosome, position, effect allele, other allele, effect, and p-value.
+`minimum_mapped_columns: 3` retains files with at least three mapped roles,
+matching the original script's inclusion threshold. Combined coordinates satisfy
+both coordinate roles, and a Z-score can satisfy the effect role. This is a
+file-screening heuristic, not scientific validation. The normal harmonisation
+loader still requires complete mappings before analysis.
 
-Missing EAF and missing sample size are written as `NA` in the draft. The
-terminal summary identifies the affected dataset and explains how to complete
-its EAF source. The normal harmonisation sample-sheet validator remains strict:
-it rejects the draft until exactly one internal or external EAF source is
-provided, and it never invents a fixed frequency.
+Two separate TSV reports accompany the CSV:
 
-Missing sample size is written as `NA` under the default
-`sample_sheet_generator.on_missing_sample_size: write_draft` policy. The
-terminal warning identifies the exact fields that must be completed, and the
-normal harmonisation sample-sheet validator still rejects the draft until they
-are supplied. Set the policy to `fail` to reject that individual file during
-generation. The separate `failure_policy` then decides whether other valid
-files may still be written.
+- `<output>.mapping_review.tsv`: one row per candidate file, with `dataset_id`,
+  `input_file`, `status` (`ready`, `needs_attention`, or `rejected`),
+  `missing_mappings`, `missing_info`, `missing_sample_size`, `missing_frequency`,
+  and `review_notes`. Missing-field flags are `True` or `False` for retained
+  rows; rejected rows leave unassessed flags blank and include the rejection
+  reason. Notes include MAF uncertainty, reference-frequency provenance,
+  ALT alignment, and alternative matching columns.
+- `<output>.rejected_files.tsv`: full paths and reasons for files that cannot
+  be read or fail the configured screening/structural checks.
 
-MAF-like and allele-ambiguous frequency headers are retained with visible
-review warnings; reference-panel frequency columns are never relabelled as
-study EAF. An ALT-labelled frequency is accepted as EAF only when the selected
-effect-allele column is also ALT-labelled. Review every generated allele,
-frequency, effect, and sample-size mapping before starting harmonisation. Add
-external EAF/INFO sources manually when the measurements are not present in the
-study table.
+The report suffixes are configured by `review_report_suffix` and
+`rejection_report_suffix`. Reports and the output sheet are excluded from
+subsequent input discovery. `ready` means no header-mapping issue was detected;
+it does not establish scientific validity. Generation fails if no candidate
+passes screening, but still writes both diagnostic reports.
+`failure_policy: fail_all` requires every candidate to pass before a sample
+sheet is written; it still writes the diagnostic reports on failure;
+the default `write_valid` writes the retained rows and reports rejected files.
+
+`trait_type`, `effect_type`, and `p_value_type` remain `auto`. Header matching
+does not establish study design or statistical scale. Edit these fields when
+study documentation supplies an authoritative declaration.
+
+Frequency candidates including EAF, MAF, ambiguous frequency, ALT frequency,
+and `EAF_HRC` are retained in `effect_allele_frequency_column`. Explicit EAF
+aliases take priority, followed by ALT, MAF, ambiguous, and reference-frequency
+aliases; the configured order within each category breaks ties. Prefix matches
+are the fallback. MAF and reference-frequency candidates receive review notes,
+not generation errors. Retaining a header does not establish study provenance
+or allele orientation; harmonisation's existing frequency/reference checks
+remain unchanged and can still stop on inconclusive evidence.
+
+Missing sample size is written as `NA` under `on_missing_sample_size: write_draft`.
+Set this to `fail` to reject that file during generation. Explicit controls take
+priority over total/effective N. If cases and total N are present without a
+control-count column, the draft retains cases and leaves controls unresolved;
+meta-analysis weights are also left unresolved. These choices and missing INFO
+are listed in the review table. Complete the mappings or supply appropriate
+external EAF/INFO sources or `--fixed-info` before harmonisation.
 
 ## Examples
 

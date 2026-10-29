@@ -26,7 +26,7 @@ from postgwas.core.ui.screen import (
 )
 
 
-_NON_SCIENTIFIC_COMMANDS = {"config", "resources"}
+_NON_SCIENTIFIC_COMMANDS = {"config", "resources", "sample_sheet_generator"}
 _ACTIVE_RECORDERS = 0
 _PROGRESS_DISPLAY_CONSOLE: Console | None = None
 _PROGRESS_DISPLAY_STREAM: TextIO | None = None

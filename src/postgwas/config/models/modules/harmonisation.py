@@ -181,10 +181,29 @@ class SampleSheetGeneratorConfig(StrictModel):
     p_value_type: Literal["auto"]
     failure_policy: Literal["write_valid", "fail_all"]
     rejection_report_suffix: str
+    review_report_suffix: str
+    minimum_mapped_columns: int = Field(ge=1)
+    screening_columns: list[Literal[
+        "chromosome_column", "position_column", "effect_allele_column",
+        "other_allele_column", "effect_column", "p_value_column",
+    ]]
+
     on_missing_sample_size: Literal["write_draft", "fail"]
     effect_frequency_prefixes: list[str]
     alternative_frequency: SampleSheetAlternativeFrequencyAliases
     column_aliases: SampleSheetColumnAliases
+
+    @model_validator(mode="after")
+    def valid_draft_screening(self):
+        if (
+            not self.screening_columns
+            or len(self.screening_columns) != len(set(self.screening_columns))
+            or self.minimum_mapped_columns > len(self.screening_columns)
+        ):
+            raise ValueError("screening_columns must be unique and cover minimum_mapped_columns")
+        if self.review_report_suffix == self.rejection_report_suffix:
+            raise ValueError("review and rejection report suffixes must differ")
+        return self
 
     @field_validator("supported_suffixes")
     @classmethod
@@ -196,9 +215,9 @@ class SampleSheetGeneratorConfig(StrictModel):
             raise ValueError("supported_suffixes must be unique")
         return cleaned
 
-    @field_validator("rejection_report_suffix")
+    @field_validator("rejection_report_suffix", "review_report_suffix")
     @classmethod
-    def safe_rejection_report_suffix(cls, value: str) -> str:
+    def safe_report_suffix(cls, value: str) -> str:
         value = value.strip()
         if (
             not value.startswith(".")
@@ -208,7 +227,7 @@ class SampleSheetGeneratorConfig(StrictModel):
             or value in {".", ".."}
         ):
             raise ValueError(
-                "rejection_report_suffix must be a dot-prefixed .tsv filename "
+                "report suffix must be a dot-prefixed .tsv filename "
                 "suffix without path separators"
             )
         return value

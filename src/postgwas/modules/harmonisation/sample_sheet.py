@@ -191,19 +191,20 @@ class HarmonisationSampleSheetRow(BaseModel):
     @field_validator("dataset_id")
     @classmethod
     def validate_dataset_id(cls, value: str) -> str:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
-            raise ValueError("use only letters, numbers, '.', '_' and '-'")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value):
+            raise ValueError("use only letters, numbers, '.', '_', '+' and '-'")
         return value
 
     @model_validator(mode="after")
     def validate_alternatives(self, info: ValidationInfo):
         if self.config_version != SAMPLE_SHEET_VERSION:
             raise ValueError("config_version must be %d" % SAMPLE_SHEET_VERSION)
-        if not ((self.chromosome_column and self.position_column) or self.chromosome_position_column):
+        draft = bool(info.context and info.context.get("allow_missing_mappings"))
+        if not draft and not ((self.chromosome_column and self.position_column) or self.chromosome_position_column):
             raise ValueError(
                 "provide chromosome_column plus position_column, or chromosome_position_column"
             )
-        if not self.effect_column and not self.z_score_column:
+        if not draft and not self.effect_column and not self.z_score_column:
             raise ValueError("provide effect_column or z_score_column")
 
         internal_eaf = self.effect_allele_frequency_column is not None
@@ -267,7 +268,7 @@ class HarmonisationSampleSheetRow(BaseModel):
         )
         if not has_controls and not draft_allows_missing_sample_size:
             raise ValueError("provide control_count_column or control_count")
-        if self.trait_type == "case_control" and not has_cases:
+        if self.trait_type == "case_control" and not has_cases and not draft_allows_missing_sample_size:
             raise ValueError("case-control traits require case_count_column or case_count")
         if self.trait_type == "quantitative" and has_cases:
             raise ValueError("quantitative traits must not provide case-count fields")
@@ -276,9 +277,10 @@ class HarmonisationSampleSheetRow(BaseModel):
     @classmethod
     def validate_generated_draft(cls, value: Any) -> "HarmonisationSampleSheetRow":
         """Validate a generator draft while leaving user-completable fields unresolved."""
-        return cls.model_validate(
+        return _HarmonisationSampleSheetDraftRow.model_validate(
             value,
             context={
+                "allow_missing_mappings": True,
                 "allow_missing_sample_size": True,
                 "allow_missing_eaf": True,
             },
@@ -287,6 +289,17 @@ class HarmonisationSampleSheetRow(BaseModel):
     @property
     def normalisation_warnings(self) -> tuple[str, ...]:
         return tuple(self._normalisation_warnings)
+
+
+class _HarmonisationSampleSheetDraftRow(HarmonisationSampleSheetRow):
+    """Unresolved mapping cells are permitted only during draft publication.
+
+    Normal sample-sheet loading continues to use the required fields above.
+    """
+
+    effect_allele_column: str | None = None
+    other_allele_column: str | None = None
+    p_value_column: str | None = None
 
 
 def _read_records(sample_sheet: Path) -> tuple[list[str], list[dict[str, str]]]:
