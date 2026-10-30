@@ -1,8 +1,11 @@
 # Harmonisation Sample Sheet
 
 The sample sheet is a CSV or TSV with one dataset per row. Its header is
-normalized for case, whitespace, Unicode compatibility, and hyphens; unknown
-fields are rejected. Referenced data files are checked for existence and size
+normalized for case, whitespace, Unicode compatibility, and hyphens. Extra
+columns, such as `phenotype`, `pubmed_id`, or custom review notes, are allowed
+and ignored during harmonisation. They remain in your source sheet and are
+not included in the normalized analysis row. Required fields and the values
+of recognized fields are still validated. Referenced data files are checked for existence and size
 during sample-sheet preflight but opened only by later execution preflight.
 
 ## Required identity and file fields
@@ -341,8 +344,9 @@ study-specific value.
 ## Preflight failures
 
 The sheet is rejected for wrong version, duplicate dataset IDs, invalid IDs,
-missing alternative mappings, invalid trait/count combinations, extra columns,
-or missing/empty referenced files. Validation errors identify the CSV row,
+missing required fields or alternative mappings, invalid trait/count
+combinations, or missing/empty referenced files. Extra metadata columns do not
+cause rejection. Validation errors identify the CSV row,
 dataset and exact fields that must be corrected without exposing internal
 validation-library output. A header can pass this stage and still fail
 execution if a mapped column is absent from the actual summary-statistics file.

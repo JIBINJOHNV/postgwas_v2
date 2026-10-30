@@ -256,8 +256,10 @@ and references, not a bundled demonstration dataset.
 ### Generate and review the sample sheet
 
 A version-2 CSV/TSV sample sheet maps each study's columns and metadata to
-PostGWAS concepts. It is separate from the run-configuration YAML, which
-controls processing policies and resources. Use `postgwas sample_sheet_generator`
+PostGWAS concepts. Additional metadata columns are allowed and ignored; required
+analysis fields and recognized values are still validated. It is separate from
+the run-configuration YAML, which controls processing policies and resources.
+Use `postgwas sample_sheet_generator`
 to generate a draft from the headers of files in your raw-data directory:
 
 ```bash

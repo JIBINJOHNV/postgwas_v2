@@ -150,7 +150,8 @@ def _require_external_resource(path: Path, field: str, row_number: int) -> None:
 
 
 class HarmonisationSampleSheetRow(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # User metadata may accompany mappings without entering the analysis contract.
+    model_config = ConfigDict(extra="ignore")
 
     config_version: int
     dataset_id: str
