@@ -227,6 +227,12 @@ if Path(sys.prefix).resolve() != prefix or not Path(pip.__file__).resolve().is_r
 print("  Installation Python: " + sys.executable)
 '
 
+printf 'Installing canonical Python analysis dependencies into %s\n' "$environment_name"
+# Explicitly enforce the pip section even if the environment manager skipped it.
+# Do not install overlapping analysis extras: polars-lts-cpu supplies polars.
+run_target_python -I "$script_directory/python_runtime.py" install \
+    --environment-file "$environment_file"
+
 printf 'Installing PostGWAS Python package into %s\n' "$environment_name"
 # Absolute checkout path makes this equivalent to `python -m pip install .`
 # from the repository root, regardless of the caller's current directory.
@@ -240,6 +246,7 @@ run_target_python "${pip_arguments[@]}"
 # Isolated Python cannot accidentally import a checkout via the working directory.
 # Check the reported failing module before beginning lengthy external builds.
 run_target_python -I -m postgwas sample_sheet_generator --help >/dev/null
+run_target_python -I "$script_directory/python_runtime.py" verify
 POSTGWAS_INSTALL_JOBS="$build_jobs" \
     "$environment_manager" run -n "$environment_name" \
     bash "$script_directory/install_bcftools_liftover.sh"
@@ -258,6 +265,10 @@ fi
 
 printf 'Verifying installation\n'
 run_target_python -I -m pip --isolated check
+if ! $all_tools; then
+    # Complete installations repeat this check in the full software verifier.
+    run_target_python -I "$script_directory/python_runtime.py" verify
+fi
 "$environment_manager" run -n "$environment_name" postgwas --help >/dev/null
 "$environment_manager" run -n "$environment_name" \
     bcftools plugin -l | grep -qx liftover

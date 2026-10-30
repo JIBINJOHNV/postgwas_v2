@@ -103,6 +103,7 @@ for executable in "${required_commands[@]}"; do
 done
 
 python -m pip check
+"$install_prefix/bin/python" -I "$script_directory/python_runtime.py" verify
 postgwas --help >/dev/null
 postgwas config --help >/dev/null
 python -c \

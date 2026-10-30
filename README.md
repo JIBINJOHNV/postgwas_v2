@@ -82,13 +82,14 @@ Windows and Linux ARM64 are not supported by these installation paths.
 
 ### Verify the local installation
 
-The complete installer runs the repository's software verifier. These additional
-checks confirm Python dependency consistency and public-command availability:
-
-```bash
-python -m pip check
-postgwas --help
-```
+The single installer command explicitly installs the pip requirements from
+`environment.yml` using the selected environment's Python, then installs
+PostGWAS. This includes `polars-lts-cpu`, which provides the `polars` module;
+no separate pip installation is required. It exercises every registered public
+command's help entry point (including harmonisation), checks Python dependency
+consistency, and runs the native software verifier before reporting success.
+Failed checks stop installation with a nonzero exit and a diagnostic. Command
+checks run before native builds and again afterwards to catch later changes.
 
 Software checks are not an analysis-readiness certificate. Reference panels,
 expression data, annotation caches and service credentials must be prepared
