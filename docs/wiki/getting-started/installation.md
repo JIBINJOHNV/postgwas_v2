@@ -86,14 +86,15 @@ bash tools/setup/install_postgwas.sh \
 The installer performs these operations in order:
 
 1. creates the named Mamba environment from `environment.yml`;
-2. installs the checkout without a second dependency resolution;
+2. explicitly installs the canonical Python dependencies and the checkout
+   through that environment's Python, then checks every public command import;
 3. downloads, checksum-verifies, builds, and installs bcftools plus its
    liftover plugin;
 4. downloads verified MAGMA, FINEMAP, and LDstore distributions and, on
-   macOS, official PLINK 2 and GCTA distributions plus verified BGENIX source;
+   macOS, official PLINK 2 plus verified GCTA and BGENIX sources;
 5. installs immutable LDSC, K-POPS, CALDERA, and MiXeR upstream revisions;
 6. creates dependency-isolated LDSC, pathway-enrichment, and VEP runtimes
-   beneath the main environment, plus Intel-tool and MiXeR runtimes on macOS;
+   beneath the main environment, plus GCTA, Intel-tool and MiXeR runtimes on macOS;
 7. exposes their commands through the activated PostGWAS environment; and
 8. runs the complete installation verifier.
 
@@ -138,6 +139,9 @@ installer places these runtimes under `$CONDA_PREFIX/share/postgwas/environments
 - On Apple silicon, FINEMAP and LDstore use a small Intel library runtime, and
   MiXeR uses its pinned Intel Python/native stack. Their public commands remain
   in the main environment and dispatch through Rosetta automatically.
+- Apple-silicon GCTA is built from pinned upstream source against its own ARM
+  numerical-library environment. Its main-environment command requires no
+  additional activation.
 
 Combining these dependency sets with the main single-cell and numerical stack
 would make the environment inconsistent. This is one user-facing activation,
@@ -208,11 +212,29 @@ The environment isolates its R library from per-user R packages, preventing an
 incompatible package in `~/Library/R` or an equivalent user library from
 shadowing the tested R stack.
 
+## Harmonisation configuration after installation
+
+Export a current module configuration from the installed command:
+
+```bash
+postgwas config export --module harmonisation --style full --output harmonisation.yaml
+postgwas config validate --module harmonisation --config harmonisation.yaml
+```
+
+Both module-only and full-run YAML files are accepted by `--run-config`.
+Harmonisation uses the resolved global `execution.threads` and
+`execution.memory_gb`, including `--threads` and `--memory-gb` overrides.
+Null library-call budgets in a full module export do not override those values.
+For example, `--memory-gb 230` means 230 GB; supply a number without a `G` suffix.
+Study allele, effect and p-value declarations still need to match the source data.
+
 ## Docker installation
 
 The repository includes a [Dockerfile](https://github.com/JIBINJOHNV/postgwas_v2/blob/main/Dockerfile)
-that builds PostGWAS, its external programs and isolated runtimes into one local
-image. You do not need Mamba, Python or R installed on the host for this route.
+that starts from pinned Ubuntu 24.04 and runs the same
+`install_postgwas.sh --all-tools` used for native installation, including its
+verification. Software definitions are shared rather than maintained in a second
+Docker installation recipe. You do not need Mamba, Python or R installed on the host for this route.
 Reference panels, annotation/cache data and service credentials are not included.
 
 ### Prepare Docker and choose the platform
@@ -232,8 +254,8 @@ PostGWAS compute settings must fit within those allocations.
 ### Build and check the image
 
 Use a clean checkout with no private study files, credentials or local notes.
-The Dockerfile copies the build context into the image: `.gitignore` does not
-replace [Docker's `.dockerignore` rules](https://docs.docker.com/build/concepts/context/#dockerignore-files).
+The Dockerfile copies the package source, tools and installation manifests;
+`.gitignore` does not replace [Docker's `.dockerignore` rules](https://docs.docker.com/build/concepts/context/#dockerignore-files).
 Keep study data outside the checkout and mount it only when running analyses.
 
 ```console
@@ -246,16 +268,16 @@ docker run --rm --platform linux/amd64 postgwas:local postgwas --help
 `postgwas:local` is the image you build, not a published image to pull. Record
 the source commit and resulting image ID with the analysis. Rebuild after
 updating the checkout; an existing image does not change when local files change.
-The Dockerfile has no PostGWAS entrypoint, so commands after the image name must
-include `postgwas`, as above.
+The entrypoint activates the installed Conda environment. Commands after the
+image name include `postgwas`, as above; `bash` also starts inside that environment.
 
-The build runs `tools/setup/verify_all_tools.sh`, checking program availability,
+The build runs `tools/setup/verify_mamba_installation.sh`, checking program availability,
 selected imports, dependency consistency, versions and required model/library
 files. You can repeat those checks after a successful build:
 
 ```console
 docker run --rm --platform linux/amd64 postgwas:local \
-  bash /opt/postgwas/tools/setup/verify_all_tools.sh
+  bash /opt/postgwas/tools/setup/verify_mamba_installation.sh
 ```
 
 Current installation CI tests the Mamba route, not Docker builds or full module
@@ -402,8 +424,14 @@ population must agree with the study.
 - [PLINK 1.9 and PLINK 2](https://www.cog-genomics.org/plink/) are separate
   programs installed through the canonical Mamba environment.
 - [GCTA](https://yanglab.westlake.edu.cn/software/gcta/) and BGENIX use their
-  Bioconda packages on Linux; on macOS, GCTA uses its official arm64 archive
-  and BGENIX is checksum-verified and built from its official source release.
+  Bioconda packages on Linux. Apple-silicon GCTA 1.95.3 is built from
+  [official source commit 21a0151](https://github.com/JianYang-Lab/GCTA/tree/21a0151af7a5741766a511704f2cda9469945135),
+  including its pinned PLINK submodule, using the upstream ARM implementation.
+  The build redirects Homebrew dependency paths into a private Conda runtime
+  and links compression libraries statically; it does not alter analysis code.
+  This avoids the lab download site's browser challenge and the older Intel
+  binary's MKL failure under Rosetta. Linux retains its canonical GCTA 1.94.1
+  package. BGENIX is checksum-verified and built from its official source release.
 - [MAGMA](https://cncr.nl/research/magma/) 1.10 is downloaded from the official
   CNCR link. MAGMA states that post-v1.0 binaries and source may not be
   redistributed or modified, so the repository stores only the downloader,

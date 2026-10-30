@@ -1,0 +1,9 @@
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - cmake>=3.16
+  - make
+  - gsl=2.7
+  - openblas=0.3.25
+  - llvm-openmp

@@ -245,3 +245,15 @@ The method is described by Frei et al. in
 [Nature Genetics (2024)](https://doi.org/10.1038/s41588-024-01771-1), and the
 univariate model by Holland et al. in
 [PLOS Genetics (2020)](https://doi.org/10.1371/journal.pgen.1008612).
+
+## Native exclusion accounting
+
+PostGWAS reconciles the input total against reference-compatible variants and
+all disjoint exclusions reported by the pinned native parser: unmatched IDs,
+strand ambiguity, allele mismatch, non-ACTG alleles, duplicates, incomplete
+rows, undefined Z/N, and non-digit chromosomes. The summary retains each count.
+The [pinned upstream parser](https://github.com/precimed/gsa-mixer/blob/cf65c57d5d1ad76597db1d4fa3907f1d711d39e7/src/bgmg_parse.cc)
+prints exclusion counters only when positive. An omitted counter is treated as
+zero only when both the native input-line total and well-defined-variant summary
+are present; an absent log does not establish zero exclusions. This reporting
+rule does not change the native allele matching, exclusions, or model fit.

@@ -21,13 +21,27 @@ from postgwas.core.values import (
 )
 
 
+# Upstream SumstatFile::read emits these disjoint exclusion counters only when
+# positive. Their omission means zero only within an observed summary block.
+_EXCLUSION_LOG_PATTERNS = {
+    "reference_unmatched": re.compile(r"(\d+) lines were ignored .* did not match reference"),
+    "strand_ambiguous": re.compile(r"(\d+) variants .* strand-ambiguous,\s+removing them from analysis"),
+    "allele_mismatch": re.compile(r"(\d+) variants were ignored as they had A1/A2 alleles that do not match reference"),
+    "non_actg_alleles": re.compile(r"(\d+) variants were ignored as they had non-ACTG alleles codes"),
+    "duplicate_variants": re.compile(r"(\d+) lines were ignored as they contain duplicated RS#"),
+    "incomplete_rows": re.compile(r"(\d+) lines were ignored as there are incomplete"),
+    "undefined_z_or_n": re.compile(r"(\d+) lines were ignored as Z or N value was not define"),
+    "non_digit_chromosome": re.compile(r"(\d+) lines were ignored as CHR label had non-digit codes"),
+}
+
+
 # These expressions describe MiXeR v2's upstream log protocol. They are not
 # scientific thresholds or user policy; unavailable values remain null.
 _LOG_PATTERNS = {
     "version": re.compile(r"MiXeR v([^\s]+) software"),
     "coordinate_fallback_matches": re.compile(r"(\d+) lines matched via CHR:BP:A1:A2"),
-    "reference_unmatched": re.compile(r"(\d+) lines were ignored .* did not match reference"),
-    "strand_ambiguous": re.compile(r"(\d+) variants .* strand-ambiguous"),
+    **_EXCLUSION_LOG_PATTERNS,
+    "input_lines": re.compile(r"(\d+) lines found \(including header\)"),
     "alleles_flipped": re.compile(r"(\d+) variants had flipped A1/A2 alleles"),
     "well_defined_variants": re.compile(r"Found (\d+) variants with well-defined Z and N"),
 }
@@ -196,6 +210,9 @@ def _log_metrics(path: str | Path) -> dict[str, Any]:
                     values[name] = (
                         match.group(1) if name == "version" else int(match.group(1))
                     )
+    if "input_lines" in values and "well_defined_variants" in values:
+        for name in _EXCLUSION_LOG_PATTERNS:
+            values.setdefault(name, 0)
     return values
 
 
@@ -300,8 +317,7 @@ def build_mixer_summary(
             error_type,
         )
     required_log_metrics = (
-        "reference_unmatched",
-        "strand_ambiguous",
+        *_EXCLUSION_LOG_PATTERNS,
         "well_defined_variants",
     )
     unavailable_log_metrics = [
@@ -392,14 +408,13 @@ def build_mixer_summary(
     if not unavailable_log_metrics:
         accounted = (
             reference_compatible
-            + int(log_metrics["reference_unmatched"])
-            + int(log_metrics["strand_ambiguous"])
+            + sum(int(log_metrics[name]) for name in _EXCLUSION_LOG_PATTERNS)
         )
         if accounted != formatted:
             raise error_type(
                 "MiXeR input accounting failed: %d reference-compatible + "
-                "unmatched + strand-ambiguous variants does not equal %d "
-                "formatted variants" % (reference_compatible, formatted)
+                "%d excluded variants does not equal %d formatted variants"
+                % (reference_compatible, accounted - reference_compatible, formatted)
             )
     input_qc = {
         **dict(input_metrics),
@@ -410,8 +425,7 @@ def build_mixer_summary(
             formatter_metrics.get("rows_excluded") if formatter_metrics else None
         ),
         "coordinate_fallback_matches": log_metrics.get("coordinate_fallback_matches"),
-        "reference_unmatched": log_metrics.get("reference_unmatched"),
-        "strand_ambiguous": log_metrics.get("strand_ambiguous"),
+        **{name: log_metrics.get(name) for name in _EXCLUSION_LOG_PATTERNS},
         "alleles_flipped": log_metrics.get("alleles_flipped"),
         "reference_compatible_variants": reference_compatible,
         "post_matching_excluded_variants": post_matching_excluded,
@@ -483,6 +497,12 @@ def _summary_records(summary: Mapping[str, Any]) -> list[dict[str, Any]]:
         ("formatted_variants", "variants", "formatter input", "Variants supplied to MiXeR"),
         ("reference_unmatched", "variants", "fit log", "Variants not matched to the reference"),
         ("strand_ambiguous", "variants", "fit log", "Strand-ambiguous variants excluded by MiXeR"),
+        ("allele_mismatch", "variants", "fit log", "Variants whose alleles do not match the reference"),
+        ("non_actg_alleles", "variants", "fit log", "Variants with non-ACTG allele codes"),
+        ("duplicate_variants", "variants", "fit log", "Duplicate reference variants excluded by MiXeR"),
+        ("incomplete_rows", "rows", "fit log", "Rows with too few fields"),
+        ("undefined_z_or_n", "rows", "fit log", "Rows with undefined Z or N"),
+        ("non_digit_chromosome", "rows", "fit log", "Rows with non-digit chromosome labels"),
         ("coordinate_fallback_matches", "variants", "fit log", "Variants matched by chromosome, position and alleles"),
         ("alleles_flipped", "variants", "fit log", "Variants whose A1/A2 orientation and Z sign were flipped"),
         ("reference_compatible_variants", "variants", "fit log", "Reference-compatible variants before configured range exclusions"),
@@ -762,6 +782,7 @@ def render_mixer_summary(summary: Mapping[str, Any]) -> str:
         screen_line("genetic", "Input and reference matching", indent=6),
         screen_field("count", "Formatted variants", format_count(qc["formatted_variants"]), indent=10, label_width=30),
         screen_field("loss", "Unmatched to reference", format_count(qc.get("reference_unmatched"), missing="not available"), indent=10, label_width=30),
+        screen_field("loss", "Allele-mismatched variants", format_count(qc.get("allele_mismatch"), missing="not available"), indent=10, label_width=30),
         screen_field("loss", "Strand-ambiguous variants", format_count(qc.get("strand_ambiguous"), missing="not available"), indent=10, label_width=30),
         screen_field("count", "Fit replicates", format_count(run["replicates"]), indent=10, label_width=30),
         screen_field("count", "Mean fit tag variants", format_number(qc["fit_tag_variants_mean"], "%.0f"), indent=10, label_width=30),

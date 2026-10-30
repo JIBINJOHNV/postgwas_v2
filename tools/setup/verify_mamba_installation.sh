@@ -44,7 +44,7 @@ verify_postgwas_import_origins() {
     local python_executable="$1"
     shift
     "$python_executable" - "$@" <<'PY'
-from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 import sys
 
@@ -53,9 +53,16 @@ module_names = (
     "postgwas",
     "postgwas.modules.flames.service",
     "postgwas.modules.pops.service",
+    "postgwas.modules.enrichment.service",
 )
 for module_name in module_names:
-    module_path = Path(import_module(module_name).__file__).resolve()
+    # Check package origins without importing analysis dependencies from a
+    # different isolated runtime. Required imports are exercised separately
+    # below, inside the runtime that actually executes each analysis.
+    spec = find_spec(module_name)
+    if spec is None or spec.origin is None:
+        raise SystemExit("Installed PostGWAS module is missing: %s" % module_name)
+    module_path = Path(spec.origin).resolve()
     if not any(module_path.is_relative_to(root) for root in allowed_roots):
         raise SystemExit(
             "%s resolved outside the installed PostGWAS roots: %s"
@@ -75,6 +82,10 @@ verify_gcta() {
     rm -rf -- "$temporary_directory"
     printf '%s\n' "$version_output" | \
         grep -Eq '^\* version v[0-9]+([.][0-9]+)+'
+    if [[ "$host_os" == "Darwin" ]]; then
+        printf '%s\n' "$version_output" | \
+            grep -Fq "* version v${POSTGWAS_GCTA_MACOS_VERSION} Mac"
+    fi
 }
 
 install_prefix="${CONDA_PREFIX:-$(python -c 'import sys; print(sys.prefix)')}"
@@ -136,6 +147,10 @@ if [[ "$host_os" == "Darwin" ]]; then
     file "$(command -v magma)" | grep -q 'x86_64'
     file "$(command -v plink2)" | grep -q 'arm64'
     file "$(command -v gcta64)" | grep -q 'arm64'
+    [[ "$(cat "$install_prefix/share/postgwas/software/gcta/POSTGWAS_UPSTREAM_COMMIT")" == "$POSTGWAS_GCTA_COMMIT" ]]
+    if otool -L "$(command -v gcta64)" | grep -Eq '/opt/homebrew|/usr/local|postgwas-tools[.]'; then
+        fail "GCTA contains a dependency outside its installed runtime"
+    fi
     file "$(command -v bgenix)" | grep -q 'arm64'
     file "$vep_environment/bin/perl" | grep -q 'x86_64'
     for binary_path in \

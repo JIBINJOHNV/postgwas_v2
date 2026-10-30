@@ -192,7 +192,6 @@ install_binary_archives() {
 install_macos_binary_archives() {
     local install_root="$1"
     local software_root="$install_prefix/share/postgwas/software/intel-tools"
-    local gcta_root="$install_prefix/share/postgwas/software/gcta"
     local gcc_archive="$install_root/gcc10.tar.gz"
     local gcc_extraction="$install_root/gcc10"
 
@@ -238,22 +237,13 @@ install_macos_binary_archives() {
         "$install_root/plink2.zip"
     unzip -q "$install_root/plink2.zip" -d "$install_root/plink2"
     install -m 0755 "$install_root/plink2/plink2" "$install_prefix/bin/plink2"
-
-    download \
-        "$POSTGWAS_GCTA_MACOS_URL" "$POSTGWAS_GCTA_MACOS_SHA256" \
-        "$install_root/gcta.zip"
-    unzip -q "$install_root/gcta.zip" -d "$install_root/gcta"
-    mkdir -p "$gcta_root"
-    cp -R \
-        "$install_root/gcta/gcta-${POSTGWAS_GCTA_MACOS_VERSION}-macOS-arm64/." \
-        "$gcta_root/"
-    ln -s "$gcta_root/bin/gcta64" "$install_prefix/bin/gcta64"
 }
 
 checkout_commit() {
     local repository="$1"
     local commit="$2"
     local destination="$3"
+    local recursive="${4:-false}"
     mkdir -p "$destination"
     git -C "$destination" init --quiet
     git -C "$destination" remote add origin "$repository"
@@ -263,7 +253,60 @@ checkout_commit() {
         printf 'ERROR: downloaded commit does not match %s.\n' "$commit" >&2
         exit 1
     fi
+    if [[ "$recursive" == true ]]; then
+        git -C "$destination" submodule update --init --recursive --depth 1
+    fi
     rm -rf -- "$destination/.git"
+}
+
+install_gcta_macos() {
+    [[ "$host_os" == Darwin ]] || return 0
+    local source_root="$temporary_root/gcta"
+    local source_build="$source_root/build"
+    local gcta_environment="$install_prefix/share/postgwas/environments/gcta"
+    local gcta_root="$install_prefix/share/postgwas/software/gcta"
+    postgwas_environment "$mamba_executable" create \
+        --prefix "$gcta_environment" \
+        --file "$script_directory/environments/gcta-macos.yml"
+    checkout_commit \
+        "$POSTGWAS_GCTA_REPOSITORY" "$POSTGWAS_GCTA_COMMIT" "$source_root" true
+
+    # Only relocate dependency paths and select static compression libraries.
+    # Keep the upstream ARM numerical implementation and its Eigen version.
+    python - "$source_root/CMakeLists.txt" "$gcta_environment" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacements = {
+    "/opt/homebrew/opt/libomp": (sys.argv[2], 3),
+    "/opt/homebrew/opt/openblas": (sys.argv[2], 1),
+    '"ZSTD_BUILD_SHARED ON"': ('"ZSTD_BUILD_SHARED OFF"', 1),
+    "libzstd Threads::Threads zlib)": ("libzstd Threads::Threads zlibstatic)", 1),
+}
+for old, (new, count) in replacements.items():
+    if text.count(old) != count:
+        raise SystemExit("Unexpected pinned GCTA build declaration: " + old)
+    text = text.replace(old, new)
+path.write_text(text, encoding="utf-8")
+PY
+    "$gcta_environment/bin/cmake" \
+        -S "$source_root" -B "$source_build" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER="$(xcrun --find clang)" \
+        -DCMAKE_CXX_COMPILER="$(xcrun --find clang++)" \
+        -DCMAKE_PREFIX_PATH="$gcta_environment" \
+        -DCMAKE_BUILD_RPATH="$gcta_environment/lib" \
+        -DBUILD_TESTING=OFF -DEIGEN_BUILD_DOC=OFF \
+        -DCMAKE_Fortran_COMPILER=NOTFOUND
+    # GCTA uses C/C++; Eigen's optional Fortran BLAS target is not consumed.
+    "$gcta_environment/bin/cmake" --build "$source_build" \
+        --target gcta64 --parallel "$build_jobs"
+    install -m 0755 "$source_build/gcta64" "$install_prefix/bin/gcta64"
+    mkdir -p "$gcta_root"
+    install -m 0644 "$source_root/LICENSE" "$gcta_root/LICENSE"
+    printf '%s\n' "$POSTGWAS_GCTA_COMMIT" > "$gcta_root/POSTGWAS_UPSTREAM_COMMIT"
 }
 
 create_isolated_environments() {
@@ -581,6 +624,13 @@ install_mixer_macos() {
     local mixer_environment="$install_prefix/share/postgwas/environments/mixer"
     local compile_flags="-arch x86_64 -I${mixer_environment}/include"
     local linker_flags="-arch x86_64 -L${mixer_environment}/lib -lomp -Wl,-rpath,${mixer_environment}/lib"
+    local c_compiler
+    local cxx_compiler
+    # Resolve the native toolchain before entering the Intel runtime. The
+    # /usr/bin compiler shims can invoke an Intel xcrun under Rosetta, while
+    # recent Apple Command Line Tools ship an ARM-only libxcrun.
+    c_compiler="$(xcrun --find clang)"
+    cxx_compiler="$(xcrun --find clang++)"
     mkdir -p "$build_root"
 
     download \
@@ -672,8 +722,8 @@ PY
 
     "$mamba_executable" run --prefix "$mixer_environment" \
         env \
-        CC=/usr/bin/clang \
-        CXX=/usr/bin/clang++ \
+        CC="$c_compiler" \
+        CXX="$cxx_compiler" \
         CFLAGS="$compile_flags" \
         CXXFLAGS="$compile_flags" \
         cmake \
@@ -710,6 +760,7 @@ PY
 
 printf 'Installing pinned external scientific programs into %s\n' "$install_prefix"
 install_binary_archives
+install_gcta_macos
 create_isolated_environments
 relocate_macos_intel_tools
 install_bgenix_macos

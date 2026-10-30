@@ -20,7 +20,6 @@ from postgwas.config import (
     write_resolved_configuration,
 )
 from postgwas.config.cli_overrides import explicit_overrides
-from postgwas.config.merger import deep_merge
 from postgwas.cli.compute import get_compute_parser
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.paths import configured_output_path
@@ -584,15 +583,20 @@ def get_harmonisation_parser(add_help: bool = False) -> argparse.ArgumentParser:
 
 
 def _module_policy_block(config) -> dict[str, Any]:
-    harmonisation = config.modules.harmonisation
-    configured = {
+    # Canonical execution settings already include explicit CLI overrides.
+    # Exported module templates retain null library-call budgets, which must
+    # not replace the resolved run budgets. Normalise dotted/nested policies
+    # through their shared loader before applying these execution settings.
+    policies = load_policies(
+        config.modules.harmonisation.policies,
+        base={"logging.level": config.logging.file_level},
+    )
+    return policies.with_overrides({
         "execution": {
             "total_cpu_budget": config.execution.threads,
             "memory_budget_gb": config.execution.memory_gb,
         },
-        "logging": {"level": config.logging.file_level},
-    }
-    return deep_merge(configured, harmonisation.policies)
+    }).nested_dict()
 
 
 def harmonisation_executable_requirements(config) -> dict[str, str]:

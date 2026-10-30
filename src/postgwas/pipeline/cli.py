@@ -565,6 +565,11 @@ def main():
         for reference in REGISTRY.get(m).parser_factories:
             if reference not in seen:
                 parent = resolve_reference(reference)()
+                # argparse copies each parent's group-level handler when
+                # composing parsers. Apply the pipeline's shared-option
+                # resolution to those groups as well as the outer parser.
+                for group in parent._action_groups:
+                    group.conflict_handler = "resolve"
                 parent_parsers.append(parent)
                 seen.add(reference)
 
