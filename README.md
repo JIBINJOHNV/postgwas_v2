@@ -72,8 +72,22 @@ bash tools/setup/install_postgwas.sh --all-tools --name postgwas
 conda activate postgwas
 ```
 
-The installer creates a **new** environment. If `postgwas` already exists,
-choose another name with `--name` and activate that name instead. You activate
+For later updates, keep the same environment and run from the repository:
+
+```bash
+git pull --ff-only origin main
+bash tools/setup/install_postgwas.sh --all-tools --update --name postgwas --jobs 2
+conda activate postgwas
+```
+
+Replace `postgwas` with your existing environment name. This refreshes PostGWAS
+and resolves the current dependency requirements, reusing native tools whose
+build records and installed files still match. Older installations without
+these records need a one-time rebuild of those tools. Stop running analyses
+before updating; the installer does not rerun analyses or regenerate inputs.
+See [update details](docs/wiki/getting-started/installation.md#update-an-existing-installation).
+
+Without `--update`, the installer requires a new environment name. You activate
 one environment; tools with incompatible dependencies use managed internal
 environments. Not every tool runs natively on Apple silicon.
 

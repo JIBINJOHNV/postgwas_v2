@@ -4,6 +4,8 @@ set -euo pipefail
 script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tools/setup/software_versions.env
 source "$script_directory/software_versions.env"
+source "$script_directory/environment_manager.sh"
+POSTGWAS_SETUP_DIRECTORY="${POSTGWAS_SETUP_DIRECTORY:-$script_directory}"
 
 default_bcftools_version="$POSTGWAS_BCFTOOLS_VERSION"
 default_score_revision="$POSTGWAS_SCORE_COMMIT"
@@ -40,7 +42,6 @@ if [[ -z "$liftover_sha256" ]]; then
 fi
 
 install_prefix="${CONDA_PREFIX:?Activate the target conda environment first.}"
-build_directory="$(mktemp -d "${TMPDIR:-/tmp}/postgwas-liftover.XXXXXX")"
 
 verify_sha256() {
     local expected="$1"
@@ -61,41 +62,52 @@ verify_sha256() {
     fi
 }
 
-cleanup() {
-    rm -rf -- "$build_directory"
+build_bcftools() {
+    build_directory="$(mktemp -d "${TMPDIR:-/tmp}/postgwas-liftover.XXXXXX")"
+    cleanup() {
+        rm -rf -- "$build_directory"
+    }
+    trap cleanup EXIT
+
+    archive="$build_directory/bcftools.tar.bz2"
+    source_directory="$build_directory/bcftools-$bcftools_version"
+    curl -fsSL \
+        "https://github.com/samtools/bcftools/releases/download/$bcftools_version/bcftools-$bcftools_version.tar.bz2" \
+        -o "$archive"
+    verify_sha256 "$bcftools_sha256" "$archive"
+    tar -xjf "$archive" -C "$build_directory"
+    curl -fsSL \
+        "https://raw.githubusercontent.com/freeseek/score/$score_revision/liftover.c" \
+        -o "$source_directory/plugins/liftover.c"
+    verify_sha256 "$liftover_sha256" "$source_directory/plugins/liftover.c"
+
+    cd "$source_directory"
+    ./configure --prefix="$install_prefix" --with-htslib="$install_prefix"
+    make -j "$build_jobs" bcftools
+    make plugins/liftover.so
+    install -d "$install_prefix/bin" "$install_prefix/share/man/man1"
+    install -m 755 bcftools "$install_prefix/bin/bcftools"
+    install -m 755 misc/* "$install_prefix/bin/"
+    install -m 644 doc/bcftools.1 "$install_prefix/share/man/man1/bcftools.1"
+    install -d "$install_prefix/libexec/bcftools"
+    install -m 755 plugins/liftover.so "$install_prefix/libexec/bcftools/liftover.so"
+
+    installed_bcftools_version="$(bcftools --version-only)"
+    installed_bcftools_version="${installed_bcftools_version%%+*}"
+    if [[ "$installed_bcftools_version" != "$bcftools_version" ]]; then
+        printf 'ERROR: installed bcftools version does not match %s.\n' \
+            "$bcftools_version" >&2
+        exit 1
+    fi
+    bcftools plugin -l | grep -qx liftover
+    printf 'Installed bcftools %s and its liftover plugin in %s\n' \
+        "$bcftools_version" "$install_prefix"
 }
-trap cleanup EXIT
 
-archive="$build_directory/bcftools.tar.bz2"
-source_directory="$build_directory/bcftools-$bcftools_version"
-curl -fsSL \
-    "https://github.com/samtools/bcftools/releases/download/$bcftools_version/bcftools-$bcftools_version.tar.bz2" \
-    -o "$archive"
-verify_sha256 "$bcftools_sha256" "$archive"
-tar -xjf "$archive" -C "$build_directory"
-curl -fsSL \
-    "https://raw.githubusercontent.com/freeseek/score/$score_revision/liftover.c" \
-    -o "$source_directory/plugins/liftover.c"
-verify_sha256 "$liftover_sha256" "$source_directory/plugins/liftover.c"
-
-cd "$source_directory"
-./configure --prefix="$install_prefix" --with-htslib="$install_prefix"
-make -j "$build_jobs" bcftools
-make plugins/liftover.so
-install -d "$install_prefix/bin" "$install_prefix/share/man/man1"
-install -m 755 bcftools "$install_prefix/bin/bcftools"
-install -m 755 misc/* "$install_prefix/bin/"
-install -m 644 doc/bcftools.1 "$install_prefix/share/man/man1/bcftools.1"
-install -d "$install_prefix/libexec/bcftools"
-install -m 755 plugins/liftover.so "$install_prefix/libexec/bcftools/liftover.so"
-
-installed_bcftools_version="$(bcftools --version-only)"
-installed_bcftools_version="${installed_bcftools_version%%+*}"
-if [[ "$installed_bcftools_version" != "$bcftools_version" ]]; then
-    printf 'ERROR: installed bcftools version does not match %s.\n' \
-        "$bcftools_version" >&2
-    exit 1
-fi
-bcftools plugin -l | grep -qx liftover
-printf 'Installed bcftools %s and its liftover plugin in %s\n' \
-    "$bcftools_version" "$install_prefix"
+postgwas_component bcftools \
+    --input "$script_directory/install_bcftools_liftover.sh" \
+    --input "$install_prefix/conda-meta/*.json" \
+    --value "$bcftools_version:$score_revision:$bcftools_sha256:$liftover_sha256" \
+    --output "$install_prefix/bin/bcftools" \
+    --output "$install_prefix/libexec/bcftools/liftover.so" \
+    -- build_bcftools

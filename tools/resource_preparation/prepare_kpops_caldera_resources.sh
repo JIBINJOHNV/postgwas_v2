@@ -4,6 +4,7 @@ set -euo pipefail
 script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tools/setup/software_versions.env
 source "$script_directory/../setup/software_versions.env"
+source "$script_directory/../setup/environment_manager.sh"
 
 KPOPS_COMMIT="$POSTGWAS_KPOPS_COMMIT"
 KPOPS_ARCHIVE_SHA256="$POSTGWAS_KPOPS_SHA256"
@@ -13,11 +14,12 @@ GENE_ANNOTATION_SHA256="940086e0781e9b244da76d27f02cc25dd45c957ee4415915cd1ced37
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 --resource-root PATH [--python PATH] [--software-only] [--prepare-linear-kernel]" \
+        "Usage: $0 --resource-root PATH [--python PATH] [--software-only] [--update-software] [--prepare-linear-kernel]" \
         "" \
         "Downloads pinned K-POPS and CALDERA sources into versioned resource" \
         "directories. Supplying --python installs both tools into that environment." \
         "--software-only skips validation of separately supplied PoPS feature data." \
+        "--update-software permits replacing installed tools; retains the previous CALDERA tree." \
         "With --prepare-linear-kernel, it also derives the standardized GRCh37" \
         "linear kernel from an existing PoPS munged feature matrix."
 }
@@ -26,6 +28,7 @@ resource_root=""
 python_bin=""
 prepare_kernel=false
 software_only=false
+update_software=false
 while (($#)); do
     case "$1" in
         --resource-root)
@@ -44,6 +47,10 @@ while (($#)); do
             software_only=true
             shift
             ;;
+        --update-software)
+            update_software=true
+            shift
+            ;;
         --help|-h)
             usage
             exit 0
@@ -60,8 +67,8 @@ if [[ -z "$resource_root" ]]; then
     printf '%s\n' "--resource-root is required" >&2
     exit 2
 fi
-if [[ "$prepare_kernel" == true && -z "$python_bin" ]]; then
-    printf '%s\n' "--python is required with --prepare-linear-kernel" >&2
+if { [[ "$prepare_kernel" == true ]] || [[ "$update_software" == true ]]; } && [[ -z "$python_bin" ]]; then
+    printf '%s\n' "--python is required with --prepare-linear-kernel or --update-software" >&2
     exit 2
 fi
 if [[ "$prepare_kernel" == true && "$software_only" == true ]]; then
@@ -79,7 +86,7 @@ if [[ -n "$python_bin" && ! -x "$python_bin" ]]; then
     exit 1
 fi
 if [[ -n "$python_bin" ]]; then
-    for executable in cmp cp install; do
+    for executable in cmp cp diff install; do
         command -v "$executable" >/dev/null || {
             printf 'Required executable not found: %s\n' "$executable" >&2
             exit 1
@@ -89,13 +96,9 @@ fi
 
 resource_root="$(cd "$resource_root" && pwd -P)"
 work_directory="$(mktemp -d "${resource_root}/.kpops-caldera-preparation.XXXXXX")"
-caldera_staging=""
 cleanup() {
     if [[ -n "${work_directory:-}" && -d "$work_directory" ]]; then
         rm -rf -- "$work_directory"
-    fi
-    if [[ -n "${caldera_staging:-}" && -d "$caldera_staging" ]]; then
-        rm -rf -- "$caldera_staging"
     fi
 }
 trap cleanup EXIT
@@ -168,13 +171,15 @@ install_archive \
 
 if [[ -n "$python_bin" ]]; then
     kpops_command="$(dirname "$python_bin")/k-pops.py"
-    if [[ -e "$kpops_command" ]] && ! cmp -s \
+    if [[ "$update_software" == false && -e "$kpops_command" ]] && ! cmp -s \
         "${kpops_destination}/k-pops.py" "$kpops_command"; then
         printf 'Refusing to replace a different installed K-POPS command: %s\n' \
             "$kpops_command" >&2
         exit 1
     fi
-    install -m 0755 "${kpops_destination}/k-pops.py" "$kpops_command"
+    if ! cmp -s "${kpops_destination}/k-pops.py" "$kpops_command" || [[ ! -x "$kpops_command" ]]; then
+        install -m 0755 "${kpops_destination}/k-pops.py" "$kpops_command"
+    fi
     printf 'Installed K-POPS command: %s\n' "$kpops_command"
 
     python_environment="$(cd "$(dirname "$python_bin")/.." && pwd -P)"
@@ -184,21 +189,26 @@ if [[ -n "$python_bin" ]]; then
             "$caldera_install" >&2
         exit 1
     fi
+    replace_caldera=false
     if [[ -d "$caldera_install" ]]; then
         if [[ ! -f "${caldera_install}/POSTGWAS_UPSTREAM_COMMIT" ]] \
             || [[ "$(<"${caldera_install}/POSTGWAS_UPSTREAM_COMMIT")" != "$CALDERA_COMMIT" ]] \
             || [[ ! -f "${caldera_install}/POSTGWAS_ARCHIVE_SHA256" ]] \
             || [[ "$(<"${caldera_install}/POSTGWAS_ARCHIVE_SHA256")" != "$CALDERA_ARCHIVE_SHA256" ]]; then
-            printf 'Refusing to replace a different CALDERA installation: %s\n' \
-                "$caldera_install" >&2
-            exit 1
+            if [[ "$update_software" == false ]]; then
+                printf 'Refusing to replace a different CALDERA installation: %s\n' \
+                    "$caldera_install" >&2
+                exit 1
+            fi
+            replace_caldera=true
         fi
-    else
-        mkdir -p "$(dirname "$caldera_install")"
-        caldera_staging="$(mktemp -d "${caldera_install}.XXXXXX")"
-        cp -R "${caldera_destination}/." "$caldera_staging"
-        mv "$caldera_staging" "$caldera_install"
-        caldera_staging=""
+    fi
+    if [[ "$update_software" == true && -d "$caldera_install" ]] \
+        && ! diff -qr "$caldera_destination" "$caldera_install" >/dev/null; then
+        replace_caldera=true
+    fi
+    if [[ ! -d "$caldera_install" || "$replace_caldera" == true ]]; then
+        postgwas_replace_directory "$caldera_destination" "$caldera_install"
     fi
     for required in z_caldera.R \
         data/high_h2_coding_SNPs.tsv \

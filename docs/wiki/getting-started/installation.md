@@ -63,9 +63,9 @@ bash tools/setup/install_postgwas.sh \
 conda activate postgwas
 ```
 
-`--all-tools` requires Mamba and always creates a new environment. It refuses
-to alter an existing environment. Choose another name if `postgwas` already
-exists:
+`--all-tools` requires Mamba. Without `--update`, it creates a new environment
+and refuses to alter an existing one. Choose another name for a separate
+installation, or use the [update command](#update-an-existing-installation):
 
 ```console
 bash tools/setup/install_postgwas.sh \
@@ -152,8 +152,10 @@ and [pip cache locations](https://pip.pypa.io/en/stable/topics/caching/#default-
 See [Conda cache and linking settings](https://docs.conda.io/projects/conda/en/stable/configuration.html).
 
 If an earlier installation failed, an environment that can be activated may
-still be incomplete. Run the same installer with a new name, for example
-`--name postgwas-v2-clean`; existing environments and shared caches are preserved.
+still be incomplete. Correct the reported cause, then retry with the same name
+and `--update`, or choose a new name for a separate installation. An update is
+not transactional: a failed attempt can leave changed packages. Only the final
+success message confirms that the selected software checks passed.
 Use `postgwas --help` after the installer reports successful verification.
 
 FLaMEs 1.1.2-compatible code, its model, and PoPS are packaged PostGWAS
@@ -197,6 +199,50 @@ FLaMEs, and PoPS resolve from the new environment or the selected current
 checkout, never from a sibling or retired repository. Old checkouts may remain
 on disk, but the installed commands do not search or execute them.
 
+## Update an existing installation
+
+Stop analyses using the environment before updating; do not run concurrent
+installers against the same environment. From your existing checkout:
+
+```bash
+git pull --ff-only origin main
+bash tools/setup/install_postgwas.sh \
+  --all-tools --update --name postgwas --jobs 2
+conda activate postgwas
+```
+
+Use your actual existing environment name, for example `postgwas-v2-clean`.
+The same `--work-directory PATH` option can place temporary caches and builds
+on a filesystem with enough free space. No separate pip command is needed.
+
+The update installs the current checkout into the main environment and the
+private enrichment runtime, and resolves the canonical requirements in
+`environment.yml` and `tools/setup/environments/`. Existing private runtimes
+are updated; missing ones are created. Native tool versions and checksums
+continue to come from `tools/setup/software_versions.env`. This is an update
+to the repository's requirements, not an unrestricted upgrade to every
+upstream latest version. Exact pins remain pinned; dependency solves may
+change packages within declared ranges. Pip keeps already satisfied
+requirements unless installation requires a change; see the official
+[Conda environment update](https://docs.conda.io/projects/conda/en/stable/commands/env/update.html)
+and [pip install](https://pip.pypa.io/en/stable/cli/pip_install/) documentation.
+
+Native components are reused only when their recipe, required dependency
+records and installed content match their saved SHA-256 build record.
+Missing or changed files, versions or recipes cause the affected component
+to be installed again. Shared recipe or dependency changes can conservatively
+rebuild several components. An older installation without build records needs
+a one-time rebuild. Records are saved under
+`$CONDA_PREFIX/share/postgwas/install-state` only after the complete installer
+verification succeeds. Every update still runs the software verifier.
+Changed CALDERA trees are retained beside the replacement as
+`caldera.previous.*`; scientific reference data are not rebuilt.
+
+The installer does not run scientific analyses, rewrite sample sheets, change
+run configurations, or remove analysis results. After updating, rerun your
+analysis command when ready. Existing analysis checkpoint validation determines
+whether results can be reused with the new software and configuration.
+
 ## Portable installation
 
 Use portable mode when the complete third-party stack is not needed:
@@ -220,8 +266,7 @@ bash tools/setup/install_postgwas.sh \
   --editable
 ```
 
-Portable mode alone may update its own existing environment when explicitly
-requested:
+Portable mode also supports updates to an existing environment:
 
 ```console
 bash tools/setup/install_postgwas.sh \

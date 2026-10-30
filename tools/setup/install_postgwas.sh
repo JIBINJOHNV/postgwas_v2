@@ -20,7 +20,7 @@ usage() {
     cat <<'EOF'
 Usage: bash tools/setup/install_postgwas.sh [options]
 
-Create a new PostGWAS environment, install the current checkout and its
+Create or explicitly update a PostGWAS environment, install this checkout and its
 dependencies, and verify the installation. --all-tools also downloads and
 installs the complete scientific-software stack on Apple-silicon macOS or
 glibc Linux x86-64.
@@ -33,7 +33,7 @@ Options:
                     Parent for temporary caches and builds; created if needed.
                     Default: TMPDIR when set, otherwise the checkout directory.
   --editable        Install the checkout in editable development mode.
-  --update          Update an existing portable environment instead of refusing.
+  --update          Update an existing environment, reusing verified native tools.
   -h, --help        Show this help message.
 
 Supported hosts:
@@ -101,10 +101,6 @@ done
 if [[ ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then
     printf 'ERROR: --jobs must be a positive integer; found %s.\n' \
         "$build_jobs" >&2
-    exit 2
-fi
-if $all_tools && $update; then
-    printf 'ERROR: --all-tools always creates a new environment and cannot be combined with --update.\n' >&2
     exit 2
 fi
 if [[ ! "$environment_name" =~ ^[A-Za-z0-9._-]+$ ]] ||
@@ -184,8 +180,12 @@ fi
 
 if $environment_exists && ! $update; then
     printf 'ERROR: Conda environment %s already exists.\n' "$environment_name" >&2
-    printf 'Select a new environment with --name. Portable installs may instead use --update.\n' >&2
+    printf 'Select a new environment with --name, or use --update to update this environment.\n' >&2
     exit 1
+fi
+if $all_tools && $update && ! $environment_exists; then
+    printf 'ERROR: --update requires an existing environment: %s. Omit --update for a new installation.\n' "$environment_name" >&2
+    exit 2
 fi
 
 # Keep this invocation independent of a damaged or concurrently modified shared
@@ -206,12 +206,15 @@ cleanup_installation() {
     local status=$?
     rm -rf -- "$installation_workspace"
     if [[ "$status" -ne 0 ]]; then
-        printf 'ERROR: PostGWAS installation did not complete. Environment %s may be partial; use a new --name for a complete installation.\n' \
+        printf 'ERROR: PostGWAS installation did not complete. Environment %s may be partial; correct the reported failure and retry with --update, or select a new --name.\n' \
             "$environment_name" >&2
     fi
     return "$status"
 }
 trap cleanup_installation EXIT
+export POSTGWAS_SETUP_DIRECTORY="$script_directory"
+export POSTGWAS_INSTALL_UPDATE="$update"
+export POSTGWAS_INSTALL_STATE_STAGE="$installation_workspace/receipts"
 # Propagate the chosen filesystem to Python/pip, Conda launchers and all native
 # build helpers, not just the package extraction cache.
 export TMPDIR="$installation_workspace/tmp"
@@ -321,6 +324,8 @@ if $all_tools; then
     "$environment_manager" run -n "$environment_name" \
         bash "$script_directory/verify_mamba_installation.sh"
 fi
+run_target_python -I "$script_directory/installation_state.py" commit \
+    --staging "$POSTGWAS_INSTALL_STATE_STAGE"
 
 printf '\nPostGWAS software installation completed successfully.\n'
 printf 'Activate it with: conda activate %s\n' "$environment_name"

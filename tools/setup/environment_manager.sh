@@ -67,3 +67,72 @@ postgwas_environment() (
     CONDA_ALWAYS_YES=true MAMBA_ALWAYS_YES=true \
         "$manager" env "$operation" "$@"
 )
+
+# Reuse native/source components only with matching content records. Staging is
+# invocation-local; the top-level installer publishes records after verification.
+postgwas_install_state() {
+    [[ -n "${POSTGWAS_INSTALL_STATE_STAGE:-}" ]] || return 0
+    "${CONDA_PREFIX:?}/bin/python" -I \
+        "${POSTGWAS_SETUP_DIRECTORY:?}/installation_state.py" "$1" \
+        --prefix "$CONDA_PREFIX" --staging "$POSTGWAS_INSTALL_STATE_STAGE" "${@:2}"
+}
+
+postgwas_component() {
+    local component="$1"
+    shift
+    local arguments=(--component "$component"
+        --input "$POSTGWAS_SETUP_DIRECTORY/environment_manager.sh"
+        --input "$POSTGWAS_SETUP_DIRECTORY/installation_state.py")
+    while [[ "${1:-}" != -- ]]; do
+        [[ $# -gt 0 ]] || { printf 'ERROR: missing component command.\n' >&2; return 2; }
+        arguments+=("$1")
+        shift
+    done
+    shift
+    if [[ "${POSTGWAS_INSTALL_UPDATE:-false}" == true && -n "${POSTGWAS_INSTALL_STATE_STAGE:-}" ]]; then
+        if postgwas_install_state check "${arguments[@]}"; then
+            return 0
+        fi
+    fi
+    printf 'Installing component: %s\n' "$component"
+    "$@"
+    postgwas_install_state record "${arguments[@]}"
+}
+
+postgwas_runtime_environment() {
+    local manager="$1" prefix="$2" manifest="$3"
+    shift 3
+    local operation=create
+    if [[ -d "$prefix/conda-meta" ]]; then
+        operation=update
+    elif [[ -e "$prefix" ]]; then
+        printf 'ERROR: existing runtime is not a Conda environment: %s\n' "$prefix" >&2
+        return 2
+    fi
+    postgwas_environment "$manager" "$operation" "$@" --prefix "$prefix" --file "$manifest"
+}
+
+# Replace a complete installed source/library tree so removed upstream files
+# cannot survive an update. Retain the old tree, including any local additions.
+postgwas_replace_directory() (
+    local source="$1" destination="$2" staging backup=""
+    [[ -d "$source" ]] || { printf 'ERROR: source directory is missing: %s\n' "$source" >&2; return 2; }
+    if [[ -e "$destination" && ! -d "$destination" ]]; then
+        printf 'ERROR: installed path is not a directory: %s\n' "$destination" >&2
+        return 2
+    fi
+    mkdir -p "$(dirname "$destination")"
+    staging="$(mktemp -d "${destination}.staging.XXXXXX")"
+    trap 'rm -rf -- "$staging"' EXIT
+    cp -R "$source/." "$staging"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        backup="$(mktemp -d "${destination}.previous.XXXXXX")"
+        rmdir "$backup"
+        mv "$destination" "$backup"
+    fi
+    if ! mv "$staging" "$destination"; then
+        [[ -z "$backup" ]] || mv "$backup" "$destination"
+        return 1
+    fi
+    [[ -z "$backup" ]] || printf 'Previous software directory retained: %s\n' "$backup"
+)

@@ -11,6 +11,7 @@ source "$script_directory/environment_manager.sh"
 repository_root="$(cd "$script_directory/../.." && pwd)"
 # shellcheck source=tools/setup/software_versions.env
 source "$script_directory/software_versions.env"
+POSTGWAS_SETUP_DIRECTORY="${POSTGWAS_SETUP_DIRECTORY:-$script_directory}"
 
 mamba_executable=""
 build_jobs="${POSTGWAS_INSTALL_JOBS:-2}"
@@ -187,6 +188,7 @@ install_binary_archives() {
     fi
 
     install_macos_binary_archives "$install_root"
+    relocate_macos_intel_tools
 }
 
 install_macos_binary_archives() {
@@ -222,8 +224,7 @@ install_macos_binary_archives() {
         "$POSTGWAS_GCC10_MACOS_SHA256" \
         "$gcc_archive"
     tar -xzf "$gcc_archive" -C "$gcc_extraction"
-    mkdir -p "$software_root/gcc"
-    cp -R \
+    postgwas_replace_directory \
         "$gcc_extraction/$POSTGWAS_GCC10_MACOS_PREFIX/$POSTGWAS_GCC10_MACOS_LIBRARY_SUBDIRECTORY" \
         "$software_root/gcc/runtime"
     for command_name in finemap ldstore; do
@@ -265,9 +266,8 @@ install_gcta_macos() {
     local source_build="$source_root/build"
     local gcta_environment="$install_prefix/share/postgwas/environments/gcta"
     local gcta_root="$install_prefix/share/postgwas/software/gcta"
-    postgwas_environment "$mamba_executable" create \
-        --prefix "$gcta_environment" \
-        --file "$script_directory/environments/gcta-macos.yml"
+    postgwas_runtime_environment "$mamba_executable" "$gcta_environment" \
+        "$script_directory/environments/gcta-macos.yml"
     checkout_commit \
         "$POSTGWAS_GCTA_REPOSITORY" "$POSTGWAS_GCTA_COMMIT" "$source_root" true
 
@@ -309,44 +309,60 @@ PY
     printf '%s\n' "$POSTGWAS_GCTA_COMMIT" > "$gcta_root/POSTGWAS_UPSTREAM_COMMIT"
 }
 
+install_ldsc() {
+    local ldsc_environment="$1"
+    local ldsc_source="$temporary_root/ldsc/$POSTGWAS_LDSC_COMMIT"
+    checkout_commit "$POSTGWAS_LDSC_REPOSITORY" "$POSTGWAS_LDSC_COMMIT" "$ldsc_source"
+    "$mamba_executable" run --prefix "$ldsc_environment" \
+        python -m pip install --no-deps --no-build-isolation "$ldsc_source"
+}
+
+install_mixer_venn() {
+    local mixer_environment="$1"
+    local archive="${temporary_root}/matplotlib-venn-${POSTGWAS_MIXER_MATPLOTLIB_VENN_VERSION}.zip"
+    download "$POSTGWAS_MIXER_MATPLOTLIB_VENN_URL" \
+        "$POSTGWAS_MIXER_MATPLOTLIB_VENN_SHA256" "$archive"
+    "$mamba_executable" run --prefix "$mixer_environment" \
+        python -m pip install --no-deps --no-build-isolation "$archive"
+}
+
 create_isolated_environments() {
     local environments_root="$install_prefix/share/postgwas/environments"
-    local software_root="$install_prefix/share/postgwas/software"
     local ldsc_environment="$environments_root/ldsc"
     local enrichment_environment="$environments_root/enrichment"
     local vep_environment="$environments_root/vep"
     local intel_tools_environment="$environments_root/intel-tools"
     local mixer_environment="$environments_root/mixer"
-    local ldsc_source="$software_root/ldsc/$POSTGWAS_LDSC_COMMIT"
-    local mixer_matplotlib_venn_archive="${temporary_root}/matplotlib-venn-${POSTGWAS_MIXER_MATPLOTLIB_VENN_VERSION}.zip"
     local environment_platform=()
 
     if [[ "$host_os" == "Darwin" ]]; then
         environment_platform=(--platform osx-64)
     fi
 
-    mkdir -p "$environments_root" "$(dirname "$ldsc_source")"
-    postgwas_environment "$mamba_executable" create ${environment_platform[@]+"${environment_platform[@]}"} \
-        --prefix "$ldsc_environment" \
-        --file "$script_directory/environments/ldsc.yml"
-    checkout_commit \
-        "$POSTGWAS_LDSC_REPOSITORY" "$POSTGWAS_LDSC_COMMIT" "$ldsc_source"
-    "$mamba_executable" run --prefix "$ldsc_environment" \
-        python -m pip install --no-deps --no-build-isolation "$ldsc_source"
+    mkdir -p "$environments_root"
+    postgwas_runtime_environment "$mamba_executable" "$ldsc_environment" \
+        "$script_directory/environments/ldsc.yml" ${environment_platform[@]+"${environment_platform[@]}"}
+    postgwas_component ldsc \
+        --input "$script_directory/install_external_tools.sh" \
+        --input "$ldsc_environment/conda-meta/*.json" --value "$POSTGWAS_LDSC_COMMIT" \
+        --output "$ldsc_environment/bin/ldsc.py" --output "$ldsc_environment/bin/munge_sumstats.py" \
+        --output "$ldsc_environment/lib/python*/site-packages/ldscore" \
+        -- install_ldsc "$ldsc_environment"
     "$mamba_executable" run --prefix "$ldsc_environment" python -m pip check
-    ln -s "$ldsc_environment/bin/ldsc.py" "$install_prefix/bin/ldsc.py"
-    ln -s \
+    ln -sf "$ldsc_environment/bin/ldsc.py" "$install_prefix/bin/ldsc.py"
+    ln -sf \
         "$ldsc_environment/bin/munge_sumstats.py" \
         "$install_prefix/bin/munge_sumstats.py"
 
-    postgwas_environment "$mamba_executable" create ${environment_platform[@]+"${environment_platform[@]}"} \
-        --prefix "$enrichment_environment" \
-        --file "$script_directory/environments/enrichment.yml"
+    postgwas_runtime_environment "$mamba_executable" "$enrichment_environment" \
+        "$script_directory/environments/enrichment.yml" ${environment_platform[@]+"${environment_platform[@]}"}
     "$mamba_executable" run --prefix "$enrichment_environment" \
         python -m pip install --no-deps --no-build-isolation "$repository_root"
     "$mamba_executable" run --prefix "$enrichment_environment" python -m pip check
 
-    "$mamba_executable" create --yes ${environment_platform[@]+"${environment_platform[@]}"} \
+    local vep_operation=create
+    [[ ! -d "$vep_environment/conda-meta" ]] || vep_operation=install
+    "$mamba_executable" "$vep_operation" --yes ${environment_platform[@]+"${environment_platform[@]}"} \
         --prefix "$vep_environment" \
         --channel conda-forge --channel bioconda --override-channels \
         "ensembl-vep=$POSTGWAS_VEP_VERSION"
@@ -355,19 +371,16 @@ create_isolated_environments() {
         "$install_prefix/bin/vep"
 
     if [[ "$host_os" == "Darwin" ]]; then
-        postgwas_environment "$mamba_executable" create --platform osx-64 \
-            --prefix "$intel_tools_environment" \
-            --file "$script_directory/environments/intel-tools-macos.yml"
-        postgwas_environment "$mamba_executable" create --platform osx-64 \
-            --prefix "$mixer_environment" \
-            --file "$script_directory/environments/mixer-macos.yml"
-        download \
-            "$POSTGWAS_MIXER_MATPLOTLIB_VENN_URL" \
-            "$POSTGWAS_MIXER_MATPLOTLIB_VENN_SHA256" \
-            "$mixer_matplotlib_venn_archive"
-        "$mamba_executable" run --prefix "$mixer_environment" \
-            python -m pip install --no-deps --no-build-isolation \
-            "$mixer_matplotlib_venn_archive"
+        postgwas_runtime_environment "$mamba_executable" "$intel_tools_environment" \
+            "$script_directory/environments/intel-tools-macos.yml" --platform osx-64
+        postgwas_runtime_environment "$mamba_executable" "$mixer_environment" \
+            "$script_directory/environments/mixer-macos.yml" --platform osx-64
+        postgwas_component mixer-venn \
+            --input "$script_directory/install_external_tools.sh" \
+            --input "$mixer_environment/conda-meta/*.json" \
+            --value "$POSTGWAS_MIXER_MATPLOTLIB_VENN_SHA256" \
+            --output "$mixer_environment/lib/python*/site-packages/matplotlib_venn" \
+            -- install_mixer_venn "$mixer_environment"
         "$mamba_executable" run --prefix "$mixer_environment" \
             python -m pip check
     fi
@@ -536,10 +549,14 @@ PY
 install_kpops_and_caldera() {
     local resource_root="$install_prefix/share/postgwas/upstream"
     mkdir -p "$resource_root"
+    local update_arguments=()
+    if [[ "${POSTGWAS_INSTALL_UPDATE:-false}" == true ]]; then
+        update_arguments=(--update-software)
+    fi
     bash "$repository_root/tools/resource_preparation/prepare_kpops_caldera_resources.sh" \
         --resource-root "$resource_root" \
         --python "$install_prefix/bin/python" \
-        --software-only
+        --software-only ${update_arguments[@]+"${update_arguments[@]}"}
 }
 
 install_mixer() {
@@ -600,8 +617,8 @@ install_mixer() {
         --target bgmg \
         --parallel "$build_jobs"
 
-    mkdir -p "$mixer_root/precimed" "$mixer_root/lib"
-    cp -R "$source_root/precimed/." "$mixer_root/precimed/"
+    mkdir -p "$mixer_root/lib"
+    postgwas_replace_directory "$source_root/precimed" "$mixer_root/precimed"
     install -m 0755 "$source_root/src/build/lib/libbgmg.so" "$mixer_root/lib/libbgmg.so"
     install -m 0644 "$source_root/LICENSE" "$mixer_root/LICENSE"
     rm -rf -- "$mixer_root/precimed/mixer-test" "$mixer_root/precimed/__pycache__"
@@ -743,8 +760,8 @@ PY
         /usr/bin/arch -x86_64 "$source_build/bin/bgmg-test" \
         --gtest_filter='BgmgTest.CalcLikelihood:TestLd.SingleMarker:UgmgTest.CalcUnifiedGaussianLikelihood'
 
-    mkdir -p "$mixer_root/precimed" "$mixer_root/lib"
-    cp -R "$source_root/precimed/." "$mixer_root/precimed/"
+    mkdir -p "$mixer_root/lib"
+    postgwas_replace_directory "$source_root/precimed" "$mixer_root/precimed"
     install -m 0755 "$source_build/lib/libbgmg.dylib" \
         "$mixer_root/lib/libbgmg.dylib"
     install -m 0644 "$source_root/LICENSE" "$mixer_root/LICENSE"
@@ -759,11 +776,48 @@ PY
 }
 
 printf 'Installing pinned external scientific programs into %s\n' "$install_prefix"
-install_binary_archives
-install_gcta_macos
 create_isolated_environments
-relocate_macos_intel_tools
-install_bgenix_macos
-install_kpops_and_caldera
-install_mixer
+postgwas_component kpops-caldera \
+    --input "$script_directory/install_external_tools.sh" \
+    --input "$repository_root/tools/resource_preparation/prepare_kpops_caldera_resources.sh" \
+    --value "$POSTGWAS_KPOPS_COMMIT:$POSTGWAS_KPOPS_SHA256:$POSTGWAS_CALDERA_COMMIT:$POSTGWAS_CALDERA_SHA256" \
+    --output "$install_prefix/bin/k-pops.py" \
+    --output "$install_prefix/share/postgwas/caldera" \
+    -- install_kpops_and_caldera
+component_inputs=(--input "$script_directory/install_external_tools.sh")
+binary_outputs=(--output "$install_prefix/bin/magma" --output "$install_prefix/bin/finemap"
+    --output "$install_prefix/bin/ldstore")
+if [[ "$host_os" == Darwin ]]; then
+    binary_outputs+=(--output "$install_prefix/share/postgwas/software/intel-tools"
+        --output "$install_prefix/bin/plink2")
+else
+    binary_outputs+=(--output "$install_prefix/share/postgwas/software/linux-tools")
+fi
+postgwas_component binary-archives "${component_inputs[@]}" \
+    --input "$script_directory/intel_tool_wrapper.sh" --input "$script_directory/linux_tool_wrapper.sh" \
+    --value "$POSTGWAS_MAGMA_SHA256:$POSTGWAS_MAGMA_MACOS_SHA256:$POSTGWAS_FINEMAP_SHA256:$POSTGWAS_FINEMAP_MACOS_SHA256:$POSTGWAS_LDSTORE_SHA256:$POSTGWAS_LDSTORE_MACOS_SHA256:$POSTGWAS_GCC10_MACOS_SHA256:$POSTGWAS_PLINK2_MACOS_SHA256" \
+    --value "$POSTGWAS_MAGMA_VERSION:$POSTGWAS_FINEMAP_VERSION:$POSTGWAS_LDSTORE_VERSION:$POSTGWAS_GCC10_MACOS_PREFIX:$POSTGWAS_GCC10_MACOS_LIBRARY_SUBDIRECTORY:$POSTGWAS_PLINK2_MACOS_VERSION" \
+    "${binary_outputs[@]}" -- install_binary_archives
+if [[ "$host_os" == Darwin ]]; then
+    postgwas_component gcta "${component_inputs[@]}" \
+        --input "$script_directory/environments/gcta-macos.yml" \
+        --value "$POSTGWAS_GCTA_COMMIT" \
+        --output "$install_prefix/bin/gcta64" \
+        --output "$install_prefix/share/postgwas/environments/gcta/conda-meta/*.json" \
+        -- install_gcta_macos
+    postgwas_component bgenix "${component_inputs[@]}" \
+        --input "$install_prefix/conda-meta/*.json" --value "$POSTGWAS_BGENIX_SOURCE_SHA256" \
+        --output "$install_prefix/bin/bgenix" -- install_bgenix_macos
+fi
+mixer_inputs=(--input "$install_prefix/conda-meta/*.json")
+if [[ "$host_os" == Darwin ]]; then
+    mixer_inputs+=(--input "$install_prefix/share/postgwas/environments/mixer/conda-meta/*.json")
+fi
+postgwas_component mixer "${component_inputs[@]}" "${mixer_inputs[@]}" \
+    --input "$script_directory/mixer_wrapper.py" \
+    --value "$POSTGWAS_MIXER_COMMIT:$POSTGWAS_MIXER_BOOST_SHA256" \
+    --output "$install_prefix/share/postgwas/mixer" \
+    --output "$install_prefix/bin/mixer.py" --output "$install_prefix/bin/mixer_figures.py" \
+    --output "$install_prefix/bin/mixer_dev.py" \
+    -- install_mixer
 printf 'Installed external scientific programs successfully.\n'

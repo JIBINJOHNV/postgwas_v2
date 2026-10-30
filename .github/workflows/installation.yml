@@ -72,3 +72,10 @@ jobs:
           --all-tools
           --name postgwas-ci
           --jobs 2
+
+      - name: Update and verify the existing PostGWAS environment
+        run: >-
+          bash tools/setup/install_postgwas.sh
+          --all-tools --update
+          --name postgwas-ci
+          --jobs 2
