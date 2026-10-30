@@ -14,7 +14,11 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from postgwas.config import load_configuration, write_resolved_configuration
+from postgwas.config import (
+    load_configuration,
+    load_run_configuration_for_module,
+    write_resolved_configuration,
+)
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.config.merger import deep_merge
 from postgwas.cli.compute import get_compute_parser
@@ -1827,8 +1831,9 @@ def run_harmonisation(
         raise ConfigurationError("--sample-sheet is required")
 
     overrides = explicit_overrides(args, CLI_OVERRIDE_PATHS)
-    config = configuration or load_configuration(
-        getattr(args, "run_config", None), cli_overrides=overrides,
+    config = configuration or load_run_configuration_for_module(
+        "harmonisation", getattr(args, "run_config", None),
+        module_overrides=overrides,
     )
     preflight_log = _top_run_log(config, config.run.output_directory)
     rows: list[HarmonisationSampleSheetRow] = []
