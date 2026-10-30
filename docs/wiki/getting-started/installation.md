@@ -124,10 +124,31 @@ its main and private runtimes. It does not reuse or delete the caller's shared
 cache, including corrupted cached packages. Package safety checks remain enabled,
 and package files are copied into environments so post-link scripts cannot
 alter cached files reused by another runtime. Removing that cache cannot break
-the installed environment. The cache is removed
-on exit. It needs download/extraction space under `TMPDIR` (or `/tmp`); set
-`TMPDIR` to an existing writable scratch directory if needed. These settings
-apply only to the installer process, not the user's Conda configuration.
+the installed environment. The temporary workspace is removed on exit.
+Its parent is selected by `--work-directory`, otherwise an existing `TMPDIR`
+setting, otherwise the checkout directory. The installer creates the parent
+directory if needed and prints the workspace path. Only its uniquely named
+workspace is removed; other files in the parent directory are preserved.
+
+On a server with a small `/tmp` filesystem, select a larger filesystem explicitly:
+
+```console
+bash tools/setup/install_postgwas.sh \
+  --all-tools --name postgwas-v2-home --jobs 2 \
+  --work-directory "$HOME/postgwas-install-work"
+```
+
+This single command places the Conda package cache, temporary Python/pip files
+and native builds on the selected filesystem. Linux pip download caches also
+follow the workspace's `XDG_CACHE_HOME`. These temporary settings apply only to
+the installer process. The final environments still use the normal Conda
+environment location; both filesystems need sufficient space and inodes.
+`No space left on device` during extraction is a storage failure; a subsequent
+`incorrect download` message does not establish a bad upstream package. Check
+`df -h` and `df -i` for the workspace and environment locations. Package sizes
+vary with platform and dependency resolution, so no fixed free-space figure
+guarantees completion. See the [Python temporary-directory rules](https://docs.python.org/3/library/tempfile.html#tempfile.gettempdir)
+and [pip cache locations](https://pip.pypa.io/en/stable/topics/caching/#default-paths).
 See [Conda cache and linking settings](https://docs.conda.io/projects/conda/en/stable/configuration.html).
 
 If an earlier installation failed, an environment that can be activated may

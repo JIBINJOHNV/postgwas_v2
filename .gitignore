@@ -10,6 +10,7 @@
 
 # PostGWAS runtime output and local scientific data
 /cache/
+.postgwas-install.*/
 /logs/
 /output/
 /results/

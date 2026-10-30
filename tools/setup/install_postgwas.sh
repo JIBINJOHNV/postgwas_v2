@@ -14,6 +14,7 @@ editable=false
 update=false
 all_tools=false
 build_jobs="${POSTGWAS_INSTALL_JOBS:-2}"
+work_directory="${TMPDIR:-$repository_root}"
 
 usage() {
     cat <<'EOF'
@@ -28,6 +29,9 @@ Options:
   --all-tools       Install all supported software into one user-facing Mamba env.
   --name NAME       Override the environment.yml environment name.
   --jobs N          Use N parallel jobs for source builds (default: 2).
+  --work-directory PATH
+                    Parent for temporary caches and builds; created if needed.
+                    Default: TMPDIR when set, otherwise the checkout directory.
   --editable        Install the checkout in editable development mode.
   --update          Update an existing portable environment instead of refusing.
   -h, --help        Show this help message.
@@ -72,6 +76,14 @@ while (($#)); do
                 exit 2
             fi
             build_jobs="$2"
+            shift 2
+            ;;
+        --work-directory)
+            if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
+                printf 'ERROR: --work-directory requires a directory path.\n' >&2
+                exit 2
+            fi
+            work_directory="$2"
             shift 2
             ;;
         -h|--help)
@@ -179,7 +191,17 @@ fi
 # Keep this invocation independent of a damaged or concurrently modified shared
 # cache. All isolated runtimes reuse this cache during installation. Copy files
 # so post-link scripts cannot alter cached packages reused by another runtime.
-installation_workspace="$(mktemp -d "${TMPDIR:-/tmp}/postgwas-install.XXXXXX")"
+if ! mkdir -p -- "$work_directory" || [[ ! -w "$work_directory" ]]; then
+    printf 'ERROR: --work-directory must name a writable directory: %s\n' \
+        "$work_directory" >&2
+    exit 2
+fi
+work_directory="$(cd "$work_directory" && pwd -P)"
+if ! installation_workspace="$(mktemp -d "$work_directory/.postgwas-install.XXXXXX")"; then
+    printf 'ERROR: cannot create installation workspace in %s. Check free space, inodes and permissions, or select another --work-directory.\n' \
+        "$work_directory" >&2
+    exit 1
+fi
 cleanup_installation() {
     local status=$?
     rm -rf -- "$installation_workspace"
@@ -190,6 +212,11 @@ cleanup_installation() {
     return "$status"
 }
 trap cleanup_installation EXIT
+# Propagate the chosen filesystem to Python/pip, Conda launchers and all native
+# build helpers, not just the package extraction cache.
+export TMPDIR="$installation_workspace/tmp"
+export XDG_CACHE_HOME="$installation_workspace/cache"
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
 export CONDA_PKGS_DIRS="$installation_workspace/pkgs"
 export MAMBA_PKGS_DIRS="$CONDA_PKGS_DIRS"
 export CONDA_ALWAYS_COPY=true MAMBA_ALWAYS_COPY=true
@@ -198,6 +225,7 @@ export CONDA_ALWAYS_SOFTLINK=false MAMBA_ALWAYS_SOFTLINK=false
 export CONDA_SAFETY_CHECKS=enabled MAMBA_SAFETY_CHECKS=enabled
 resolved_environment_file="$installation_workspace/environment.yml"
 postgwas_render_environment "$environment_file" "$host_os" > "$resolved_environment_file"
+printf '  Build workspace: %s\n' "$installation_workspace"
 printf '  Package cache: %s (isolated for this installation)\n' "$CONDA_PKGS_DIRS"
 
 if $environment_exists; then

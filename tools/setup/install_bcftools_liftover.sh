@@ -40,7 +40,7 @@ if [[ -z "$liftover_sha256" ]]; then
 fi
 
 install_prefix="${CONDA_PREFIX:?Activate the target conda environment first.}"
-build_directory="$(mktemp -d /tmp/postgwas-liftover.XXXXXX)"
+build_directory="$(mktemp -d "${TMPDIR:-/tmp}/postgwas-liftover.XXXXXX")"
 
 verify_sha256() {
     local expected="$1"
