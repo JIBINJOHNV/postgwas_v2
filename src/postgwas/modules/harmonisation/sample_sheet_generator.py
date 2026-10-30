@@ -24,6 +24,7 @@ from postgwas.core.io.delimiters import (
     open_text,
 )
 
+from .sample_sheet_preparation import DelimiterPreparationError, whitespace_copy
 from .resource_paths import validate_external_resource_spec
 from .policies import load_policies
 from .sample_sheet import (
@@ -54,6 +55,8 @@ class SampleSheetDatasetStatus:
     warnings: tuple[str, ...]
     eaf_source: str = "missing"
     info_source: str = "missing"
+    prepared_input_file: Path | None = None
+    converted_rows: int = 0
 
     @property
     def needs_attention(self) -> bool:
@@ -70,6 +73,7 @@ class SampleSheetDatasetStatus:
 class SampleSheetFileRejection:
     input_file: Path
     reason: str
+    conversion_attempted: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,7 @@ def _candidate_files(
     input_directory: Path,
     excluded_files: Sequence[Path],
     suffixes: Sequence[str],
+    converted_suffix: str,
 ) -> list[Path]:
     if not input_directory.is_dir():
         raise ConfigurationError(
@@ -112,6 +117,7 @@ def _candidate_files(
         for path in input_directory.iterdir()
         if path.is_file()
         and not path.name.startswith(".")
+        and not path.name.endswith(converted_suffix)
         and path.resolve() not in excluded
         and any(path.name.lower().endswith(suffix) for suffix in suffixes)
     ]
@@ -141,10 +147,13 @@ def _delimiter_name(path: Path, policies) -> tuple[str, str]:
         minimum_columns=int(policies.get("input.delimiter_min_columns")),
         maximum_columns=int(policies.get("input.delimiter_max_columns")),
         sample_lines=int(policies.get("input.delimiter_sample_rows")),
+        fail_policy="unknown",
         comment_prefix=(
             "##" if bool(policies.get("input.strip_double_hash_lines")) else None
         ),
     )
+    if result.kind == "unknown":
+        raise DelimiterPreparationError("No configured delimiter produced a consistent table: %s" % path)
     for name in candidates:
         if delimiter_character(name) == result.value:
             return name, str(result.value)
@@ -327,9 +336,11 @@ def _missing_mappings(row):
     return tuple(missing)
 
 
-def _row_for_file(path: Path, generator_config, policies) -> tuple[dict[str, Any], list[str]]:
+def _row_for_file(path: Path, generator_config, policies, *, identity_path: Path | None = None) -> tuple[dict[str, Any], list[str]]:
     delimiter_name, delimiter = _delimiter_name(path, policies)
     headers = _read_header(path, delimiter, bool(policies.get("input.strip_double_hash_lines")))
+    input_path = path
+    path = identity_path or path
     index = _header_index(headers)
     aliases = generator_config.column_aliases
     warnings: list[str] = []
@@ -337,7 +348,7 @@ def _row_for_file(path: Path, generator_config, policies) -> tuple[dict[str, Any
     row = {
         "config_version": SAMPLE_SHEET_VERSION,
         "dataset_id": _dataset_id(path, generator_config.supported_suffixes),
-        "input_file": str(path),
+        "input_file": str(input_path),
         "trait_type": generator_config.trait_type,
         "effect_type": generator_config.effect_type,
         "p_value_type": generator_config.p_value_type,
@@ -510,17 +521,22 @@ def _write_generation_reports(dataset_statuses, rejected_files, suffixes, reject
         "missing_frequency": item.missing_eaf,
         "eaf_source": item.eaf_source,
         "info_source": item.info_source,
+        "prepared_input_file": str(item.prepared_input_file) if item.prepared_input_file else "",
+        "conversion_status": "converted" if item.prepared_input_file else "not_needed",
+        "converted_rows": item.converted_rows,
         "review_notes": "; ".join(item.warnings),
     } for item in dataset_statuses]
     review_rows.extend({
         "dataset_id": _dataset_id(item.input_file, suffixes),
         "input_file": str(item.input_file), "status": "rejected", "review_notes": item.reason,
+        "conversion_status": "rejected" if item.conversion_attempted else "not_attempted",
     } for item in rejected_files)
     review_rows.sort(key=lambda row: (Path(row["input_file"]).name.casefold(), row["input_file"]))
     _write_table_report(
         review_rows,
         ("dataset_id", "input_file", "status", "missing_mappings", "missing_info",
-         "missing_sample_size", "missing_frequency", "eaf_source", "info_source", "review_notes"),
+         "missing_sample_size", "missing_frequency", "eaf_source", "info_source", "prepared_input_file",
+         "conversion_status", "converted_rows", "review_notes"),
         review_report,
     )
 
@@ -560,6 +576,7 @@ def generate_sample_sheet(
         source_directory,
         (destination, rejection_report, review_report, *reference_files),
         generator_config.supported_suffixes,
+        generator_config.converted_file_suffix,
     )
 
     rows: list[dict[str, Any]] = []
@@ -567,8 +584,36 @@ def generate_sample_sheet(
     dataset_statuses: list[SampleSheetDatasetStatus] = []
     rejected_files: list[SampleSheetFileRejection] = []
     for path in files:
+        conversion_attempted = False
+        prepared_input_file = None
+        converted_rows = 0
         try:
-            row, row_warnings = _row_for_file(path, generator_config, policies)
+            try:
+                row, row_warnings = _row_for_file(path, generator_config, policies)
+            except DelimiterPreparationError as original_error:
+                if not generator_config.convert_mixed_whitespace:
+                    raise
+                conversion_attempted = True
+                try:
+                    with whitespace_copy(
+                        path, destination.parent / generator_config.prepared_input_directory,
+                        generator_config.converted_file_suffix,
+                        strip_double_hash=bool(policies.get("input.strip_double_hash_lines")),
+                    ) as prepared:
+                        row, row_warnings = _row_for_file(
+                            prepared.temporary, generator_config, policies, identity_path=path,
+                        )
+                        HarmonisationSampleSheetRow.validate_generated_draft(row)
+                        prepared_input_file = prepared.publish()
+                        row["input_file"] = str(prepared_input_file)
+                        converted_rows = prepared.data_rows
+                        row_warnings.append(
+                            "%s; converted tabs to spaces and squeezed repeated spaces: "
+                            "%s -> %s; validated %d data rows; changed %d lines."
+                            % (original_error, path, prepared_input_file, converted_rows, prepared.changed_lines)
+                        )
+                except (ConfigurationError, OSError, ValueError, csv.Error) as exc:
+                    raise ConfigurationError("%s; whitespace conversion rejected: %s" % (original_error, exc)) from exc
             for source, internal_field in _EXTERNAL_SOURCES.items():
                 if not row.get(internal_field) and defaults.get(f"external_{source}_file"):
                     row.update({f"external_{source}_{part}": defaults[f"external_{source}_{part}"]
@@ -594,10 +639,13 @@ def generate_sample_sheet(
                 has_coordinates=bool(row.get("chromosome_position_column") or
                                      (row.get("chromosome_column") and row.get("position_column"))),
                 warnings=tuple(row_warnings),
+                prepared_input_file=prepared_input_file,
+                converted_rows=converted_rows,
             ))
         except (ConfigurationError, OSError, ValueError, csv.Error) as exc:
             rejected_files.append(SampleSheetFileRejection(
                 input_file=path,
+                conversion_attempted=conversion_attempted,
                 reason=(
                     _validation_error_text(exc)
                     if isinstance(exc, ValidationError) else str(exc)
@@ -610,14 +658,16 @@ def generate_sample_sheet(
     if rejected_files and generator_config.failure_policy == "fail_all":
         raise ConfigurationError(
             "Sample-sheet generation rejected %d/%d files; fail_all requested, "
-            "no sample sheet was written. See %s and %s."
-            % (len(rejected_files), len(files), rejection_report, review_report)
+            "no sample sheet was written. See %s and %s. %s"
+            % (len(rejected_files), len(files), rejection_report, review_report,
+               _conversion_summary(dataset_statuses, rejected_files))
         )
     if not rows:
         raise ConfigurationError(
             "None of the %d candidate files passed draft screening; no sample sheet "
-            "was written. See %s and %s."
-            % (len(files), rejection_report, review_report)
+            "was written. See %s and %s. %s"
+            % (len(files), rejection_report, review_report,
+               _conversion_summary(dataset_statuses, rejected_files))
         )
 
     dataset_ids: dict[str, str] = {}
@@ -652,6 +702,14 @@ def generate_sample_sheet(
     )
 
 
+def _conversion_summary(datasets, rejected_files) -> str:
+    converted = sum(d.prepared_input_file is not None for d in datasets)
+    rejected = sum(d.conversion_attempted for d in rejected_files)
+    return "Conversions       : %d attempted; %d accepted; %d rejected" % (
+        converted + rejected, converted, rejected,
+    )
+
+
 def _generation_summary(result: SampleSheetGenerationResult) -> str:
     """Keep the terminal aggregate-only; individual findings live in TSV reports."""
     datasets = result.datasets
@@ -661,6 +719,7 @@ def _generation_summary(result: SampleSheetGenerationResult) -> str:
         "  Input files       : %d" % result.candidate_count,
         "  Rows written      : %d" % result.dataset_count,
         "  Rejected files    : %d" % len(result.rejected_files),
+        "  " + _conversion_summary(datasets, result.rejected_files),
         "  Ready             : %d" % (result.dataset_count - attention),
         "  Need attention    : %d" % attention,
         "  Missing INFO      : %d" % sum(d.missing_info for d in datasets),

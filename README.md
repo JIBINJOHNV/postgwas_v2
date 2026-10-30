@@ -328,7 +328,17 @@ Supported inputs include `.tbl`, `.tbl.gz`, `.tbl.zip`, and other supported
 text tables ending in `.gz` or `.zip`. A ZIP archive must contain exactly one
 data file (directories and `__MACOSX/` entries are ignored). The same header
 screening applies regardless of extension.
-The command produces three files:
+
+When delimiter detection fails, mixed tabs/spaces are converted into a
+validated copy such as `prepared_inputs/ILAE3_CAE_final.tbl.converted.txt`
+beside the output CSV. The CSV uses the copy's **absolute path** and preserves
+the original dataset ID. Originals stay unchanged. The terminal reports
+conversion counts; the review report records both paths and validation details.
+Ambiguous or inconsistent conversions remain rejected. See the
+[sample-sheet guide](docs/wiki/harmonisation/sample-sheet.md#generate-a-draft-from-gwas-headers)
+for configuration, compressed-file handling and rerun behaviour.
+
+The sample sheet and its two reports are:
 
 | Output | Contents |
 |---|---|

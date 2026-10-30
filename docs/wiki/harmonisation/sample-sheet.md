@@ -244,6 +244,35 @@ both coordinate roles, and a Z-score can satisfy the effect role. This is a
 file-screening heuristic, not scientific validation. The normal harmonisation
 loader still requires complete mappings before analysis.
 
+If normal delimiter detection fails, the generator can rescue mixed tabs and
+spaces by writing a separate, validated copy. For example,
+`ILAE3_CAE_final.tbl` becomes `prepared_inputs/ILAE3_CAE_final.tbl.converted.txt`
+beside the output CSV. The CSV records its **absolute path**, keeps the original
+dataset ID, and uses `delimiter: space`. Originals are never modified.
+
+The fallback applies to all discovered supported extensions, including
+compressed inputs, which are streamed through decompression first. It performs
+the equivalent of `tr '\t' ' ' | tr -s ' '` and validates every data row.
+Quoted text, positional empty tab fields, boundary whitespace, invalid text,
+and inconsistent converted field counts are rejected. Files failing only
+column-name mapping or other non-delimiter checks are not converted. Normal
+files retain the existing sampled delimiter detection; this is not a full-file
+structural audit of every input.
+
+The terminal reports conversions attempted, accepted and rejected on one line.
+The review TSV retains the original `input_file` and adds `prepared_input_file`,
+`conversion_status` and `converted_rows`, with transformation details in
+`review_notes`. Converted rows remain flagged for review. Identical existing
+copies are reused; differing files or symlink destinations are refused.
+Generated copies are excluded from subsequent study discovery.
+
+Configure `modules.harmonisation.sample_sheet_generator` with
+`convert_mixed_whitespace: true` (default), `prepared_input_directory: prepared_inputs`
+and `converted_file_suffix: .converted.txt`. The directory is a single folder
+name relative to the CSV output directory. Set `convert_mixed_whitespace: false`
+to disable rescue. Conversion fixes separators only; it does not add missing
+frequency, sample-size or INFO mappings.
+
 Two separate TSV reports accompany the CSV:
 
 - `<output>.mapping_review.tsv`: one row per candidate file, with `dataset_id`,

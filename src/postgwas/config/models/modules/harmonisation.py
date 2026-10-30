@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import Field, RootModel, field_validator, model_validator
 
 from postgwas.config.models.common import ModuleConfig, StrictModel
+from postgwas.core.paths import validate_filename_component
 
 
 class FrequencyReferenceConfig(StrictModel):
@@ -175,6 +176,9 @@ class SampleSheetAlternativeFrequencyAliases(StrictModel):
 class SampleSheetGeneratorConfig(StrictModel):
     """File discovery and header semantics for v2 sample-sheet generation."""
 
+    convert_mixed_whitespace: bool
+    prepared_input_directory: str
+    converted_file_suffix: str
     external_eaf_file: str | None
     external_eaf_column: str | None
     external_info_file: str | None
@@ -196,6 +200,14 @@ class SampleSheetGeneratorConfig(StrictModel):
     effect_frequency_prefixes: list[str]
     alternative_frequency: SampleSheetAlternativeFrequencyAliases
     column_aliases: SampleSheetColumnAliases
+
+    @field_validator("prepared_input_directory", "converted_file_suffix")
+    @classmethod
+    def preparation_filename_component(cls, value: str) -> str:
+        value = validate_filename_component(value)
+        if "\\" in value or "{" in value or "}" in value:
+            raise ValueError("preparation names must be literal filename components")
+        return value
 
     @field_validator("external_eaf_file", "external_eaf_column", "external_info_file", "external_info_column")
     @classmethod

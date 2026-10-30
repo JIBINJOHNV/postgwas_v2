@@ -80,6 +80,9 @@ module:
   # select column names only; the harmonisation preflight still validates the
   # selected columns and infers study properties from the complete dataset.
   sample_sheet_generator:
+    convert_mixed_whitespace: true
+    prepared_input_directory: prepared_inputs
+    converted_file_suffix: .converted.txt
     # Optional sources used only when the corresponding internal mapping is absent.
     external_eaf_file: null
     external_eaf_column: null
