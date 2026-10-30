@@ -170,42 +170,44 @@ else
     printf '  Software coverage: portable stack\n'
 fi
 
-if $environment_exists; then
-    if ! $update; then
-        printf 'ERROR: Conda environment %s already exists.\n' "$environment_name" >&2
-        printf 'Select a new environment with --name. Portable installs may instead use --update.\n' >&2
-        exit 1
+if $environment_exists && ! $update; then
+    printf 'ERROR: Conda environment %s already exists.\n' "$environment_name" >&2
+    printf 'Select a new environment with --name. Portable installs may instead use --update.\n' >&2
+    exit 1
+fi
+
+# Keep this invocation independent of a damaged or concurrently modified shared
+# cache. All isolated runtimes reuse this cache during installation. Copy files
+# so post-link scripts cannot alter cached packages reused by another runtime.
+installation_workspace="$(mktemp -d "${TMPDIR:-/tmp}/postgwas-install.XXXXXX")"
+cleanup_installation() {
+    local status=$?
+    rm -rf -- "$installation_workspace"
+    if [[ "$status" -ne 0 ]]; then
+        printf 'ERROR: PostGWAS installation did not complete. Environment %s may be partial; use a new --name for a complete installation.\n' \
+            "$environment_name" >&2
     fi
+    return "$status"
+}
+trap cleanup_installation EXIT
+export CONDA_PKGS_DIRS="$installation_workspace/pkgs"
+export MAMBA_PKGS_DIRS="$CONDA_PKGS_DIRS"
+export CONDA_ALWAYS_COPY=true MAMBA_ALWAYS_COPY=true
+export CONDA_ALLOW_SOFTLINKS=false MAMBA_ALLOW_SOFTLINKS=false
+export CONDA_ALWAYS_SOFTLINK=false MAMBA_ALWAYS_SOFTLINK=false
+export CONDA_SAFETY_CHECKS=enabled MAMBA_SAFETY_CHECKS=enabled
+resolved_environment_file="$installation_workspace/environment.yml"
+postgwas_render_environment "$environment_file" "$host_os" > "$resolved_environment_file"
+printf '  Package cache: %s (isolated for this installation)\n' "$CONDA_PKGS_DIRS"
+
+if $environment_exists; then
     postgwas_environment "$environment_manager" update \
         --name "$environment_name" \
-        --file "$environment_file"
+        --file "$resolved_environment_file"
 else
     postgwas_environment "$environment_manager" create \
         --name "$environment_name" \
-        --file "$environment_file"
-fi
-
-if [[ "$host_os" == "Linux" ]]; then
-    linux_packages=()
-    while IFS= read -r package_name; do
-        if [[ -n "$package_name" ]]; then
-            linux_packages+=("$package_name")
-        fi
-    done < <(
-        awk '$1 == "-" && $2 == "sel(linux):" { print $3 }' \
-            "$environment_file"
-    )
-    if ((${#linux_packages[@]} == 0)); then
-        printf 'ERROR: environment.yml contains no Linux-selected package definitions.\n' >&2
-        exit 1
-    fi
-    "$environment_manager" install \
-        --yes \
-        --name "$environment_name" \
-        --channel conda-forge \
-        --channel bioconda \
-        --override-channels \
-        "${linux_packages[@]}"
+        --file "$resolved_environment_file"
 fi
 
 # Resolve Python only after the requested environment has been activated by

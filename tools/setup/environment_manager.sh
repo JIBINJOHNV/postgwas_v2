@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
 
+# Resolve the inline CEP-24 OS selectors used by the canonical manifest before
+# passing it to clients that otherwise treat selector keys as pip-like installers.
+# Do not copy package names into shell code or silently accept unknown selectors.
+postgwas_render_environment() {
+    local source_file="$1"
+    local host_os="$2"
+    local target
+    case "$host_os" in
+        Linux) target=linux ;;
+        Darwin) target=osx ;;
+        *) printf 'ERROR: unsupported environment target: %s\n' "$host_os" >&2; return 2 ;;
+    esac
+    awk -v target="$target" '
+        /^[[:space:]]*-[[:space:]]*sel\(/ {
+            if ($0 !~ /^[[:space:]]*-[[:space:]]*sel\((linux|osx|unix|win)\):[[:space:]]*[^[:space:]#]/) {
+                print "ERROR: unsupported or empty environment selector at line " NR > "/dev/stderr"
+                exit 2
+            }
+            selector = $0
+            sub(/^[^(]*\(/, "", selector)
+            sub(/\).*/, "", selector)
+            if (selector == target || selector == "unix") {
+                sub(/sel\([^)]*\):[[:space:]]*/, "")
+                print
+            }
+            next
+        }
+        { print }
+    ' "$source_file"
+}
+
 # Shared by the bootstrap and isolated-runtime installers. Keep the native
 # command first; only argparse's rejection of --yes permits a compatibility
 # retry, before any environment transaction has started.

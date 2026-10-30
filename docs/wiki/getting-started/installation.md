@@ -85,7 +85,8 @@ bash tools/setup/install_postgwas.sh \
 
 The installer performs these operations in order:
 
-1. creates the named Mamba environment from `environment.yml`;
+1. resolves the operating-system selectors in `environment.yml` and creates
+   the named Mamba environment with all applicable Conda packages in one solve;
 2. explicitly installs the canonical Python dependencies and the checkout
    through that environment's Python, then checks every public command import;
 3. downloads, checksum-verifies, builds, and installs bcftools plus its
@@ -110,8 +111,29 @@ option. It sets `CONDA_ALWAYS_YES=true` and `MAMBA_ALWAYS_YES=true` for that
 retry, following the documented [Conda configuration interface](https://www.anaconda.com/blog/conda-configuration-engine-power-users)
 and [Mamba configuration interface](https://mamba.readthedocs.io/en/latest/user_guide/configuration.html).
 This applies to the main environment and isolated runtimes. Other failures stop
-installation immediately; package selections and environment-file requirements
-remain unchanged, including support for CEP-24 selectors.
+installation immediately. The script resolves the canonical inline
+`sel(linux)`, `sel(osx)`, `sel(unix)` and `sel(win)` dependency entries before
+calling the client. Older Mamba/Conda clients therefore receive ordinary package
+strings instead of mistaking `sel(linux)` for an installer name. Package versions,
+channels, environment variables and pip requirements still come from the same
+canonical YAML. Unknown selector syntax fails before environment creation.
+See the [CEP-24 selector specification](https://conda.org/learn/ceps/cep-0024/#dictionary-based-selectors).
+
+Each installation uses a fresh temporary Conda/Mamba package cache shared by
+its main and private runtimes. It does not reuse or delete the caller's shared
+cache, including corrupted cached packages. Package safety checks remain enabled,
+and package files are copied into environments so post-link scripts cannot
+alter cached files reused by another runtime. Removing that cache cannot break
+the installed environment. The cache is removed
+on exit. It needs download/extraction space under `TMPDIR` (or `/tmp`); set
+`TMPDIR` to an existing writable scratch directory if needed. These settings
+apply only to the installer process, not the user's Conda configuration.
+See [Conda cache and linking settings](https://docs.conda.io/projects/conda/en/stable/configuration.html).
+
+If an earlier installation failed, an environment that can be activated may
+still be incomplete. Run the same installer with a new name, for example
+`--name postgwas-v2-clean`; existing environments and shared caches are preserved.
+Use `postgwas --help` after the installer reports successful verification.
 
 FLaMEs 1.1.2-compatible code, its model, and PoPS are packaged PostGWAS
 modules, so they do not require a second external executable. The verifier
@@ -184,15 +206,6 @@ requested:
 bash tools/setup/install_postgwas.sh \
   --name postgwas-portable \
   --update
-```
-
-The equivalent portable manual commands are:
-
-```console
-mamba env create --name postgwas-portable --file environment.yml
-conda activate postgwas-portable
-python -m pip install .
-bash tools/setup/install_bcftools_liftover.sh
 ```
 
 The bootstrap installs the checkout with the target environment's
