@@ -580,6 +580,27 @@ class HarmonisationVcfProvenanceConfig(StrictModel):
         return cleaned
 
 
+class HarmonisationCsqPrefixes(StrictModel):
+    """Literal, case-sensitive native CSQ prefixes; null leaves labels intact."""
+
+    vcf: str | None
+    gff: str | None
+    fasta: str | None
+
+    @field_validator("vcf", "gff", "fasta")
+    @classmethod
+    def native_prefix(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value or value == "-" or "," in value or "\x00" in value
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError(
+                "must be a non-empty literal prefix without NUL, commas or whitespace; "
+                "use null, not '-', for no prefix"
+            )
+        return value
+
+
 class HarmonisationVcfConfig(StrictModel):
     """Tool-facing VCF fields and build transitions used by bcftools."""
 
@@ -587,6 +608,7 @@ class HarmonisationVcfConfig(StrictModel):
     missing_id_format: str
     genome_build_header: str
     target_builds: dict[str, str]
+    csq_prefixes_by_build: dict[str, HarmonisationCsqPrefixes]
     required_merge_groups: list[str]
     liftover_plugin: str
     liftover_tag_roles: HarmonisationLiftoverTagRoles
@@ -705,6 +727,10 @@ class HarmonisationVcfConfig(StrictModel):
             for source, target in self.target_builds.items()
         ):
             raise ValueError("target_builds must contain reversible build pairs")
+        if set(self.csq_prefixes_by_build) != set(self.target_builds):
+            raise ValueError(
+                "csq_prefixes_by_build must define exactly every target_builds genome build"
+            )
         return self
 
 

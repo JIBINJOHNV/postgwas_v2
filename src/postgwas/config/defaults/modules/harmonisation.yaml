@@ -506,6 +506,12 @@ module:
   # VCF fields and build transitions passed to bcftools. These are explicit so
   # a reference panel with different INFO tags can be configured without code.
   vcf_processing:
+    # Explicit native CSQ lookup prefixes in VCF, GFF, FASTA order. Null means
+    # no prefix. These preserve the previous command's expected resource layout;
+    # preflight verifies the actual names. Set gff: null for numeric GFF names.
+    csq_prefixes_by_build:
+      GRCh37: {vcf: null, gff: chr, fasta: null}
+      GRCh38: {vcf: null, gff: chr, fasta: null}
     external_frequency_columns: [CHROM, POS, REF, ALT, INFO/AFR, INFO/EAS, INFO/EUR, INFO/SAS]
     missing_id_format: '+%CHROM\_%POS\_%REF\_%ALT'
     genome_build_header: '##genome_build={build}'

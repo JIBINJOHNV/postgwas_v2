@@ -1887,6 +1887,7 @@ def preflight_harmonisation_resources(
         try:
             summary = validate_harmonisation_resource_maps(
                 resource_maps,
+                grch_version=grch_version,
                 bcftools=executables["bcftools"],
                 vcf_config=vcf_config,
                 default_eaf_colmap=default_eaf_colmap,

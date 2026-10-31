@@ -20,6 +20,9 @@ from postgwas.core.input_validation import (
 from postgwas.modules.harmonisation.shared.allele_join import prepare_reference_values
 from postgwas.modules.harmonisation.shared.variant_columns import read_reference_variant_table
 from postgwas.modules.harmonisation.shared.statistics import frequency_maf_screen
+from .shared.csq_contigs import (
+    CSQ_PREFIX_CONFIG_KEY, resolve_csq_prefixes, csq_contig_lookup, csq_target_contig,
+)
 from postgwas.core.io.delimiters import open_text, resolve_delimiter
 from postgwas.core.processes import run_checked_command
 from postgwas.core.vcf import annotation_vcf_fields, declared_vcf_tag_definitions
@@ -238,6 +241,8 @@ def _fasta_index_state(path: Path) -> tuple[set[str], str | None]:
                         "FASTA index reports a non-positive sequence length at line %d"
                         % line_number
                     )
+                if fields[0] in contigs:
+                    return set(), "FASTA index repeats chromosome label %r" % fields[0]
                 contigs.add(fields[0])
     except OSError as exc:
         return set(), "FASTA index cannot be read: %s" % exc
@@ -290,10 +295,12 @@ def _table_header(
     return set(normalized), None
 
 
-def _gff_problem(path: Path) -> str | None:
+def _gff_contig_state(path: Path) -> tuple[set[str], str | None]:
+    """Stream every feature row once; directives alone do not prove coverage."""
+    contigs = set()
     try:
         with open_text(path) as handle:
-            for raw in handle:
+            for line_number, raw in enumerate(handle, start=1):
                 line = raw.strip()
                 if not line:
                     continue
@@ -301,12 +308,20 @@ def _gff_problem(path: Path) -> str | None:
                     break
                 if line.startswith("#"):
                     continue
-                if len(raw.rstrip("\r\n").split("\t")) != 9:
-                    return "first GFF data row does not contain exactly 9 columns"
-                return None
-    except (OSError, UnicodeError, ValueError) as exc:
-        return "GFF file cannot be read: %s" % exc
-    return "GFF file contains no data records"
+                fields = raw.rstrip("\r\n").split("\t")
+                if len(fields) != 9:
+                    return set(), "GFF data row %d does not contain exactly 9 columns" % line_number
+                if not fields[0] or any(character.isspace() for character in fields[0]):
+                    return set(), "GFF data row %d has an empty or invalid chromosome label" % line_number
+                start, end = int(fields[3]), int(fields[4])
+                if start <= 0 or end < start:
+                    return set(), "GFF data row %d has invalid 1-based start/end coordinates" % line_number
+                contigs.add(fields[0])
+    except (OSError, EOFError, UnicodeError, ValueError) as exc:
+        return set(), "GFF file cannot be read: %s" % exc
+    if not contigs:
+        return set(), "GFF file contains no data records"
+    return contigs, None
 
 
 def _chain_mapping_state(
@@ -415,6 +430,7 @@ def _external_frequency_screen(path, column, mapping, policies):
 def validate_harmonisation_resource_maps(
     resource_maps: Mapping[str, Mapping[str, Any]],
     *,
+    grch_version: str,
     bcftools: str,
     vcf_config: Mapping[str, Any],
     default_eaf_colmap: Mapping[str, Any],
@@ -427,6 +443,8 @@ def validate_harmonisation_resource_maps(
     validate_frequency_semantics: bool = True,
 ) -> dict[str, Any]:
     """Validate every resolved resource and return serialisable provenance."""
+    csq_prefixes = resolve_csq_prefixes(vcf_config, grch_version)
+    csq_names = {}
     issues: dict[tuple[str, str, str], set[str]] = {}
     file_cache: dict[str, str | None] = {}
     identities = {}
@@ -436,7 +454,7 @@ def validate_harmonisation_resource_maps(
     ] = {}
     fasta_cache: dict[str, tuple[set[str], str | None]] = {}
     table_cache: dict[tuple[str, str, tuple[str, ...]], str | None] = {}
-    gff_cache: dict[str, str | None] = {}
+    gff_cache: dict[str, tuple[set[str], str | None]] = {}
     chain_cache: dict[str, tuple[dict[str, set[str]], str | None]] = {}
 
     expected_info_tags = {
@@ -597,10 +615,10 @@ def validate_harmonisation_resource_maps(
 
             elif key == "annot_path":
                 if str(path) not in gff_cache:
-                    _result, gff_cache[str(path)] = _read_resource_once(
-                        [path], ("harmonisation.gff_header",), lambda: (None, _gff_problem(path)),
+                    gff_cache[str(path)] = _read_resource_once(
+                        [path], ("harmonisation.gff_feature_contigs",), lambda: _gff_contig_state(path),
                     )
-                problem = gff_cache[str(path)]
+                _contigs, problem = gff_cache[str(path)]
                 if problem is not None:
                     _add_issue(issues, chromosome, label, path, problem)
             elif key == "chain_file":
@@ -611,6 +629,35 @@ def validate_harmonisation_resource_maps(
                 _mappings, problem = chain_cache[str(path)]
                 if problem is not None:
                     _add_issue(issues, chromosome, label, path, problem)
+
+        # Mapping checks stay outside the cached raw scans: a different build
+        # or prefix policy must never reuse an earlier compatibility decision.
+        gff_path = resources.get("annot_path")
+        fasta_path = resources.get("genome_fasta_file")
+        gff_state = gff_cache.get(str(gff_path))
+        fasta_state = fasta_cache.get(str(fasta_path))
+        if gff_state and fasta_state and gff_state[1] is None and fasta_state[1] is None:
+            names = {"vcf": str(chromosome)}
+            for role, state, path, label in (
+                ("gff", gff_state, gff_path, _RESOURCE_LABELS["annot_path"]),
+                ("fasta", fasta_state, fasta_path, _RESOURCE_LABELS["genome_fasta_file"]),
+            ):
+                try:
+                    csq_contig_lookup(state[0], csq_prefixes[role], role)
+                    expected = csq_target_contig(str(chromosome), csq_prefixes, role)
+                    if expected not in state[0]:
+                        raise ValueError(
+                            "CSQ expects chromosome %r for VCF chromosome %r, but it "
+                            "is absent from this resource" % (expected, str(chromosome))
+                        )
+                    names[role] = expected
+                except ValueError as exc:
+                    _add_issue(
+                        issues, chromosome, label, path,
+                        "%s. Check %s.%s (%s prefix %r)."
+                        % (exc, CSQ_PREFIX_CONFIG_KEY, grch_version, role, csq_prefixes[role]),
+                    )
+            csq_names[str(chromosome)] = names
 
         chain_path = resources.get("chain_file")
         target_fasta_path = resources.get("target_fasta")
@@ -680,6 +727,10 @@ def validate_harmonisation_resource_maps(
     require_unchanged_preflight_files(identities.values())
     return {
         "status": "passed",
+        "consequence_annotation_naming": {
+            "source_build": grch_version, "prefixes": csq_prefixes,
+            "chromosomes": csq_names,
+        },
         "file_identities": [{**asdict(value), "path": str(value.path)} for value in identities.values()],
         "chromosomes": sorted(resource_maps, key=_chromosome_sort_key),
         "require_default_eaf": bool(require_default_eaf),

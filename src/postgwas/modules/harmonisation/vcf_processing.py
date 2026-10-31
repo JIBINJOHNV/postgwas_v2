@@ -30,6 +30,7 @@ from typing import Any, Dict, Mapping, Sequence
 
 
 from .policies import default_policies
+from .shared.csq_contigs import resolve_csq_prefixes, csq_prefix_arguments, csq_target_contig
 from postgwas.core.paths import configured_output_path, resolve_executable
 from postgwas.core.processes import run_checked_command
 from postgwas.core.ui.screen import screen_line
@@ -400,6 +401,8 @@ def annotate_and_liftover_vcf(
 ) -> str:
 
     plugin = str(vcf_config["liftover_plugin"])
+    csq_prefixes = resolve_csq_prefixes(vcf_config, grch_version)
+    csq_target_contig(str(chromosome), csq_prefixes, "vcf")
     binaries = dict(executables)
     bash = binaries["bash"]
     bcftools = binaries["bcftools"]
@@ -569,6 +572,8 @@ def annotate_and_liftover_vcf(
             logger.record(
                 "PARAM", "consequence_annotation",
                 mode=CONSEQUENCE_ANNOTATION_MODE,
+                source_build=grch_version,
+                chromosome_prefixes=csq_prefixes,
             )
         _run_bcftools_step([
             bcftools, "csq",
@@ -576,7 +581,7 @@ def annotate_and_liftover_vcf(
             "--fasta-ref", str(genome_fasta_file),
             "--gff-annot", str(gff_file),
             "--threads", str(threads),
-            "--unify-chr-names", "-,chr,-",
+            *csq_prefix_arguments(csq_prefixes),
             "-Oz", "-o", str(csq_vcf),
             "--write-index=tbi",
             str(af_vcf)

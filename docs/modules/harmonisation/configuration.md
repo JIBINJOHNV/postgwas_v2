@@ -1336,3 +1336,45 @@ genome-wide reference table. Compact partition counts are combined globally,
 while exact medians, Pearson and Spearman correlations are calculated by lazy
 scans of the temporary matched records. Final reports retain deterministic
 source-row ordering, and all staging files are removed on success or failure.
+
+### Consequence annotation chromosome names
+
+`modules.harmonisation.vcf_processing.csq_prefixes_by_build` declares the
+literal, case-sensitive prefixes used by native `bcftools csq` in each source
+genome build. Every supported build must define `vcf`, `gff` and `fasta`;
+`null` means no prefix. The native option order is VCF, GFF, FASTA.
+
+The packaged mappings preserve the prior command's expected layout: VCF and
+FASTA names such as `1`, with GFF names such as `chr1`. If all three resources
+use matching unprefixed chromosome names, explicitly configure:
+
+```yaml
+modules:
+  harmonisation:
+    vcf_processing:
+      csq_prefixes_by_build:
+        GRCh37: {vcf: null, gff: null, fasta: null}
+        GRCh38: {vcf: null, gff: null, fasta: null}
+```
+
+For a `chr`-prefixed GFF with unprefixed VCF/FASTA, set that build's `gff` to
+`chr`. This emits `--unify-chr-names -,chr,-`; an all-null mapping omits the
+option. Prefixes cannot be empty, contain NUL/commas/whitespace or be the native
+`-` sentinel: use YAML `null` for an unchanged label. No CLI flag is added.
+
+Resource preflight scans all GFF feature rows once per unchanged shared file
+and compares the configured mapping with the source FASTA index and expected
+VCF chromosome labels before workers start. Sequence-region directives alone
+do not prove feature coverage. Distinct labels that collapse to one chromosome
+are rejected; unrelated alternative contigs need not occur in every resource.
+Existing exact FASTA/reference-VCF requirements from normalization and allele
+annotation remain authoritative. Prefix matching performs no chromosome alias
+inference and does not establish genome-build or sequence equivalence.
+
+The source build, resolved prefixes and expected native lookup labels are
+recorded in resource-preflight evidence and annotation command provenance.
+Reference FASTA/GFF files and VCF output labels are preserved; no FASTA, GFF or
+GTF rewrite is performed. The [`bcftools csq` manual](https://samtools.github.io/bcftools/bcftools.html#csq)
+defines the prefix order and preserved output names; the
+[native implementation](https://github.com/samtools/bcftools/blob/1.23/csq.c)
+requires literal source-prefix removal before adding the destination prefix.
