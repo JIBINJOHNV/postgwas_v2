@@ -162,9 +162,15 @@ from postgwas.modules.harmonisation.cleanup import (
 from postgwas.modules.harmonisation.resource_preflight import (
     ResourcePreflightError,
     recheck_preflighted_resource_map,
+    resource_preflight_file_paths,
+    preflight_resource_identities,
     validate_harmonisation_resource_maps,
 )
 from postgwas.modules.harmonisation.qc_results import qc_results_to_dataframe
+from postgwas.core.completion import file_fingerprint, configuration_digest
+from postgwas.core.input_validation import (
+    capture_preflight_file_identities, require_unchanged_preflight_files, validate_once,
+)
 from postgwas.core.values import optional_text
 
 from postgwas.config.models.modules.qc_summary import QCSummaryConfig
@@ -394,6 +400,39 @@ class _DatasetPreparation:
     ready_snps: int
     ready_indels_or_other: int
     partition_rows: Dict[str, int]
+
+
+@dataclass(frozen=True)
+class PreparedHarmonisation:
+    """Invocation-local preparation, never a durable or user-set skip flag."""
+
+    dataset: _DatasetPreparation
+    contract: str
+    identities: tuple
+    work_fingerprints: tuple = ()
+
+    def validate(self, sample_columns, defaults):
+        if self.contract != configuration_digest([sample_columns, defaults]):
+            raise PipelineError("Harmonisation configuration changed after preflight; rerun validation.")
+        try:
+            require_unchanged_preflight_files(self.identities, error_type=PipelineError)
+        except PipelineError as exc:
+            current = capture_preflight_file_identities((item.path for item in self.identities), error_type=PipelineError)
+            changes = [str(before.path)
+                       for before, after in zip(self.identities, current) if before != after]
+            raise PipelineError("%s\n%s" % (exc, "\n".join(changes))) from exc
+        for expected in self.work_fingerprints:
+            if _prepared_work_fingerprint(expected["path"]) != expected:
+                raise PipelineError("Prepared harmonisation work file changed after preflight: %s" % expected["path"])
+
+
+def _prepared_work_fingerprint(path):
+    # Generated work is validated as content, as in the global checkpoint
+    # contract. Filesystem metadata updates alone do not change scientific data.
+    return validate_once(
+        [path], ("harmonisation.prepared_work_fingerprint",),
+        lambda: file_fingerprint(path, error_type=PipelineError), error_type=PipelineError,
+    )
 
 
 @dataclass(frozen=True)
@@ -3462,6 +3501,8 @@ def harmonise_chromosomes(
     logger,
     input_line_count=None,
     progress=None,
+    preparation_only=False,
+    prepared=None,
 ):
     """Dataset steps 03-08, then the per-chromosome fan-out with retry rounds.
 
@@ -3500,7 +3541,7 @@ def harmonise_chromosomes(
     _announce(
         logger,
         "\n" + "\n".join([
-            screen_line("run", "Starting harmonisation and GWAS-to-VCF", indent=4),
+            screen_line("run", "Validating and preparing dataset inputs" if preparation_only else "Starting harmonisation and GWAS-to-VCF", indent=4),
             screen_field(
                 "info", "Input file", sumstat_file,
                 indent=8, label_width=18,
@@ -3514,35 +3555,38 @@ def harmonise_chromosomes(
         "chromosomes": {},
         "reject_files": [],
     }  # type: Dict[str, Any]
-    prepared = _prepare_dataset_for_chromosome_processing(
-        sumstat_file=sumstat_file,
-        sample_column_dict=sample_column_dict,
-        output_dir_path=output_dir_path,
-        resource_folder=resource_folder,
-        default_eaf_reference_source=default_eaf_reference_source,
-        default_comparison_af_file=default_comparison_af_file,
-        dbsnp=dbsnp,
-        resource_layout=resource_layout,
-        output_layout=output_layout,
-        gwas2vcf_input=gwas2vcf_input,
-        executables=executables,
-        vcf_config=vcf_config,
-        user_eaf_file=user_eaf_file,
-        user_eaf_column=user_eaf_column,
-        user_info_file=user_info_file,
-        user_info_column=user_info_column,
-        default_eaf_reference_column=default_eaf_reference_column,
-        default_comparison_af_column=default_comparison_af_column,
-        build_reference_files=build_reference_files,
-        build_check_colmap=build_check_colmap,
-        default_eaf_colmap=default_eaf_colmap,
-        external_eaf_colmap=external_eaf_colmap,
-        external_info_colmap=external_info_colmap,
-        external_reference_staging=external_reference_staging,
-        policies=pol,
-        logger=logger,
-        input_line_count=input_line_count,
-    )
+    if prepared is None:
+        prepared = _prepare_dataset_for_chromosome_processing(
+            sumstat_file=sumstat_file,
+            sample_column_dict=sample_column_dict,
+            output_dir_path=output_dir_path,
+            resource_folder=resource_folder,
+            default_eaf_reference_source=default_eaf_reference_source,
+            default_comparison_af_file=default_comparison_af_file,
+            dbsnp=dbsnp,
+            resource_layout=resource_layout,
+            output_layout=output_layout,
+            gwas2vcf_input=gwas2vcf_input,
+            executables=executables,
+            vcf_config=vcf_config,
+            user_eaf_file=user_eaf_file,
+            user_eaf_column=user_eaf_column,
+            user_info_file=user_info_file,
+            user_info_column=user_info_column,
+            default_eaf_reference_column=default_eaf_reference_column,
+            default_comparison_af_column=default_comparison_af_column,
+            build_reference_files=build_reference_files,
+            build_check_colmap=build_check_colmap,
+            default_eaf_colmap=default_eaf_colmap,
+            external_eaf_colmap=external_eaf_colmap,
+            external_info_colmap=external_info_colmap,
+            external_reference_staging=external_reference_staging,
+            policies=pol,
+            logger=logger,
+            input_line_count=input_line_count,
+        )
+    if preparation_only:
+        return prepared
     sample_column_dict = prepared.sample_columns
     chr_file_by_chrom = prepared.chromosome_files
     resource_maps = prepared.resource_maps
@@ -4908,22 +4952,66 @@ def _run_post_merge_stages(
     )
 
 
+def validate_harmonisation_inputs(sample_columns, defaults, *, policies=None, logger=None):
+    """Collect independent configuration, header and build-resource failures."""
+    policies = policies or _resolve_policies(defaults, sample_columns)
+    view = _validation_view(sample_columns, defaults)
+    problems = []
+    for operation in (
+        lambda: validate_config(view, policies=policies, logger=logger,
+            external_reference_delimiters={
+                "eaffile": defaults["external_eaf_colmap"]["delimiter"],
+                "infofile": defaults["external_info_colmap"]["delimiter"],
+            }),
+        lambda: validate_header(view, sample_columns.get("sumstat_file"), policies=policies, logger=logger),
+    ):
+        ok, found = operation()
+        if not ok:
+            problems.extend(found)
+    build_files = {
+        build: configured_output_path(
+            sample_columns["resource_folder"], defaults["resource_layout"]["build_check"],
+            error_type=PipelineError, build=build,
+        ) for build in defaults["vcf_processing"]["target_builds"]
+    }
+    errors = []
+    validator = validate_path(must_exist=True, must_be_file=True, must_not_be_empty=True)
+    for path in [sample_columns["sumstat_file"], *build_files.values()]:
+        try:
+            validator(path)
+        except argparse.ArgumentTypeError as exc:
+            errors.append("File invalid: %s: %s" % (path, exc))
+    if problems or errors:
+        raise ConfigError(problems, message="\n".join([
+            format_problems(problems, title="Input preflight for %s" % sample_columns["gwas_outputname"]),
+            *errors,
+        ]))
+    return build_files
+
+
 def run_harmonisation_pipeline(
     sample_column_dict: Dict[str, Any],
     default_cfg: Dict[str, Any],
     threads: int,
+    *,
+    preparation_only: bool = False,
+    prepared: PreparedHarmonisation | None = None,
 ):
     """Full harmonisation + gwas2vcf + merge + cleanup pipeline for one dataset.
 
     Restructured to plan Part 2: the configuration and the file header are
-    checked *before* the ten-million-row parse, so a mistyped column name costs
-    a second rather than a full read.  Nothing here calls ``sys.exit``; a bad
-    configuration raises :class:`ConfigError` and an incomplete run raises
-    :class:`PipelineError`, so ``cli.py`` can carry on with the next dataset.
+    checked together *before* the ten-million-row parse. ``preparation_only``
+    returns invocation-local evidence and partitions; ``prepared`` reuses that
+    evidence only with identical configuration and unchanged files. The CLI
+    prepares all rows before executing any. Nothing here calls ``sys.exit``;
+    failures are collected by that all-row boundary.
     Once the run manifest has been created, every ordinary exception records a
     terminal ``FAILED`` or ``PARTIAL`` state before it is re-raised; a user
     interruption records ``INTERRUPTED``.
     """
+    contract = configuration_digest([sample_column_dict, default_cfg])
+    if prepared is not None:
+        prepared.validate(sample_column_dict, default_cfg)
     started_at = time.time()
 
     # -----------------------------------------------------
@@ -5068,8 +5156,8 @@ def run_harmonisation_pipeline(
     try:
         logger.blank()
         logger.info(
-            "Harmonising %s from %s."
-            % (sample_id, sample_column_dict.get("sumstat_file"))
+            "%s %s from %s."
+            % ("Preparing" if preparation_only else "Harmonising", sample_id, sample_column_dict.get("sumstat_file"))
         )
         if executables_prevalidated:
             logger.info(
@@ -5139,128 +5227,47 @@ def run_harmonisation_pipeline(
             ]),
         )
 
-        # =====================================================
-        # 01/08  validate_config    — no file is read
-        # =====================================================
-        with logger.step(
-            1, DATASET_STEP_TOTAL, "Check the configuration", "validator.validate_config",
-            policy_keys=[
-            ],
-        ) as ctx:
-            ok, problems = validate_config(
-                _validation_view(sample_column_dict, default_cfg_obj),
-                policies=policies,
-                logger=logger,
-                external_reference_delimiters={
-                    "eaffile": external_eaf_colmap["delimiter"],
-                    "infofile": external_info_colmap["delimiter"],
-                },
-            )
-            if not ok:
-                report = format_problems(
-                    problems,
-                    title="Configuration check for %s" % sample_id,
-                    footer="Nothing was read from the input file. Fix the config and re-run.",
+        build_reference_files = None
+        input_line_count = None
+        initial_identities = ()
+        if prepared is None:
+            with logger.step(
+                1, DATASET_STEP_TOTAL, "Check configuration, header and build resources",
+                "service.validate_harmonisation_inputs",
+            ) as ctx:
+                build_reference_files = validate_harmonisation_inputs(
+                    sample_column_dict, default_cfg_obj, policies=policies, logger=logger,
                 )
-                ctx.failure_hint = (
-                    "The configuration for this dataset is not usable as written."
+                ctx.info("Configuration, input header and build resources passed together.")
+            with logger.step(
+                2, DATASET_STEP_TOTAL, "Confirm the file header", "validator.validate_header",
+            ) as ctx:
+                ctx.info("All mapped columns were checked with the configuration; the header is not reread.")
+            if preparation_only:
+                initial_identities = capture_preflight_file_identities(
+                    [sample_column_dict["sumstat_file"], *build_reference_files.values()],
+                    error_type=PipelineError,
                 )
-                raise ConfigError(problems, message=report)
-            ctx.info("The configuration is complete and every named file exists.")
 
-        # ---------------------------------------------------------
-        # Resource folder and build check files
-        # ---------------------------------------------------------
-        resource_folder = Path(sample_column_dict["resource_folder"])
-        if not resource_folder.exists():
-            raise ConfigError(
-                [], message="Resource folder does not exist:\n   %s" % resource_folder
-            )
-        if not resource_folder.is_dir():
-            raise ConfigError(
-                [], message="Resource folder is not a directory:\n   %s" % resource_folder
-            )
-        if not any(resource_folder.iterdir()):
-            raise ConfigError(
-                [], message="Resource folder is empty:\n   %s" % resource_folder
-            )
-
-        file_validator = validate_path(
-            must_exist=True,
-            must_be_file=True,
-            must_not_be_empty=True,
-        )
-        errors = []
-        build_reference_files = {
-            build: configured_output_path(
-                sample_column_dict["resource_folder"],
-                resource_layout["build_check"],
-                error_type=PipelineError,
-                build=build,
-            )
-            for build in vcf_config["target_builds"]
-        }
-        for path in [
-            sample_column_dict["sumstat_file"],
-            *build_reference_files.values(),
-        ]:
-            try:
-                file_validator(path)
-            except argparse.ArgumentTypeError as e:
-                errors.append("File invalid: %s\n   → %s" % (path, e))
-        if errors:
-            raise ConfigError(
-                [],
-                message="One or more required files are invalid:\n" + "\n".join(errors),
-            )
-
-        # =====================================================
-        # 02/08  validate_header    — reads one line
-        # =====================================================
-        with logger.step(
-            2, DATASET_STEP_TOTAL, "Check the file header", "validator.validate_header",
-            policy_keys=[
-                "input.delimiter",
-                "validation.declaration_mismatch_action",
-                "validation.fuzzy_match_cutoff",
-                "validation.on_ambiguous_column_mapping",
-                "validation.on_duplicate_header",
-            ],
-        ) as ctx:
-            ok, problems = validate_header(
-                _validation_view(sample_column_dict, default_cfg_obj),
-                sample_column_dict["sumstat_file"],
+            # --------------------------------------------------------
+            # Truncation check, before a long run
+            # ---------------------------------------------------------
+            _truncation_warnings, input_line_count = inspect_summary_statistics_file(
+                file_path=sample_column_dict["sumstat_file"],
+                io_buffer_bytes=vcf_config["io_buffer_bytes"],
                 policies=policies,
                 logger=logger,
             )
-            if not ok:
-                report = format_problems(
-                    problems,
-                    title="Header check for %s" % sample_id,
-                    footer="Nothing was read beyond the header. Fix the config and re-run.",
-                )
-                ctx.failure_hint = (
-                    "The configuration names columns that are not in the input file."
-                )
-                raise ConfigError(problems, message=report)
-            ctx.info("Every configured column name is present in the file header.")
 
-        # --------------------------------------------------------
-        # Truncation check, before a long run
-        # ---------------------------------------------------------
-        _truncation_warnings, input_line_count = inspect_summary_statistics_file(
-            file_path=sample_column_dict["sumstat_file"],
-            io_buffer_bytes=vcf_config["io_buffer_bytes"],
-            policies=policies,
-            logger=logger,
-        )
+        else:
+            logger.info("Reusing validated dataset preparation after the all-row preflight.")
 
         # ---------------------------------------------------------
         # STEPS 03-08 + the per-chromosome fan-out
         # ---------------------------------------------------------
         dataset_extra = {}  # type: Dict[str, Any]
         try:
-            qc_results, grch_version = harmonise_chromosomes(
+            chromosome_result = harmonise_chromosomes(
                 sumstat_file=sample_column_dict["sumstat_file"],
                 sample_column_dict=sample_column_dict,
                 output_dir=sample_column_dict["output_folder"],
@@ -5291,7 +5298,32 @@ def run_harmonisation_pipeline(
                 logger=logger,
                 input_line_count=input_line_count,
                 progress=progress,
+                preparation_only=preparation_only,
+                prepared=prepared.dataset if prepared is not None else None,
             )
+            if preparation_only:
+                require_unchanged_preflight_files(initial_identities, error_type=PipelineError)
+                reference_identities = preflight_resource_identities(chromosome_result.resource_preflight)
+                require_unchanged_preflight_files(reference_identities, error_type=PipelineError)
+                original_paths = {item.path for item in reference_identities}
+                staged_paths = {path.resolve() for path in resource_preflight_file_paths(chromosome_result.resource_maps)} - original_paths
+                work_paths = {Path(path) for path in chromosome_result.chromosome_files.values()} | staged_paths
+                work_paths.add(chromosome_result.field_completeness_path)
+                if policies.get("rejects.enabled"):
+                    work_paths.update(configured_output_path(
+                        output_folder, output_layout["chromosome_source_snapshot"],
+                        dataset_id=sample_id, chromosome=chromosome,
+                    ) for chromosome in chromosome_result.chromosome_files)
+                work_fingerprints = tuple(_prepared_work_fingerprint(path) for path in sorted(work_paths))
+                manifest["status"] = "PREFLIGHT_PASSED"
+                manifest["dataset"] = {"study_decisions": chromosome_result.dataset_study_decisions}
+                _write_run_manifest(manifest_path, manifest)
+                return PreparedHarmonisation(
+                    chromosome_result, contract,
+                    tuple({item.path: item for item in (*initial_identities, *reference_identities)}.values()),
+                    work_fingerprints,
+                )
+            qc_results, grch_version = chromosome_result
         except PipelineError as exc:
             progress.fail_active_chromosomes()
             # The chromosomes that did complete still have QC worth keeping.

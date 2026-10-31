@@ -181,6 +181,7 @@ class HarmonisationSampleSheetRow(BaseModel):
     external_eaf_column: str | None = None
     delimiter: Literal["auto", "tab", "comma", "semicolon", "space", "whitespace"] = "auto"
     _normalisation_warnings: list[str] = PrivateAttr(default_factory=list)
+    _row_number: int | None = PrivateAttr(default=None)
 
     @field_validator("*", mode="before")
     @classmethod
@@ -198,15 +199,16 @@ class HarmonisationSampleSheetRow(BaseModel):
 
     @model_validator(mode="after")
     def validate_alternatives(self, info: ValidationInfo):
+        problems = []
         if self.config_version != SAMPLE_SHEET_VERSION:
-            raise ValueError("config_version must be %d" % SAMPLE_SHEET_VERSION)
+            problems.append("config_version must be %d" % SAMPLE_SHEET_VERSION)
         draft = bool(info.context and info.context.get("allow_missing_mappings"))
         if not draft and not ((self.chromosome_column and self.position_column) or self.chromosome_position_column):
-            raise ValueError(
+            problems.append(
                 "provide chromosome_column plus position_column, or chromosome_position_column"
             )
         if not draft and not self.effect_column and not self.z_score_column:
-            raise ValueError("provide effect_column or z_score_column")
+            problems.append("provide effect_column or z_score_column")
 
         internal_eaf = self.effect_allele_frequency_column is not None
         external_eaf = self.external_eaf_file is not None or self.external_eaf_column is not None
@@ -216,7 +218,7 @@ class HarmonisationSampleSheetRow(BaseModel):
                 if self.external_eaf_file is None
                 else "external_eaf_column"
             )
-            raise ValueError(
+            problems.append(
                 "Dataset %r has an incomplete external EAF source: %s is missing. "
                 "Set both external_eaf_file and external_eaf_column, or set both "
                 "to NA and provide effect_allele_frequency_column instead."
@@ -226,7 +228,7 @@ class HarmonisationSampleSheetRow(BaseModel):
             info.context and info.context.get("allow_missing_eaf")
         )
         if internal_eaf and external_eaf:
-            raise ValueError(
+            problems.append(
                 "Dataset %r provides two allele-frequency sources: internal "
                 "effect_allele_frequency_column=%r and external_eaf_file plus "
                 "external_eaf_column. Keep exactly one source and set the other "
@@ -234,7 +236,7 @@ class HarmonisationSampleSheetRow(BaseModel):
                 % (self.dataset_id, self.effect_allele_frequency_column)
             )
         if not internal_eaf and not external_eaf and not draft_allows_missing_eaf:
-            raise ValueError(
+            problems.append(
                 "Dataset %r has no allele-frequency source. Complete the sample "
                 "sheet by setting either effect_allele_frequency_column to the "
                 "exact study EAF/MAF column name, or both external_eaf_file and "
@@ -254,7 +256,7 @@ class HarmonisationSampleSheetRow(BaseModel):
                 if self.external_info_file is None
                 else "external_info_column"
             )
-            raise ValueError(
+            problems.append(
                 "Dataset %r has an incomplete external INFO source: %s is "
                 "missing. Set both external_info_file and external_info_column, "
                 "or set both to NA and provide imputation_info_column or the "
@@ -268,11 +270,13 @@ class HarmonisationSampleSheetRow(BaseModel):
             info.context and info.context.get("allow_missing_sample_size")
         )
         if not has_controls and not draft_allows_missing_sample_size:
-            raise ValueError("provide control_count_column or control_count")
+            problems.append("provide control_count_column or control_count")
         if self.trait_type == "case_control" and not has_cases and not draft_allows_missing_sample_size:
-            raise ValueError("case-control traits require case_count_column or case_count")
+            problems.append("case-control traits require case_count_column or case_count")
         if self.trait_type == "quantitative" and has_cases:
-            raise ValueError("quantitative traits must not provide case-count fields")
+            problems.append("quantitative traits must not provide case-count fields")
+        if problems:
+            raise ValueError("; ".join(problems))
         return self
 
     @classmethod
@@ -303,7 +307,7 @@ class _HarmonisationSampleSheetDraftRow(HarmonisationSampleSheetRow):
     p_value_column: str | None = None
 
 
-def _read_records(sample_sheet: Path) -> tuple[list[str], list[dict[str, str]]]:
+def _read_records(sample_sheet: Path, issues: list[dict]) -> tuple[list[str], list[tuple[int, dict[str, str]]]]:
     try:
         with sample_sheet.open("r", encoding="utf-8", newline="") as handle:
             sample = handle.read(8192)
@@ -317,18 +321,22 @@ def _read_records(sample_sheet: Path) -> tuple[list[str], list[dict[str, str]]]:
             reader = csv.reader(handle, dialect)
             raw_header = next(reader)
             records = []
-            for line_number, row in enumerate(reader, start=2):
+            for row in reader:
+                line_number = reader.line_num
                 if not any(cell.strip() for cell in row):
                     continue
                 if len(row) != len(raw_header):
-                    raise ConfigurationError(
-                        "Sample-sheet row %d has %d values but the header has %d columns."
-                        % (line_number, len(row), len(raw_header))
-                    )
-                records.append(dict(zip(raw_header, row)))
+                    issues.append({
+                        "row": line_number, "dataset_id": "", "input_file": "",
+                        "stage": "sample sheet", "status": "failed",
+                        "problem": "Sample-sheet row %d has %d values but the header has %d columns."
+                        % (line_number, len(row), len(raw_header)),
+                    })
+                    continue
+                records.append((line_number, dict(zip(raw_header, row))))
     except (OSError, csv.Error) as exc:
         raise ConfigurationError("Cannot parse sample sheet %s: %s" % (sample_sheet, exc)) from exc
-    if not records:
+    if not records and not issues:
         raise ConfigurationError("Sample sheet has no dataset rows: %s" % sample_sheet)
     return raw_header, records
 
@@ -351,10 +359,17 @@ def _validation_error_text(exc: ValidationError) -> str:
     return "; ".join(messages) or str(exc)
 
 
-def load_harmonisation_sample_sheet(path: str | Path) -> list[HarmonisationSampleSheetRow]:
-    """Normalize and validate rows without opening any referenced data file."""
+def load_harmonisation_sample_sheet(
+    path: str | Path, *, issues: list[dict] | None = None,
+) -> list[HarmonisationSampleSheetRow]:
+    """Check every row; optionally collect issues for the full-run preflight.
+
+    Without a collector, preserve the public fail-on-invalid-sheet contract,
+    but raise only after every independently readable row has been checked.
+    """
+    collected = [] if issues is None else issues
     sample_sheet = Path(path).expanduser().resolve()
-    raw_header, raw_records = _read_records(sample_sheet)
+    raw_header, raw_records = _read_records(sample_sheet, collected)
     normalized_header = [normalise_header(name) for name in raw_header]
     duplicates = sorted({name for name in normalized_header if normalized_header.count(name) > 1})
     if duplicates:
@@ -362,69 +377,76 @@ def load_harmonisation_sample_sheet(path: str | Path) -> list[HarmonisationSampl
 
     rows: list[HarmonisationSampleSheetRow] = []
     seen_ids: dict[str, int] = {}
-    seen_inputs: dict[Path, int] = {}
+    seen_inputs: dict[str, int] = {}
     normalized_names = dict(zip(raw_header, normalized_header))
-    for row_number, raw in enumerate(raw_records, start=2):
+    for row_number, raw in raw_records:
         record = {normalized_names[key]: value for key, value in raw.items()}
+        row_problems = []
         warnings: list[str] = []
         for field in INFERABLE_FIELDS:
             record[field] = _normalise_inferable(field, record.get(field), warnings, row_number)
         for field in ("control_count", "case_count"):
-            record[field] = _normalise_count(record.get(field), field, row_number)
+            try:
+                record[field] = _normalise_count(record.get(field), field, row_number)
+            except ConfigurationError as exc:
+                row_problems.append(str(exc))
+                record[field] = None
         for field in ("input_file", "external_info_file", "external_eaf_file"):
-            record[field] = _normalise_path(record.get(field), sample_sheet)
+            try:
+                record[field] = _normalise_path(record.get(field), sample_sheet)
+            except (OSError, ValueError, RuntimeError) as exc:
+                row_problems.append("Invalid %s: %s" % (field, exc))
+                record[field] = None
         try:
             row = HarmonisationSampleSheetRow.model_validate(record)
         except ValidationError as exc:
-            dataset = record.get("dataset_id")
-            dataset_context = (
-                " for dataset %r" % dataset if not _missing(dataset) else ""
-            )
-            raise ConfigurationError(
-                "Invalid sample-sheet row %d%s in %s: %s"
-                % (
-                    row_number,
-                    dataset_context,
-                    sample_sheet,
-                    _validation_error_text(exc),
-                )
-            ) from exc
-        row._normalisation_warnings.extend(warnings)
-        if row.imputation_info_column and (
-            row.external_info_file or row.external_info_column
+            row = None
+            row_problems.append(_validation_error_text(exc))
+        # File availability and duplicate identities do not depend on a valid
+        # scientific mapping. Check them even when another cell is invalid.
+        for field in ("input_file", "external_eaf_file", "external_info_file"):
+            value = record.get(field)
+            if value is None or (field == "external_info_file" and not _missing(record.get("imputation_info_column"))):
+                continue
+            try:
+                check = _require_nonempty_file if field == "input_file" else _require_external_resource
+                check(Path(value), field, row_number)
+            except (ConfigurationError, OSError, ValueError, RuntimeError) as exc:
+                row_problems.append(str(exc))
+        for field, seen, identity in (
+            ("dataset_id", seen_ids, str(record.get("dataset_id") or "").casefold()),
+            ("input_file", seen_inputs, record.get("input_file")),
         ):
+            if not identity:
+                continue
+            if identity in seen:
+                row_problems.append("Duplicate %s %r in rows %d and %d." % (
+                    field, record[field], seen[identity], row_number,
+                ))
+            else:
+                seen[identity] = row_number
+        if row_problems:
+            for problem in row_problems:
+                collected.append({
+                    "row": row_number, "dataset_id": record.get("dataset_id") or "",
+                    "input_file": record.get("input_file") or "",
+                    "stage": "sample sheet", "status": "failed",
+                    "problem": "Invalid sample-sheet row %d for dataset %r: %s"
+                    % (row_number, record.get("dataset_id"), problem),
+                })
+            continue
+        row._row_number = row_number
+        row._normalisation_warnings.extend(warnings)
+        if row.imputation_info_column and (row.external_info_file or row.external_info_column):
             row._normalisation_warnings.append(
-                "Row %d: internal INFO column %r has priority; the listed "
-                "external INFO source will not be used."
+                "Row %d: internal INFO column %r has priority; the listed external INFO source will not be used."
                 % (row_number, row.imputation_info_column)
             )
-
-        _require_nonempty_file(row.input_file, "input_file", row_number)
-        if row.external_eaf_file:
-            _require_external_resource(
-                row.external_eaf_file, "external_eaf_file", row_number,
-            )
-        if row.external_info_file and row.imputation_info_column is None:
-            _require_external_resource(
-                row.external_info_file, "external_info_file", row_number,
-            )
-
-        normalized_id = row.dataset_id.casefold()
-        if normalized_id in seen_ids:
-            raise ConfigurationError(
-                "Duplicate dataset_id %r in rows %d and %d."
-                % (row.dataset_id, seen_ids[normalized_id], row_number)
-            )
-        seen_ids[normalized_id] = row_number
-
-        normalized_input = row.input_file.resolve(strict=False)
-        if normalized_input in seen_inputs:
-            raise ConfigurationError(
-                "Duplicate input_file %s in rows %d and %d."
-                % (normalized_input, seen_inputs[normalized_input], row_number)
-            )
-        seen_inputs[normalized_input] = row_number
         rows.append(row)
+    if issues is None and collected:
+        raise ConfigurationError("Sample-sheet validation failed:\n" + "\n".join(
+            item["problem"] for item in collected
+        ))
     return rows
 
 

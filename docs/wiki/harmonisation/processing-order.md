@@ -3,6 +3,13 @@
 PostGWAS takes a study's raw GWAS summary-statistics table and produces
 allele-aligned, build-resolved GWAS-VCFs with QC and rejection evidence.
 
+Before chromosome processing, PostGWAS now completes dataset preparation for every
+usable selected sample-sheet row. Errors from all rows are collected in the configured
+preflight CSV and canonical log. If any row fails, no dataset enters chromosome
+harmonisation. On success, the existing prepared partitions and decisions are reused;
+the original summary-statistics files are not parsed again. This changes scheduling,
+not the order or thresholds of the scientific checks within a dataset.
+
 This page is the step-by-step walkthrough of that process. It follows the real
 runtime order: the same stage and step names appear in the log files, so you can
 read a log alongside this page and know exactly where a run is. Nothing here is
@@ -79,8 +86,8 @@ The 29 numbered steps inside stages 2, 3 and 5 are the ones named in the logs:
 
 | Stage | Log label | What happens |
 |---|---|---|
-| 2 | Dataset step 1 | Check configuration, column mappings, and policy compatibility. |
-| 2 | Dataset step 2 | Check the header and count data rows. |
+| 2 | Dataset step 1 | Check configuration, header mappings and build resources together. |
+| 2 | Dataset step 2 | Confirm the completed header check, then inspect the input stream and count data rows. |
 | 2 | Dataset step 3 | Read and clean the study; reject unusable rows. |
 | 2 | Dataset step 4 | Check parsed values and plan missing sample sizes. |
 | — | *chromosome-X reconstruction guard* | Stop before further dataset work when X would require assumption-based Z-only BETA/SE reconstruction. |
@@ -211,12 +218,13 @@ PostGWAS performs these checks first:
 4. Check the resource root, output directory, required executables, and the
    configured bcftools liftover plugin. Exact chromosome files cannot yet be
    selected because the study's build and observed chromosomes are not known.
-5. Save the resolved configuration, command, normalized sample-sheet row, and
-   initial logs. Initialize one screen report per selected dataset and the
-   run-level summary CSV with one `NOT_RUN` row for every selected dataset.
-6. Process sample-sheet datasets one at a time. A failed dataset does not erase
-   another dataset that completed successfully. Before each dataset begins,
-   its summary row changes to `RUNNING`.
+5. Save the resolved configuration and start the canonical logs.
+6. Prepare every usable selected dataset and collect failures across rows. Save
+   the preflight CSV. If any prerequisite fails, stop before chromosome processing
+   for all datasets. Otherwise initialize the per-dataset reports, normalized
+   sample-sheet rows, command records and run summary with `NOT_RUN` rows.
+   Process datasets one at a time using their existing preparation; each analysis
+   summary changes to `RUNNING` when execution begins.
 
 If one of these checks fails, chromosome analysis has not started.
 
@@ -232,12 +240,14 @@ chromosome will reuse.
 
 These eight steps run once on the complete study.
 
-1. **Dataset step 1 — Check configuration.** PostGWAS checks column mappings,
-   alternative inputs, EAF/INFO sources, sample-size declarations, resources,
-   and policy compatibility. The full study file is not read yet.
+1. **Dataset step 1 — Check configuration, header and build resources.** PostGWAS
+   collects independent failures in column mappings, alternative inputs, EAF/INFO
+   sources, sample-size declarations, file headers and required build-check files.
+   The full study file is not read yet.
 
-2. **Dataset step 2 — Check the header.** It confirms that every configured
-   column exists. It then checks that the input stream is readable and not
+2. **Dataset step 2 — Confirm the file header.** It records that every configured
+   column was checked in the previous step, without rereading the header. The
+   following stream inspection checks that the input is readable and not
    obviously truncated, and counts the data rows for later accounting.
 
 3. **Dataset step 3 — Read and clean the study.** Polars reads the configured

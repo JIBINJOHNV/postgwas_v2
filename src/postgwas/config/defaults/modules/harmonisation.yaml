@@ -654,6 +654,7 @@ module:
     top_metadata_directory: run_metadata
     resolved_config_file: resolved_config.yaml
     run_summary_file: harmonisation_run_summary.csv
+    preflight_report_file: harmonisation_preflight.csv
     run_html_report: harmonisation_run_report.html
     sample_sheet_row_file: sample_sheet_row.json
     command_file: command.txt

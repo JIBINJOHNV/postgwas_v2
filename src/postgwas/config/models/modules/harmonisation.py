@@ -747,6 +747,7 @@ class HarmonisationRuntimeConfig(StrictModel):
     top_metadata_directory: str
     resolved_config_file: str
     run_summary_file: str
+    preflight_report_file: str
     run_html_report: str
     sample_sheet_row_file: str
     command_file: str
@@ -754,7 +755,7 @@ class HarmonisationRuntimeConfig(StrictModel):
 
     @field_validator(
         "metadata_directory", "top_metadata_directory", "resolved_config_file",
-        "run_summary_file", "run_html_report",
+        "run_summary_file", "preflight_report_file", "run_html_report",
         "sample_sheet_row_file", "command_file", "supplied_config_file",
     )
     @classmethod

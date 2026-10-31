@@ -8,9 +8,18 @@ before chromosome partitions are written or worker processes are started.
 from __future__ import annotations
 
 import csv
+import os
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from postgwas.core.input_validation import (
+    validate_once, record_file_validation, capture_preflight_file_identities,
+    require_unchanged_preflight_files, PreflightFileIdentity,
+)
+from postgwas.modules.harmonisation.shared.allele_join import prepare_reference_values
+from postgwas.modules.harmonisation.shared.variant_columns import read_reference_variant_table
+from postgwas.modules.harmonisation.shared.statistics import frequency_maf_screen
 from postgwas.core.io.delimiters import open_text, resolve_delimiter
 from postgwas.core.processes import run_checked_command
 from postgwas.core.vcf import annotation_vcf_fields, declared_vcf_tag_definitions
@@ -340,6 +349,60 @@ def _mapping_columns(
     return structural | {value}, None
 
 
+def _read_resource_once(paths, contract, operation):
+    """Cache only successful read-only checks, including companion files."""
+    def check():
+        result, problem = operation()
+        if problem is not None:
+            raise ValueError(problem)
+        record_file_validation(paths[0], "Harmonisation reference", checks=(contract[0],))
+        return result
+    try:
+        return validate_once(paths, contract, check), None
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {}, str(exc)
+
+
+def resource_preflight_file_paths(resource_maps):
+    """Include the actual reference files and their index dependencies."""
+    paths = set()
+    for resources in resource_maps.values():
+        for key in _RESOURCE_LABELS:
+            value = resources.get(key)
+            if value is None:
+                continue
+            path = Path(value)
+            paths.add(path)
+            if key in ("default_comparison_af_file", "dbsnp_file"):
+                index = _index_path(path, (".tbi", ".csi"))
+                if index is not None:
+                    paths.add(index)
+            elif key in ("genome_fasta_file", "target_fasta"):
+                paths.add(Path(str(path) + ".fai"))
+    return sorted(paths)
+
+
+def _external_frequency_screen(path, column, mapping, policies):
+    """Same normalized, deduplicated raw column as the external AF join."""
+    def check():
+        raw, _delimiter = read_reference_variant_table(
+            path, mapping, policies, value_columns=[column],
+        )
+        normalized, _duplicates, _rows = prepare_reference_values(
+            raw,
+            {"chr": mapping["chr"], "pos": mapping["pos"], "ea": mapping["a1"], "oa": mapping["a2"]},
+            column, policies,
+            exact_action=str(policies.get("external_reference.exact_duplicate_action")),
+            non_identical_action=str(policies.get("external_reference.non_identical_duplicate_action")),
+            label="external frequency reference",
+        )
+        return frequency_maf_screen(normalized, column, float(policies.get("eaf.maf_decision_cutoff")))
+
+    return validate_once(
+        [path], ("harmonisation.external_frequency_screen", column, dict(mapping), policies.resolved_dict()), check,
+    )
+
+
 def validate_harmonisation_resource_maps(
     resource_maps: Mapping[str, Mapping[str, Any]],
     *,
@@ -355,6 +418,7 @@ def validate_harmonisation_resource_maps(
     """Validate every resolved resource and return serialisable provenance."""
     issues: dict[tuple[str, str, str], set[str]] = {}
     file_cache: dict[str, str | None] = {}
+    identities = {}
     vcf_cache: dict[str, tuple[dict[str, int | None], str | None]] = {}
     vcf_header_cache: dict[
         str, tuple[dict[str, dict[str, str]], str | None]
@@ -397,10 +461,21 @@ def validate_harmonisation_resource_maps(
                 _add_issue(issues, chromosome, label, path, problem)
                 continue
 
+            for dependency in resource_preflight_file_paths({chromosome: {key: path}}):
+                if dependency not in identities and _basic_file_problem(dependency) is None:
+                    try:
+                        identity = capture_preflight_file_identities([dependency])[0]
+                        identities.setdefault(identity.path, identity)
+                    except (OSError, RuntimeError) as exc:
+                        _add_issue(issues, chromosome, label, dependency, str(exc))
+
             if key in ("default_comparison_af_file", "dbsnp_file"):
                 if str(path) not in vcf_cache:
-                    vcf_cache[str(path)] = _vcf_index_state(
-                        path, bcftools, logger=logger,
+                    index = _index_path(path, (".tbi", ".csi"))
+                    vcf_cache[str(path)] = _read_resource_once(
+                        [path, *([index] if index is not None else [])],
+                        ("harmonisation.vcf_index", bcftools),
+                        lambda: _vcf_index_state(path, bcftools, logger=logger),
                     )
                 contigs, problem = vcf_cache[str(path)]
                 if problem is not None:
@@ -419,8 +494,9 @@ def validate_harmonisation_resource_maps(
                     )
                 if key == "default_comparison_af_file":
                     if str(path) not in vcf_header_cache:
-                        vcf_header_cache[str(path)] = _vcf_info_definitions(
-                            path, bcftools, logger=logger,
+                        vcf_header_cache[str(path)] = _read_resource_once(
+                            [path], ("harmonisation.vcf_header", bcftools),
+                            lambda: _vcf_info_definitions(path, bcftools, logger=logger),
                         )
                     definitions, header_problem = vcf_header_cache[str(path)]
                     if header_problem is not None:
@@ -456,7 +532,10 @@ def validate_harmonisation_resource_maps(
 
             elif key in ("genome_fasta_file", "target_fasta"):
                 if str(path) not in fasta_cache:
-                    fasta_cache[str(path)] = _fasta_index_state(path)
+                    fasta_cache[str(path)] = _read_resource_once(
+                        [path, Path(str(path) + ".fai")], ("harmonisation.fasta_index",),
+                        lambda: _fasta_index_state(path),
+                    )
                 contigs, problem = fasta_cache[str(path)]
                 if problem is not None:
                     _add_issue(issues, chromosome, label, path, problem)
@@ -488,8 +567,9 @@ def validate_harmonisation_resource_maps(
                     tuple(sorted(required_columns)),
                 )
                 if cache_key not in table_cache:
-                    columns, header_problem = _table_header(
-                        path, str(mapping["delimiter"]), policies,
+                    columns, header_problem = _read_resource_once(
+                        [path], ("harmonisation.table_header", str(mapping["delimiter"]), policies.resolved_dict()),
+                        lambda: _table_header(path, str(mapping["delimiter"]), policies),
                     )
                     if header_problem is not None:
                         table_cache[cache_key] = header_problem
@@ -506,13 +586,17 @@ def validate_harmonisation_resource_maps(
 
             elif key == "annot_path":
                 if str(path) not in gff_cache:
-                    gff_cache[str(path)] = _gff_problem(path)
+                    _result, gff_cache[str(path)] = _read_resource_once(
+                        [path], ("harmonisation.gff_header",), lambda: (None, _gff_problem(path)),
+                    )
                 problem = gff_cache[str(path)]
                 if problem is not None:
                     _add_issue(issues, chromosome, label, path, problem)
             elif key == "chain_file":
                 if str(path) not in chain_cache:
-                    chain_cache[str(path)] = _chain_mapping_state(path)
+                    chain_cache[str(path)] = _read_resource_once(
+                        [path], ("harmonisation.chain_mapping",), lambda: _chain_mapping_state(path),
+                    )
                 _mappings, problem = chain_cache[str(path)]
                 if problem is not None:
                     _add_issue(issues, chromosome, label, path, problem)
@@ -545,12 +629,45 @@ def validate_harmonisation_resource_maps(
                         % (str(chromosome), ", ".join(sorted(target_labels))),
                     )
 
+    # File identity alone is not an error. A MAF-like source cannot validate
+    # itself, even via another path, symlink, hard link or population column.
+    for chromosome, resources in resource_maps.items():
+        external = resources.get("user_eaf_file")
+        reference = resources.get("default_eaf_file")
+        if external is None or reference is None:
+            continue
+        try:
+            if not os.path.samefile(external, reference):
+                continue
+            column = resources.get("user_eaf_column")
+            required, problem = _mapping_columns(external_eaf_colmap, column)
+            if problem is not None:
+                continue
+            cache_key = (str(external), str(external_eaf_colmap["delimiter"]), tuple(sorted(required)))
+            if cache_key not in table_cache or table_cache[cache_key] is not None:
+                continue
+            screen = _external_frequency_screen(external, column, external_eaf_colmap, policies)
+            if screen["maf_like"]:
+                raise ValueError(
+                    "External AF column %r is MAF-like: %.2f%% of %d usable frequencies are at or below 0.5 "
+                    "(cutoff %.2f%%). external_eaf_file and modules.harmonisation.default_eaf.source "
+                    "resolve to the same file, so this source cannot independently validate itself. "
+                    "Configure an independent default_eaf.source with compatible build, alleles and population."
+                    % (column, 100 * screen["low_fraction_of_usable"], screen["usable"], 100 * screen["decision_cutoff"])
+                )
+            record_file_validation(external, "External allele-frequency source", checks=("independent reference when MAF-like",), metrics=screen)
+        except Exception as exc:
+            _add_issue(issues, chromosome, "external/default AF compatibility", external, str(exc))
+            record_file_validation(external, "External allele-frequency source", status="failed", message=str(exc))
+
     records = _issue_records(issues)
     if records:
         raise ResourcePreflightError(records)
 
+    require_unchanged_preflight_files(identities.values())
     return {
         "status": "passed",
+        "file_identities": [{**asdict(value), "path": str(value.path)} for value in identities.values()],
         "chromosomes": sorted(resource_maps, key=_chromosome_sort_key),
         "require_default_eaf": bool(require_default_eaf),
         "unique_resource_files_checked": len(file_cache),
@@ -564,6 +681,12 @@ def validate_harmonisation_resource_maps(
             for chromosome, resources in resource_maps.items()
         },
     }
+
+
+def preflight_resource_identities(summary):
+    """Restore invocation-local identities from serialisable resource evidence."""
+    return tuple(PreflightFileIdentity(**{**item, "path": Path(item["path"])})
+                 for item in summary["file_identities"])
 
 
 def recheck_preflighted_resource_map(

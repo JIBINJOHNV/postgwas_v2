@@ -142,6 +142,30 @@ def deduplicate_reference_values(
     }
 
 
+def prepare_reference_values(
+    reference, columns, value_column, policies, *, exact_action,
+    non_identical_action, error_type=RuntimeError, warn=None, label="reference table",
+    output_columns=None,
+):
+    """Normalize allele keys and resolve duplicates before AF screening/joining."""
+    keys = [columns[key] for key in ("chr", "pos", "ea", "oa")]
+    reference, _normalization = canonicalize_variant_frame(
+        reference.select([*keys, value_column]), columns, policies,
+        error_type=error_type, warn=warn, label=label,
+    )
+    reference = reference.with_columns(pl.col(value_column).cast(pl.Float64, strict=False))
+    if output_columns is not None:
+        reference = reference.rename({columns[key]: output_columns[key] for key in ("chr", "pos", "ea", "oa")})
+        keys = [output_columns[key] for key in ("chr", "pos", "ea", "oa")]
+    rows_before = reference.height
+    reference, statistics = deduplicate_reference_values(
+        reference, keys, value_column, exact_action=exact_action,
+        non_identical_action=non_identical_action, reference_label=label,
+        error_type=error_type,
+    )
+    return reference, statistics, rows_before
+
+
 def allele_oriented_left_join(
     study: pl.DataFrame,
     reference: pl.DataFrame,
@@ -226,30 +250,10 @@ def allele_oriented_left_join(
             label="study",
         )
 
-    reference = reference.select(required_reference_columns)
-    reference, _reference_normalization = canonicalize_variant_frame(
-        reference,
-        reference_columns,
-        policies,
-        error_type=error_type,
-        warn=warn,
-        label=reference_label,
-    )
-    reference = reference.with_columns(
-        pl.col(value_column).cast(pl.Float64, strict=False)
-    ).rename({
-        reference_columns[key]: study_columns[key] for key in required_keys
-    })
-
-    rows_before_deduplication = reference.height
-    reference, duplicate_stats = deduplicate_reference_values(
-        reference,
-        study_keys,
-        value_column,
-        exact_action=duplicate_exact_action,
-        non_identical_action=duplicate_non_identical_action,
-        reference_label=reference_label,
-        error_type=error_type,
+    reference, duplicate_stats, rows_before_deduplication = prepare_reference_values(
+        reference, reference_columns, value_column, policies,
+        exact_action=duplicate_exact_action, non_identical_action=duplicate_non_identical_action,
+        error_type=error_type, warn=warn, label=reference_label, output_columns=study_columns,
     )
     rows_after_deduplication = reference.height
     if swapped_value == "one_minus":

@@ -6,7 +6,33 @@ columns, such as `phenotype`, `pubmed_id`, or custom review notes, are allowed
 and ignored during harmonisation. They remain in your source sheet and are
 not included in the normalized analysis row. Required fields and the values
 of recognized fields are still validated. Referenced data files are checked for existence and size
-during sample-sheet preflight but opened only by later execution preflight.
+during sample-sheet validation and opened during dataset preparation. All selected
+datasets finish preflight before any chromosome harmonisation starts.
+
+## All-row preflight
+
+PostGWAS collects sample-sheet errors across all readable rows, then checks the
+configuration, headers, content, inferred build, observed chromosomes and required
+resources for each independently usable selected row. Extra metadata columns remain
+allowed. A bad row does not prevent later rows from being checked. Checks that depend
+on a failed prerequisite cannot be completed and remain blocked; an unreadable YAML
+or ambiguous CSV header must be repaired before dependent checks can run.
+
+The terminal reports counts; `run_metadata/harmonisation_preflight.csv` contains
+row numbers, dataset IDs, input paths, stages, status and detailed problems. Its
+filename is controlled by `modules.harmonisation.runtime.preflight_report_file`.
+The canonical log also records failures. Any fatal preflight error stops the entire
+invocation with a nonzero exit before chromosome workers or GWAS-VCF generation.
+Validation logs and prepared Parquet work files may exist; they do not indicate a
+completed analysis.
+
+Successful preparation is reused within the same invocation. Full study frames are
+released after partitioning; the selected datasets' work files use disk space until
+execution/cleanup. Configuration and input identities are checked again
+before execution. Prepared work files must retain their SHA-256 content fingerprints;
+metadata-only changes do not establish a data change. Successful read-only reference checks are reused only for unchanged
+files under the same validation contract. Runtime scientific and output checks remain
+active; preflight is not a guarantee against later I/O or external-tool failures.
 
 ## Required identity and file fields
 
@@ -83,7 +109,9 @@ A non-MAF-like distribution retains that declaration. A MAF-like distribution
 must be confirmed against the independently configured
 `modules.harmonisation.default_eaf` panel. Confirmed MAF or inconclusive evidence
 stops; PostGWAS does not auto-convert it. If both sources resolve to the same
-physical file, choose a different `modules.harmonisation.default_eaf.source` so
+physical file **and the external column is MAF-like**, preflight reports the
+conflict for every affected chromosome before workers start. Choose a different
+`modules.harmonisation.default_eaf.source` so
 the comparison is independent. Before deciding EAF versus MAF, PostGWAS also
 requires the supplied and default panels to have compatible folded-MAF spectra
 under the YAML-configured correlation and mean-absolute-difference limits. This

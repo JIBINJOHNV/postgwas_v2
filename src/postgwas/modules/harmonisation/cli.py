@@ -22,6 +22,7 @@ from postgwas.config import (
 from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.cli.compute import get_compute_parser
 from postgwas.core.errors import ConfigurationError
+from postgwas.core.input_validation import record_file_validation
 from postgwas.core.paths import configured_output_path
 from postgwas.core.screen_logging import screen_recording_active
 from postgwas.modules.harmonisation.sample_sheet import (
@@ -44,6 +45,7 @@ from postgwas.modules.harmonisation.service import (
     ConfigError,
     PipelineError,
     run_harmonisation_pipeline,
+    validate_harmonisation_inputs,
 )
 from postgwas.modules.harmonisation.concordance.errors import (
     ConcordanceValidationError,
@@ -1309,6 +1311,7 @@ def _run_validated_rows(
     rows: list[HarmonisationSampleSheetRow],
     resolved_executables=None,
     screen_router: _DatasetScreenRouter | None = None,
+    prepared_runs=None,
 ):
     if screen_router is None:
         report_paths = _screen_report_paths(config, rows)
@@ -1322,6 +1325,7 @@ def _run_validated_rows(
                 rows,
                 resolved_executables=resolved_executables,
                 screen_router=managed_router,
+                prepared_runs=prepared_runs,
             )
 
     fixed_info_from_cli = _fixed_info_cli_value(args, config)
@@ -1363,12 +1367,13 @@ def _run_validated_rows(
     top_metadata = _runtime_path(
         config, output_root, "top_metadata_directory",
     )
-    write_resolved_configuration(
-        config,
-        _runtime_path(config, top_metadata, "resolved_config_file"),
-        modules=("harmonisation", "qc_summary"),
-        resource_paths=_RESOLVED_RESOURCE_PATHS,
-    )
+    if prepared_runs is None:
+        write_resolved_configuration(
+            config,
+            _runtime_path(config, top_metadata, "resolved_config_file"),
+            modules=("harmonisation", "qc_summary"),
+            resource_paths=_RESOLVED_RESOURCE_PATHS,
+        )
     run_summary_path = _runtime_path(
         config, top_metadata, "run_summary_file",
     )
@@ -1564,6 +1569,7 @@ def _run_validated_rows(
                     sample_column_dict=engine_input,
                     default_cfg=defaults,
                     threads=config.execution.threads,
+                    **({"prepared": prepared_runs[row.dataset_id]} if prepared_runs is not None else {}),
                 )
                 validation_manifest = result.get("manifest") or str(manifest_path)
                 reported_manifest = Path(validation_manifest).expanduser().resolve()
@@ -1833,6 +1839,109 @@ def _run_validated_rows(
     return results
 
 
+class HarmonisationPreflightError(ConfigurationError, RuntimeError):
+    """Aggregated input/configuration failures, including unavailable tools."""
+
+
+def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavailable_tools=None):
+    """Prepare every independently valid row before allowing any worker launch."""
+    output_root = Path(config.run.output_directory).expanduser().resolve()
+    metadata = _runtime_path(config, output_root, "top_metadata_directory")
+    report_path = _runtime_path(config, metadata, "preflight_report_file")
+    top_log = _top_run_log(config, output_root)
+    write_resolved_configuration(
+        config, _runtime_path(config, metadata, "resolved_config_file"),
+        modules=("harmonisation", "qc_summary"), resource_paths=_RESOLVED_RESOURCE_PATHS,
+    )
+    defaults = _engine_defaults(config, resolved_executables=resolved_executables)
+    prepared_runs = {}
+    records = list(issues)
+    engine_inputs = {}
+    try:
+        fixed_info = _fixed_info_cli_value(args, config)
+    except ConfigurationError as exc:
+        fixed_info = None
+        records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "configuration", "status": "failed", "problem": str(exc)})
+    if unavailable_tools:
+        records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "executables", "status": "failed", "problem": unavailable_tools})
+    for row in rows:
+        record = {
+            "row": row._row_number, "dataset_id": row.dataset_id,
+            "input_file": str(row.input_file), "stage": "dataset preparation",
+            "status": "passed", "problem": "",
+        }
+        try:
+            engine_input = to_harmonisation_input(
+                row, resource_directory=config.resources.root,
+                output_directory=output_root, output_layout=defaults["output_layout"],
+                fixed_info=fixed_info, fixed_info_column=config.modules.harmonisation.fixed_info.column,
+            )
+            engine_inputs[row.dataset_id] = engine_input
+            if unavailable_tools:
+                validate_harmonisation_inputs(engine_input, defaults)
+                record.update(status="blocked", problem="Header/configuration checked; deeper validation requires the unavailable executables.")
+            else:
+                prepared_runs[row.dataset_id] = run_harmonisation_pipeline(
+                    sample_column_dict=engine_input, default_cfg=defaults,
+                    threads=config.execution.threads, preparation_only=True,
+                )
+        except Exception as exc:
+            record.update(status="failed", problem=str(exc))
+            _append_run_log(top_log, "ERROR", "Preflight row %s, dataset %s: %s" % (
+                row._row_number, row.dataset_id, exc,
+            ))
+        records.append(record)
+        record_file_validation(
+            row.input_file, "Harmonisation dataset preflight",
+            checks=("sample sheet and resolved configuration", "dataset preparation"),
+            status=record["status"], message=record["problem"],
+            metrics={"dataset_id": row.dataset_id, "sample_sheet_row": row._row_number},
+        )
+        for warning in row.normalisation_warnings:
+            records.append({**record, "stage": "sample sheet", "status": "warning", "problem": warning})
+    # Validate earlier preparations again after the final row. Changes while
+    # another dataset was being checked must block the whole invocation.
+    for row in rows:
+        prepared = prepared_runs.get(row.dataset_id)
+        if prepared is None:
+            continue
+        try:
+            prepared.validate(engine_inputs[row.dataset_id], defaults)
+        except Exception as exc:
+            records.append({
+                "row": row._row_number, "dataset_id": row.dataset_id, "input_file": str(row.input_file),
+                "stage": "unchanged inputs", "status": "failed", "problem": str(exc),
+            })
+    failures = [item for item in records if item["status"] == "failed"]
+    failed_rows = {item["row"] for item in failures if item["row"] is not None}
+    checked_rows = {item["row"] for item in records if item["row"] is not None}
+    blocked_rows = {item["row"] for item in records if item["status"] == "blocked"}
+    summary = "Rows checked: %d; passed: %d; failed: %d; blocked: %d; warnings: %d; global errors: %d. Report: %s" % (
+        len(checked_rows), len(checked_rows - failed_rows - blocked_rows), len(failed_rows), len(blocked_rows),
+        sum(item["status"] == "warning" for item in records), sum(item["row"] is None for item in failures), report_path,
+    )
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=("row", "dataset_id", "input_file", "stage", "status", "problem"))
+    writer.writeheader()
+    writer.writerows(records)
+    _write_text(report_path, buffer.getvalue())
+    _append_run_log(top_log, "ERROR" if failures else "INFO", summary)
+    print(screen_field("error" if failures else "success", "All-row preflight", summary, indent=4))
+    if failures:
+        for item in records:
+            if item["status"] == "failed":
+                _append_run_log(top_log, "ERROR", "Row %s, dataset %s: %s" % (
+                    item["row"], item["dataset_id"], item["problem"],
+                ))
+        global_problems = "; ".join(item["problem"] for item in failures if item["row"] is None)
+        raise HarmonisationPreflightError(
+            "Harmonisation preflight found %d error(s). No chromosome analysis was started. "
+            "All detected problems are in %s; dependent checks on failed rows remain blocked.%s"
+            % (len(failures), report_path, " Global errors: " + global_problems if global_problems else "")
+        )
+    return prepared_runs
+
+
 def run_harmonisation(
     args,
     *,
@@ -1844,50 +1953,42 @@ def run_harmonisation(
 
     overrides = explicit_overrides(args, CLI_OVERRIDE_PATHS)
     config = configuration or load_run_configuration_for_module(
-        "harmonisation", getattr(args, "run_config", None),
-        module_overrides=overrides,
+        "harmonisation", getattr(args, "run_config", None), module_overrides=overrides,
     )
     preflight_log = _top_run_log(config, config.run.output_directory)
     rows: list[HarmonisationSampleSheetRow] = []
+    issues = []
     try:
-        rows = load_harmonisation_sample_sheet(args.sample_sheet)
+        rows = load_harmonisation_sample_sheet(args.sample_sheet, issues=issues)
         if hasattr(args, "dataset_id"):
             rows = [row for row in rows if row.dataset_id == args.dataset_id]
-            if not rows:
+            if not rows and not issues:
                 raise ConfigurationError(
-                    "dataset_id %r is not present in sample sheet %s"
-                    % (args.dataset_id, args.sample_sheet)
+                    "dataset_id %r is not present in sample sheet %s" % (args.dataset_id, args.sample_sheet)
                 )
-        _validate_info_fallback(rows, _fixed_info_cli_value(args, config))
+        unavailable_tools = None
         if resolved_executables is None:
-            resolved_executables = require_binaries(
-                harmonisation_executable_requirements(config),
-                plugins=(
-                    config.modules.harmonisation.vcf_processing.liftover_plugin,
-                ),
-            )
+            try:
+                resolved_executables = require_binaries(
+                    harmonisation_executable_requirements(config),
+                    plugins=(config.modules.harmonisation.vcf_processing.liftover_plugin,),
+                )
+            except Exception as exc:
+                unavailable_tools = str(exc)
+        prepared_runs = _preflight_rows(
+            args, config, rows, issues, resolved_executables, unavailable_tools=unavailable_tools,
+        )
     except Exception as exc:
         _append_run_log(preflight_log, "ERROR", "Harmonisation preflight failed: %s" % exc)
         if rows:
             try:
-                summary_path = _write_preflight_failure_run_summary(
-                    config, rows, exc, sample_sheet=args.sample_sheet,
-                )
-                _append_run_log(
-                    preflight_log,
-                    "INFO",
-                    "Preflight-failure dataset summary: %s" % summary_path,
-                )
+                summary_path = _write_preflight_failure_run_summary(config, rows, exc, sample_sheet=args.sample_sheet)
+                _append_run_log(preflight_log, "INFO", "Preflight-failure dataset summary: %s" % summary_path)
             except (RunSummaryError, ScreenReportError) as summary_exc:
-                _append_run_log(
-                    preflight_log,
-                    "ERROR",
-                    "The preflight failure could not be written to the required "
-                    "run reports: %s" % summary_exc,
-                )
+                _append_run_log(preflight_log, "ERROR", "Cannot save preflight failure reports: %s" % summary_exc)
         raise
     return _run_validated_rows(
-        args, config, rows, resolved_executables=resolved_executables,
+        args, config, rows, resolved_executables=resolved_executables, prepared_runs=prepared_runs,
     )
 
 
