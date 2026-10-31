@@ -30,7 +30,8 @@ from .external_reference_staging import (
     projected_reference_batches,
 )
 from .shared.runtime import reject_rows, resolve_policies, step_context
-from .shared.allele_join import allele_oriented_left_join
+from .shared.allele_join import allele_oriented_left_join, unused_column_name
+from .shared.column_mapping import validate_scientific_column_mappings
 from .shared.variant_columns import (
     canonical_chromosome_expression,
     canonicalize_variant_frame,
@@ -482,6 +483,9 @@ def harmonise_imputation_quality(
         operation="imputation_quality.harmonise_imputation_quality",
         rows_in=rows_in, policy_keys=POLICY_KEYS,
     ) as step:
+        validate_scientific_column_mappings(
+            sample_column_dict, stage=STEP_LABEL, error_type=ImputationQualityError,
+        )
         chr_col = sample_column_dict["chr_col"]
         pos_col = sample_column_dict["pos_col"]
         ea_col = sample_column_dict["ea_col"]
@@ -578,10 +582,12 @@ def harmonise_imputation_quality(
         ):
             info_file_to_use = external_file
             info_col_to_use = external_column
+            info_col = unused_column_name(info_col_to_use, df)
 
             step.info(
-                "Imputation quality comes from %s, column %r."
-                % (info_file_to_use, info_col_to_use)
+                "Imputation quality comes from %s, source column %r, and is "
+                "assigned to study column %r."
+                % (info_file_to_use, info_col_to_use, info_col)
             )
 
             # --------------------------------------------------------------
@@ -603,12 +609,6 @@ def harmonise_imputation_quality(
             ref_pos = external_info_colmap["pos"]
             ref_effect = external_info_colmap["a1"]
             ref_other = external_info_colmap["a2"]
-            if info_col_to_use in df.columns:
-                step.warn(
-                    "The study frame already has a column named %r; it is being "
-                    "replaced by the imputation quality taken from the reference."
-                    % info_col_to_use
-                )
             df, orientation_col, join_stats = allele_oriented_left_join(
                 df,
                 info_raw,
@@ -621,7 +621,7 @@ def harmonise_imputation_quality(
                 },
                 policies=policies,
                 value_column=info_col_to_use,
-                output_column=info_col_to_use,
+                output_column=info_col,
                 duplicate_exact_action=duplicate_exact_action,
                 duplicate_non_identical_action=duplicate_non_identical_action,
                 swapped_value="same",
@@ -667,9 +667,11 @@ def harmonise_imputation_quality(
             qc_info["matched_flipped"] = matched_flipped
             qc_info.update(join_stats)
 
-            info_col = info_col_to_use
             sample_column_dict["imp_info_col"] = info_col
             qc_info["source"] = "external_file:%s" % info_file_to_use
+            qc_info["source_file"] = info_file_to_use
+            qc_info["source_column"] = info_col_to_use
+            qc_info["destination_column"] = info_col
         elif fixed_info is not None and (
             resolved_source == "fixed_cli"
             or (resolved_source is None and source == "auto")
@@ -715,6 +717,9 @@ def harmonise_imputation_quality(
                 % (chromosome, requested)
             )
 
+        validate_scientific_column_mappings(
+            sample_column_dict, stage=STEP_LABEL, error_type=ImputationQualityError,
+        )
         qc_info["info_column"] = info_col
         qc_info["info_score_type"] = resolved_score_type
         qc_info["info_score_type_configured"] = configured_score_type

@@ -918,8 +918,8 @@ required_inputs:
       - [chr_col, pos_col]
       - [chr_pos_col]
     why: >
-      Two separate columns, or one combined column that the pipeline splits at
-      chromosome step 02.
+      Two separate columns, or one optional combined column used to derive only
+      missing coordinate mappings. Supplied coordinate mappings remain authoritative.
 
   alleles:
     label: effect and other allele
@@ -1953,8 +1953,11 @@ policies:
           chromosome:position field.
         When it applies: only when the coordinate step splits a combined column, that is when
           chr_pos_col names a column that exists and either chr_col or pos_col is missing. A file
-          with genuine chromosome and position columns never consults it. The split normally
-          happens once during the read (dataset step 03), otherwise at chromosome step 02.
+          with both chromosome and position mappings never consults it. Only the missing coordinate
+          is created; a supplied coordinate mapping is retained and checked against the combined
+          source after normalization. New coordinates use unused column names. Missing cells inside
+          a mapped column follow the existing rejection policy rather than being filled from another
+          source. The split normally happens once during the read (dataset step 03).
         Values:
           strip_non_digits - deletes every non-digit anywhere in the field and glues the
             remaining digits together.
@@ -4779,7 +4782,9 @@ policies:
           'fail' raises again and names both configuration keys.
         Values:
           fail - reported as an error, so the run stops at the header check, and the read refuses too.
-          warn - reported as a warning, the column is read once, and the run continues.
+          warn - reported as a warning and the column is read once at input validation.
+            This does not permit unrelated scientific roles to share a resolved working column;
+            transformation and export checks reject that incompatible representation before writing.
         Example: a config with beta_or_col: Z and imp_z_col: Z both naming the column 'Z'. Before this
           setting existed the run died with a polars "duplicate output name 'Z'" error that named the
           column and not the two configuration keys; now the message names beta_or_col and imp_z_col.

@@ -267,6 +267,79 @@ def canonical_position_expression(expression: pl.Expr) -> pl.Expr:
     return canonical
 
 
+def allowed_coordinate_chromosomes(policies, drop_mt: bool) -> list[str]:
+    """Return the resolved study-coordinate scope used by validation and audit."""
+    allowed = [
+        str(value).strip().upper()
+        for value in policies.get("chromosome.allowed_after_split") or []
+    ]
+    return [value for value in allowed if value != "MT"] if drop_mt else allowed
+
+
+def validate_coordinate_agreement(
+    frame: pl.DataFrame,
+    role: str,
+    retained_column: str,
+    combined_expression: pl.Expr,
+    combined_column: str,
+    policies,
+    *,
+    allowed_chromosomes: Sequence[str] | None = None,
+    context=None,
+    error_type: Type[Exception] = ValueError,
+) -> dict[str, int]:
+    """Refuse usable CP conflicts without filling invalid selected values.
+
+    Coordinate harmonisation and original-input concordance share this check.
+    Missing or invalid mapped cells remain the responsibility of each caller's
+    established row-validation policy; they never authorize CP replacement.
+    """
+    if role == "chromosome":
+        if allowed_chromosomes is None:
+            allowed_chromosomes = allowed_coordinate_chromosomes(
+                policies, bool(policies.get("chromosome.drop_mt")),
+            )
+        retained = canonical_chromosome_expression(pl.col(retained_column), policies)
+        combined = canonical_chromosome_expression(combined_expression, policies)
+        # Analysis exclusion does not make a known CP chromosome invalid: a
+        # position on Y must not be attached to a selected autosomal chromosome.
+        recognized_chromosomes = policies.policy(
+            "chromosome.allowed_after_split"
+        ).validator.item.members
+        usable = (
+            retained.is_in(allowed_chromosomes)
+            & combined.is_in(recognized_chromosomes)
+        )
+    elif role == "position":
+        retained = canonical_position_expression(pl.col(retained_column))
+        combined = canonical_position_expression(combined_expression)
+        usable = retained.is_not_null() & combined.is_not_null()
+        minimum = policies.get("position.min_value")
+        if minimum is not None:
+            usable &= (retained >= int(minimum)) & (combined >= int(minimum))
+    else:
+        raise error_type("Unsupported coordinate role %r." % role)
+
+    checked, conflicts = frame.select(
+        usable.fill_null(False).sum().alias("checked"),
+        (usable & (retained != combined)).fill_null(False).sum().alias("conflicts"),
+    ).row(0)
+    counts = {"compared": int(checked or 0), "conflicts": int(conflicts or 0)}
+    if context is not None:
+        context.observed(
+            "combined coordinate comparison", source_column=combined_column,
+            retained_column=retained_column, coordinate=role, **counts,
+        )
+    if counts["conflicts"]:
+        raise error_type(
+            "%d usable %s value(s) conflict between combined column '%s' and "
+            "selected column '%s'. Correct the sample-sheet coordinate mappings "
+            "or the inconsistent source values before harmonisation."
+            % (counts["conflicts"], role, combined_column, retained_column)
+        )
+    return counts
+
+
 def canonicalize_variant_frame(
     frame: pl.DataFrame,
     columns: Mapping[str, object],
@@ -504,6 +577,7 @@ def mark_canonical_variant_columns(column_mapping: dict) -> None:
 __all__ = [
     "CANONICAL_VARIANT_COLUMNS_KEY",
     "PALINDROMIC_SNP_PAIRS",
+    "allowed_coordinate_chromosomes",
     "canonical_allele_expression",
     "canonical_chromosome_expression",
     "canonical_position_expression",
@@ -517,4 +591,5 @@ __all__ = [
     "read_reference_variant_table",
     "reverse_complement_expression",
     "study_string_schema",
+    "validate_coordinate_agreement",
 ]

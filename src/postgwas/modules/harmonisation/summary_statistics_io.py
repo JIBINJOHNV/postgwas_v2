@@ -27,6 +27,7 @@ from .sample_size import (
     sample_count_expression,
 )
 from .shared.runtime import emit_message, reject_rows, resolve_policies
+from .shared.column_mapping import COLUMN_CONFIG_KEYS, column_mapping_groups
 from .shared.variant_columns import (
     mark_canonical_variant_columns,
     minimal_allele_representation_series,
@@ -55,14 +56,6 @@ FIELD_TO_CONFIG_KEY = {
     "ncontrol": "ncontrol_col",
     "ncase": "ncase_col",
 }
-
-#: Config keys that name columns read out of the study file.
-COLUMN_CONFIG_KEYS = (
-    "chr_col", "pos_col", "chr_pos_col", "snp_id_col",
-    "ea_col", "oa_col", "eaf_col",
-    "beta_or_col", "se_col", "imp_z_col", "pval_col",
-    "ncontrol_col", "ncase_col", "imp_info_col",
-)
 
 #: Configured scientific measurements that may be converted to Float64 after
 #: coordinate/allele normalization. Unknown input columns retain the type that
@@ -590,16 +583,8 @@ def _resolve_mapped_columns(sample_column_dict, df_columns, policies, logger):
     name and died with ``DuplicateError: projections contained duplicate output
     name 'Z'`` — a polars error naming a column, not the config key.
     """
-    by_column = {}
-    order = []
-    for key in COLUMN_CONFIG_KEYS:
-        column = optional_text(sample_column_dict.get(key)) or ""
-        if not column:
-            continue
-        if column not in by_column:
-            by_column[column] = []
-            order.append(column)
-        by_column[column].append(key)
+    by_column = column_mapping_groups(sample_column_dict)
+    order = list(by_column)
 
     collisions = [(c, by_column[c]) for c in order if len(by_column[c]) > 1]
     for column, keys in collisions:

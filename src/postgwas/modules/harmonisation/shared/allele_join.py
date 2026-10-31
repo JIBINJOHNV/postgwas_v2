@@ -10,10 +10,13 @@ from .statistics import frequency_maf_screen
 from .variant_columns import canonicalize_variant_frame
 
 
-def unused_column_name(prefix: str, *frames: pl.DataFrame) -> str:
-    """Return ``prefix`` or a suffixed name that preserves every input column."""
+def unused_column_name(
+    prefix: str, *frames: pl.DataFrame, reserved: Sequence[str] = (),
+) -> str:
+    """Preserve existing columns and destinations planned for later expressions."""
     name = prefix
     occupied = {column for frame in frames for column in frame.columns}
+    occupied.update(reserved)
     while name in occupied:
         name += "_"
     return name
@@ -264,13 +267,15 @@ def allele_oriented_left_join(
         )
 
     value_name = unused_column_name(
-        "__postgwas_reference_value__", study, reference
+        "__postgwas_reference_value__", study, reference, reserved=(output_column,),
     )
     orientation_name = unused_column_name(
-        "__postgwas_allele_match_orientation__", study, reference
+        "__postgwas_allele_match_orientation__", study, reference,
+        reserved=(output_column, value_name),
     )
     priority_name = unused_column_name(
-        "__postgwas_match_priority__", study, reference
+        "__postgwas_match_priority__", study, reference,
+        reserved=(output_column, value_name, orientation_name),
     )
     reference = reference.rename({value_column: value_name})
 
@@ -320,7 +325,7 @@ def allele_oriented_left_join(
     # explicitly with a collision-safe row index and remove it immediately
     # after the one-to-one left join.
     row_order_name = unused_column_name(
-        "__postgwas_study_row_order__", study, oriented,
+        "__postgwas_study_row_order__", study, oriented, reserved=(output_column,),
     )
     joined = (
         study.with_row_index(row_order_name)

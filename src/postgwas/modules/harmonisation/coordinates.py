@@ -1,6 +1,6 @@
 """Step 02 - chromosome and position harmonisation.
 
-Splits a combined chromosome:position column when one is configured, normalises
+Derives only missing coordinate roles from a mapped combined column, normalises
 the chromosome label, turns the position into an integer, and removes variants
 whose coordinates cannot be used.
 
@@ -28,11 +28,15 @@ import polars as pl
 from postgwas.core.values import optional_text
 
 from .policies import default_policies
+from .shared.allele_join import unused_column_name
+from .shared.column_mapping import validate_scientific_column_mappings
 from .shared.runtime import reject_rows, step_context
 from .shared.variant_columns import (
+    allowed_coordinate_chromosomes,
     canonical_chromosome_expression,
     canonicalize_variant_frame,
     position_text_expression,
+    validate_coordinate_agreement,
 )
 
 
@@ -90,15 +94,6 @@ def _resolve_drop_mt(drop_mt, policies, ctx):
     return bool(drop_mt)
 
 
-def _allowed_chromosomes(policies, drop_mt):
-    # type: (Any, bool) -> list
-    """The chromosomes kept after this step, as upper-case strings."""
-    allowed = [str(c).strip().upper() for c in (policies.chromosome.allowed_after_split or [])]
-    if drop_mt:
-        allowed = [c for c in allowed if c != "MT"]
-    return allowed
-
-
 # =============================================================================
 # the step
 # =============================================================================
@@ -153,6 +148,9 @@ def harmonise_coordinates_and_alleles(
         operation="coordinates.harmonise_coordinates_and_alleles",
         rows_in=rows_in, policy_keys=POLICY_KEYS,
     ) as step_ctx:
+        validate_scientific_column_mappings(
+            sample_column_dict, stage="coordinate harmonisation",
+        )
         df, sample_column_dict = _harmonise(
             df=df,
             sample_column_dict=sample_column_dict,
@@ -162,6 +160,9 @@ def harmonise_coordinates_and_alleles(
             drop_mt=drop_mt,
             counters=counters,
             qc_info=qc_info,
+        )
+        validate_scientific_column_mappings(
+            sample_column_dict, stage="resolved coordinate harmonisation",
         )
         qc_info["removed_by_reason"] = dict(counters)
         qc_info["final_variants"] = df.height
@@ -181,8 +182,18 @@ def _harmonise(df, sample_column_dict, policies, ctx, rejects,
     pos_col = _clean_name(sample_column_dict.get("pos_col"))
     chr_pos_col = _clean_name(sample_column_dict.get("chr_pos_col"))
 
+    for key, column in (
+        ("chr_col", chr_col), ("pos_col", pos_col), ("chr_pos_col", chr_pos_col),
+    ):
+        if column and column not in df.columns:
+            raise ValueError(
+                "Configured coordinate mapping %s=%r is absent from the study header. "
+                "Correct the corresponding sample-sheet column mapping."
+                % (key, column)
+            )
+
     effective_drop_mt = _resolve_drop_mt(drop_mt, policies, ctx)
-    allowed = _allowed_chromosomes(policies, effective_drop_mt)
+    allowed = allowed_coordinate_chromosomes(policies, effective_drop_mt)
     qc_info["drop_mt"] = effective_drop_mt
     qc_info["allowed_chromosomes"] = list(allowed)
 
@@ -190,36 +201,28 @@ def _harmonise(df, sample_column_dict, policies, ctx, rejects,
     # 1. split a combined chromosome:position column
     # ------------------------------------------------------------------
     qc_info["split_performed"] = False
-    if chr_pos_col and chr_pos_col in df.columns and (not chr_col or not pos_col):
+    if not chr_col or not pos_col:
+        if not chr_pos_col:
+            raise ValueError(
+                "Coordinate mappings are incomplete. Supply chromosome_column and "
+                "position_column, or chromosome_position_column in the sample sheet "
+                "to derive only the missing coordinate roles."
+            )
         df, chr_col, pos_col = _split_chromosome_position(
-            df, chr_pos_col, policies, ctx, qc_info
+            df, chr_pos_col, policies, ctx, qc_info,
+            chr_col=chr_col, pos_col=pos_col, allowed=allowed,
         )
         sample_column_dict.update({
-            "chr_col": "Chr",
-            "pos_col": "Pos",
+            "chr_col": chr_col,
+            "pos_col": pos_col,
             "chr_pos_col": None,
         })
-
-    if not chr_col or chr_col not in df.columns:
-        raise ValueError(
-            "No chromosome column to work with. The configuration points at %r and the file "
-            "has %s. Set chr_col, or set chr_pos_col to a combined chromosome:position column."
-            % (chr_col, ", ".join(df.columns[:20]) or "no columns")
-        )
 
     # ------------------------------------------------------------------
     # 2. normalise the chromosome label and the position
     # ------------------------------------------------------------------
     source_before_normalization = df
-    variant_columns = {"chr": chr_col}
-    has_pos = bool(pos_col) and pos_col in df.columns
-    if has_pos:
-        variant_columns["pos"] = pos_col
-    else:
-        qc_info["positions_unreadable"] = 0
-        ctx.warn(
-            "No position column is present, so positions cannot be checked at this step."
-        )
+    variant_columns = {"chr": chr_col, "pos": pos_col}
 
     for role, allele_key in (("ea", "ea_col"), ("oa", "oa_col")):
         allele_col = _clean_name(sample_column_dict.get(allele_key))
@@ -274,33 +277,29 @@ def _harmonise(df, sample_column_dict, policies, ctx, rejects,
     )
     qc_info["dropped_null_chr"] = int(dropped_null_chr)
 
-    if has_pos:
-        df, dropped_null_pos = reject_rows(
-            df, pl.col(pos_col).is_null(), step_label=STEP_LABEL,
-            reason="invalid_position", context=ctx, collector=rejects,
-            counters=counters,
-            detail=(
-                "position is empty, unreadable, non-finite, non-integral, or outside "
-                "the supported integer range"
-            ),
+    df, dropped_null_pos = reject_rows(
+        df, pl.col(pos_col).is_null(), step_label=STEP_LABEL,
+        reason="invalid_position", context=ctx, collector=rejects,
+        counters=counters,
+        detail=(
+            "position is empty, unreadable, non-finite, non-integral, or outside "
+            "the supported integer range"
+        ),
+    )
+    qc_info["dropped_null_pos"] = int(dropped_null_pos)
+    min_value = policies.position.min_value
+    if min_value is not None:
+        df, dropped_below_min_pos = reject_rows(
+            df,
+            pl.col(pos_col).is_not_null() & (pl.col(pos_col) < int(min_value)),
+            step_label=STEP_LABEL, reason="invalid_position", context=ctx,
+            collector=rejects, counters=counters,
+            detail="position below position.min_value (%d)" % int(min_value),
         )
-        qc_info["dropped_null_pos"] = int(dropped_null_pos)
-        min_value = policies.position.min_value
-        if min_value is not None:
-            df, dropped_below_min_pos = reject_rows(
-                df,
-                pl.col(pos_col).is_not_null() & (pl.col(pos_col) < int(min_value)),
-                step_label=STEP_LABEL, reason="invalid_position", context=ctx,
-                collector=rejects, counters=counters,
-                detail="position below position.min_value (%d)" % int(min_value),
-            )
-        else:
-            dropped_below_min_pos = 0
-        qc_info["dropped_below_min_pos"] = int(dropped_below_min_pos)
-        qc_info["position_min_value"] = None if min_value is None else int(min_value)
     else:
-        qc_info["dropped_null_pos"] = 0
-        qc_info["dropped_below_min_pos"] = 0
+        dropped_below_min_pos = 0
+    qc_info["dropped_below_min_pos"] = int(dropped_below_min_pos)
+    qc_info["position_min_value"] = None if min_value is None else int(min_value)
 
     _warn_about_allowed_sets(df, chr_col, policies, allowed, ctx)
     excluded = _excluded_chromosome_counts(df, chr_col, allowed)
@@ -326,12 +325,15 @@ def _harmonise(df, sample_column_dict, policies, ctx, rejects,
 # the pieces
 # =============================================================================
 
-def _split_chromosome_position(df, chr_pos_col, policies, ctx, qc_info):
-    # type: (pl.DataFrame, str, Any, Any, Dict[str, Any]) -> Tuple[pl.DataFrame, str, str]
-    """Split '1:123456' (or '1:123456:A:G') into 'Chr' and 'Pos'."""
+def _split_chromosome_position(
+    df, chr_pos_col, policies, ctx, qc_info, *, chr_col, pos_col, allowed,
+):
+    """Derive absent roles without replacing any original study column."""
+    split_chr_col = unused_column_name("Chr", df)
+    split_pos_col = unused_column_name("Pos", df)
     ctx.info(
-        "The chromosome and position columns are not both configured, so the combined column "
-        "'%s' is being split into 'Chr' and 'Pos'." % chr_pos_col
+        "The combined column '%s' supplies only missing coordinate mappings; "
+        "configured chromosome and position columns remain authoritative." % chr_pos_col
     )
 
     non_null_before = df.select(pl.col(chr_pos_col).is_not_null().sum()).item()
@@ -342,11 +344,11 @@ def _split_chromosome_position(df, chr_pos_col, policies, ctx, qc_info):
         try:
             temp = df.with_columns([
                 pl.col(chr_pos_col).cast(pl.Utf8, strict=False)
-                  .str.split_exact(sep, 1).struct.field("field_0").alias("Chr"),
+                  .str.split_exact(sep, 1).struct.field("field_0").alias(split_chr_col),
                 pl.col(chr_pos_col).cast(pl.Utf8, strict=False)
-                  .str.split_exact(sep, 1).struct.field("field_1").alias("Pos"),
+                  .str.split_exact(sep, 1).struct.field("field_1").alias(split_pos_col),
             ])
-            non_null_after = temp.select(pl.col("Pos").is_not_null().sum()).item()
+            non_null_after = temp.select(pl.col(split_pos_col).is_not_null().sum()).item()
             if non_null_after == non_null_before:
                 df = temp
                 used_sep = sep
@@ -365,7 +367,8 @@ def _split_chromosome_position(df, chr_pos_col, policies, ctx, qc_info):
     ctx.decide(
         "Combined chromosome/position column '%s'" % chr_pos_col,
         {"separator that worked": used_sep, "values split": int(non_null_before)},
-        "split into 'Chr' and 'Pos'",
+        "use chromosome column '%s' and position column '%s'; derive only missing roles"
+        % (chr_col or split_chr_col, pos_col or split_pos_col),
     )
 
     # A non-null combined value must produce a non-null chromosome.  This is the
@@ -375,7 +378,7 @@ def _split_chromosome_position(df, chr_pos_col, policies, ctx, qc_info):
     # so those two counts differ for perfectly good data and the guard raised on
     # the most common identifier convention.
     lost = df.select(
-        (pl.col(chr_pos_col).is_not_null() & pl.col("Chr").is_null()).sum()
+        (pl.col(chr_pos_col).is_not_null() & pl.col(split_chr_col).is_null()).sum()
     ).item()
     if lost:
         raise RuntimeError(
@@ -383,9 +386,28 @@ def _split_chromosome_position(df, chr_pos_col, policies, ctx, qc_info):
             % ("{:,}".format(int(lost)), chr_pos_col, used_sep)
         )
 
-    df, changed, empty_after = _extract_position(df, "Pos", chr_pos_col, policies, ctx)
+    if pos_col:
+        df = df.with_columns(position_text_expression(
+            pl.col(split_pos_col), str(policies.position.extraction),
+        ).alias(split_pos_col))
+        changed, empty_after = 0, 0
+    else:
+        df, changed, empty_after = _extract_position(
+            df, split_pos_col, chr_pos_col, policies, ctx,
+        )
 
-    dup_after = df.select(pl.struct(["Chr", "Pos"]).is_duplicated().sum()).item()
+    for role, retained, split in (
+        ("chromosome", chr_col, split_chr_col), ("position", pos_col, split_pos_col),
+    ):
+        if retained:
+            validate_coordinate_agreement(
+                df, role, retained, pl.col(split), chr_pos_col, policies,
+                allowed_chromosomes=allowed, context=ctx,
+            )
+
+    dup_after = df.select(
+        pl.struct([split_chr_col, split_pos_col]).is_duplicated().sum()
+    ).item()
     ctx.info(
         "After the split, %s rows share an identical '%s' value and %s rows share an identical "
         "chromosome and position. These two numbers are not expected to match when the combined "
@@ -394,6 +416,25 @@ def _split_chromosome_position(df, chr_pos_col, policies, ctx, qc_info):
         % ("{:,}".format(int(dup_before)), chr_pos_col, "{:,}".format(int(dup_after)))
     )
 
+    generated = {
+        role: column
+        for role, retained, column in (
+            ("chr_col", chr_col, split_chr_col), ("pos_col", pos_col, split_pos_col),
+        )
+        if not retained
+    }
+    chromosome_values = (
+        df.height - df[split_chr_col].null_count() if not chr_col else 0
+    )
+    position_values = (
+        df.height - df[split_pos_col].null_count() if not pos_col else 0
+    )
+    ctx.output(
+        "derived coordinates", source_column=chr_pos_col,
+        chromosome_column=chr_col or split_chr_col,
+        position_column=pos_col or split_pos_col,
+        chromosome_values=chromosome_values, position_values=position_values,
+    )
     qc_info.update({
         "split_performed": True,
         "split_separator": used_sep,
@@ -402,8 +443,16 @@ def _split_chromosome_position(df, chr_pos_col, policies, ctx, qc_info):
         "split_duplicate_coordinates": int(dup_after),
         "positions_rewritten": int(changed),
         "positions_empty_after_extraction": int(empty_after),
+        "generated_coordinate_columns": generated,
+        "derived_chromosome_values": chromosome_values,
+        "derived_position_values": position_values,
     })
-    return df, "Chr", "Pos"
+    temporary_columns = [
+        column for retained, column in (
+            (chr_col, split_chr_col), (pos_col, split_pos_col),
+        ) if retained
+    ]
+    return df.drop(temporary_columns), chr_col or split_chr_col, pos_col or split_pos_col
 
 
 def _extract_position(df, pos_col, source_col, policies, ctx):

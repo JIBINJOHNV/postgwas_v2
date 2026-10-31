@@ -280,7 +280,13 @@ These eight steps run once on the complete study.
    - reports post-parse missingness for every configured study column, then
      rejects rows missing a read-stage mandatory value or every value in a
      mandatory alternative group such as BETA-or-Z;
-   - splits a combined coordinate such as `1:100000`, when configured;
+   - uses an explicitly mapped combined coordinate such as `1:100000` only to
+     derive missing coordinate mappings. If both chromosome and position are
+     mapped, the combined column is unused. If just one is mapped, it is retained
+     and the other is generated in an unused column. Usable disagreement between
+     the retained coordinate and the combined source stops the dataset after
+     canonical normalization. A supplied header that is absent is an invalid
+     mapping; null cells in a mapped column keep the existing rejection policy;
    - normalizes chromosome labels and alleles, and accepts a position only when
      it resolves to a finite whole-number coordinate (`100`, `100.0`, and `1e2`
      all mean position 100; a fractional value is never truncated);
@@ -482,13 +488,26 @@ configured builds.
 Chromosomes may run in parallel, but the following sixteen steps always occur
 in this order inside each chromosome.
 
-Every step uses the resolved column mapping. Generated BETA, SE, Z, fixed sample
-counts, and effective N receive collision-free working names, and downstream
-checks and adapter export follow those names. Unselected raw statistic columns
+Every step uses the resolved column mapping. Generated coordinates, identifiers,
+BETA, SE, Z, fixed sample counts, and effective N receive collision-free working
+names, and downstream checks and adapter export follow those names. External
+EAF and INFO source names are kept in provenance while their values are attached
+to unused study destinations. An existing selected statistic or unselected raw
+column is never replaced merely because its name matches a generated or external
+field. This is necessary because
+[Polars `with_columns`](https://docs.pola.rs/api/python/version/0.20/reference/dataframe/api/polars.DataFrame.with_columns.html)
+replaces an existing column with the same name. Unselected raw statistic columns
 remain preserved rather than supplying values through a familiar header.
 Populated mapped SE cells are preserved during missing-statistic recovery;
 null cells follow the existing configured recovery, sign, and P-value policies.
 This mapping contract changes no calculation defaults or scientific equations.
+Coordinate, identifier and annotation stages check resolved role compatibility
+before and after their transformations. The input and resolved effect aliases
+may share their effect column, but unrelated scientific roles cannot share one
+working column. Export independently requires a distinct physical destination
+for each exported role and reports conflicting field names before creating its
+outputs. The input-to-VCF concordance path uses the same coordinate-selection
+contract as the reader.
 See [Authoritative input mappings](sample-sheet.md#authoritative-input-mappings).
 
 1. **Chromosome step 1 — Load the partition.** Read the typed Parquet rows with
@@ -667,12 +686,17 @@ See [Authoritative input mappings](sample-sheet.md#authoritative-input-mappings)
 11. **Chromosome step 11 — Obtain INFO.** Use internal INFO first, otherwise
     external allele-matched INFO, otherwise the explicitly requested fixed INFO.
     Missing and out-of-range values follow the resolved policy. A fixed value is
-    clearly logged as user-assigned rather than measured.
+    clearly logged as user-assigned rather than measured. External values receive
+    an unused destination; QC records their source file and source column, the
+    resolved study destination, and the actual matching counts.
 
 12. **Chromosome step 12 — Complete variant identifiers.** Preserve and
     normalize a supplied study ID. Fill missing IDs with a deterministic
-    chromosome-position-allele ID. dbSNP IDs are assigned later by exact CHROM,
-    POS, REF, and ALT matching.
+    chromosome-position-allele ID. If no ID is selected, create an unused output
+    column and update only the ID mapping, preserving every original field.
+    Record the destination and generated, filled, rewritten and remaining-missing
+    counts. A selected ID header that is absent fails rather than triggering
+    generation. dbSNP IDs are assigned later by exact CHROM, POS, REF, and ALT matching.
 
 13. **Chromosome step 13 — Check required output fields.** Confirm that every
     required column exists and that required row values are present. A completely

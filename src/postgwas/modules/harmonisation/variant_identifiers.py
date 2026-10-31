@@ -20,6 +20,8 @@ import polars as pl
 from postgwas.core.values import missing_tokens, optional_text
 
 from .policies import default_policies
+from .shared.allele_join import unused_column_name
+from .shared.column_mapping import validate_scientific_column_mappings
 from .shared.runtime import step_context
 
 
@@ -103,8 +105,9 @@ def harmonise_variant_identifiers(
 ) -> Tuple[pl.DataFrame, dict]:
     """Ensure the dataframe has a usable variant identifier column.
 
-    - creates one from chromosome, position and the two alleles when the study
-      has none, or names one that is not in the file;
+    - creates one in an unused column from chromosome, position and the two
+      alleles when no identifier column is mapped;
+    - rejects a supplied identifier mapping whose column is absent;
     - replaces ':' with '_';
     - fills in identifiers that are missing, empty, or one of the configured or
       shared optional-text placeholders.
@@ -129,11 +132,17 @@ def harmonise_variant_identifiers(
         operation="variant_identifiers.harmonise_variant_identifiers",
         rows_in=rows_in, policy_keys=POLICY_KEYS,
     ) as step_ctx:
+        validate_scientific_column_mappings(
+            sample_column_dict, stage="before identifier harmonisation",
+        )
         df, sample_column_dict, info = _harmonise(
             df=df,
             sample_column_dict=sample_column_dict,
             policies=policies,
             ctx=step_ctx,
+        )
+        validate_scientific_column_mappings(
+            sample_column_dict, stage="after identifier harmonisation",
         )
         step_ctx.set_rows(df.height)
         step_ctx.extra.update(info)
@@ -143,9 +152,17 @@ def harmonise_variant_identifiers(
 
 def _harmonise(df, sample_column_dict, policies, ctx):
     # type: (pl.DataFrame, dict, Any, Any) -> Tuple[pl.DataFrame, dict, Dict[str, Any]]
-    info = {"step": STEP_LABEL}     # type: Dict[str, Any]
+    info = {"step": STEP_LABEL, "identifiers_generated": 0, "identifiers_filled": 0}
 
     snp_col = _clean_name(sample_column_dict.get("snp_id_col"))
+    if snp_col is not None and snp_col not in df.columns:
+        raise ValueError(
+            "Configured snp_id_col %r is absent from the study data. "
+            "Correct the variant_id_column mapping, or leave it missing to "
+            "generate identifiers from the mapped coordinates and alleles."
+            % snp_col
+        )
+    generated_column = snp_col is None
     (chr_col, pos_col, ea_col, oa_col), missing_coords = _coordinate_columns(
         df, sample_column_dict
     )
@@ -154,7 +171,7 @@ def _harmonise(df, sample_column_dict, policies, ctx):
     # ------------------------------------------------------------------
     # 1. create the column when there is none
     # ------------------------------------------------------------------
-    if snp_col is None or snp_col not in df.columns:
+    if generated_column:
         if not can_build:
             raise ValueError(
                 "There is no SNP identifier column (snp_id_col = %r) and one cannot be built, "
@@ -162,12 +179,12 @@ def _harmonise(df, sample_column_dict, policies, ctx):
                 "chromosome, position and allele columns are configured."
                 % (sample_column_dict.get("snp_id_col"), "; ".join(missing_coords))
             )
+        snp_col = unused_column_name("snp_col", df)
         ctx.info(
-            "No SNP identifier column is present, so one is being built from %s, %s, %s and %s "
+            "No SNP identifier column is mapped, so '%s' is being built from %s, %s, %s and %s "
             "in the form chromosome_position_effect_other."
-            % (chr_col, pos_col, ea_col, oa_col)
+            % (snp_col, chr_col, pos_col, ea_col, oa_col)
         )
-        snp_col = "snp_col"
         df = df.with_columns(
             _identifier_expr(chr_col, pos_col, ea_col, oa_col).alias(snp_col)
         )
@@ -179,6 +196,7 @@ def _harmonise(df, sample_column_dict, policies, ctx):
             "for missing values." % snp_col
         )
         info["source"] = "study_column:%s" % snp_col
+    info["identifier_column"] = snp_col
 
     # ------------------------------------------------------------------
     # 2. clean: ':' becomes '_'
@@ -209,6 +227,9 @@ def _harmonise(df, sample_column_dict, policies, ctx):
     missing_expr = _missing_expr(snp_col, sentinels)
     n_missing = int(df.select(missing_expr.sum()).item() or 0)
     info["missing_identifiers"] = n_missing
+    info["identifiers_still_missing"] = n_missing
+    if generated_column:
+        info["identifiers_generated"] = df.height - n_missing
     info["missing_sentinels"] = list(sentinels)
 
     if n_missing == 0:

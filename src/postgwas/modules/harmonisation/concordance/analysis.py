@@ -28,6 +28,7 @@ from ..shared.variant_columns import (
     palindromic_snp_expression,
     position_text_expression,
     reverse_complement_expression,
+    validate_coordinate_agreement,
 )
 from ..strand import (
     EXPORTABLE_STRAND_ACTIONS,
@@ -125,23 +126,35 @@ def _source_text(frame: pl.DataFrame, name: str | None) -> pl.Expr:
     return pl.col(name).cast(pl.String, strict=False).str.strip_chars()
 
 
-def _input_coordinates(row, policies) -> tuple[pl.Expr, pl.Expr]:
+def _input_coordinates(
+    row, policies,
+) -> tuple[pl.Expr, pl.Expr, tuple[pl.Expr, pl.Expr] | None]:
     if row.chromosome_column and row.position_column:
-        return pl.col(row.chromosome_column), pl.col(row.position_column)
+        return pl.col(row.chromosome_column), pl.col(row.position_column), None
+    if not row.chromosome_position_column:
+        raise ValueError(
+            "Coordinate mappings are incomplete. Supply chromosome_column and "
+            "position_column, or chromosome_position_column in the sample sheet."
+        )
     combined = pl.col(row.chromosome_position_column).cast(pl.String, strict=False)
     pattern = r"(?i)^(?:chr)?([^:_\-]+)[:_\-]+(.+)$"
-    return (
+    parsed = (
         combined.str.extract(pattern, 1),
         position_text_expression(
             combined.str.extract(pattern, 2),
             str(policies.get("position.extraction")),
         ),
     )
+    return (
+        pl.col(row.chromosome_column) if row.chromosome_column else parsed[0],
+        pl.col(row.position_column) if row.position_column else parsed[1],
+        parsed,
+    )
 
 
 def input_chromosome_expression(row, policies) -> pl.Expr:
     """Return the canonical chromosome expression shared by staging and analysis."""
-    chromosome, _ = _input_coordinates(row, policies)
+    chromosome, _, _ = _input_coordinates(row, policies)
     return canonical_chromosome_expression(chromosome, policies)
 
 
@@ -193,7 +206,25 @@ def prepare_input_table(
     policies,
 ) -> pl.DataFrame:
     """Normalize audit fields; indels are never reference-left-aligned."""
-    chrom, pos = _input_coordinates(row, policies)
+    for column in (
+        row.chromosome_column, row.position_column, row.chromosome_position_column,
+    ):
+        if column and column not in frame.columns:
+            raise ValueError(
+                "Configured coordinate column '%s' is absent from the study header. "
+                "Correct the sample-sheet coordinate mapping." % column
+            )
+    chrom, pos, combined = _input_coordinates(row, policies)
+    if combined is not None:
+        for role, retained, expression in (
+            ("chromosome", row.chromosome_column, combined[0]),
+            ("position", row.position_column, combined[1]),
+        ):
+            if retained:
+                validate_coordinate_agreement(
+                    frame, role, retained, expression,
+                    row.chromosome_position_column, policies,
+                )
     minimum_position = int(policies.get("position.min_value"))
     effect = _numeric(frame, row.effect_column)
     beta = (

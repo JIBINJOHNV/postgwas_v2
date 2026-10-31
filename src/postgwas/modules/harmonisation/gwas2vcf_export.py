@@ -9,6 +9,10 @@ from postgwas.core.paths import configured_output_path
 from postgwas.core.values import optional_text
 
 from .p_values import P_VALUE_EXACT_RAW_KEY
+from .shared.column_mapping import (
+    column_mapping_groups,
+    validate_scientific_column_mappings,
+)
 from .strand import EXPORTABLE_STRAND_ACTIONS, STRAND_ACTION_COLUMN
 
 
@@ -121,6 +125,22 @@ def export_gwas2vcf_input(
         for key in required_keys + optional_keys
         if optional_text(sample_column_dict.get(key)) is not None
     }
+    validate_scientific_column_mappings(
+        sample_column_dict, stage="Chromosome %s adapter export" % chromosome,
+    )
+    repeated = {
+        column: keys for column, keys in column_mapping_groups(pairs, keys=pairs).items()
+        if len(keys) > 1
+    }
+    if repeated:
+        raise ValueError(
+            "Cannot export chromosome %s; exported mappings require distinct "
+            "column names: %s"
+            % (chromosome, "; ".join(
+                "%s -> %r" % (" and ".join(keys), column)
+                for column, keys in repeated.items()
+            ))
+        )
     absent = [column for column in pairs.values() if column not in df.columns]
     if absent:
         raise ValueError(

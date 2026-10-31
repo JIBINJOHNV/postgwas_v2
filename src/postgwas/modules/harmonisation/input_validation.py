@@ -50,6 +50,10 @@ from postgwas.modules.harmonisation.shared.runtime import (
     emit_high_visibility_warning,
     emit_message,
 )
+from postgwas.modules.harmonisation.shared.column_mapping import (
+    COLUMN_CONFIG_KEYS,
+    column_mapping_groups,
+)
 from postgwas.modules.harmonisation.shared.variant_columns import (
     canonical_chromosome_expression,
     canonical_position_expression,
@@ -74,23 +78,6 @@ __all__ = [
 # ----------------------------------------------------------------------
 # The config keys that name a column in the input file (plan 2.3).
 # ----------------------------------------------------------------------
-COLUMN_CONFIG_KEYS = (
-    "chr_col",
-    "pos_col",
-    "snp_id_col",
-    "ea_col",
-    "oa_col",
-    "eaf_col",
-    "beta_or_col",
-    "se_col",
-    "imp_z_col",
-    "pval_col",
-    "ncase_col",
-    "ncontrol_col",
-    "imp_info_col",
-    "chr_pos_col",
-)
-
 # Of those, the ones that must hold numbers once parsed.
 NUMERIC_COLUMN_KEYS = (
     "pos_col",
@@ -1004,18 +991,14 @@ def validate_header(cfg, sumstat_path, policies=None, logger=None):
 
     cutoff = float(policies.get("validation.fuzzy_match_cutoff"))
 
-    # chr_col / pos_col may legitimately be derived from a combined column.
-    chr_pos = _clean(cfg.get("chr_pos_col"))
-    derived_coordinates = bool(chr_pos) and chr_pos in exact
-
-    by_value = OrderedDict()  # type: Dict[str, List[str]]
+    # Missing coordinate mappings may be derived from the selected combined
+    # column. A supplied mapping remains authoritative and must exist even
+    # when that alternative source is also present.
+    by_value = column_mapping_groups(cfg)
     for key in COLUMN_CONFIG_KEYS:
         value = _clean(cfg.get(key))
         if not value:
             continue  # a normalized missing value means this column was not supplied
-        if derived_coordinates and key in ("chr_col", "pos_col"):
-            continue
-        by_value.setdefault(value, []).append(key)
         if value in exact:
             continue
         candidates = loose.get(value.strip().lower())

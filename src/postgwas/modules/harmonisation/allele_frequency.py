@@ -67,6 +67,7 @@ from .shared.runtime import (
     step_context as shared_step_context,
 )
 from .shared.allele_join import allele_oriented_left_join, unused_column_name
+from .shared.column_mapping import validate_scientific_column_mappings
 from .shared.statistics import valid_frequency_mask
 from .shared.variant_columns import (
     palindromic_snp_expression,
@@ -1026,7 +1027,7 @@ def merge_external_allele_frequencies(
     ext_df, detected = read_reference_variant_table(
         load_path,
         colmap,
-        policies,
+        resolved_policies,
         value_columns=[eaf_col],
         error_type=AlleleFrequencyError,
         description="external frequency file",
@@ -1046,9 +1047,16 @@ def merge_external_allele_frequencies(
         )
     )
     stats["external_rows_loaded"] = ext_df.height
-    row_col = "__postgwas_external_eaf_row"
-    while row_col in df.columns:
-        row_col += "_"
+    source_column = eaf_col
+    eaf_col = unused_column_name(source_column, df)
+    stats.update(
+        source_file=load_path,
+        source_column=source_column,
+        destination_column=eaf_col,
+    )
+    row_col = unused_column_name(
+        "__postgwas_external_eaf_row", df, reserved=(eaf_col,),
+    )
     study_for_join = df.with_row_index(row_col)
     matched_all, orientation_col, join_stats = allele_oriented_left_join(
         study_for_join,
@@ -1061,7 +1069,7 @@ def merge_external_allele_frequencies(
             "oa": colmap["a2"],
         },
         policies=resolved_policies,
-        value_column=eaf_col,
+        value_column=source_column,
         output_column=eaf_col,
         duplicate_exact_action=duplicate_exact_action,
         duplicate_non_identical_action=duplicate_non_identical_action,
@@ -1108,12 +1116,11 @@ def merge_external_allele_frequencies(
                 "not available for confirmation."
                 % validation_reference_col
             )
-        candidate_col = "__postgwas_external_raw_af"
-        while candidate_col in matched_all.columns:
-            candidate_col += "_"
-        expected_col = "__postgwas_external_validation_eaf"
-        while expected_col in matched_all.columns or expected_col == candidate_col:
-            expected_col += "_"
+        candidate_col = unused_column_name("__postgwas_external_raw_af", matched_all)
+        expected_col = unused_column_name(
+            "__postgwas_external_validation_eaf", matched_all,
+            reserved=(candidate_col,),
+        )
         swapped = pl.col(orientation_col) == 1
         semantic_frame = matched_all.select([
             *[pl.col(std_cols[name]) for name in ("chr", "pos", "ea", "oa")],
@@ -1167,6 +1174,7 @@ def merge_external_allele_frequencies(
         if STRAND_ACTION_COLUMN in matched_all.columns
         else pl.lit(False)
     ).fill_null(False)
+    state_col = unused_column_name("palindromic_orientation_state", matched_all)
     palindromic_orientation = (
         matched_all.filter(matched_palindromic)
         .select(row_col, orientation_resolved.alias("__orientation_resolved"))
@@ -1174,7 +1182,7 @@ def merge_external_allele_frequencies(
             pl.when(pl.col("__orientation_resolved"))
             .then(pl.lit("resolved_by_study_orientation"))
             .otherwise(pl.lit("orientation_unavailable"))
-            .alias("palindromic_orientation_state")
+            .alias(state_col)
         )
         .drop("__orientation_resolved")
     )
@@ -1184,7 +1192,7 @@ def merge_external_allele_frequencies(
         pl.when(
             matched_palindromic
             & (
-                pl.col("palindromic_orientation_state")
+                pl.col(state_col)
                 != "resolved_by_study_orientation"
             ).fill_null(True)
         )
@@ -1193,9 +1201,9 @@ def merge_external_allele_frequencies(
         .alias(eaf_col)
     )
     palindromic_state_counts = {
-        str(row["palindromic_orientation_state"]): int(row["len"])
+        str(row[state_col]): int(row["len"])
         for row in palindromic_orientation.group_by(
-            "palindromic_orientation_state"
+            state_col
         ).len().to_dicts()
     }
     stats["palindromic_evaluated_rows"] = palindromic_orientation.height
@@ -1288,7 +1296,7 @@ def merge_external_allele_frequencies(
         final_df,
         matched_palindromic
         & (
-            pl.col("palindromic_orientation_state")
+            pl.col(state_col)
             != "resolved_by_study_orientation"
         ).fill_null(True),
         step_label=STEP_LABEL,
@@ -1313,15 +1321,19 @@ def merge_external_allele_frequencies(
     final_df = final_df.drop([
         orientation_col,
         row_col,
-        "palindromic_orientation_state",
+        state_col,
     ])
 
     emit.info("Direct allele-key matches  : %s" % _fmt_int(stats["direct_match_rows"]))
     emit.info("Swapped allele-key matches : %s" % _fmt_int(stats["flip_match_rows"]))
     emit.info("No allele-key match        : %s" % _fmt_int(stats["unmatched_rows"]))
     emit.info(
-        "Usable external frequencies : %s of %s variants (%s)."
+        "External frequency file %s, source column %r, was assigned to study "
+        "column %r: %s of %s variants have usable frequencies (%s)."
         % (
+            load_path,
+            source_column,
+            eaf_col,
             _fmt_int(stats["usable_match_rows"]),
             _fmt_int(df.height),
             _fmt_pct(stats["usable_match_fraction"]),
@@ -1559,6 +1571,9 @@ def harmonise_allele_frequency(
         )
 
         try:
+            validate_scientific_column_mappings(
+                sample_column_dict, stage=STEP_LABEL, error_type=AlleleFrequencyError,
+            )
             std_cols = {
                 "chr": sample_column_dict["chr_col"],
                 "pos": sample_column_dict["pos_col"],
@@ -1902,9 +1917,14 @@ def harmonise_allele_frequency(
                     new_col_name = REFERENCE_AF_COLUMN
                     emit.info(
                         "Reused the allele-aligned population AF already retained from "
-                        "strand orientation because the explicitly selected external EAF "
-                        "file, column and allele mapping are identical; the reference "
-                        "table was not read a second time."
+                        "strand orientation: external EAF file %s, source column %r, "
+                        "study column %r, %s usable frequencies among %s variants. "
+                        "The explicitly selected file, column and allele mapping are "
+                        "identical; the reference table was not read a second time."
+                        % (
+                            target_file, target_col, new_col_name,
+                            _fmt_int(usable_rows), _fmt_int(merged_df.height),
+                        )
                     )
                 else:
                     merged_df, new_col_name, merge_stats = merge_external_allele_frequencies(
@@ -1928,6 +1948,11 @@ def harmonise_allele_frequency(
                         validation_reference_column=default_eaf_column,
                     )
 
+                merge_stats.update(
+                    source_file=target_file,
+                    source_column=target_col,
+                    destination_column=new_col_name,
+                )
                 raw_frequency_screen = dict(
                     merge_stats.get("raw_frequency_screen") or {}
                 )
@@ -2080,6 +2105,9 @@ def harmonise_allele_frequency(
             # falsely call an EAF disagreement that step 04 was still required
             # to reconcile.
             sample_column_dict["eaf_col"] = final_eaf_col
+            validate_scientific_column_mappings(
+                sample_column_dict, stage=STEP_LABEL, error_type=AlleleFrequencyError,
+            )
             final_df, post_orientation_duplicate_qc = (
                 _resolve_reference_aligned_duplicates(
                     chromosome=chromosome,
