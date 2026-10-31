@@ -427,8 +427,22 @@ and the standard
    contains multiple chromosomes, PostGWAS then scans that file once in
    configured-size batches, projects only the mapped variant and value fields,
    and atomically writes a temporary Parquet partition for each observed
-   chromosome. A
-   `{chromosome}` path template and a single-chromosome run are left unchanged.
+   chromosome. A `{chromosome}` path template and a single-chromosome run are
+   left unchanged.
+
+   Before study splitting, PostGWAS validates reference-input paths against
+   chromosome work-file and immutable-source-snapshot destinations, even when
+   reference staging is unnecessary. Before creating staging outputs, it repeats
+   those checks and validates the resolved source, final-partition, and
+   atomic-temporary paths for all staging groups together.
+   Conflicting custom paths stop processing before any staging file is written
+   or replaced; paths are never silently renamed. This protects selected external
+   inputs, chromosome work files, and immutable source snapshots from being
+   replaced by a reference partition, and prevents one group's temporary or final
+   output from overwriting another's. EAF and INFO may legitimately share a
+   partition when they use the same resolved source and structural mapping:
+   their selected value columns are projected together in one read.
+
    Staging does not deduplicate, transform alleles, or change annotation values;
    the ordinary chromosome step remains responsible for all scientific
    validation and harmonisation. The full in-memory study is released before

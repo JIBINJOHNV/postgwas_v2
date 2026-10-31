@@ -14,9 +14,10 @@ def configured_output_path(
     pattern: str,
     *,
     error_type: Type[Exception] = ValueError,
+    reject_symlinks: bool = False,
     **values,
 ) -> Path:
-    """Render a relative configured pattern without allowing directory escape."""
+    """Render a contained output, optionally rejecting lexical symlink paths."""
     base = Path(root).expanduser().resolve()
     try:
         relative = Path(str(pattern).format(**values))
@@ -24,6 +25,13 @@ def configured_output_path(
         raise error_type("Invalid output path pattern %r: %s" % (pattern, exc)) from exc
     if relative.is_absolute():
         raise error_type("Output path patterns must be relative: %s" % pattern)
+    if reject_symlinks:
+        # Check before resolve() follows links and loses their lexical identity.
+        candidate = base
+        for component in relative.parts:
+            candidate = candidate / component
+            if candidate.is_symlink():
+                raise error_type("Refusing a symlinked output path: %s" % candidate)
     destination = (base / relative).resolve()
     if destination != base and base not in destination.parents:
         raise error_type("Output path pattern leaves its configured root: %s" % pattern)

@@ -25,6 +25,7 @@ from postgwas.core.paths import configured_output_path
 from postgwas.core.values import optional_text
 
 from .resource_paths import external_resource_template_fields
+from .resource_preflight import resource_preflight_file_paths
 from .shared.variant_columns import canonical_chromosome_expression
 
 
@@ -50,6 +51,13 @@ class _StagingGroup:
     chromosome_column: str
     configured_delimiter: str
     output_layout_key: str
+
+
+@dataclass(frozen=True)
+class _StagingPlan:
+    group: _StagingGroup
+    destinations: Mapping[str, Path]
+    temporary: Mapping[str, Path]
 
 
 def _selected_columns(
@@ -276,15 +284,13 @@ def projected_reference_batches(
 
 
 def _partition_group(
-    group: _StagingGroup,
+    plan: _StagingPlan,
     *,
     chromosomes: Sequence[str],
-    dataset_id: str,
-    output_directory: Path,
-    output_layout: Mapping[str, str],
     settings: Mapping[str, Any],
     policies,
 ) -> tuple[dict[str, str], dict[str, Any]]:
+    group = plan.group
     detected = resolve_delimiter(
         group.source,
         group.configured_delimiter,
@@ -301,31 +307,14 @@ def _partition_group(
 
     batch_rows = int(settings["batch_rows"])
     compression = str(settings["compression"])
-    atomic_suffix = str(settings["atomic_output_suffix"])
     compressed_suffixes = tuple(settings["compressed_suffixes"])
     parquet_compression = None if compression == "none" else compression
     partition_column = "__postgwas_external_reference_chromosome"
     while partition_column in group.columns:
         partition_column += "_"
 
-    destinations = {
-        chromosome: configured_output_path(
-            output_directory,
-            output_layout[group.output_layout_key],
-            error_type=ExternalReferenceStagingError,
-            dataset_id=dataset_id,
-            chromosome=chromosome,
-        )
-        for chromosome in chromosomes
-    }
-    if len(set(destinations.values())) != len(destinations):
-        raise ExternalReferenceStagingError(
-            "Configured external-reference partition paths are not unique by chromosome."
-        )
-    temporary = {
-        chromosome: path.with_name(path.name + atomic_suffix)
-        for chromosome, path in destinations.items()
-    }
+    destinations = plan.destinations
+    temporary = plan.temporary
     for chromosome, path in destinations.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.is_symlink() or temporary[chromosome].is_symlink():
@@ -434,7 +423,7 @@ def _partition_group(
     )
 
 
-def stage_shared_external_reference_files(
+def validate_external_reference_staging_paths(
     resource_maps: Mapping[str, Mapping[str, Any]],
     *,
     chromosomes: Sequence[str],
@@ -448,21 +437,15 @@ def stage_shared_external_reference_files(
     user_info_column: str | None,
     external_info_mapping: Mapping[str, Any],
     settings: Mapping[str, Any],
-    policies,
-    logger=None,
-) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """Stage only whole-file user EAF/INFO inputs and return worker maps.
+) -> tuple[_StagingPlan, ...]:
+    """Plan all groups without mutation, before either study or reference writes.
 
-    A user path containing ``{chromosome}`` and every single-chromosome run are
-    deliberately no-ops.  When EAF and INFO use the same file and identical
-    structural mapping, their selected value fields are projected in one read
-    and both worker resource keys point at the same chromosome partition.
+    Grouping determines legitimate shared projections. Every other final or
+    temporary destination must be distinct from inputs and other output roles,
+    including existing hard links. Validation is cheap and is repeated by the
+    direct staging entry point so library callers receive the same protection.
     """
     ordered_chromosomes = tuple(str(chromosome) for chromosome in chromosomes)
-    maps = {
-        chromosome: dict(resource_maps[chromosome])
-        for chromosome in ordered_chromosomes
-    }
     roles = (
         _ReferenceRole(
             "user_eaf_file",
@@ -481,8 +464,121 @@ def stage_shared_external_reference_files(
             "external_info_partition",
         ),
     )
-    groups = _group_roles(_eligible_roles(maps, roles, ordered_chromosomes))
-    if not groups:
+    groups = _group_roles(_eligible_roles(resource_maps, roles, ordered_chromosomes))
+
+    output_root = Path(output_directory).expanduser().resolve()
+    paths: dict[Path, tuple[str, bool]] = {}
+    identities: dict[tuple[int, int], tuple[Path, str, bool]] = {}
+
+    def claim(path: Path, label: str, *, output: bool) -> None:
+        path = path.expanduser().resolve()
+        for other, (other_label, other_output) in paths.items():
+            if (output or other_output) and (
+                path == other or path in other.parents or other in path.parents
+            ):
+                raise ExternalReferenceStagingError(
+                    "External-reference path collision: %s '%s' conflicts with "
+                    "%s '%s'. Configure distinct output_layout paths."
+                    % (label, path, other_label, other)
+                )
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            metadata = None
+        except OSError as exc:
+            raise ExternalReferenceStagingError(
+                "Could not validate %s path '%s': %s" % (label, path, exc)
+            ) from exc
+        if metadata is not None:
+            identity = (metadata.st_dev, metadata.st_ino)
+            other = identities.get(identity)
+            if other is not None and (output or other[2]):
+                raise ExternalReferenceStagingError(
+                    "External-reference file alias: %s '%s' and %s '%s' refer "
+                    "to the same file. Configure distinct output_layout paths."
+                    % (label, path, other[1], other[0])
+                )
+            if output and not path.is_file():
+                raise ExternalReferenceStagingError(
+                    "External-reference output is not a regular file: %s" % path
+                )
+            identities[identity] = (path, label, output)
+        paths[path] = (label, output)
+
+    # Reuse the preflight inventory, including non-staged roles and indexes.
+    for source in resource_preflight_file_paths(resource_maps):
+        claim(source, "reference input", output=False)
+    for key in ("chromosome_table", "chromosome_source_snapshot"):
+        if key in output_layout:
+            for chromosome in ordered_chromosomes:
+                path = configured_output_path(
+                    output_root, output_layout[key],
+                    error_type=ExternalReferenceStagingError,
+                    reject_symlinks=True,
+                    dataset_id=dataset_id, chromosome=chromosome,
+                )
+                claim(path, "%s chromosome %s" % (key, chromosome), output=True)
+
+    plans = []
+    for group in groups:
+        destinations = {}
+        temporary = {}
+        for chromosome in ordered_chromosomes:
+            destination = configured_output_path(
+                output_root, output_layout[group.output_layout_key],
+                error_type=ExternalReferenceStagingError,
+                reject_symlinks=True,
+                dataset_id=dataset_id, chromosome=chromosome,
+            )
+            staging_path = configured_output_path(
+                output_root, "{partition}{suffix}",
+                error_type=ExternalReferenceStagingError,
+                reject_symlinks=True,
+                partition=str(destination.relative_to(output_root)),
+                suffix=str(settings["atomic_output_suffix"]),
+            )
+            label = "%s chromosome %s" % (group.output_layout_key, chromosome)
+            claim(destination, label + " final", output=True)
+            claim(staging_path, label + " temporary", output=True)
+            destinations[chromosome] = destination
+            temporary[chromosome] = staging_path
+        plans.append(_StagingPlan(group, destinations, temporary))
+    return tuple(plans)
+
+
+def stage_shared_external_reference_files(
+    resource_maps: Mapping[str, Mapping[str, Any]],
+    *,
+    chromosomes: Sequence[str],
+    dataset_id: str,
+    output_directory: str | Path,
+    output_layout: Mapping[str, str],
+    user_eaf_specification: str | None,
+    user_eaf_column: str | None,
+    external_eaf_mapping: Mapping[str, Any],
+    user_info_specification: str | None,
+    user_info_column: str | None,
+    external_info_mapping: Mapping[str, Any],
+    settings: Mapping[str, Any],
+    policies,
+    logger=None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Stage whole-file references, retaining compatible roles in one scan."""
+    ordered_chromosomes = tuple(str(chromosome) for chromosome in chromosomes)
+    maps = {
+        chromosome: dict(resource_maps[chromosome])
+        for chromosome in ordered_chromosomes
+    }
+    plans = validate_external_reference_staging_paths(
+        resource_maps, chromosomes=ordered_chromosomes, dataset_id=dataset_id,
+        output_directory=output_directory, output_layout=output_layout,
+        user_eaf_specification=user_eaf_specification,
+        user_eaf_column=user_eaf_column, external_eaf_mapping=external_eaf_mapping,
+        user_info_specification=user_info_specification,
+        user_info_column=user_info_column, external_info_mapping=external_info_mapping,
+        settings=settings,
+    )
+    if not plans:
         return maps, {
             "status": "not_needed",
             "source_files_read": 0,
@@ -494,13 +590,11 @@ def stage_shared_external_reference_files(
         }
 
     results = []
-    for group in groups:
+    for plan in plans:
+        group = plan.group
         partitions, result = _partition_group(
-            group,
+            plan,
             chromosomes=ordered_chromosomes,
-            dataset_id=dataset_id,
-            output_directory=Path(output_directory).expanduser().resolve(),
-            output_layout=output_layout,
             settings=settings,
             policies=policies,
         )
@@ -523,7 +617,7 @@ def stage_shared_external_reference_files(
 
     return maps, {
         "status": "staged",
-        "source_files_read": len(groups),
+        "source_files_read": len(plans),
         "resources": results,
     }
 
@@ -531,5 +625,6 @@ def stage_shared_external_reference_files(
 __all__ = [
     "ExternalReferenceStagingError",
     "projected_reference_batches",
+    "validate_external_reference_staging_paths",
     "stage_shared_external_reference_files",
 ]

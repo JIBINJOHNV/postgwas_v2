@@ -93,6 +93,7 @@ from postgwas.modules.harmonisation.resource_paths import resolve_resource_file
 from postgwas.modules.harmonisation.external_reference_staging import (
     ExternalReferenceStagingError,
     stage_shared_external_reference_files,
+    validate_external_reference_staging_paths,
 )
 from postgwas.modules.harmonisation.input_validation import (
     validate_config,
@@ -3309,6 +3310,29 @@ def _prepare_dataset_for_chromosome_processing(
             "info.maximum_invalid_fraction",
         ],
     ) as ctx:
+        # Validate all reference and study destinations before the first split
+        # writer can replace a source or an existing partition. The staging
+        # entry point repeats this cheap guard for direct library callers.
+        try:
+            validate_external_reference_staging_paths(
+                resource_maps,
+                chromosomes=observed_chromosomes,
+                dataset_id=sample_id,
+                output_directory=output_dir_path,
+                output_layout=output_layout,
+                user_eaf_specification=user_eaf_file,
+                user_eaf_column=user_eaf_column,
+                external_eaf_mapping=external_eaf_colmap,
+                user_info_specification=user_info_file,
+                user_info_column=user_info_column,
+                external_info_mapping=external_info_colmap,
+                settings=external_reference_staging,
+            )
+        except ExternalReferenceStagingError as exc:
+            raise PipelineError(
+                "%s No chromosome partitions or workers were created; fix the "
+                "external-reference paths or output_layout and rerun." % exc
+            ) from exc
         info_score_decision = None
         if sample_column_dict.get("info_source") in ("internal", "fixed_cli"):
             info_score_decision = resolve_dataset_info_score_type(
