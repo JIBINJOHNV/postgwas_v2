@@ -17,7 +17,9 @@ frequency-informed TwoSampleMR harmonisation method:
 https://ebispot.github.io/gwas-sumstats-harmoniser-documentation/Introduction/Orientation-of-palindromic-variants/
 https://mrcieu.github.io/TwoSampleMR/articles/harmonise.html
 
-The study-frequency guard follows the GWAS-SSF and GWAS-VCF requirement that
+Dataset workers reuse the conditional whole-study AF acceptance decision.
+For direct library calls without that decision, the study-frequency guard follows
+the GWAS-SSF and GWAS-VCF requirement that
 association frequency belongs to the listed effect/ALT allele. It compares the
 declared EAF interpretation with its one-minus alternative on uniquely oriented
 non-palindromic variants and fails only when all configured evidence thresholds
@@ -27,12 +29,16 @@ https://github.com/MRCIEU/gwas-vcf-specification
 """
 
 import math
+from dataclasses import asdict
 from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
 
 from postgwas.core.values import optional_text
+from postgwas.core.input_validation import capture_preflight_file_identities
 
+from .chromosome_partition import _validate_source_row_ids
+from .rejects import SOURCE_INPUT_ROW_COLUMN
 from .shared.allele_join import deduplicate_reference_values
 from .shared.runtime import reject_rows, resolve_policies
 from .shared.statistics import frequency_maf_screen, valid_frequency_mask
@@ -53,6 +59,7 @@ __all__ = [
     "EXPORTABLE_STRAND_ACTIONS",
     "StrandOrientationError",
     "resolve_strand_consensus",
+    "prepare_study_reference_matches",
     "assess_study_frequency_allele_alignment",
     "resolve_palindromic_frequency_evidence",
 ]
@@ -60,6 +67,14 @@ __all__ = [
 
 STRAND_ACTION_COLUMN = "strand_action"
 REFERENCE_AF_COLUMN = "strand_reference_af"
+# Internal work-file protocol: keep every candidate, including palindromes.
+# These columns are removed before scientific outputs are produced.
+PREPARED_MATCHES_COLUMN = "__postgwas_reference_matches"
+PREPARED_INPUT_COLUMN = "__postgwas_reference_input"
+_MATCH_COLUMNS = (
+    STRAND_ACTION_COLUMN, "__strand_swapped", "__strand_ref", "__strand_alt",
+    "__strand_af", "__strand_palindromic", "__strand_candidates",
+)
 STEP_LABEL = "04 strand_orientation"
 RESOLVED_STRAND_ACTIONS = (
     "forward",
@@ -246,6 +261,184 @@ def _finite_float(value):
     return number if math.isfinite(number) else None
 
 
+def _reference_orientation_candidates(study, reference, columns, row_col, mode):
+    """Share the same allele matching for read-only preflight and orientation."""
+    chr_col, pos_col, ea_col, oa_col = (
+        columns[key] for key in ("chr_col", "pos_col", "ea_col", "oa_col")
+    )
+    joined = study.join(
+        reference,
+        left_on=[chr_col, pos_col],
+        right_on=["__strand_chr", "__strand_pos"],
+        how="inner",
+    ).with_columns([
+        reverse_complement_expression(
+            pl.col(ea_col)
+        ).alias("__strand_ea_rc"),
+        reverse_complement_expression(
+            pl.col(oa_col)
+        ).alias("__strand_oa_rc"),
+    ])
+
+    ea = pl.col(ea_col)
+    oa = pl.col(oa_col)
+    ref = pl.col("__strand_ref")
+    alt = pl.col("__strand_alt")
+    snv = (
+        (ea.str.len_chars() == 1)
+        & (oa.str.len_chars() == 1)
+        & (ref.str.len_chars() == 1)
+        & (alt.str.len_chars() == 1)
+    )
+    orientations = [
+        ("forward", (ea == alt) & (oa == ref), False),
+        ("forward_swapped", (ea == ref) & (oa == alt), True),
+        (
+            "reverse_complement",
+            snv
+            & (pl.col("__strand_ea_rc") == alt)
+            & (pl.col("__strand_oa_rc") == ref),
+            False,
+        ),
+        (
+            "reverse_complement_swapped",
+            snv
+            & (pl.col("__strand_ea_rc") == ref)
+            & (pl.col("__strand_oa_rc") == alt),
+            True,
+        ),
+    ]
+    if mode == "reference_aligned":
+        orientations = orientations[:2]
+    candidate_frames = [
+        joined.filter(condition).with_columns([
+            pl.lit(action).alias(STRAND_ACTION_COLUMN),
+            pl.lit(swapped).alias("__strand_swapped"),
+        ])
+        for action, condition, swapped in orientations
+    ]
+    candidates = pl.concat(candidate_frames, how="vertical_relaxed").unique(
+        subset=[
+            row_col, STRAND_ACTION_COLUMN, "__strand_ref", "__strand_alt", "__strand_af"
+        ],
+        maintain_order=True,
+    )
+
+    candidates = candidates.with_columns([
+        palindromic_snp_expression(
+            pl.col(ea_col), pl.col(oa_col)
+        ).alias("__strand_palindromic"),
+        pl.len().over(row_col).alias("__strand_candidates"),
+    ])
+    return candidates
+
+
+def _study_reference_frequency_pairs(candidates, row_column, frequency_column):
+    """Return valid, uniquely matched non-palindromic diagnostic pairs only."""
+    counted_candidates = (
+        candidates
+        if "__strand_candidates" in candidates.columns
+        else candidates.with_columns(
+            pl.len().over(row_column).alias("__strand_candidates")
+        )
+    )
+    unique_non_palindromic = counted_candidates.filter(
+        ~pl.col("__strand_palindromic")
+        & (pl.col("__strand_candidates") == 1)
+    )
+    study_frequency = pl.col(frequency_column).cast(pl.Float64, strict=False)
+    reference_alt_frequency = pl.col("__strand_af").cast(
+        pl.Float64, strict=False
+    )
+    expected_effect_frequency = (
+        pl.when(pl.col("__strand_swapped"))
+        .then(1.0 - reference_alt_frequency)
+        .otherwise(reference_alt_frequency)
+    )
+    comparable = (
+        unique_non_palindromic.select([
+            study_frequency.alias("__study_frequency"),
+            expected_effect_frequency.alias("__expected_effect_frequency"),
+        ])
+        .filter(
+            valid_frequency_mask(pl.col("__study_frequency"))
+            & valid_frequency_mask(pl.col("__expected_effect_frequency"))
+        )
+    )
+    return comparable
+
+
+def _reference_match_contract(path, population, mapping, columns, policies):
+    """Bind invocation-local matches to their exact reference and settings."""
+    identity, = capture_preflight_file_identities(
+        [path], error_type=StrandOrientationError, label="Strand reference",
+    )
+    identity = asdict(identity)
+    identity["path"] = str(identity["path"])
+    return {
+        "reference": identity, "population": population, "mapping": dict(mapping),
+        "study_columns": {key: columns[key] for key in
+                          ("chr_col", "pos_col", "ea_col", "oa_col", "eaf_col")},
+        "policies": {key: policies.get(key) for key in POLICY_KEYS},
+    }
+
+
+def _reference_input(columns):
+    return pl.struct([SOURCE_INPUT_ROW_COLUMN] + [
+        columns[key] for key in ("chr_col", "pos_col", "ea_col", "oa_col", "eaf_col")
+    ])
+
+
+def prepare_study_reference_matches(
+    df, columns, frequency_column, reference_file, population_column,
+    reference_mapping, policies, *, warn=None,
+):
+    """Align reference AF to original study EA without transforming study data.
+
+    Return diagnostic pairs, compact row-bound candidates and their contract.
+    All candidates survive preparation, including ambiguous and palindromic
+    matches that cannot contribute to the study-level frequency decision.
+    """
+    _validate_source_row_ids(df, "Study reference preparation")
+    study = df.select([SOURCE_INPUT_ROW_COLUMN] + [
+        columns[key] for key in ("chr_col", "pos_col", "ea_col", "oa_col")
+    ] + [frequency_column])
+    row_col = SOURCE_INPUT_ROW_COLUMN
+    inputs = study.select(row_col, _reference_input(columns).alias(PREPARED_INPUT_COLUMN))
+    study, _ = canonicalize_variant_frame(
+        study,
+        {key: columns[key + "_col"] for key in ("chr", "pos", "ea", "oa")},
+        policies, error_type=StrandOrientationError, warn=warn,
+        label="study frequency preflight",
+    )
+    contract = _reference_match_contract(
+        reference_file, population_column, reference_mapping, columns, policies,
+    )
+    reference, duplicates = _load_reference(
+        reference_file, population_column, reference_mapping, policies,
+        ",".join(study[columns["chr_col"]].unique().sort().to_list()),
+        warn=warn,
+    )
+    candidates = _reference_orientation_candidates(
+        study, reference, columns, row_col, str(policies.get("strand.mode")),
+    )
+    if contract != _reference_match_contract(
+        reference_file, population_column, reference_mapping, columns, policies,
+    ):
+        raise StrandOrientationError("Strand reference changed during preparation; restart the run.")
+    packed = candidates.group_by(row_col).agg(
+        pl.struct(list(_MATCH_COLUMNS)).alias(PREPARED_MATCHES_COLUMN)
+    )
+    # Empty lists explicitly represent unmatched rows; null means incomplete data.
+    packed = inputs.join(packed, on=row_col, how="left", coalesce=True).with_columns(
+        pl.col(PREPARED_MATCHES_COLUMN).fill_null([])
+    )
+    return (
+        _study_reference_frequency_pairs(candidates, row_col, frequency_column),
+        packed, {"contract": contract, "duplicate_statistics": duplicates},
+    )
+
+
 def assess_study_frequency_allele_alignment(
     candidates: pl.DataFrame,
     *,
@@ -296,35 +489,8 @@ def assess_study_frequency_allele_alignment(
     if candidates.is_empty() or frequency_column not in candidates.columns:
         return evidence
 
-    counted_candidates = (
-        candidates
-        if "__strand_candidates" in candidates.columns
-        else candidates.with_columns(
-            pl.len().over(row_column).alias("__strand_candidates")
-        )
-    )
-    unique_non_palindromic = counted_candidates.filter(
-        ~pl.col("__strand_palindromic")
-        & (pl.col("__strand_candidates") == 1)
-    )
-    study_frequency = pl.col(frequency_column).cast(pl.Float64, strict=False)
-    reference_alt_frequency = pl.col("__strand_af").cast(
-        pl.Float64, strict=False
-    )
-    expected_effect_frequency = (
-        pl.when(pl.col("__strand_swapped"))
-        .then(1.0 - reference_alt_frequency)
-        .otherwise(reference_alt_frequency)
-    )
-    comparable = (
-        unique_non_palindromic.select([
-            study_frequency.alias("__study_frequency"),
-            expected_effect_frequency.alias("__expected_effect_frequency"),
-        ])
-        .filter(
-            valid_frequency_mask(pl.col("__study_frequency"))
-            & valid_frequency_mask(pl.col("__expected_effect_frequency"))
-        )
+    comparable = _study_reference_frequency_pairs(
+        candidates, row_column, frequency_column,
     )
     if comparable.is_empty():
         return evidence
@@ -623,14 +789,32 @@ def harmonise_strand_orientation(
             value=str(_study_value(study_decision, "strand", "unresolved") or "unresolved"),
         )
 
-    reference, reference_duplicate_stats = _load_reference(
-        reference_file,
-        population_col,
-        reference_colmap,
-        pol,
-        chromosome,
-        warn=ctx.warn if ctx is not None else None,
-    )
+    prepared = _study_value(study_decision, "eaf_prepared_references", {}).get(str(chromosome))
+    prepared_columns = (PREPARED_MATCHES_COLUMN, PREPARED_INPUT_COLUMN)
+    if prepared is not None:
+        accepted = _study_value(study_decision, "eaf_reference_validation", {}).get("status") == "passed"
+        if not accepted or not all(column in df.columns for column in prepared_columns):
+            raise StrandOrientationError("Prepared reference matches are incomplete or lack study AF acceptance.")
+        if prepared["contract"] != _reference_match_contract(
+            reference_file, population_col, reference_colmap, sample_column_dict, pol,
+        ):
+            raise StrandOrientationError("Prepared reference or matching settings changed; restart the run.")
+        _validate_source_row_ids(df, "Prepared chromosome reference matches")
+        if df.select((
+            ~_reference_input(sample_column_dict).eq_missing(pl.col(PREPARED_INPUT_COLUMN))
+            | pl.col(PREPARED_MATCHES_COLUMN).is_null()
+        ).any()).item():
+            raise StrandOrientationError("Study rows changed or prepared reference matches are incomplete; restart the run.")
+        reference_duplicate_stats = prepared["duplicate_statistics"]
+        if ctx is not None:
+            ctx.info("Reusing prepared reference matches and whole-study AF decision; no reference reread or rematching.")
+    else:
+        if any(column in df.columns for column in prepared_columns):
+            raise StrandOrientationError("Prepared reference columns have no matching preparation contract.")
+        reference, reference_duplicate_stats = _load_reference(
+            reference_file, population_col, reference_colmap, pol, chromosome,
+            warn=ctx.warn if ctx is not None else None,
+        )
     if ctx is not None and reference_duplicate_stats["reference_duplicate_groups"]:
         ctx.info(
             "Strand reference duplicate groups: %s exact and %s non-identical; "
@@ -645,7 +829,8 @@ def harmonise_strand_orientation(
                 ],
             )
         )
-    study = df.with_row_index(row_col)
+    study = df.drop(list(prepared_columns)) if prepared is not None else df
+    study = study.with_row_index(row_col)
     if not has_canonical_variant_columns(df, sample_column_dict):
         study, _normalization = canonicalize_variant_frame(
             study,
@@ -655,70 +840,15 @@ def harmonise_strand_orientation(
             warn=ctx.warn if ctx is not None else None,
             label="study before strand-reference matching",
         )
-    joined = study.join(
-        reference,
-        left_on=[chr_col, pos_col],
-        right_on=["__strand_chr", "__strand_pos"],
-        how="inner",
-    ).with_columns([
-        reverse_complement_expression(
-            pl.col(ea_col)
-        ).alias("__strand_ea_rc"),
-        reverse_complement_expression(
-            pl.col(oa_col)
-        ).alias("__strand_oa_rc"),
-    ])
-
-    ea = pl.col(ea_col)
-    oa = pl.col(oa_col)
-    ref = pl.col("__strand_ref")
-    alt = pl.col("__strand_alt")
-    snv = (
-        (ea.str.len_chars() == 1)
-        & (oa.str.len_chars() == 1)
-        & (ref.str.len_chars() == 1)
-        & (alt.str.len_chars() == 1)
-    )
-    orientations = [
-        ("forward", (ea == alt) & (oa == ref), False),
-        ("forward_swapped", (ea == ref) & (oa == alt), True),
-        (
-            "reverse_complement",
-            snv
-            & (pl.col("__strand_ea_rc") == alt)
-            & (pl.col("__strand_oa_rc") == ref),
-            False,
-        ),
-        (
-            "reverse_complement_swapped",
-            snv
-            & (pl.col("__strand_ea_rc") == ref)
-            & (pl.col("__strand_oa_rc") == alt),
-            True,
-        ),
-    ]
-    if mode == "reference_aligned":
-        orientations = orientations[:2]
-    candidate_frames = [
-        joined.filter(condition).with_columns([
-            pl.lit(action).alias(STRAND_ACTION_COLUMN),
-            pl.lit(swapped).alias("__strand_swapped"),
-        ])
-        for action, condition, swapped in orientations
-    ]
-    candidates = pl.concat(candidate_frames, how="vertical_relaxed").unique(
-        subset=[
-            row_col, STRAND_ACTION_COLUMN, "__strand_ref", "__strand_alt", "__strand_af"
-        ],
-        maintain_order=True,
-    )
-
-    candidates = candidates.with_columns([
-        palindromic_snp_expression(
-            pl.col(ea_col), pl.col(oa_col)
-        ).alias("__strand_palindromic"),
-        pl.len().over(row_col).alias("__strand_candidates"),
-    ])
+    if prepared is not None:
+        matched = df.with_row_index(row_col).select(row_col, PREPARED_MATCHES_COLUMN).explode(
+            PREPARED_MATCHES_COLUMN
+        ).unnest(PREPARED_MATCHES_COLUMN).filter(pl.col(STRAND_ACTION_COLUMN).is_not_null())
+        candidates = study.join(matched, on=row_col, how="inner")
+    else:
+        candidates = _reference_orientation_candidates(
+            study, reference, sample_column_dict, row_col, mode,
+        )
     candidate_counts = candidates.select([
         row_col, "__strand_candidates",
     ]).unique(subset=[row_col], maintain_order=True)
@@ -733,10 +863,19 @@ def harmonise_strand_orientation(
             else "frequency alignment check was not applicable"
         ),
     }
+    dataset_frequency_validation = _study_value(
+        study_decision, "eaf_reference_validation", {},
+    )
+    dataset_frequency_accepted = dataset_frequency_validation.get("status") in (
+        "passed", "not_required",
+    )
+    if dataset_frequency_accepted:
+        frequency_alignment = dict(dataset_frequency_validation)
     if (
         eaf_col is not None
         and eaf_col in candidates.columns
         and not eaf_is_maf
+        and not dataset_frequency_accepted
     ):
         frequency_alignment = assess_study_frequency_allele_alignment(
             candidates,
@@ -1206,6 +1345,7 @@ def harmonise_strand_orientation(
         "final_variants": output.height,
         "reference_file": reference_file,
         "reference_population_column": population_col,
+        "reference_matches_reused": prepared is not None,
         "strand_mode": mode,
         "study_strand_consensus": consensus,
         "study_frequency_allele_alignment": frequency_alignment,

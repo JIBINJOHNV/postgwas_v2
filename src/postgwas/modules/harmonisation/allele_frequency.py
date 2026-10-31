@@ -4,13 +4,14 @@ Plan v3 sections 5.2 and 5.3.
 
 What this module does, in order:
 
-1.  Join the raw chromosome reference once on chromosome and position, resolve
+1.  Reuse prepared study-reference matches, or join the raw chromosome reference
+    when no study AF comparison was needed. Resolve
     forward/swapped/reverse-complement orientations, and transform allele-specific
     statistics consistently.
 2.  If the study supplies its own frequency column, describe it, apply the configured
-    out-of-range action without silently clipping under other policies, and decide whether the
-    column is really an *effect* allele frequency or a *minor* allele frequency.
-    A MAF-like distribution is checked against the configured default EAF table:
+    out-of-range action without silently clipping under other policies, and follow
+    the dataset AF acceptance decision. Before chromosome workers,
+    a MAF-like study distribution is checked against the configured default EAF table:
     direct matches use ALT frequency and swapped matches use ``1-AF``. This follows
     the GWAS-SSF requirement that frequency is aligned to the listed effect allele
     (https://www.ebi.ac.uk/gwas/docs/methods/summary-statistics).
@@ -65,24 +66,30 @@ from .shared.runtime import (
     resolve_policies,
     step_context as shared_step_context,
 )
-from .shared.allele_join import allele_oriented_left_join
+from .shared.allele_join import allele_oriented_left_join, unused_column_name
 from .shared.statistics import valid_frequency_mask
 from .shared.variant_columns import (
     palindromic_snp_expression,
     read_reference_variant_table,
 )
 from .summary_statistics_io import resolve_duplicate_variants
+from .rejects import SOURCE_INPUT_ROW_COLUMN
 from .strand import (
     POLICY_KEYS as STRAND_POLICY_KEYS,
     REFERENCE_AF_COLUMN,
     RESOLVED_STRAND_ACTIONS,
     STEP_LABEL as STRAND_STEP_LABEL,
     STRAND_ACTION_COLUMN,
+    PREPARED_MATCHES_COLUMN,
+    PREPARED_INPUT_COLUMN,
     harmonise_strand_orientation,
+    prepare_study_reference_matches,
 )
 
 __all__ = [
     "AlleleFrequencyError",
+    "StudyAlleleFrequencyError",
+    "validate_study_allele_frequency",
     "STEP_LABEL",
     "STEP_TITLE",
     "POLICY_KEYS",
@@ -136,6 +143,153 @@ class AlleleFrequencyError(RuntimeError):
     Derives from ``RuntimeError`` so the dataset orchestrator can catch it,
     record the chromosome failure, and apply its retry policy.
     """
+
+
+class StudyAlleleFrequencyError(AlleleFrequencyError):
+    """Fatal dataset AF preflight failure; never retry or start another dataset."""
+
+
+def validate_study_allele_frequency(
+    df, sample_columns, study_decisions, resource_maps, reference_mapping,
+    policies=None, logger=None,
+):
+    """Return the AF decision and study frame with reusable reference matches.
+
+    The distribution screen is resolved once by study_properties. Only a
+    MAF-like study needs reference concordance. Pool diagnostic pairs across
+    the dataset, not chromosome averages, and compare unfolded frequencies
+    aligned to the original effect allele. Thresholds are configurable QC
+    heuristics, not proof of the semantic meaning of every individual value.
+    """
+    pol = resolve_policies(policies)
+    emit = active_context(logger)
+    decisions = dict(study_decisions)
+    if any(key in df.columns for key in (PREPARED_MATCHES_COLUMN, PREPARED_INPUT_COLUMN)):
+        raise StudyAlleleFrequencyError("Study input contains reserved reference-preparation columns.")
+    column = decisions.get("eaf_column")
+    initial = decisions.get("eaf_is_maf")
+    evidence = {"status": "not_applicable", "decision_reason": "no_study_frequency"}
+    if column is not None:
+        if initial is not True and initial is not False:
+            raise StudyAlleleFrequencyError(
+                "Study frequency preflight requires the whole-study MAF screen."
+            )
+        evidence = {
+            "status": "not_required",
+            "decision_reason": "study_frequency_not_predominantly_minor",
+        }
+        if initial:
+            # A whole-genome reference used by several chromosomes is read once.
+            references = {}
+            for chromosome, resources in resource_maps.items():
+                key = (
+                    resources["default_eaf_file"],
+                    resources["default_eaf_reference_column"],
+                )
+                references.setdefault(key, []).append(str(chromosome))
+            pairs, prepared = [], []
+            prepared_references = {}
+            projected = df.select([SOURCE_INPUT_ROW_COLUMN] + [
+                sample_columns[key + "_col"] for key in ("chr", "pos", "ea", "oa")
+            ] + [column])
+            for (path, population), chromosomes in references.items():
+                emit.info(
+                    "Study AF preflight: reference %s; population %s; chromosomes %s."
+                    % (path, population, ", ".join(chromosomes))
+                )
+                paired, matches, metadata = prepare_study_reference_matches(
+                    projected.filter(
+                        pl.col(sample_columns["chr_col"]).cast(pl.Utf8).is_in(chromosomes)
+                    ),
+                    sample_columns, column, path, population, reference_mapping,
+                    pol, warn=emit.warn,
+                )
+                pairs.append(paired)
+                prepared.append(matches)
+                prepared_references.update({chromosome: metadata for chromosome in chromosomes})
+            paired = pl.concat(pairs, rechunk=False) if pairs else pl.DataFrame(
+                schema={
+                    "__study_frequency": pl.Float64,
+                    "__expected_effect_frequency": pl.Float64,
+                }
+            )
+            study = pl.col("__study_frequency")
+            reference = pl.col("__expected_effect_frequency")
+            method = str(pol.get("eaf.maf_reference_correlation_method"))
+            statistics = paired.select([
+                pl.corr(study, reference, method=method).alias("correlation"),
+                (study - reference).abs().mean().alias("mean_absolute_difference"),
+                (reference <= 0.5).mean().alias("reference_effect_allele_minor_fraction"),
+            ]).to_dicts()[0]
+            evidence = {
+                "status": "failed",
+                "comparable_variants": paired.height,
+                "minimum_overlap": int(pol.get("eaf.maf_reference_min_overlap")),
+                "correlation_method": method,
+                "minimum_correlation": float(pol.get("eaf.maf_reference_min_correlation")),
+                "maximum_mean_absolute_difference": float(
+                    pol.get("eaf.maf_reference_max_mean_absolute_difference")
+                ),
+                **{
+                    key: float(value) if value is not None and math.isfinite(value) else None
+                    for key, value in statistics.items()
+                },
+            }
+            if paired.height < evidence["minimum_overlap"]:
+                reason = "insufficient_overlap"
+            elif evidence["correlation"] is None:
+                reason = "correlation_unavailable"
+            elif evidence["correlation"] < evidence["minimum_correlation"]:
+                reason = "correlation_below_minimum"
+            elif (
+                evidence["mean_absolute_difference"] is None
+                or evidence["mean_absolute_difference"] > evidence["maximum_mean_absolute_difference"]
+            ):
+                reason = "mean_absolute_difference_above_maximum"
+            else:
+                reason = "allele_aligned_frequency_agreement"
+                evidence["status"] = "passed"
+            evidence["decision_reason"] = reason
+            emit.decide("Whole-study AF acceptance", evidence, evidence["status"])
+            if evidence["status"] != "passed":
+                message = (
+                    "Study frequency column '%s' cannot be accepted as EAF: %s. "
+                    "Comparable non-palindromic variants: %s (minimum %s); %s correlation: %s "
+                    "(minimum %s); mean absolute allele-aligned AF difference: %s (maximum %s). "
+                    "No AF values were changed. Check the study AF/allele mapping, reference "
+                    "population and genome build, or supply a valid external EAF source. "
+                    "The run stopped before chromosome analysis; no dataset retry will be attempted."
+                    % (column, reason, paired.height, evidence["minimum_overlap"], method,
+                       _fmt_metric(evidence["correlation"]), evidence["minimum_correlation"],
+                       _fmt_metric(evidence["mean_absolute_difference"]),
+                       evidence["maximum_mean_absolute_difference"])
+                )
+                emit.warn(message)
+                emit.error(message)
+                raise StudyAlleleFrequencyError(message)
+            # Preparation adds internal evidence only; preserve all source rows
+            # and their order, including rows without diagnostic AF matches.
+            matches = pl.concat(prepared, rechunk=False)
+            if matches.height != df.height or matches[SOURCE_INPUT_ROW_COLUMN].n_unique() != df.height:
+                raise StudyAlleleFrequencyError("Reference preparation did not cover every study row exactly once.")
+            order_column = unused_column_name("__postgwas_preparation_order", df)
+            df = df.with_row_index(order_column).join(
+                matches, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True,
+            ).sort(order_column).drop(order_column)
+            decisions["eaf_prepared_references"] = prepared_references
+        else:
+            emit.info(
+                "Study AF accepted as declared EAF: the whole-study MAF screen "
+                "did not exceed its cutoff; no additional frequency comparison was required."
+            )
+        decisions["eaf_is_maf_initial"] = initial
+        decisions["eaf_is_maf_initial_source"] = decisions.get("eaf_is_maf_source")
+        decisions["eaf_is_maf"] = False
+        decisions["eaf_is_maf_source"] = (
+            "dataset_reference_concordance" if initial else "study_level_statistic"
+        )
+    decisions["eaf_reference_validation"] = evidence
+    return decisions, df
 
 
 _fmt_int = format_count
@@ -290,9 +444,13 @@ def validate_allele_frequency(
     rejects=None,
     out_of_range: Optional[str] = None,
     clip_tolerance: Optional[float] = None,
+    study_eaf_accepted: bool = False,
 ) -> Tuple[bool, bool, int, int, pl.DataFrame, float, Dict[str, Any]]:
     """
     Validate and clean AF/EAF column.
+
+    ``study_eaf_accepted`` reuses the whole-study decision without repeating
+    MAF classification or its warning. Descriptive, range and missing QC remain.
 
     Out-of-range values are counted *before* anything is modified, then handled
     according to ``eaf.out_of_range``:
@@ -471,12 +629,13 @@ def validate_allele_frequency(
     low_freq = int(final_stats.get("le_0_5_rows") or 0)
     low_freq_pct = float(final_stats.get("le_0_5_fraction_among_usable") or 0.0)
     usable_rows = int(final_stats.get("usable_rows") or 0)
-    is_suspicious = low_freq_pct > maf_cutoff
+    # Range/missing QC still runs, but accepted study AF is not reclassified.
+    is_suspicious = not study_eaf_accepted and low_freq_pct > maf_cutoff
     if is_suspicious:
         emit.warn(
             "Column '%s': %s of its %s usable finite frequencies are at or below 0.5, more than the %s set by "
-            "eaf.maf_decision_cutoff. That is what a minor allele frequency looks like, not an effect "
-            "allele frequency."
+            "eaf.maf_decision_cutoff. This is a MAF-like distribution; EAF can also have this "
+            "distribution when effect alleles are predominantly minor."
             % (colname, _fmt_pct(low_freq_pct), _fmt_int(usable_rows), _fmt_pct(maf_cutoff))
         )
 
@@ -1456,6 +1615,11 @@ def harmonise_allele_frequency(
                         logger=logger,
                         ctx=ctx,
                         rejects=rejects,
+                        study_eaf_accepted=(
+                            isinstance(study_decision, dict)
+                            and study_decision.get("eaf_reference_validation", {}).get("status")
+                            in ("passed", "not_required")
+                        ),
                     )
 
                 qc_info["Internal_AF"] = "present"

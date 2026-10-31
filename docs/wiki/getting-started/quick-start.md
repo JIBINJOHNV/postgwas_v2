@@ -105,7 +105,7 @@ following choices affect interpretation, not just file layout:
 
 | Decision | Packaged behaviour to review |
 |---|---|
-| Frequency reference | ALFA EUR is used by both the default tabular comparison and VCF population comparison; choose a suitable panel/population for your study rather than assuming EUR is appropriate. |
+| Frequency reference | 1000G EUR is used by the default tabular strand/MAF–EAF reference; ALFA EUR is used by the VCF population comparison. Choose a suitable panel/population for your study rather than assuming EUR is appropriate. |
 | Dataset-wide inference | Inspect the logged `DECIDE` records for build, effect type, SE scale, P-value scale, frequency interpretation and strand consensus. Insufficient evidence can stop the run rather than force a decision. |
 | Variant retention | Invalid records, duplicate groups, unresolved strand cases and reference-unmatched variants can be rejected before VCF export. The default does not preserve every input row. |
 | Opposite-build VCF | `policies.vcf.liftover_swap: exclude` removes successfully lifted REF/ALT-swapped records. These policy exclusions are distinct from plugin lift failures; inspect both counts. |

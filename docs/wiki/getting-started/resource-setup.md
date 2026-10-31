@@ -100,7 +100,7 @@ The packaged build transition is GRCh37 ↔ GRCh38. The indexed VCF comparison
 sources exposed by the CLI are `1000G` and `ALFA`; ALFA EUR is the packaged
 default for VCF population-frequency annotation and post-merge QC. The
 separate tabular strand/MAF–EAF reference supports `ALFA`, `wgs_ukb`, `panukb`,
-`1000G`, and `fingen`, and defaults to ALFA EUR. Select one source per run under
+`1000G`, and `fingen`, and defaults to 1000G EUR. Select one source per run under
 `modules.harmonisation.default_eaf`; the source name must match the filename
 exactly. The configured panel coverage differs by chromosome and build and is
 checked against each dataset during preflight; confirm that the corresponding

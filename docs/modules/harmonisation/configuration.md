@@ -245,27 +245,16 @@ Chromosome step 03 has already converted an odds ratio and any declared raw
 OR-scale SE to canonical log-odds BETA and SE. Complementing both alleles then
 preserves BETA, Z and true EAF. Changing the effect allele negates BETA and Z
 and replaces true EAF with `1-EAF`; log-scale SE, p-value, INFO and sample size
-remain unchanged. A confirmed MAF is never inverted because it is not tied to
-the listed effect allele. Before a study-supplied EAF can participate in
-palindromic orientation, the existing non-palindromic reference join compares
-the declared EAF interpretation with its one-minus alternative. A non-effect-
-allele-frequency diagnosis requires all four YAML-configured safeguards:
-`eaf.non_effect_frequency_min_overlap`,
-`eaf.non_effect_frequency_min_correlation`,
-`eaf.non_effect_frequency_max_error`, and
-`eaf.non_effect_frequency_error_margin`. A conclusive diagnosis stops; the
-pipeline never auto-inverts the supplied column. These checks enforce the
-[GWAS-SSF effect-allele-frequency contract](https://www.ebi.ac.uk/gwas/docs/summary-statistics-format)
-and the [GWAS-VCF ALT/effect-allele contract](https://github.com/MRCIEU/gwas-vcf-specification).
-If the second-level reference comparison instead proves that a MAF-like column
-is true EAF, swapped rows are inverted at that
-point. After chromosome processing, PostGWAS consolidates every completed
-chromosome's `maf_reference_decision`. A confirmed MAF or an inconclusive
-comparison stops that chromosome; PostGWAS does not guess, export an unoriented
-frequency, or apply a deferred frequency flip without evidence. Only unanimous
-conclusive EAF evidence produces a successful final dataset frequency type.
-The manifest preserves the initial MAF suspicion separately and records the
-final type, its source, and the chromosome decision counts. A palindromic A/T
+remain unchanged. Study AF acceptance now happens once, before chromosome processing.
+The whole-study screen triggers a reference check only when more than
+`eaf.maf_decision_cutoff` (default 95%) of usable study AF values are at or below
+0.5. Otherwise the declared EAF contract is accepted without another frequency
+concordance check. For a MAF-like distribution, reference AF must agree with the
+study's original effect-allele frequencies across the dataset; see the detailed
+thresholds below. Chromosome workers reuse that decision and apply ordinary
+allele swaps exactly once. The manifest keeps the initial screen and the final
+`eaf_reference_validation` evidence separately. The comparison neither filters
+study rows nor replaces their frequencies. A palindromic A/T
 or C/G SNP in `strand.mode: auto` first follows a strong full-study
 non-palindromic strand consensus.
 When that consensus is mixed, unresolved, or insufficient, a true internal EAF
@@ -1077,21 +1066,76 @@ those values rather than maintained independently. This indexed VCF supplies
 population INFO annotations and post-merge frequency QC. The packaged default
 is ALFA with the EUR population field.
 
-When an internal study frequency distribution or a raw external frequency
-column is MAF-like, chromosome step 04 checks it against `default_eaf.column`
+Study AF preflight and the separate external-file classifier use `default_eaf.column`
 from the tabular panel selected by `default_eaf.source` and declared by
-`resource_layout.default_eaf`. The shipped default is ALFA EUR. The validated
+`resource_layout.default_eaf`. The shipped default is 1000G EUR. The validated
 tabular choices are `ALFA`, `wgs_ukb`,
 `panukb`, `1000G`, and `fingen`; their exact resource examples are maintained
 under `default_eaf.available_sources` and `default_eaf.resource_examples` in
-the canonical YAML. Every choice uses the same configured chromosome TSV path
+the canonical YAML. Existing run YAMLs that explicitly set `default_eaf.source:
+ALFA` retain that selection after updating PostGWAS; change that key to `1000G`
+to use the new tabular default. In a full-run YAML the key is under
+`modules.harmonisation`. `comparison_af.source` remains the independent VCF
+selection, with ALFA as its packaged default.
+
+Every choice uses the same configured chromosome TSV path
 contract and must contain the selected population column. This role remains
 independent of the comparison VCF annotation panel. Structural columns and the
 tab delimiter come from `default_eaf_mapping`. Autosomes are available for all
 five configured panels and both supported builds; sex-chromosome coverage is
 panel- and build-dependent, so dataset preflight verifies every chromosome
 actually required by the study. Direct allele matches use the ALT frequency;
-swapped matches use `1-AF`. An external frequency is screened on its
+swapped matches use `1-AF`.
+
+For a study-supplied AF column, additional reference comparison is required only
+when the whole-study share of usable values at or below 0.5 is **greater than 95%**
+(or the configured `eaf.maf_decision_cutoff`). The paired diagnostic set contains
+finite, uniquely allele-matched, non-palindromic variants across all chromosomes.
+Reference AF is aligned to the **original study effect allele** before comparing;
+neither frequency vector is folded to MAF. All three configurable gates must pass:
+
+| Policy under `modules.harmonisation.policies.eaf` | Default | Acceptance |
+|---|---:|---|
+| `maf_reference_min_overlap` | 1000 | Matched diagnostic variants ≥ minimum |
+| `maf_reference_min_correlation` | 0.80 | Finite correlation ≥ minimum |
+| `maf_reference_max_mean_absolute_difference` | 0.10 | Mean absolute AF difference ≤ maximum |
+
+`maf_reference_correlation_method` remains `pearson` by default; the existing
+`spearman` override is also supported. These are dataset QC heuristics, not
+validated universal cutoffs or proof that every frequency is correctly labelled.
+A constant vector, too few matches, or either failed agreement threshold stops
+the entire invocation before chromosome analysis, without retrying this dataset
+or starting subsequent datasets. Logs record the measured evidence and failure.
+Missing and invalid values remain subject to the existing range/missing policies.
+No individual variant is selected, removed, imputed or replaced by this decision.
+In particular, a mean difference limit of 0.10 is not a per-variant filter.
+
+When this study-level comparison reads a reference, PostGWAS also retains its
+allele matches, including ambiguous and palindromic candidates. Compact matches
+are bound to the original source-row IDs in the existing chromosome Parquet work
+files. Workers reuse them without rereading the original frequency table or
+repeating allele matching or MAF classification. No extra CLI option is needed.
+The preparation contract checks reference identity, population, column mappings,
+matching policies and unchanged study keys/frequencies. Incomplete or changed
+preparation stops instead of silently reusing stale evidence. Preparation is
+rebuilt within each invocation; existing validated checkpoint rules still govern
+completed-stage reuse. Normal allele transformations and range/missing-value QC
+remain in their existing order. Internal matching columns are removed before
+scientific outputs. A study that does not trigger the comparison continues to
+read its reference normally for chromosome orientation.
+
+The aligned reference's share at or below 0.5 is reported but **does not veto
+acceptance**. If effect alleles are minor, their EAF legitimately equals MAF.
+The `reference_minor_fraction_cutoff` and `maf_reference_error_margin` vetoes
+therefore do not apply to this whole-study acceptance step. A passing result
+means reference-consistent declared EAF, not proof of the original column's
+provenance. Allele semantics follow the
+[GWAS-SSF contract](https://www.ebi.ac.uk/gwas/docs/summary-statistics-format/);
+subsequent swaps follow the
+[GWAS Catalog harmonisation rules](https://ebispot.github.io/gwas-sumstats-harmoniser-documentation/Introduction/Harmonising-the-variants/).
+
+The **separate external-file classifier is unchanged**. An external frequency is
+screened on its
 deduplicated raw values before this swap operation. A non-MAF-like result
 retains the sample sheet's declared ALT/EAF meaning. A MAF-like result requires
 an independent default panel; if `external_eaf_file` and the resource selected

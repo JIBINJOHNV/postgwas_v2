@@ -26,9 +26,9 @@ modules:
       source: ALFA
       column: EUR
     # Tabular reference used for strand and MAF/EAF validation. Other validated
-    # sources are wgs_ukb, panukb, 1000G, and fingen.
+    # sources are ALFA, wgs_ukb, panukb, and fingen.
     default_eaf:
-      source: ALFA
+      source: 1000G
       column: EUR
     concordance_validation:
       enabled: false

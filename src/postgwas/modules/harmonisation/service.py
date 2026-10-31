@@ -108,7 +108,10 @@ from postgwas.modules.harmonisation.study_properties import (
     finalise_eaf_decision_from_chromosomes,
     resolve_study_properties,
 )
-from postgwas.modules.harmonisation.allele_frequency import harmonise_allele_frequency
+from postgwas.modules.harmonisation.allele_frequency import (
+    harmonise_allele_frequency,
+    validate_study_allele_frequency,
+)
 from postgwas.modules.harmonisation.sample_size import (
     harmonise_sample_sizes,
     prepare_missing_sample_sizes,
@@ -2706,7 +2709,8 @@ def _prepare_dataset_for_chromosome_processing(
 
     Scientific order is invariant: read, content validation, chromosome-X
     reconstruction safety, build inference, strand consensus, study-property
-    resolution, exact resource preflight, and chromosome partitioning. The
+    resolution, exact resource preflight, conditional study AF concordance,
+    and chromosome partitioning. The
     genome-wide frame is intentionally kept local and is released when this
     function returns.
     """
@@ -3191,6 +3195,17 @@ def _prepare_dataset_for_chromosome_processing(
             ),
         ]),
     )
+
+    study_decisions, df = validate_study_allele_frequency(
+        df, sample_column_dict, study_decisions, resource_maps,
+        default_eaf_colmap, policies=policies, logger=logger,
+    )
+    dataset_study_decisions.update({
+        key: value for key, value in study_decisions.items() if key.startswith("eaf_")
+    })
+    logger.info("Dataset AF decision: %s" % json.dumps(
+        dataset_study_decisions["eaf_reference_validation"], sort_keys=True,
+    ))
 
     # ------------------------------------------------------------------
     # 08/08  split by chromosome and stage shared user references

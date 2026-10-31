@@ -8,8 +8,8 @@ Effect type, odds-ratio SE scale, p-value scale and whether the frequency column
 is MAF-like are properties of the STUDY, not of a chromosome. This step decides
 them once, on the full input, records the evidence as DECIDE lines, and hands
 the answers to every worker as data. A MAF-like distribution is only a
-suspicion; chromosome reference checks are consolidated into the final dataset
-frequency type after the workers complete.
+suspicion; whole-study reference concordance resolves acceptance before workers
+start. The original screen and acceptance evidence are preserved in the manifest.
 
 **Why the estimator has to be sound.**  Optional per-chromosome re-verification
 of the effect and p-value decisions is off by default, and the study-level answer
@@ -991,12 +991,10 @@ def _decide_eaf_is_maf(df, sample_column_dict, pol, ctx, decisions, statistics):
             "decision cutoff": cutoff,
             "median": evidence["median"],
         },
-        ("MAF-like and requiring reference confirmation - the "
-         "per-chromosome cross-check against the reference panel decides what to do "
-         "about it. Applied to all chromosomes."
+        ("MAF-like; requires whole-study allele-aligned reference agreement before "
+         "chromosome analysis. The distribution alone does not prove MAF."
          if suspected else
-         "an effect allele frequency, not a minor allele frequency. Applied to all "
-         "chromosomes."),
+         "accepted as declared EAF; no additional frequency comparison required."),
     )
 
 
@@ -1120,10 +1118,9 @@ def finalise_eaf_decision_from_chromosomes(
     # type: (Dict[str, Any], Dict[str, Any], Optional[list]) -> Dict[str, Any]
     """Resolve the final dataset frequency semantics from chromosome evidence.
 
-    The study-level distribution is only an initial MAF suspicion. When it is
-    MAF-like, each completed chromosome performs the reference comparison. A
-    final EAF/MAF label is assigned only when every completed chromosome has the
-    same conclusive result; otherwise the final type remains unresolved.
+    Preserve a whole-study acceptance decision and collect chromosome provenance.
+    Direct chromosome callers without preflight evidence still require conclusive
+    consensus; the distribution screen alone must never become final EAF evidence.
     """
     result = dict(study_decisions or {})
     has_initial_decision = (
@@ -1163,7 +1160,9 @@ def finalise_eaf_decision_from_chromosomes(
             provenance_counts[provenance] += 1
         else:
             provenance_counts["missing"] += 1
-    if initial is True:
+    dataset_validation = result.get("eaf_reference_validation", {})
+    dataset_accepted = dataset_validation.get("status") in ("passed", "not_required")
+    if initial is True and not dataset_accepted:
         for chromosome in completed:
             summary = summaries.get(chromosome, summaries.get(str(chromosome), {}))
             stage_qc = summary.get("stage_qc", {}) if isinstance(summary, dict) else {}
@@ -1179,7 +1178,10 @@ def finalise_eaf_decision_from_chromosomes(
                 counts["missing"] += 1
 
     completed_count = len(completed)
-    if not has_initial_decision:
+    if dataset_accepted:
+        final = False
+        source = result["eaf_is_maf_source"]
+    elif not has_initial_decision:
         final = None
         source = "frequency_decision_missing"
     elif initial is False:

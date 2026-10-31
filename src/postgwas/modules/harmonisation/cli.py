@@ -30,6 +30,7 @@ from postgwas.modules.harmonisation.sample_sheet import (
     to_harmonisation_input,
 )
 from postgwas.modules.harmonisation.policies import POLICIES, load_policies
+from postgwas.modules.harmonisation.allele_frequency import StudyAlleleFrequencyError
 from postgwas.modules.harmonisation.qc_reporting import (
     effect_scale_description,
     summarise_strand_orientation,
@@ -1701,6 +1702,13 @@ def _run_validated_rows(
                     "Run interrupted by the user while processing dataset %s."
                     % row.dataset_id,
                 )
+                raise
+            except StudyAlleleFrequencyError as exc:
+                record_dataset(row, "FAILED", active_manifest_path, failure=exc)
+                message = "Study AF preflight failed; stopping the entire run without retry: %s" % exc
+                _append_run_log(dataset_log, "ERROR", message)
+                _append_run_log(top_log, "ERROR", message)
+                print(screen_field("error", "Study AF preflight", str(exc), indent=4))
                 raise
             except ConfigError as exc:
                 record_dataset(row, "FAILED", active_manifest_path, failure=exc)

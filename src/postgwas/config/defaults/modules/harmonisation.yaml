@@ -31,9 +31,9 @@ module:
   # Allele-orientation and MAF/EAF validation table. This is intentionally
   # separate from comparison_af because chromosome harmonisation consumes
   # tabular reference frequencies rather than annotation VCFs. Select exactly
-  # one source per run; ALFA EUR is the packaged default.
+  # one source per run; 1000G EUR is the packaged default.
   default_eaf:
-    source: ALFA
+    source: 1000G
     column: EUR
     available_sources: [ALFA, wgs_ukb, panukb, 1000G, fingen]
     resource_examples:
@@ -3685,8 +3685,8 @@ policies:
         What it does: Sets the fewest uniquely oriented, non-palindromic study variants that must
           have usable study and population-reference frequencies before PostGWAS may diagnose a
           supplied frequency column as belonging to the non-effect allele.
-        When it applies: chromosome step 04 after the existing reference join and before any study
-          frequency is used to orient a palindrome or transformed for an allele swap. The check
+        When it applies: direct chromosome helpers without a whole-study AF acceptance decision,
+          after the existing reference join and before any study frequency is used to orient a palindrome or transformed for an allele swap. The check
           applies only to a study-supplied column screened as EAF rather than MAF-like.
         Values: A positive whole number. Below this count the diagnosis is inconclusive and the
           declared effect-allele-frequency contract remains the user's responsibility.
@@ -3714,8 +3714,8 @@ policies:
         What it does: Requires one-minus the supplied study frequency to have at least this Pearson
           correlation with the expected frequency of the study's listed effect allele before the
           column can be diagnosed as non-effect-allele frequency.
-        When it applies: together with the overlap, maximum-error and error-margin requirements;
-          every requirement must pass, so correlation alone never changes or rejects data.
+        When it applies: only without a whole-study AF acceptance decision, together with the
+          overlap, maximum-error and error-margin requirements; every requirement must pass, so correlation alone never changes or rejects data.
         Values: A correlation magnitude from 0 to 1. Larger is more conservative.
         Example: correlation -0.94 between supplied AF and expected effect AF means correlation
           +0.94 after inversion and passes the default correlation requirement.
@@ -3735,8 +3735,8 @@ policies:
       help: |-
         What it does: Sets the largest mean absolute difference allowed between one-minus the study
           frequency and the expected effect-allele frequency for a non-effect-frequency diagnosis.
-        When it applies: chromosome step 04 on the same uniquely oriented, non-palindromic evidence
-          used by the correlation check.
+        When it applies: direct chromosome helpers without a whole-study AF acceptance decision,
+          on the same uniquely oriented, non-palindromic evidence used by the correlation check.
         Values: Frequency units from 0 to 1. A smaller value requires a closer ancestry-matched
           reference agreement and reduces false diagnoses when the comparison panel is unsuitable.
         Example: inverted mean absolute error 0.04 passes the default; 0.14 remains inconclusive.
@@ -3756,8 +3756,8 @@ policies:
       help: |-
         What it does: Requires the mean absolute error after one-minus inversion to be at least this
           much smaller than the error under the declared effect-allele-frequency interpretation.
-        When it applies: chromosome step 04 after the correlation and maximum inverted-error
-          requirements. The pipeline fails on a conclusive diagnosis; it never auto-inverts data.
+        When it applies: direct chromosome helpers without a whole-study AF acceptance decision,
+          after the correlation and maximum inverted-error requirements. The pipeline fails on a conclusive diagnosis; it never auto-inverts data.
         Values: Frequency units from 0 to 1. Larger is more conservative; exactly the configured
           separation passes.
         Example: declared-alignment error 0.61 and inverted error 0.03 differ by 0.58 and pass the
@@ -3776,30 +3776,21 @@ policies:
     maf_decision_cutoff:
       default: 0.95
       help: |-
-        What it does: Sets the share of frequency values at or below 0.5 above which a column is
-          suspected of holding minor allele frequencies rather than effect allele frequencies.
-        When it applies: Dataset step 07 screens a study-supplied frequency column on the whole
-          file before splitting. Chromosome step 04 also screens the deduplicated raw value column
-          from a selected external_eaf_file before direct/swap allele alignment. A non-MAF-like
-          external result retains the sample sheet's declared ALT/EAF contract. A MAF-like result
-          requires confirmation against the independent default EAF source; when both settings
-          resolve to the same physical file, the chromosome stops and asks for a different
-          modules.harmonisation.default_eaf.source. The share is measured only among finite numeric
-          values inside the closed interval 0 to 1. Missing, unparseable, NaN, infinite and finite
-          out-of-range values are excluded from both the numerator and denominator and are reported
-          separately.
-        Values: Larger makes the pipeline slower to suspect a minor allele frequency; smaller
-          suspects one sooner. A real effect allele frequency column has roughly half its values at
-          or below 0.5; a real minor allele frequency column has all of them. The distribution is a
-          conservative screen, not proof of allele meaning, so PostGWAS never auto-converts it.
-        Scientific basis: The GWAS Catalog summary-statistics format defines effect allele
-          frequency as the frequency of the listed effect allele. The raw external value must be
-          screened before a swapped match applies 1-AF, otherwise that alignment operation can hide
-          a source column that contains MAF rather than ALT/effect-allele frequency.
-        Example: 6,400,000 usable frequencies with 6,300,000 at or below 0.5 give a share of
-          0.984. That is above the default 0.95, so the column is MAF-like and chromosome step 04
-          checks it against the configured default EAF table. If external_eaf_file is that same
-          table, independent confirmation is impossible and processing stops.
+        What it does: Screens the share of usable study AF at or below 0.5 across the whole dataset.
+          Only a share strictly above this cutoff triggers additional reference-frequency comparison.
+        When it applies: Before chromosome processing for a study-supplied AF column. At or below
+          the cutoff, accept its declared EAF contract without an additional AF-concordance check.
+          Above it, require whole-study agreement with reference AF aligned to the original effect
+          allele. Values must be finite and inside 0 to 1 to contribute to the screen; other values
+          remain subject to the separate missing/range policies. No study rows change in this check.
+        Values: A MAF column is at or below 0.5, but genuine EAF can have the same distribution when
+          effect alleles are minor. Neither the study nor reference distribution alone proves meaning.
+          For external_eaf_file, chromosome step 04 retains its separate raw-frequency screen and
+          independent-panel EAF-versus-MAF classification, before applying allele-swap transformations.
+        Scientific basis: GWAS-SSF defines EAF relative to the listed effect allele. The 0.95 screen
+          is a configurable PostGWAS heuristic, not a universal biological frequency distribution.
+        Example: Study AF with 99.97% at or below 0.5 requires reference concordance; exactly 95%
+          does not at the default cutoff. A mostly-minor reference is not a study-level rejection.
       origin: study_properties.py:_decide_eaf_is_maf; shared/statistics.py:frequency_maf_screen; allele_frequency.py:harmonise_allele_frequency
       recommendation: null
       type: float
@@ -3814,20 +3805,16 @@ policies:
     maf_reference_min_overlap:
       default: 1000
       help: |-
-        What it does: Sets the fewest non-palindromic variants shared with the default EAF table
-          before a MAF-like internal or external frequency column can be classified from
-          reference-frequency distances.
-        When it applies: chromosome step 04 after the whole-study distribution flags an internal
-          column as MAF-like, or after the raw external-frequency screen flags an independently
-          supplied external column. Direct and allele-swapped matches both count.
-        Values: An integer of at least 2 because correlation is undefined for one observation.
-          Larger requires stronger chromosome-level evidence; smaller permits a decision from
-          fewer variants. Below this count the result is inconclusive and processing stops;
-          PostGWAS never guesses that an unconfirmed MAF-like column is effect-aligned EAF.
-        Scientific basis: frequency is usable only when it is aligned to the listed effect allele;
-          the comparison therefore tests input AF against both aligned reference EAF and reference
-          MAF after allele matching. The default is deliberately conservative for GWAS-scale data.
-      origin: allele_frequency.py:confirm_eaf_with_reference
+        What it does: Sets the fewest usable matched non-palindromic variants for AF comparison.
+        When it applies: Whole-study preflight pools uniquely oriented matches across all chromosomes
+          when the study AF screen is MAF-like. The external-file classifier uses this count per
+          chromosome. Direct, swapped and valid reverse-complement study matches can contribute.
+        Values: Integer at least 2. Too few matches stops the run before chromosome processing for
+          study AF. Missing, invalid, palindromic and ambiguously matched values provide no evidence;
+          their exclusion from diagnostics does not remove study rows.
+        Scientific basis: A configurable evidence floor for GWAS-scale data, not a universal cutoff.
+          It cannot prove the semantic meaning of every supplied AF value.
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference
       recommendation: null
       type: int
       validator:
@@ -3841,23 +3828,16 @@ policies:
     maf_reference_correlation_method:
       default: pearson
       help: |-
-        What it does: Selects the correlation statistic used to test whether the supplied
-          frequency spectrum and the independently configured default EAF panel have compatible
-          minor-allele frequencies. Both inputs are folded as MAF=min(AF, 1-AF) after validated
-          allele matching, so the result measures reference-panel suitability rather than effect
-          allele direction.
-        When it applies: chromosome step 04 after a MAF-like internal or external frequency column
-          has at least eaf.maf_reference_min_overlap valid non-palindromic matches to an independent
-          default EAF panel, and before EAF-versus-MAF direction is classified.
-        Values: pearson measures linear agreement on the frequency scale and is the default;
-          spearman measures monotonic rank agreement. A finite result must also pass
-          eaf.maf_reference_min_correlation and the paired mean absolute MAF difference must pass
-          eaf.maf_reference_max_mean_absolute_difference. Correlation alone never validates EAF.
-        Scientific basis: population allele frequencies differ across ancestry groups, as
-          characterised by the 1000 Genomes Project Consortium (Nature 2015,
-          doi:10.1038/nature15393). Folding removes allele direction, so this is a compatibility
-          check only; GWAS-SSF still requires frequency to refer to the listed effect allele.
-      origin: allele_frequency.py:confirm_eaf_with_reference
+        What it does: Selects the correlation statistic for reference-frequency agreement.
+        When it applies: MAF-like study AF is compared directly with reference AF aligned to the
+          original effect allele, across the whole dataset. Neither vector is folded to MAF.
+          The separate external-file classifier still compares folded MAF for panel suitability.
+        Values: pearson (default) measures linear agreement; spearman measures rank agreement.
+          Correlation must be finite and meet eaf.maf_reference_min_correlation, and the mean
+          absolute difference must also meet eaf.maf_reference_max_mean_absolute_difference.
+        Scientific basis: Correlation alone cannot establish effect-allele alignment. GWAS-SSF
+          requires AF to refer to the listed effect allele, even when that allele is usually minor.
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference
       recommendation: null
       type: enum
       validator:
@@ -3867,19 +3847,15 @@ policies:
     maf_reference_min_correlation:
       default: 0.80
       help: |-
-        What it does: Sets the smallest acceptable correlation between the supplied folded MAF and
-          the independently configured default panel's folded MAF on the same matched variants.
-        When it applies: chromosome step 04 together with
-          eaf.maf_reference_max_mean_absolute_difference, before a MAF-like internal or external
-          column can be classified as EAF or MAF.
-        Values: A correlation from 0 to 1; larger demands closer reference-panel compatibility.
-          Exactly the configured value passes. A missing or non-finite correlation, including a
-          constant folded-MAF vector, is inconclusive and processing stops. The default 0.80 is a
-          conservative PostGWAS QC setting rather than a universal ancestry-classification cutoff.
-        Example: correlation 0.92 passes the default correlation requirement, but the reference is
-          accepted as suitable only if its mean absolute MAF difference also passes its configured
-          maximum.
-      origin: allele_frequency.py:confirm_eaf_with_reference
+        What it does: Sets the minimum correlation for the paired frequency comparison.
+        When it applies: Whole-study preflight compares supplied AF with allele-aligned reference AF
+          without folding. The external-file classifier uses folded MAF for panel suitability.
+        Values: From 0 to 1; exactly the configured minimum passes. Missing or non-finite correlation,
+          including a constant vector, fails study preflight. The mean absolute difference and
+          overlap requirements must also pass. The default 0.80 is a configurable QC heuristic.
+        Example: Correlation 0.92 passes this gate, but does not compensate for an excessive mean
+          absolute difference or insufficient overlap.
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference
       recommendation: null
       type: float
       validator:
@@ -3893,18 +3869,15 @@ policies:
     maf_reference_max_mean_absolute_difference:
       default: 0.10
       help: |-
-        What it does: Sets the largest acceptable mean absolute difference between the supplied
-          folded MAF and the independently configured default panel's folded MAF on the same
-          matched variants.
-        When it applies: chromosome step 04 together with eaf.maf_reference_min_correlation,
-          before a MAF-like internal or external column can be classified as EAF or MAF.
-        Values: Frequency units from 0 to 0.5. Smaller demands closer agreement; exactly the
-          configured maximum passes. This absolute-error guard prevents a high correlation caused
-          by similarly ranked but systematically different frequency spectra from certifying an
-          unsuitable panel.
-        Example: correlation 0.95 with mean absolute MAF difference 0.14 fails the default 0.10
-          maximum, while difference 0.08 passes this guard and proceeds to the remaining checks.
-      origin: allele_frequency.py:confirm_eaf_with_reference
+        What it does: Sets the maximum mean absolute difference across the paired frequencies.
+        When it applies: Whole-study preflight uses supplied AF and reference AF aligned to the
+          original effect allele. The external-file classifier uses folded MAF for panel suitability.
+        Values: Frequency units; exactly the configured maximum passes. This is an aggregate mean,
+          not a per-variant tolerance or filtering rule. All diagnostic pairs contribute regardless
+          of their difference. Correlation and overlap must also pass; defaults are QC heuristics.
+        Example: Mean difference 0.08 passes the default 0.10 gate. This does not imply that every
+          variant differs by at most 0.10, and no individual AF is replaced or rejected by this gate.
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference
       recommendation: null
       type: float
       validator:
@@ -3918,19 +3891,15 @@ policies:
     reference_minor_fraction_cutoff:
       default: 0.95
       help: |-
-        What it does: Detects a reference comparison that cannot reliably distinguish EAF from MAF
-          because almost every matched reference effect allele is itself minor (reference EAF at or
-          below 0.5). Such a panel makes aligned EAF and folded MAF nearly identical.
-        When it applies: chromosome step 04, after an internal or external frequency column was
-          flagged MAF-like and at least eaf.maf_reference_min_overlap non-palindromic reference
-          matches are available.
-        Values: If the share is greater than this cutoff, the result is inconclusive and the
-          chromosome stops. Larger values permit more reference sets to reach the error comparison;
-          smaller values are more conservative. This is deliberately separate from
-          eaf.maf_decision_cutoff, which screens the study column rather than the reference panel.
-        Example: if 980 of 1,000 aligned reference frequencies are at or below 0.5, the share is
-          0.98. That exceeds the default 0.95, so PostGWAS reports inconclusive instead of treating
-          equal EAF and MAF errors as proof of EAF.
+        What it does: Detects an external-file reference comparison that cannot distinguish EAF
+          from MAF because the reference effect alleles are predominantly minor.
+        When it applies: Only the separate external-file classifier (and direct chromosome helpers
+          without a whole-study preflight decision). It does not veto study AF acceptance after
+          whole-study allele-aligned agreement. Study preflight records the reference fraction as
+          a diagnostic only.
+        Values: A share strictly above this cutoff makes the external-file classification inconclusive.
+        Example: Reference-aligned EAF with 98.70% at or below 0.5 is permitted for study AF if the
+          overlap, direct correlation and mean absolute difference gates all pass.
       origin: allele_frequency.py:confirm_eaf_with_reference
       recommendation: null
       type: float
@@ -3945,16 +3914,15 @@ policies:
     maf_reference_error_margin:
       default: 0.02
       help: |-
-        What it does: Sets the minimum separation required between mean absolute error as aligned
-          EAF and mean absolute error as folded MAF before either interpretation is accepted.
-        When it applies: chromosome step 04, only for a MAF-like internal or external frequency
-          column after the overlap and reference-informativeness checks pass.
-        Values: Units are allele-frequency points on the 0 to 1 scale. EAF is confirmed only when
-          its mean error plus this margin is lower than the MAF error; MAF is confirmed by the
-          reverse inequality. A tie or smaller difference is inconclusive and stops processing.
-          Larger values demand stronger evidence; 0 allows any strict difference to decide.
-        Example: mean errors 0.01 as EAF and 0.20 as MAF confirm EAF at the default 0.02 margin.
-          Errors 0.10 and 0.11 differ by only 0.01, so PostGWAS stops rather than letting noise decide.
+        What it does: Sets the minimum error separation for the separate external-file EAF-versus-MAF
+          classifier. It is not required for whole-study AF acceptance.
+        When it applies: External-file classification (and direct chromosome helpers without a
+          whole-study preflight decision), after overlap and reference suitability pass.
+        Values: EAF error plus this margin must be less than MAF error to confirm EAF; the reverse
+          confirms MAF. Otherwise that external-file result is inconclusive. Study preflight instead
+          checks direct allele-aligned agreement without requiring EAF and MAF errors to differ.
+        Example: A study whose effect alleles are minor can pass concordance even when EAF and MAF
+          errors are nearly identical.
       origin: allele_frequency.py:confirm_eaf_with_reference
       recommendation: null
       type: float
