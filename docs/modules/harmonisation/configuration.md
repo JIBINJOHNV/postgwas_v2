@@ -1291,6 +1291,12 @@ includes palindromes resolved by internal study EAF when the global consensus
 was mixed or unresolved. If that archive is unavailable, validation falls back
 to the strong forward/reverse study consensus recorded in the run manifest. No
 new palindromic INFO flag is added to delivered VCFs.
+The screen describes the recorded `palindromic_comparison_basis`: archived
+per-variant actions, study-wide consensus, per-variant actions with consensus
+fallback, or mixed recorded evidence. Excluded or unavailable orientation is
+labelled explicitly; partially excluded sets retain both counts and the
+recorded comparison basis. This wording does not change orientation decisions,
+comparison values or the validation verdict.
 `exclude` always skips those values, while `compare_as_listed` is an explicit
 override for independently pre-aligned input and does not use harmonisation's
 strand proof.

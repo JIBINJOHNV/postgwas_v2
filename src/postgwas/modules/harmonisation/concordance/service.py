@@ -1333,19 +1333,36 @@ def _screen_summary(dataset_id: str, analysis: ConcordanceAnalysis, reports: dic
     palindromic_excluded = int(
         summary["palindromic_variants_excluded_from_orientation"]
     )
+    # Describe the analysis's recorded provenance without resolving orientation
+    # again or assuming that every included palindrome used study consensus.
+    palindromic_basis = summary.get("palindromic_comparison_basis")
+    basis_description = {
+        "per_variant_strand_action": "archived per-variant strand actions",
+        "per_variant_strand_action_with_manifest_consensus_fallback": (
+            "archived per-variant strand actions with study-wide strand consensus fallback"
+        ),
+        "study_wide_forward_strand_consensus": "study-wide strand consensus (forward)",
+        "study_wide_reverse_strand_consensus": "study-wide strand consensus (reverse)",
+        "mixed": "mixed recorded comparison evidence",
+        "listed_allele_order": "listed allele order by explicit policy",
+        "excluded_by_policy": "excluded by policy",
+        "strand_consensus_unavailable": "strand orientation unavailable",
+    }.get(palindromic_basis, "orientation evidence not recorded or not recognized")
     if not palindromic:
         palindromic_message = fraction_text(0, summary["matched_variants"])
     elif palindromic_excluded:
         palindromic_message = (
             "%s; %s compared and %s excluded because a safe strand orientation "
-            "was unavailable or disabled by policy; SE and p-value remain comparable"
+            "was unavailable or disabled by policy; SE and p-value remain comparable; "
+            "comparison basis: %s"
             % (
                 fraction_text(palindromic, summary["matched_variants"]),
                 f"{palindromic_compared:,}",
                 f"{palindromic_excluded:,}",
+                basis_description,
             )
         )
-    elif summary["palindromic_comparison_basis"] == "listed_allele_order":
+    elif palindromic_basis == "listed_allele_order":
         palindromic_message = (
             fraction_text(palindromic, summary["matched_variants"])
             + "; included from listed allele order by explicit policy"
@@ -1353,7 +1370,8 @@ def _screen_summary(dataset_id: str, analysis: ConcordanceAnalysis, reports: dic
     else:
         palindromic_message = (
             fraction_text(palindromic, summary["matched_variants"])
-            + "; included in effect, EAF and Z using the study-wide strand consensus"
+            + "; included in effect, EAF and Z; comparison basis: "
+            + basis_description
         )
     lines.extend([
         screen_line("genetic", "3.2 Orientation of common variants", indent=8),
