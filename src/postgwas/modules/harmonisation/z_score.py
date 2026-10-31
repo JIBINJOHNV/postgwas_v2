@@ -25,6 +25,7 @@ import polars as pl
 
 from postgwas.core.values import optional_text
 
+from .shared.allele_join import unused_column_name
 from .shared.runtime import log_info, resolve_policies
 
 
@@ -122,6 +123,7 @@ def derive_z_score_from_effect_and_standard_error(
 
     division_floor = float(pol.get("validation.se_division_floor"))
     if not has_existing_z:
+        output_z_col = unused_column_name("imp_z_col", df)
         beta = pl.col(beta_col)
         se = pl.col(se_col)
         df = df.with_columns(
@@ -134,15 +136,16 @@ def derive_z_score_from_effect_and_standard_error(
             )
             .then(beta / se)
             .otherwise(None)
-            .alias("imp_z_col")
+            .alias(output_z_col)
         )
-        sample_column_dict["imp_z_col"] = "imp_z_col"
+        sample_column_dict["imp_z_col"] = output_z_col
         _info(
             logger,
             "The study supplies no Z score, so Z was calculated as BETA / SE from "
-            "columns '{}' and '{}'. Rows with unusable inputs were left with a null "
+            "columns '{}' and '{}' into '{}'. Rows with unusable inputs were "
+            "left with a null "
             "calculated Z for the single validation gate in step 10.".format(
-                beta_col, se_col
+                beta_col, se_col, output_z_col,
             ),
         )
 

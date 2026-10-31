@@ -52,6 +52,7 @@ from .p_values import (
     P_VALUE_LOG_KEY,
     REPORTED_ZERO_COLUMN,
 )
+from .shared.allele_join import unused_column_name
 from .shared.runtime import log_info, log_warning, reject_rows, resolve_policies
 
 
@@ -186,6 +187,8 @@ def derive_standard_error_from_effect_and_p_value(
         pol.get("pvalue.derive_partial_missing_se")
     )
     has_se = se_col is not None and se_col in df.columns
+    output_se_col = se_col if has_se else unused_column_name("SE", df)
+    qc_info["se_column"] = output_se_col
 
     numeric_columns = [
         pl.col(beta_col).cast(pl.Float64, strict=False),
@@ -655,7 +658,6 @@ def derive_standard_error_from_effect_and_p_value(
     n_recovered = int(df.select(recoverable.sum().alias("count")).item() or 0)
     n_undefined = n_requested - n_recovered
 
-    output_se_col = se_col if has_se else "SE"
     if has_se:
         # Preserve every populated supplied or Z-derived value. Only a null SE
         # cell is eligible for the p-based candidate.
@@ -676,6 +678,13 @@ def derive_standard_error_from_effect_and_p_value(
         [candidate_column, "_pval_safe", "__ln_p_safe", "__ln_p_provenance"]
     )
     sample_column_dict["se_col"] = output_se_col
+    _info(
+        logger,
+        "Standard-error output column '{}': {:,} missing cell(s) recovered "
+        "from the selected effect and p-value columns.".format(
+            output_se_col, n_recovered,
+        ),
+    )
 
     if n_undefined:
         _warn(

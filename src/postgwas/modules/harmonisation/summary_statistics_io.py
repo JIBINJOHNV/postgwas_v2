@@ -1642,10 +1642,19 @@ def read_summary_statistics(
     # transformation. Polars frames are immutable, so clone() is a cheap,
     # stable snapshot until it is partitioned for chromosome workers.
     original_columns = list(df.columns)
-    if SOURCE_INPUT_ROW_COLUMN in original_columns:
+    # Double-underscore names are the internal working/provenance namespace.
+    # A raw header must never impersonate a generated scientific decision,
+    # status flag or exact-p-value override merely by sharing its name.
+    reserved_columns = [
+        name for name in original_columns
+        if name.strip().startswith("__") or name.strip() == "_pval_safe"
+    ]
+    if reserved_columns:
         raise ValueError(
-            "The input uses reserved internal column name %r. Rename that column "
-            "before harmonisation." % SOURCE_INPUT_ROW_COLUMN
+            "The input uses reserved internal column name(s): %s. Rename those "
+            "input columns before harmonisation; names beginning with '__' "
+            "and '_pval_safe' are reserved for generated working values and provenance."
+            % ", ".join(repr(name) for name in reserved_columns)
         )
     df = df.with_row_index(SOURCE_INPUT_ROW_COLUMN, offset=1)
     source_snapshot = df.clone()

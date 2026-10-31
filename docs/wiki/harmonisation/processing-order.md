@@ -258,9 +258,14 @@ These eight steps run once on the complete study.
    following stream inspection checks that the input is readable and not
    obviously truncated, and counts the data rows for later accounting.
 
-3. **Dataset step 3 — Read and clean the study.** Polars reads the configured
-   columns. PostGWAS assigns a stable source-row number and preserves the raw
-   values for rejection provenance. It then, in order:
+3. **Dataset step 3 — Read and clean the study.** Polars reads the study table;
+   the sample-sheet mappings select its raw scientific inputs. Empty mappings
+   never trigger header-based selection. Before scientific processing, the
+   reader rejects raw headers beginning with `__` or named exactly `_pval_safe`,
+   including names padded with whitespace. These names belong to internal
+   working values and provenance; the error identifies which input columns to
+   rename. PostGWAS then assigns a stable source-row number and preserves the
+   raw values for rejection provenance. It then, in order:
 
    - reports post-parse missingness for every configured study column, then
      rejects rows missing a read-stage mandatory value or every value in a
@@ -452,6 +457,15 @@ configured builds.
 
 Chromosomes may run in parallel, but the following sixteen steps always occur
 in this order inside each chromosome.
+
+Every step uses the resolved column mapping. Generated BETA, SE, Z, fixed sample
+counts, and effective N receive collision-free working names, and downstream
+checks and adapter export follow those names. Unselected raw statistic columns
+remain preserved rather than supplying values through a familiar header.
+Populated mapped SE cells are preserved during missing-statistic recovery;
+null cells follow the existing configured recovery, sign, and P-value policies.
+This mapping contract changes no calculation defaults or scientific equations.
+See [Authoritative input mappings](sample-sheet.md#authoritative-input-mappings).
 
 1. **Chromosome step 1 — Load the partition.** Read the typed Parquet rows with
    their validated schema and connect them to the raw source snapshot used for

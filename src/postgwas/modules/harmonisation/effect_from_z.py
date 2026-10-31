@@ -92,6 +92,7 @@ import polars as pl
 from postgwas.core.dataframes import count_matching_rows
 from postgwas.core.values import format_number, optional_text
 
+from .shared.allele_join import unused_column_name
 from .shared.runtime import (
     log_info,
     log_warning,
@@ -335,6 +336,7 @@ def _recover_positive_se_from_signed_z(
     z_col: str,
     output_se_col: str,
     *,
+    supplied_se_col: Optional[str],
     policies: Any,
     logger: Optional[Any],
     rejects: Optional[Any],
@@ -344,11 +346,24 @@ def _recover_positive_se_from_signed_z(
     A standard error is strictly positive and ``Z = BETA / SE``. Therefore a
     finite, non-zero signed Z can recover SE only when BETA has the same
     non-zero sign. This shared implementation serves both a wholly absent SE
-    column and null cells in a supplied SE column.
+    column and null cells in a supplied SE column. Only ``supplied_se_col``
+    identifies supplied values; an output name never selects a source column.
     """
+    if supplied_se_col is not None and supplied_se_col not in df.columns:
+        raise ValueError(
+            "The selected standard-error column {!r} is absent from the data."
+            .format(supplied_se_col)
+        )
+    if output_se_col in df.columns and output_se_col != supplied_se_col:
+        raise ValueError(
+            "Generated standard-error output {!r} would overwrite an unrelated "
+            "input column. Allocate an unused output name.".format(output_se_col)
+        )
     action = str(policies.get("effect_from_z.beta_z_sign_mismatch"))
-    has_output = output_se_col in df.columns
-    needs_se = pl.col(output_se_col).is_null() if has_output else pl.lit(True)
+    needs_se = (
+        pl.col(supplied_se_col).is_null()
+        if supplied_se_col is not None else pl.lit(True)
+    )
     beta = pl.col(beta_col)
     z_score = pl.col(z_col)
     finite_nonzero_z_pair = (
@@ -404,7 +419,10 @@ def _recover_positive_se_from_signed_z(
     # Rebuild expressions against the surviving frame. The absolute value is
     # a numerical-domain safeguard; sign agreement is what makes this an exact
     # recovery instead of a silent correction of contradictory inputs.
-    needs_se = pl.col(output_se_col).is_null() if has_output else pl.lit(True)
+    needs_se = (
+        pl.col(supplied_se_col).is_null()
+        if supplied_se_col is not None else pl.lit(True)
+    )
     beta = pl.col(beta_col)
     z_score = pl.col(z_col)
     usable_for_se = (
@@ -420,7 +438,9 @@ def _recover_positive_se_from_signed_z(
         )
     ).fill_null(False)
     n_recovered = _count(df, usable_for_se)
-    existing_se = pl.col(output_se_col) if has_output else pl.lit(None)
+    existing_se = (
+        pl.col(supplied_se_col) if supplied_se_col is not None else pl.lit(None)
+    )
     df = df.with_columns(
         pl.when(usable_for_se)
         .then((beta / z_score).abs())
@@ -683,6 +703,7 @@ def derive_effect_and_standard_error_from_z(
                 beta_col,
                 imp_z_col,
                 se_col,
+                supplied_se_col=se_col,
                 policies=pol,
                 logger=logger,
                 rejects=rejects,
@@ -783,12 +804,14 @@ def derive_effect_and_standard_error_from_z(
         # non-zero BETA/Z pairs. The shared helper handles incompatible signs
         # before calculating abs(BETA / Z), and leaves other unusable inputs
         # null for the configured p-value fallback.
+        output_se_col = unused_column_name("SE", df)
         df, recovery = _recover_positive_se_from_signed_z(
             chromosome,
             df,
             beta_col,
             imp_z_col,
-            "SE",
+            output_se_col,
+            supplied_se_col=None,
             policies=pol,
             logger=logger,
             rejects=rejects,
@@ -800,14 +823,17 @@ def derive_effect_and_standard_error_from_z(
             "beta_z_sign_mismatches_rejected"
         ]
 
-        sample_column_dict["se_col"] = "SE"
+        sample_column_dict["se_col"] = output_se_col
         _info(
             logger,
             "The study supplies an effect size ('{}') but no standard error, so SE was "
-            "recovered as positive abs(BETA / Z) after requiring signed agreement "
-            "with Z score column '{}'. {} incompatible variant(s) followed "
+            "recovered for {:,} variant(s) into '{}' as positive abs(BETA / Z) "
+            "after requiring signed agreement with Z score column '{}'. "
+            "{} incompatible variant(s) followed "
             "effect_from_z.beta_z_sign_mismatch='{}'.".format(
                 beta_col,
+                n_recovered,
+                output_se_col,
                 imp_z_col,
                 n_sign_mismatch,
                 pol.get("effect_from_z.beta_z_sign_mismatch"),
@@ -838,7 +864,11 @@ def derive_effect_and_standard_error_from_z(
             )
         qc_info.update(
             {
-                "status": "SE derived from BETA and Z",
+                "status": (
+                    "SE derived from BETA and Z"
+                    if n_recovered else "No SE recovered from BETA and Z"
+                ),
+                "se_column": output_se_col,
                 "beta_computed": False,
                 "se_computed": n_recovered > 0,
                 "se_recovered_from_z": n_recovered,
@@ -859,6 +889,7 @@ def derive_effect_and_standard_error_from_z(
     # (has_z is guaranteed here: the no-BETA-no-Z case raised above.)
     # -------------------------------------------------------
     if has_se and not has_beta:
+        output_beta_col = unused_column_name("BETA", df)
         df = df.with_columns(
             [
                 pl.col(se_col).cast(pl.Float64, strict=False),
@@ -870,17 +901,21 @@ def derive_effect_and_standard_error_from_z(
             pl.when(pl.col(imp_z_col).is_finite() & pl.col(se_col).is_finite())
             .then(pl.col(imp_z_col) * pl.col(se_col))
             .otherwise(None)
-            .alias("BETA")
+            .alias(output_beta_col)
         )
-        n_undefined = int(df.select(pl.col("BETA").is_null().sum()).item() or 0)
+        n_undefined = int(
+            df.select(pl.col(output_beta_col).is_null().sum()).item() or 0
+        )
 
-        sample_column_dict["beta_or_col"] = "BETA"
-        sample_column_dict["beta_col"] = "BETA"
+        sample_column_dict["beta_or_col"] = output_beta_col
+        sample_column_dict["beta_col"] = output_beta_col
         _info(
             logger,
             "The study supplies a standard error ('{}') but no effect size, so BETA was "
             "recovered exactly as Z * SE from the Z score column '{}'. No allele "
-            "frequency is needed for this recovery.".format(se_col, imp_z_col),
+            "frequency is needed for this recovery. Output column: '{}'.".format(
+                se_col, imp_z_col, output_beta_col,
+            ),
         )
         if logger is not None:
             logger.qc(
@@ -903,6 +938,7 @@ def derive_effect_and_standard_error_from_z(
         qc_info.update(
             {
                 "status": "BETA derived from Z and SE",
+                "effect_column": output_beta_col,
                 "beta_computed": True,
                 "se_computed": False,
                 "beta_undefined_from_z": n_undefined,
@@ -936,11 +972,14 @@ def derive_effect_and_standard_error_from_z(
             "not present.".format(chromosome, imp_z_col, eaf_col)
         )
 
-    if "Neff" not in df.columns:
+    neff_col = optional_text(sample_column_dict.get("neff_col"))
+    if neff_col is None or neff_col not in df.columns:
         raise KeyError(
             "Chromosome {}: BETA and SE must be derived from the Z score column '{}', "
-            "which needs the effective sample size, but the 'Neff' column is not "
-            "present. It is produced by the sample size step.".format(chromosome, imp_z_col)
+            "which needs a resolved effective sample size column (neff_col), "
+            "but the mapped column {!r} is not present. Run the sample size "
+            "step first; an unselected raw Neff column is not a source."
+            .format(chromosome, imp_z_col, neff_col)
         )
 
     # -------------------------------------------------------
@@ -950,7 +989,7 @@ def derive_effect_and_standard_error_from_z(
         [
             pl.col(imp_z_col).cast(pl.Float64, strict=False),
             pl.col(eaf_col).cast(pl.Float64, strict=False),
-            pl.col("Neff").cast(pl.Float64, strict=False),
+            pl.col(neff_col).cast(pl.Float64, strict=False),
         ]
     )
 
@@ -1071,7 +1110,7 @@ def derive_effect_and_standard_error_from_z(
         )
 
     # --- 4. Effective sample size -------------------------------------------
-    cond_neff_null = pl.col("Neff").is_null() | ~pl.col("Neff").is_finite()
+    cond_neff_null = pl.col(neff_col).is_null() | ~pl.col(neff_col).is_finite()
     df, n_neff_null = reject_rows(
         df,
         cond_neff_null,
@@ -1083,7 +1122,7 @@ def derive_effect_and_standard_error_from_z(
     )
 
     # sample_size.min_value sets the minimum usable effective sample size.
-    cond_neff_invalid = (pl.col("Neff") <= 0) | (pl.col("Neff") < min_sample_size)
+    cond_neff_invalid = (pl.col(neff_col) <= 0) | (pl.col(neff_col) < min_sample_size)
     df, n_neff_invalid = reject_rows(
         df,
         cond_neff_invalid,
@@ -1107,7 +1146,7 @@ def derive_effect_and_standard_error_from_z(
             2.0
             * pl.col(eaf_col)
             * (1.0 - pl.col(eaf_col))
-            * pl.col("Neff")
+            * pl.col(neff_col)
         ).alias(effective_variance_col)
     )
     effective_variance_summary = df.select([
@@ -1157,7 +1196,7 @@ def derive_effect_and_standard_error_from_z(
     # an extreme but finite Z score. No division may use a non-positive or
     # non-finite denominator.
     denominator_col = "__effect_from_z_denominator"
-    sample_information = pl.col("Neff")
+    sample_information = pl.col(neff_col)
     if reconstruction["method"] == "zhu_2016":
         sample_information = sample_information + pl.col(imp_z_col) ** 2
     df = df.with_columns(
@@ -1243,6 +1282,8 @@ def derive_effect_and_standard_error_from_z(
         & (pl.col(denominator_col) > 0.0)
     ).fill_null(False)
     scale_multiplier = float(reconstruction["scale_multiplier"])
+    beta_col = unused_column_name("BETA", df)
+    se_col = unused_column_name("SE", df)
     df = df.with_columns(
         [
             pl.when(usable_denominator)
@@ -1252,20 +1293,20 @@ def derive_effect_and_standard_error_from_z(
                 / pl.col(denominator_col).sqrt()
             )
             .otherwise(None)
-            .alias("BETA"),
+            .alias(beta_col),
             pl.when(usable_denominator)
             .then(scale_multiplier / pl.col(denominator_col).sqrt())
             .otherwise(None)
-            .alias("SE"),
+            .alias(se_col),
         ]
     ).drop([denominator_col, effective_variance_col])
 
     invalid_reconstruction = (
-        pl.col("BETA").is_null()
-        | ~pl.col("BETA").is_finite()
-        | pl.col("SE").is_null()
-        | ~pl.col("SE").is_finite()
-        | (pl.col("SE") <= 0.0)
+        pl.col(beta_col).is_null()
+        | ~pl.col(beta_col).is_finite()
+        | pl.col(se_col).is_null()
+        | ~pl.col(se_col).is_finite()
+        | (pl.col(se_col) <= 0.0)
     )
     n_invalid_reconstruction = _count(df, invalid_reconstruction)
     if n_invalid_reconstruction:
@@ -1279,11 +1320,17 @@ def derive_effect_and_standard_error_from_z(
             )
         )
 
-    sample_column_dict["beta_or_col"] = "BETA"
-    sample_column_dict["beta_col"] = "BETA"
-    sample_column_dict["se_col"] = "SE"
-    beta_col = "BETA"
-    se_col = "SE"
+    sample_column_dict["beta_or_col"] = beta_col
+    sample_column_dict["beta_col"] = beta_col
+    sample_column_dict["se_col"] = se_col
+    qc_info.update(
+        effect_column=beta_col, se_column=se_col, neff_column=neff_col,
+    )
+    _info(
+        logger,
+        "Reconstructed BETA and SE columns: '{}' and '{}'; effective sample "
+        "size source: '{}'.".format(beta_col, se_col, neff_col),
+    )
     qc_info["beta_computed"] = True
     qc_info["se_computed"] = True
     qc_info["effect_estimate_method"] = reconstruction["method"]

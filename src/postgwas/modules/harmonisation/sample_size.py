@@ -27,6 +27,7 @@ import polars as pl
 from postgwas.core.values import optional_text, parse_integer
 
 from .policies import default_policies
+from .shared.allele_join import unused_column_name
 from .shared.runtime import reject_rows, step_context
 
 
@@ -415,9 +416,9 @@ def _harmonise(
             "Every variant is given the same control count, %s, from the configuration."
             % "{:,}".format(parsed)
         )
-        df = df.with_columns(pl.lit(parsed, dtype=pl.Int64).alias("ncontrol"))
-        ncontrol_col = "ncontrol"
-        sample_column_dict["ncontrol_col"] = "ncontrol"
+        ncontrol_col = unused_column_name("ncontrol", df)
+        df = df.with_columns(pl.lit(parsed, dtype=pl.Int64).alias(ncontrol_col))
+        sample_column_dict["ncontrol_col"] = ncontrol_col
         qc_info["ncontrol_source"] = "fixed_value:%d" % parsed
     else:
         ctx.skip("No control count column or value is configured.")
@@ -442,9 +443,9 @@ def _harmonise(
             "Every variant is given the same case count, %s, from the configuration."
             % "{:,}".format(parsed)
         )
-        df = df.with_columns(pl.lit(parsed, dtype=pl.Int64).alias("ncase"))
-        ncase_col = "ncase"
-        sample_column_dict["ncase_col"] = "ncase"
+        ncase_col = unused_column_name("ncase", df)
+        df = df.with_columns(pl.lit(parsed, dtype=pl.Int64).alias(ncase_col))
+        sample_column_dict["ncase_col"] = ncase_col
         qc_info["ncase_source"] = "fixed_value:%d" % parsed
     else:
         ctx.skip("No case count column or value is configured.")
@@ -580,6 +581,9 @@ def _harmonise(
     # 5. the effective sample size
     # ------------------------------------------------------------------
     neff_created = False
+    # Generated sample sizes must not replace an unrelated input measurement,
+    # including an effect column whose selected header happens to be "Neff".
+    neff_col = unused_column_name("Neff", df)
 
     if trait_type == "binary" and not (has_cases and has_controls):
         raise ValueError(
@@ -598,7 +602,7 @@ def _harmonise(
             )
             .round(0)
             .cast(pl.Int64, strict=False)
-            .alias("Neff")
+            .alias(neff_col)
         )
         neff_created = True
         qc_info["Neff_status"] = "calculated_from_case_control"
@@ -616,7 +620,9 @@ def _harmonise(
             {"column": ncontrol_col, "policy sample_size.controls_only": action},
             "the lone control count is the total sample size, so Neff := that count",
         )
-        df = df.with_columns(pl.col(ncontrol_col).cast(pl.Int64, strict=False).alias("Neff"))
+        df = df.with_columns(
+            pl.col(ncontrol_col).cast(pl.Int64, strict=False).alias(neff_col)
+        )
         neff_created = True
         qc_info["Neff_status"] = "fallback_ncontrol_only:%s" % ncontrol_col
 
@@ -645,7 +651,7 @@ def _harmonise(
     # be set unconditionally, so every later step was told there was an Neff
     # column even when no branch had made one.
     if neff_created:
-        sample_column_dict["neff_col"] = "Neff"
+        sample_column_dict["neff_col"] = neff_col
     else:
         sample_column_dict["neff_col"] = None
 
@@ -653,7 +659,7 @@ def _harmonise(
     # 6. remove effective sample sizes that cannot be right
     # ------------------------------------------------------------------
     if neff_created:
-        neff = pl.col("Neff")
+        neff = pl.col(neff_col)
         below_configured_minimum = (
             neff < min_value if min_value is not None else pl.lit(False)
         )

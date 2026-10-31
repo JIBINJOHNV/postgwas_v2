@@ -94,6 +94,28 @@ standard error from valid statistics under configured policies.
 logarithms and natural-log representations to raw P or non-negative -log10 P
 before harmonisation.
 
+### Authoritative input mappings
+
+The sheet selects the raw scientific input columns. An empty or `NA` mapping
+declares that the statistic was not supplied; harmonisation does not select a
+column merely because its header resembles `BETA`, `SE`, `Z`, or `Neff`.
+Header matching in the optional draft generator happens before this contract:
+review and complete its CSV before running harmonisation.
+
+Generated BETA, SE, Z, fixed sample counts, and effective N use collision-free
+working names, recorded in the resolved mapping and followed through numerical
+validation and adapter export. Unselected raw statistic columns are preserved
+and cannot become calculation inputs through their names. During missing-SE
+recovery, populated cells in the selected SE column remain authoritative; only
+null cells are eligible for the configured recovery. Existing scale conversions,
+BETA/Z sign checks, P-value policies, and calculation defaults still apply.
+
+Raw study headers beginning with `__`, and the exact header `_pval_safe`, are
+reserved for internal working values and provenance. Surrounding header
+whitespace does not bypass this restriction. The reader names offending columns
+and stops before scientific processing; rename them in the input file and
+update any corresponding CSV mappings before rerunning.
+
 ## EAF and INFO mappings
 
 Choose exactly one source for study EAF. INFO uses the explicit priority shown
