@@ -15,6 +15,7 @@ from postgwas.core.values import optional_text
 from postgwas.modules.harmonisation.effect_from_z import (
     describe_effect_from_z_reconstruction,
 )
+from postgwas.modules.harmonisation.vcf_processing import CONSEQUENCE_ANNOTATION_MODE
 
 
 def _package_version() -> str:
@@ -474,6 +475,7 @@ def build_harmonisation_vcf_provenance(
         "target_fasta_files": paths("target_fasta"),
         "liftover_chain_files": paths("chain_file"),
         "annotation_files": paths("annot_path"),
+        "consequence_annotation": CONSEQUENCE_ANNOTATION_MODE,
         "dbsnp_reference_files": paths("dbsnp_file"),
         "strand_consensus": str(study_decisions.get("strand") or missing),
         "strand_reference_column": str(

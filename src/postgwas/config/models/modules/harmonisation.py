@@ -521,7 +521,7 @@ class HarmonisationVcfProvenanceConfig(StrictModel):
             "vcf_created_at", "vcf_status", "input_genome_build",
             "output_genome_build", "liftover", "resolved_resource_files",
             "source_fasta_files", "target_fasta_files",
-            "liftover_chain_files", "annotation_files",
+            "liftover_chain_files", "annotation_files", "consequence_annotation",
             "dbsnp_reference_files", "strand_consensus",
             "strand_reference_column", "strand_reference_files", "af_source",
             "af_input_column", "af_input_type", "af_type_decision",

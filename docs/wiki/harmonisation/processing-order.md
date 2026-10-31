@@ -689,7 +689,7 @@ An imbalance stops the chromosome because a row was lost or counted twice.
     3. adds dbSNP IDs using exact allele matching and fills remaining IDs with
        the configured coordinate-allele form;
     4. adds configured population AF fields using exact allele matching;
-    5. adds consequence annotations;
+    5. adds per-record consequence annotations with `bcftools csq --local-csq`;
     6. reads the annotated VCF header and validates the configured study AF,
        ES, and EZ fields plus the population AF fields discovered from the
        annotation columns;
@@ -704,6 +704,18 @@ An imbalance stops the chromosome because a row was lost or counted twice.
     warning/failure thresholds. Policy exclusions, normalization changes, and
     duplicates are reported separately, and a required target VCF with zero
     surviving variants always fails.
+
+    GWAS-VCF study samples hold association statistics, without individual
+    genotypes or phase. Consequence annotation therefore uses the fixed
+    `--local-csq` mode: each record is evaluated separately, without inferring
+    `GT`, phase, or joint haplotypes. `-s -` alone changes sample handling but
+    does not select local prediction; see the
+    [bcftools CSQ manual](https://samtools.github.io/bcftools/bcftools.html#csq)
+    and [sample-handling implementation](https://github.com/samtools/bcftools/blob/1.23/csq.c#L681-L696).
+    The [primary methods paper](https://doi.org/10.1093/bioinformatics/btx100)
+    explains why known phase can change the combined consequence of nearby
+    variants. These per-record GWAS annotations cannot establish that combined
+    effect. This mode is a scientific requirement, not a selectable policy.
 
 ### A simple allele-swapping example
 

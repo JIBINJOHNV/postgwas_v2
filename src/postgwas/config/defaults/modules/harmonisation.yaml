@@ -541,6 +541,7 @@ module:
         target_fasta_files: postgwas_target_fasta_files
         liftover_chain_files: postgwas_liftover_chain_files
         annotation_files: postgwas_annotation_files
+        consequence_annotation: postgwas_consequence_annotation
         dbsnp_reference_files: postgwas_dbsnp_reference_files
         strand_consensus: postgwas_strand_consensus
         strand_reference_column: postgwas_strand_reference_column

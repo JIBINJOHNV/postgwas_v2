@@ -90,6 +90,23 @@ cleanup runs only after post-merge status is `OK`. The build keys come from
 `vcf_processing.target_builds`; cleanup uses only the exact configured raw path
 and cannot match either final VCF or another dataset.
 
+### Consequence annotations
+
+`INFO/BCSQ` reports per-record consequences from `bcftools csq --local-csq`.
+It does not establish joint haplotype effects. Intergenic records can legitimately
+have no BCSQ value, as the [bcftools manual](https://samtools.github.io/bcftools/bcftools.html#csq)
+explains. An unchanged variant count, readable index, or successful exit alone
+does not verify coding annotations. Native regression fixtures check known
+coding SNVs and intergenic controls while verifying that association statistics
+and study samples survive annotation unchanged; they do not require a BCSQ value
+on every record.
+
+The canonical log records `PARAM consequence_annotation` with
+`mode=local_per_record`. The YAML-configured VCF header
+`postgwas_consequence_annotation` records `local_per_record` on merged annotated
+source-build, target-build, and not-lifted outputs. The raw GWAS-to-VCF merge
+records `not_applied` because consequence annotation has not been run on it.
+
 ## Run-level dataset summary
 
 `<output>/run_metadata/harmonisation_run_summary.csv` contains exactly one row

@@ -43,6 +43,12 @@ from postgwas.core.vcf import (
 LIFTOVER_SWAP_CHOICES = ("exclude", "keep")
 ON_MERGE_FAILURE_CHOICES = ("continue", "fail")
 
+# GWAS study samples contain association statistics, not individual genotypes
+# or phased haplotypes. Per-record CSQ is therefore an input-method invariant,
+# shared by command audit and output provenance, rather than a selectable mode.
+# https://samtools.github.io/bcftools/bcftools.html#csq
+CONSEQUENCE_ANNOTATION_MODE = "local_per_record"
+
 _LIFTOVER_SUMMARY = re.compile(
     r"^Lines\s+total/swapped/reference added/rejected:\s*"
     r"(\d+)/(\d+)/(\d+)/(\d+)\s*$",
@@ -134,6 +140,9 @@ def _render_provenance_headers(
             else "Not applied"
         ),
     })
+    if merge_group == "gwas2vcf":
+        # This merge group precedes the consequence-annotation stage.
+        values["consequence_annotation"] = "not_applied"
     missing = str(settings["missing_value"])
     return [
         _vcf_metadata_line(header_name, values.get(logical_name, missing))
@@ -556,8 +565,14 @@ def annotate_and_liftover_vcf(
         # =======================================================
         # STEP 3: CSQ
         # =======================================================
+        if logger is not None:
+            logger.record(
+                "PARAM", "consequence_annotation",
+                mode=CONSEQUENCE_ANNOTATION_MODE,
+            )
         _run_bcftools_step([
             bcftools, "csq",
+            "--local-csq",
             "--fasta-ref", str(genome_fasta_file),
             "--gff-annot", str(gff_file),
             "--threads", str(threads),
