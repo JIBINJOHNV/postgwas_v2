@@ -42,7 +42,7 @@ from .analysis import (
     VCF_SOURCE_ROW_COLUMN,
     ConcordanceAnalysis,
     combine_concordance_partitions,
-    compare_input_to_vcf,
+    compare_input_partition,
     input_chromosome_expression,
     reference_chromosome_expression,
     vcf_chromosome_expression,
@@ -974,7 +974,7 @@ def _compare_staged_partitions(
             )
         else:
             external_eaf_frame = None
-        analysis = compare_input_to_vcf(
+        analysis = compare_input_partition(
             input_frame,
             vcf_frame,
             row,

@@ -50,6 +50,14 @@ and continues with the declaration; `fail` stops the dataset before chromosome
 processing. Automatic inspection is evidence, not permission to silently
 replace an explicit scientific declaration.
 
+Summary-statistics parsing remains strict. A Python `MemoryError` during the
+initial parse permits one retry with `low_memory=True`, using the same delimiter,
+schema and error-handling options. Format, schema and other non-memory parser
+errors propagate immediately rather than repeating the read. A failed retry
+also propagates through the existing canonical failure logger. Lower-memory
+parsing reduces memory pressure rather than repairing malformed data
+([Polars reader documentation](https://docs.pola.rs/api/python/version/0.20/reference/api/polars.read_csv.html)).
+
 ### P-value representation
 
 `pvalue.type` and the sample-sheet `p_value_type` accept exactly `auto`, `raw`,
@@ -1338,9 +1346,19 @@ assignment, and `staging_compression` controls the temporary Parquet compression
 Duplicate decisions and a single all-chromosome external EAF file use the same
 partition key. A per-chromosome external EAF template is resolved with the VCF's
 confirmed build and read only for the active chromosome, avoiding a combined
-genome-wide reference table. Compact partition counts are combined globally,
-while exact medians, Pearson and Spearman correlations are calculated by lazy
-scans of the temporary matched records. Final reports retain deterministic
+genome-wide reference table. Each chromosome produces the aligned comparison
+frames and counts without calculating metric suites that the combiner would
+discard. Compact partition counts are combined globally, and the final overall,
+variant-type and position-diagnostic metric suites are calculated once by lazy
+scans of the temporary records. Exact medians and Pearson/Spearman correlations
+use the combined records rather than averages of chromosome statistics. The
+direct Python `compare_input_to_vcf()` interface still returns its full metrics
+and verdict. Correlations are unavailable when either compared vector is
+constant, because Pearson and Spearman coefficients are undefined in that case
+([SciPy Pearson documentation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.pearsonr.html),
+[Spearman documentation](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.spearmanr.html)).
+This mathematical precondition adds no tolerance or filtering rule and does
+not change counts or validation verdicts. Final reports retain deterministic
 source-row ordering, and all staging files are removed on success or failure.
 
 ### Consequence annotation chromosome names

@@ -153,32 +153,24 @@ def load_summary_statistics_table(file_path: str, sample_column_dict: dict, poli
         % (delimiter.method, sep, delimiter.column_count or "configured"),
     )
     _emit(logger, "Detected delimiter: %r" % sep)
+    read_options = {
+        "separator": sep,
+        "infer_schema_length": infer_rows,
+        "ignore_errors": False,
+        "truncate_ragged_lines": False,
+        "has_header": True,
+        "null_values": null_values,
+        "comment_prefix": comment_prefix,
+        "schema_overrides": string_schema,
+    }
     try:
-        df = pl.read_csv(
-            file_path,
-            separator=sep,
-            infer_schema_length=infer_rows,
-            ignore_errors=False,
-            truncate_ragged_lines=False,
-            has_header=True,
-            null_values=null_values,
-            comment_prefix=comment_prefix,
-            schema_overrides=string_schema,
-        )
-    except Exception as e:
+        df = pl.read_csv(file_path, **read_options)
+    except MemoryError as e:
+        # Lower memory pressure can help an allocation failure; repeating a
+        # deterministic parser/schema error cannot repair the input table.
         _emit(logger, "Primary read failed: %s" % e, warn=True)
         _emit(logger, "Retrying with low_memory=True.", warn=True)
-        df = pl.read_csv(
-            file_path,
-            separator=sep,
-            infer_schema_length=infer_rows,
-            low_memory=True,
-            truncate_ragged_lines=False,
-            has_header=True,
-            null_values=null_values,
-            comment_prefix=comment_prefix,
-            schema_overrides=string_schema,
-        )
+        df = pl.read_csv(file_path, low_memory=True, **read_options)
     # ----------------------------
     # 4. Required columns  (de-duplicated: two config keys may name one column)
     # ----------------------------

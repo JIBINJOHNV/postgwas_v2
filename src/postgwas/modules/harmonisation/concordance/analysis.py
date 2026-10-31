@@ -87,6 +87,18 @@ METRIC_OBSERVED_COLUMNS = {
 
 
 @dataclass
+class ConcordancePartition:
+    """Compared rows and additive counts, without discarded metric suites."""
+
+    summary: dict[str, Any]
+    matched: pl.DataFrame | pl.LazyFrame
+    position_matches: pl.DataFrame | pl.LazyFrame
+    input_only: pl.DataFrame | pl.LazyFrame
+    vcf_only: pl.DataFrame | pl.LazyFrame
+    vcf_duplicates: pl.DataFrame | pl.LazyFrame
+
+
+@dataclass
 class ConcordanceAnalysis:
     status: str
     summary: dict[str, Any]
@@ -849,6 +861,12 @@ def _metric_aggregate_expressions(name: str, observed: str) -> list[pl.Expr]:
     expected_present = pl.when(present).then(pl.col(expected)).otherwise(None)
     observed_present = pl.when(present).then(pl.col(observed)).otherwise(None)
     difference_present = pl.when(present).then(pl.col(difference)).otherwise(None)
+    # Correlation is undefined if either paired vector is constant. Testing
+    # its range avoids finite backend artifacts for zero-variance data.
+    variable_pairs = (
+        (expected_present.min() != expected_present.max())
+        & (observed_present.min() != observed_present.max())
+    ).fill_null(False)
     prefix = "%s__" % name
     expressions = [
         pl.len().alias(prefix + "rows"),
@@ -860,9 +878,13 @@ def _metric_aggregate_expressions(name: str, observed: str) -> list[pl.Expr]:
         difference_present.median().alias(prefix + "median"),
         difference_present.max().alias(prefix + "maximum"),
         difference_present.pow(2).mean().sqrt().alias(prefix + "rmse"),
-        pl.corr(expected_present, observed_present, method="pearson")
+        pl.when(variable_pairs)
+        .then(pl.corr(expected_present, observed_present, method="pearson"))
+        .otherwise(None)
         .alias(prefix + "pearson"),
-        pl.corr(expected_present, observed_present, method="spearman")
+        pl.when(variable_pairs)
+        .then(pl.corr(expected_present, observed_present, method="spearman"))
+        .otherwise(None)
         .alias(prefix + "spearman"),
     ]
     if name in ("effect", "z_score"):
@@ -1499,7 +1521,7 @@ def _finalise_summary_status(
     return status
 
 
-def compare_input_to_vcf(
+def compare_input_partition(
     input_frame: pl.DataFrame,
     vcf_frame: pl.DataFrame,
     row,
@@ -1515,7 +1537,8 @@ def compare_input_to_vcf(
     external_eaf_mapping=None,
     duplicate_report_frame: pl.DataFrame | None = None,
     strand_action_frame: pl.DataFrame | None = None,
-) -> ConcordanceAnalysis:
+) -> ConcordancePartition:
+    """Compare rows and collect the counts needed by direct and staged runs."""
     input_table = prepare_input_table(
         input_frame, row, effect_type=effect_type, se_scale=se_scale,
         p_value_type=p_value_type,
@@ -1768,17 +1791,8 @@ def compare_input_to_vcf(
     if vcf_invalid.height:
         vcf_only = pl.concat([vcf_only, vcf_invalid], how="diagonal_relaxed")
 
-    mismatches = matched.filter(pl.col("failure_reasons") != "")
-    metric_summary = _metric_summaries(matched, eaf_is_maf=eaf_is_maf)
-    metric_summary_by_variant_type = _metric_summaries(
-        matched,
-        eaf_is_maf=eaf_is_maf,
-        group_column="input_variant_type",
-    )
-    position_metric_summary_by_variant_type = _metric_summaries(
-        position_matches,
-        eaf_is_maf=eaf_is_maf,
-        group_column="input_variant_type",
+    mismatch_count = int(
+        matched.select((pl.col("failure_reasons") != "").sum()).item() or 0
     )
 
     checked_any = 0
@@ -1792,7 +1806,7 @@ def compare_input_to_vcf(
                 | pl.col("p_value_checked")
             ).sum()
         ).item() or 0)
-    mismatch_fraction = mismatches.height / checked_any if checked_any else 0.0
+    mismatch_fraction = mismatch_count / checked_any if checked_any else 0.0
     retained_fraction = matched.height / input_unique.height if input_unique.height else 0.0
     match_counts = (
         dict(matched.group_by("match_type").len().iter_rows()) if matched.height else {}
@@ -1847,7 +1861,7 @@ def compare_input_to_vcf(
         "input_only_variants": unmatched_unique.height,
         "vcf_only_variants": valid_vcf_only.height,
         "retained_fraction": retained_fraction,
-        "value_mismatch_variants": mismatches.height,
+        "value_mismatch_variants": mismatch_count,
         "value_mismatch_fraction": mismatch_fraction,
         "palindromic_variants_compared": palindromic_compared,
         "palindromic_variants_excluded_from_orientation": palindromic_excluded,
@@ -1860,27 +1874,86 @@ def compare_input_to_vcf(
         summary["matched_variants"] / summary["variant_union"]
         if summary["variant_union"] else None
     )
+    return ConcordancePartition(
+        summary=summary,
+        matched=matched,
+        position_matches=position_matches,
+        input_only=input_only,
+        vcf_only=vcf_only,
+        vcf_duplicates=vcf_duplicates,
+    )
+
+
+def _summarise_comparison(
+    partition: ConcordancePartition,
+    *,
+    eaf_is_maf: bool | None,
+    settings,
+) -> ConcordanceAnalysis:
+    """Compute the full metric suites and verdict once for the final rows."""
+    metric_summary = _metric_summaries(partition.matched, eaf_is_maf=eaf_is_maf)
+    metric_summary_by_variant_type = _metric_summaries(
+        partition.matched,
+        eaf_is_maf=eaf_is_maf,
+        group_column="input_variant_type",
+    )
+    position_metric_summary_by_variant_type = _metric_summaries(
+        partition.position_matches,
+        eaf_is_maf=eaf_is_maf,
+        group_column="input_variant_type",
+    )
     status = _finalise_summary_status(
-        summary,
+        partition.summary,
         metric_summary,
         eaf_is_maf=eaf_is_maf,
         settings=settings,
     )
     return ConcordanceAnalysis(
         status=status,
-        summary=summary,
+        summary=partition.summary,
         metric_summary=metric_summary,
         metric_summary_by_variant_type=metric_summary_by_variant_type,
         position_metric_summary_by_variant_type=(
             position_metric_summary_by_variant_type
         ),
-        matched=matched,
-        position_matches=position_matches,
-        mismatches=mismatches,
-        input_only=input_only,
-        vcf_only=vcf_only,
-        vcf_duplicates=vcf_duplicates,
+        matched=partition.matched,
+        position_matches=partition.position_matches,
+        mismatches=partition.matched.filter(pl.col("failure_reasons") != ""),
+        input_only=partition.input_only,
+        vcf_only=partition.vcf_only,
+        vcf_duplicates=partition.vcf_duplicates,
     )
+
+
+def compare_input_to_vcf(
+    input_frame: pl.DataFrame,
+    vcf_frame: pl.DataFrame,
+    row,
+    *,
+    effect_type: str,
+    se_scale: str | None = None,
+    p_value_type: str,
+    eaf_is_maf: bool | None,
+    strand_consensus: str | None = None,
+    settings,
+    policies,
+    external_eaf_frame: pl.DataFrame | None = None,
+    external_eaf_mapping=None,
+    duplicate_report_frame: pl.DataFrame | None = None,
+    strand_action_frame: pl.DataFrame | None = None,
+) -> ConcordanceAnalysis:
+    """Return the complete direct comparison, including all metrics and verdict."""
+    partition = compare_input_partition(
+        input_frame, vcf_frame, row,
+        effect_type=effect_type, se_scale=se_scale, p_value_type=p_value_type,
+        eaf_is_maf=eaf_is_maf, strand_consensus=strand_consensus,
+        settings=settings, policies=policies,
+        external_eaf_frame=external_eaf_frame,
+        external_eaf_mapping=external_eaf_mapping,
+        duplicate_report_frame=duplicate_report_frame,
+        strand_action_frame=strand_action_frame,
+    )
+    return _summarise_comparison(partition, eaf_is_maf=eaf_is_maf, settings=settings)
 
 
 def combine_concordance_partitions(
@@ -1990,38 +2063,26 @@ def combine_concordance_partitions(
         for field in position_fields
     }
 
-    metric_summary = _metric_summaries(matched, eaf_is_maf=eaf_is_maf)
-    metric_summary_by_variant_type = _metric_summaries(
-        matched,
-        eaf_is_maf=eaf_is_maf,
-        group_column="input_variant_type",
-    )
-    position_metric_summary_by_variant_type = _metric_summaries(
-        position_matches,
-        eaf_is_maf=eaf_is_maf,
-        group_column="input_variant_type",
-    )
-    status = _finalise_summary_status(
-        summary,
-        metric_summary,
+    result = _summarise_comparison(
+        ConcordancePartition(
+            summary=summary, matched=matched, position_matches=position_matches,
+            input_only=input_only, vcf_only=vcf_only, vcf_duplicates=vcf_duplicates,
+        ),
         eaf_is_maf=eaf_is_maf,
         settings=settings,
     )
     ordered_matches = matched.sort(["_match_priority", "input_row"])
-    return ConcordanceAnalysis(
-        status=status,
-        summary=summary,
-        metric_summary=metric_summary,
-        metric_summary_by_variant_type=metric_summary_by_variant_type,
-        position_metric_summary_by_variant_type=(
-            position_metric_summary_by_variant_type
-        ),
-        matched=ordered_matches,
-        position_matches=position_matches.sort(["input_chrom", "input_pos"]),
-        mismatches=ordered_matches.filter(pl.col("failure_reasons") != ""),
-        input_only=input_only.sort("input_row"),
-        vcf_only=vcf_only.sort(
-            ["valid_vcf_variant", "vcf_row"], descending=[True, False],
-        ),
-        vcf_duplicates=vcf_duplicates.sort("vcf_row"),
+    result.matched = ordered_matches
+    result.position_matches = position_matches.sort(["input_chrom", "input_pos"])
+    # An empty report has no ordering requirement; avoid sorting its streamed plan.
+    result.mismatches = (
+        matched.limit(0)
+        if not summary["value_mismatch_variants"]
+        else ordered_matches.filter(pl.col("failure_reasons") != "")
     )
+    result.input_only = input_only.sort("input_row")
+    result.vcf_only = vcf_only.sort(
+        ["valid_vcf_variant", "vcf_row"], descending=[True, False],
+    )
+    result.vcf_duplicates = vcf_duplicates.sort("vcf_row")
+    return result
