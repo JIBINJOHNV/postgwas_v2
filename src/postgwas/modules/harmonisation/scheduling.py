@@ -48,7 +48,14 @@ def plan_chromosome_schedule(
         raise ValueError("execution.min_threads_per_chromosome must not exceed execution.threads_per_chromosome.")
     numeric = [memory, floor, margin, available]
     if cpu < 1 or requested_workers < 1 or any(not math.isfinite(v) or v <= 0 for v in numeric):
-        raise ValueError("Adaptive chromosome scheduling has no usable CPU/memory budget after parent headroom.")
+        raise ValueError(
+            "Adaptive chromosome scheduling has no usable CPU/memory budget after parent headroom. "
+            "Configured memory budget=%.3f GiB; parent RSS=%.3f GiB; "
+            "reserved headroom=%.3f GiB; remaining worker budget=%.3f GiB. "
+            "Check --memory-gb (execution.memory_gb), --threads (execution.threads) "
+            "and the parent process memory use."
+            % (memory, parent, headroom, available)
+        )
     # The lightest jobs bound possible concurrency. Actual admission below also
     # checks the sum, so a large chromosome can reduce simultaneous jobs.
     workers = min(len(chromosome_files), requested_workers, max(1, cpu // minimum_threads))

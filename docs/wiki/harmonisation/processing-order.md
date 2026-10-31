@@ -15,6 +15,16 @@ harmonisation. On success, the existing prepared partitions and decisions are re
 the original summary-statistics files are not parsed again. This changes scheduling,
 not the order or thresholds of the scientific checks within a dataset.
 
+Dataset preparation and analysis share one parent process. Failure accounting
+retains dataset IDs rather than exception objects, whose tracebacks can keep
+study dataframes alive ([Python exception semantics](https://docs.python.org/3.10/reference/compound_stmts.html#the-try-statement)).
+Unreachable objects are collected between preparations, datasets and retries,
+and after the final preparation or dataset; error details remain in the existing
+logs and reports. This does not guarantee that the process returns all allocated
+RAM to the operating system. The memory-budget guard remains enforced and, on
+failure, reports the configured budget, measured parent RSS, reserved headroom
+and remaining worker budget in GiB. Scientific policies and outputs are unchanged.
+
 This page is the step-by-step walkthrough of that process. It follows the real
 runtime order: the same stage and step names appear in the log files, so you can
 read a log alongside this page and know exactly where a run is. Nothing here is

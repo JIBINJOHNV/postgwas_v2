@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import io
 import json
 import math
@@ -1401,7 +1402,8 @@ def _run_validated_rows(
 
     defaults = _engine_defaults(config, resolved_executables=resolved_executables)
     results: dict[str, Any] = {}
-    failures = []
+    # Keep IDs only: an exception's traceback would retain failed study frames.
+    failures: list[str] = []
     dataset_count = len(rows)
     strand_reference = config.modules.harmonisation.default_eaf
     comparison_reference = config.modules.harmonisation.comparison_af
@@ -1450,6 +1452,8 @@ def _run_validated_rows(
         )
 
     for dataset_index, row in enumerate(rows, start=1):
+        # Collect after the previous handler has released its exception.
+        gc.collect()
         screen_router.select(row.dataset_id)
         run_summary_records[row.dataset_id]["status"] = "RUNNING"
         _write_run_summary(run_summary_path, list(run_summary_records.values()))
@@ -1560,11 +1564,13 @@ def _run_validated_rows(
                 "Dataset %s failed before analysis; see %s."
                 % (row.dataset_id, dataset_log),
             )
-            failures.append((row.dataset_id, exc))
+            failures.append(row.dataset_id)
             continue
         _append_run_log(dataset_log, "INFO", start_log_message)
         attempts = config.execution.retries + 1
         for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                gc.collect()
             try:
                 result = run_harmonisation_pipeline(
                     sample_column_dict=engine_input,
@@ -1726,7 +1732,7 @@ def _run_validated_rows(
                     "Dataset %s failed configuration validation; see %s."
                     % (row.dataset_id, dataset_log),
                 )
-                failures.append((row.dataset_id, exc))
+                failures.append(row.dataset_id)
                 break
             except ConcordanceValidationError as exc:
                 record_dataset(
@@ -1743,7 +1749,7 @@ def _run_validated_rows(
                     "Dataset %s harmonised but failed concordance validation; see %s."
                     % (row.dataset_id, dataset_log),
                 )
-                failures.append((row.dataset_id, exc))
+                failures.append(row.dataset_id)
                 break
             except Exception as exc:
                 _append_run_log(
@@ -1767,7 +1773,8 @@ def _run_validated_rows(
                         "Dataset %s failed after %d attempt(s); see %s."
                         % (row.dataset_id, attempts, dataset_log),
                     )
-                    failures.append((row.dataset_id, exc))
+                    failures.append(row.dataset_id)
+    gc.collect()
     screen_router.select(None)
     summary_block = _run_summary_block(
         run_summary_path,
@@ -1911,6 +1918,7 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
     for row in rows:
         if row.dataset_id not in engine_inputs:
             continue
+        gc.collect()
         record = {
             "row": row._row_number, "dataset_id": row.dataset_id,
             "input_file": str(row.input_file), "stage": "dataset preparation",
@@ -1942,6 +1950,7 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
             records.append({**record, "stage": "sample sheet", "status": "warning", "problem": warning})
     # Validate earlier preparations again after the final row. Changes while
     # another dataset was being checked must block the whole invocation.
+    gc.collect()
     for row in rows:
         prepared = prepared_runs.get(row.dataset_id)
         if prepared is None:
