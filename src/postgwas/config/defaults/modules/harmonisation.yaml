@@ -410,6 +410,12 @@ module:
     other_allele: ALT
     delimiter: tab
 
+  # Validate this expected inventory before reading/interpreting any study.
+  # This scope does not select or infer the study build or filter its variants.
+  resource_preflight:
+    builds: [GRCh37, GRCh38]
+    chromosomes: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21', '22']
+
   # Paths are relative to resources.root/--resource-directory. The available
   # fields are build, target_build, source_build, source and chromosome.
   resource_layout:
@@ -719,7 +725,7 @@ export_layout:
     - 'Archive this file together with the resolved configuration and software version from the run.'
   sections:
     - title: Reference selection and input declarations
-      fields: [enabled, default_eaf, comparison_af, reference, fixed_info]
+      fields: [enabled, default_eaf, comparison_af, reference, resource_preflight, fixed_info]
     - title: Dataset preparation and chromosome processing
       fields: [policies]
     - title: Post-merge frequency QC and optional input-to-VCF validation
@@ -737,6 +743,7 @@ export_layout:
     - comparison_af.source
     - comparison_af.column
     - reference.dbsnp_source
+    - resource_preflight
     - population_frequency_qc.enabled
     - concordance_validation.enabled
   common_run_fields:
@@ -764,6 +771,7 @@ export_layout:
     default_eaf: ['Strand orientation and EAF/MAF validation table for chromosome step 04.', 'This panel does not fill missing study EAF; an external source is declared separately in the sample sheet.']
     comparison_af: ['Reference VCF for population annotation and post-merge QC.', 'This panel does not determine the study strand or supply its EAF.']
     reference: ['dbSNP annotation used during chromosome VCF processing.']
+    resource_preflight: ['Expected reference inventory checked before study interpretation, including when build.mode is auto.', 'Both configured builds and every listed chromosome are required; this does not infer the study build or filter study chromosomes.']
     fixed_info: ['Explicit fallback for datasets with no internal or external INFO; provenance marks it as user-assigned.']
     population_frequency_qc: ['Post-merge step 02: compare population frequencies and report supporting evidence.']
     concordance_validation: ['Optional stage 6: compare original input with the same-build final VCF.', 'Enabled through this setting or --validate; discrepancies are subject to the configured failure limits.']

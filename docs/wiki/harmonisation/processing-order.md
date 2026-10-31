@@ -3,7 +3,12 @@
 PostGWAS takes a study's raw GWAS summary-statistics table and produces
 allele-aligned, build-resolved GWAS-VCFs with QC and rejection evidence.
 
-Before chromosome processing, PostGWAS now completes dataset preparation for every
+First, PostGWAS checks the configured expected reference inventory: by default,
+GRCh37 and GRCh38, chromosomes 1–22. This structural check does not infer the study
+build or read study variants, even with `build.mode: auto`. Missing or invalid
+resources block study interpretation while independent CSV/header checks continue.
+
+Before chromosome processing, PostGWAS completes dataset preparation for every
 usable selected sample-sheet row. Errors from all rows are collected in the configured
 preflight CSV and canonical log. If any row fails, no dataset enters chromosome
 harmonisation. On success, the existing prepared partitions and decisions are reused;
@@ -216,9 +221,12 @@ PostGWAS performs these checks first:
    the explicit `--fixed-info` value when neither file-based source exists.
    With no usable INFO source, the run stops.
 4. Check the resource root, output directory, required executables, and the
-   configured bcftools liftover plugin. Exact chromosome files cannot yet be
-   selected because the study's build and observed chromosomes are not known.
-5. Save the resolved configuration and start the canonical logs.
+   configured bcftools liftover plugin. Save the resolved configuration and start
+   the canonical logs.
+5. Validate the expected resource paths for every build and chromosome in
+   `resource_preflight` (defaults: GRCh37, GRCh38 and 1–22). This uses YAML and CSV
+   source declarations only; it does not infer the study build. Check file
+   availability, headers, indexes and structural compatibility before preparation.
 6. Prepare every usable selected dataset and collect failures across rows. Save
    the preflight CSV. If any prerequisite fails, stop before chromosome processing
    for all datasets. Otherwise initialize the per-dataset reports, normalized

@@ -1,8 +1,8 @@
 """Fast, aggregated validation of chromosome-specific harmonisation resources.
 
-The genome build and observed chromosomes are not known until the dataset-level
-checks have run.  This module validates the resulting exact resource set once,
-before chromosome partitions are written or worker processes are started.
+Shared validators check the configured build/chromosome inventory before study
+interpretation, then its exact resolved resources during dataset preparation.
+Successful unchanged structural checks are reused within the invocation.
 """
 
 from __future__ import annotations
@@ -69,6 +69,11 @@ def _add_issue(
 ) -> None:
     key = (resource, "not resolved" if path is None else str(path), problem)
     issues.setdefault(key, set()).add(str(chromosome))
+    if path is not None:
+        record_file_validation(
+            path, resource, checks=("reference structure",), status="failed",
+            message=problem, metrics={"chromosome": str(chromosome)},
+        )
 
 
 def _issue_records(
@@ -135,6 +140,10 @@ def _index_path(path: Path, suffixes: Sequence[str]) -> Path | None:
 
 def _run(arguments: Sequence[str], purpose: str, logger=None) -> str:
     command = [str(value) for value in arguments]
+    record_file_validation(
+        command[-1], "Harmonisation reference", checks=("command invocation",),
+        metrics={"command": command, "purpose": purpose},
+    )
     if logger is not None and hasattr(logger, "record"):
         logger.record("INPUT", "external_command", purpose=purpose, command=command)
     return run_checked_command(
@@ -414,6 +423,8 @@ def validate_harmonisation_resource_maps(
     policies,
     require_default_eaf: bool,
     logger=None,
+    resource_keys: Sequence[str] | None = None,
+    validate_frequency_semantics: bool = True,
 ) -> dict[str, Any]:
     """Validate every resolved resource and return serialisable provenance."""
     issues: dict[tuple[str, str, str], set[str]] = {}
@@ -434,8 +445,8 @@ def validate_harmonisation_resource_maps(
             vcf_config["external_frequency_columns"], "INFO",
         )
     }
-    required_keys = list(_ALWAYS_REQUIRED_KEYS)
-    if require_default_eaf:
+    required_keys = list(_ALWAYS_REQUIRED_KEYS if resource_keys is None else resource_keys)
+    if require_default_eaf and resource_keys is None:
         required_keys.insert(0, "default_eaf_file")
 
     for chromosome, resources in resource_maps.items():
@@ -632,6 +643,8 @@ def validate_harmonisation_resource_maps(
     # File identity alone is not an error. A MAF-like source cannot validate
     # itself, even via another path, symlink, hard link or population column.
     for chromosome, resources in resource_maps.items():
+        if not validate_frequency_semantics:
+            break
         external = resources.get("user_eaf_file")
         reference = resources.get("default_eaf_file")
         if external is None or reference is None:

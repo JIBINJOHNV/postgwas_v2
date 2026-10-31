@@ -46,6 +46,7 @@ from postgwas.modules.harmonisation.service import (
     PipelineError,
     run_harmonisation_pipeline,
     validate_harmonisation_inputs,
+    preflight_configured_reference_scope,
 )
 from postgwas.modules.harmonisation.concordance.errors import (
     ConcordanceValidationError,
@@ -1864,22 +1865,62 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
         records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "configuration", "status": "failed", "problem": str(exc)})
     if unavailable_tools:
         records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "executables", "status": "failed", "problem": unavailable_tools})
+    # Resolve declarations and inspect the configured reference inventory before
+    # any study variants are read or any build/AF interpretation is attempted.
     for row in rows:
+        try:
+            engine_inputs[row.dataset_id] = to_harmonisation_input(
+                row, resource_directory=config.resources.root,
+                output_directory=output_root, output_layout=defaults["output_layout"],
+                fixed_info=fixed_info, fixed_info_column=config.modules.harmonisation.fixed_info.column,
+            )
+        except Exception as exc:
+            records.append({
+                "row": row._row_number, "dataset_id": row.dataset_id, "input_file": str(row.input_file),
+                "stage": "configuration", "status": "failed", "problem": str(exc),
+            })
+    reference_blocked = bool(unavailable_tools)
+    if not unavailable_tools:
+        scope = config.modules.harmonisation.resource_preflight
+        inventories = [(None, None)] + [
+            (row, engine_inputs[row.dataset_id]) for row in rows
+            if row.dataset_id in engine_inputs and any(
+                engine_inputs[row.dataset_id].get(key) for key in ("eaffile", "infofile")
+            )
+        ]
+        for row, engine_input in inventories:
+            try:
+                preflight_configured_reference_scope(
+                    defaults, config.resources.root, scope, sample_columns=engine_input,
+                )
+            except Exception as exc:
+                reference_blocked = True
+                records.append({
+                    "row": row._row_number if row is not None else None,
+                    "dataset_id": row.dataset_id if row is not None else "",
+                    "input_file": str(row.input_file if row is not None else config.resources.root),
+                    "stage": "expected references", "status": "failed", "problem": str(exc),
+                })
+        inventory_message = "Builds: %s; chromosomes: %s. %s" % (
+            ", ".join(scope.builds), ", ".join(scope.chromosomes),
+            "Failed; details will be included in the preflight report." if reference_blocked
+            else "Configured reference structures passed; no study build was inferred.",
+        )
+        _append_run_log(top_log, "ERROR" if reference_blocked else "INFO", inventory_message)
+        print(screen_field("error" if reference_blocked else "success", "Expected references", inventory_message, indent=4))
+    for row in rows:
+        if row.dataset_id not in engine_inputs:
+            continue
         record = {
             "row": row._row_number, "dataset_id": row.dataset_id,
             "input_file": str(row.input_file), "stage": "dataset preparation",
             "status": "passed", "problem": "",
         }
         try:
-            engine_input = to_harmonisation_input(
-                row, resource_directory=config.resources.root,
-                output_directory=output_root, output_layout=defaults["output_layout"],
-                fixed_info=fixed_info, fixed_info_column=config.modules.harmonisation.fixed_info.column,
-            )
-            engine_inputs[row.dataset_id] = engine_input
-            if unavailable_tools:
+            engine_input = engine_inputs[row.dataset_id]
+            if reference_blocked:
                 validate_harmonisation_inputs(engine_input, defaults)
-                record.update(status="blocked", problem="Header/configuration checked; deeper validation requires the unavailable executables.")
+                record.update(status="blocked", problem="Header/configuration checked; study interpretation is blocked by the executable/reference preflight failures.")
             else:
                 prepared_runs[row.dataset_id] = run_harmonisation_pipeline(
                     sample_column_dict=engine_input, default_cfg=defaults,
@@ -1933,7 +1974,8 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
                 _append_run_log(top_log, "ERROR", "Row %s, dataset %s: %s" % (
                     item["row"], item["dataset_id"], item["problem"],
                 ))
-        global_problems = "; ".join(item["problem"] for item in failures if item["row"] is None)
+        global_problems = "; ".join(item["problem"] for item in failures
+                                    if item["row"] is None and item["stage"] != "expected references")
         raise HarmonisationPreflightError(
             "Harmonisation preflight found %d error(s). No chromosome analysis was started. "
             "All detected problems are in %s; dependent checks on failed rows remain blocked.%s"

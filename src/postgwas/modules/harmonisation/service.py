@@ -1848,6 +1848,8 @@ def preflight_harmonisation_resources(
     policies,
     require_default_eaf,
     logger=None,
+    resource_keys=None,
+    validate_frequency_semantics=True,
 ):
     """Resolve and validate every resource before chromosome workers start."""
     resource_maps = {}
@@ -1892,6 +1894,8 @@ def preflight_harmonisation_resources(
                 policies=policies,
                 require_default_eaf=require_default_eaf,
                 logger=logger,
+                resource_keys=resource_keys,
+                validate_frequency_semantics=validate_frequency_semantics,
             )
         except ResourcePreflightError as exc:
             issues.extend(exc.issues)
@@ -1902,6 +1906,45 @@ def preflight_harmonisation_resources(
     if issues:
         raise ResourcePreflightError(issues)
     return resource_maps, summary
+
+
+def preflight_configured_reference_scope(defaults, resource_folder, scope, *, sample_columns=None):
+    """Check configured build/chromosome paths without reading study variants.
+
+    Common references are checked once. A supplied sample mapping checks only
+    its active external EAF/INFO sources, using the same structural validators.
+    Frequency semantics remain part of subsequent dataset preparation.
+    """
+    external = sample_columns or {}
+    policies = load_policies(defaults["policies"])
+    issues = []
+    for build in scope.builds:
+        try:
+            preflight_harmonisation_resources(
+                scope.chromosomes, grch_version=build,
+                target_build=defaults["vcf_processing"]["target_builds"][build],
+                resource_folder=resource_folder,
+                user_eaf_file=external.get("eaffile"),
+                user_eaf_column=external.get("eafcolumn"),
+                user_info_file=external.get("infofile"),
+                user_info_column=external.get("infocolumn"),
+                default_eaf_reference_source=defaults["default_eaf_reference_source"],
+                default_eaf_reference_column=defaults["default_eaf_reference_column"],
+                default_comparison_af_file=defaults["default_comparison_af_file"],
+                default_comparison_af_column=defaults["default_comparison_af_column"],
+                dbsnp=defaults["default_dbsnp"], resource_layout=defaults["resource_layout"],
+                default_eaf_colmap=defaults["default_eaf_colmap"],
+                external_eaf_colmap=defaults["external_eaf_colmap"],
+                external_info_colmap=defaults["external_info_colmap"],
+                executables=defaults["executables"], vcf_config=defaults["vcf_processing"],
+                policies=policies, require_default_eaf=True,
+                resource_keys=None if sample_columns is None else (),
+                validate_frequency_semantics=False,
+            )
+        except ResourcePreflightError as exc:
+            issues.extend({**item, "resource": "%s %s" % (build, item["resource"])} for item in exc.issues)
+    if issues:
+        raise ResourcePreflightError(issues)
 
 
 # ===============================================================

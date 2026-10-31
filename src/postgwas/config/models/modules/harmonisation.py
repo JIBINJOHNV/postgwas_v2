@@ -332,6 +332,23 @@ class HarmonisationResourceLayout(StrictModel):
         return value
 
 
+class HarmonisationResourcePreflightConfig(StrictModel):
+    """Expected reference inventory, independent of study build inference."""
+
+    builds: list[str]
+    chromosomes: list[str]
+
+    @field_validator("builds", "chromosomes")
+    @classmethod
+    def unique_path_components(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if not cleaned or len(cleaned) != len(set(cleaned)):
+            raise ValueError("must contain one or more unique values")
+        for value in cleaned:
+            validate_filename_component(value, "reference inventory value")
+        return cleaned
+
+
 class HarmonisationOutputLayout(RootModel[dict[str, str]]):
     """Canonical dataset root and relative harmonisation result paths."""
 
@@ -848,6 +865,7 @@ class HarmonisationConfig(ModuleConfig):
     sample_sheet_generator: SampleSheetGeneratorConfig
     build_check_mapping: VariantReferenceMappingConfig
     resource_layout: HarmonisationResourceLayout
+    resource_preflight: HarmonisationResourcePreflightConfig
     output_layout: HarmonisationOutputLayout
     gwas2vcf_input: Gwas2VcfInputConfig
     vcf_processing: HarmonisationVcfConfig
@@ -856,3 +874,13 @@ class HarmonisationConfig(ModuleConfig):
     external_reference_staging: ExternalReferenceStagingConfig
     concordance_validation: ConcordanceValidationConfig
     policies: dict[str, Any]
+
+    @model_validator(mode="after")
+    def supported_preflight_builds(self):
+        unknown = set(self.resource_preflight.builds) - set(self.vcf_processing.target_builds)
+        if unknown:
+            raise ValueError(
+                "resource_preflight.builds must be defined in vcf_processing.target_builds: %s"
+                % ", ".join(sorted(unknown))
+            )
+        return self

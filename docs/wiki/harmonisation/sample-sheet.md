@@ -11,9 +11,24 @@ datasets finish preflight before any chromosome harmonisation starts.
 
 ## All-row preflight
 
-PostGWAS collects sample-sheet errors across all readable rows, then checks the
-configuration, headers, content, inferred build, observed chromosomes and required
-resources for each independently usable selected row. Extra metadata columns remain
+PostGWAS collects sample-sheet errors across all readable rows, then validates the
+expected reference inventory from YAML before any study interpretation. The default
+`modules.harmonisation.resource_preflight` scope is both `GRCh37` and `GRCh38`,
+chromosomes `1` through `22`, including when `policies.build.mode` is `auto` or a
+declared build. It expands the configured resource templates, checks common
+references and active external EAF/INFO sources, and validates their file structures,
+columns and indexes. It does not read study variants, infer a study build, or classify
+AF values at this stage. Every file in the configured inventory is required, even
+if a later study uses fewer chromosomes or only one source build.
+
+The scope is configurable through `resource_preflight.builds` and
+`resource_preflight.chromosomes`; these lists describe expected resources and do
+not filter study variants or set the study build. Reference files for additional
+observed chromosomes, such as X, are still checked during dataset preparation.
+
+After the inventory passes, PostGWAS checks the headers and content, resolves the
+build and study properties once per usable selected dataset, and validates its exact
+resource compatibility. Successful static reference reads are reused. Extra metadata columns remain
 allowed. A bad row does not prevent later rows from being checked. Checks that depend
 on a failed prerequisite cannot be completed and remain blocked; an unreadable YAML
 or ambiguous CSV header must be repaired before dependent checks can run.
