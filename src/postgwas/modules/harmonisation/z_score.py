@@ -5,8 +5,8 @@ Public entry point: ``derive_z_score_from_effect_and_standard_error``.
     Z = BETA / SE
 
 A study that already supplies a Z score keeps it. Otherwise this step computes
-``Z = BETA / SE`` only where BETA and SE are finite and SE is above the
-configured numerical division floor. The immediately following effect-
+``Z = BETA / SE`` only where BETA and SE are finite and SE is strictly positive.
+The immediately following effect-
 statistics step owns the six basic BETA, SE and Z checks and applies their
 policies exactly once.
 
@@ -33,9 +33,7 @@ __all__ = ["derive_z_score_from_effect_and_standard_error", "POLICY_KEYS", "STEP
 
 
 #: Every policy this step reads.  Pass to ``logger.step(policy_keys=...)``.
-POLICY_KEYS = (
-    "validation.se_division_floor",
-)
+POLICY_KEYS = ()
 
 #: The free-text step label recorded in the reject file.
 STEP_LABEL = "09 z_from_beta_se"
@@ -59,11 +57,8 @@ def derive_z_score_from_effect_and_standard_error(
     Z=0; unusable inputs produce a null calculated Z and are handled once by
     :func:`effect_validation.validate_effect_statistics` in step 10.
     """
-    pol = resolve_policies(policies)
+    resolve_policies(policies)
     qc_info = {"initial_variants": df.height}  # type: Dict[str, Any]
-
-    if logger is not None:
-        logger.settings(list(POLICY_KEYS))
 
     beta_col = optional_text(sample_column_dict.get("beta_col"))
     se_col = optional_text(sample_column_dict.get("se_col"))
@@ -121,7 +116,6 @@ def derive_z_score_from_effect_and_standard_error(
             "validation gate in step 10.".format(existing_z_col),
         )
 
-    division_floor = float(pol.get("validation.se_division_floor"))
     if not has_existing_z:
         output_z_col = unused_column_name("imp_z_col", df)
         beta = pl.col(beta_col)
@@ -132,7 +126,7 @@ def derive_z_score_from_effect_and_standard_error(
                 & beta.is_finite()
                 & se.is_not_null()
                 & se.is_finite()
-                & (se > division_floor)
+                & (se > 0)
             )
             .then(beta / se)
             .otherwise(None)
@@ -151,7 +145,6 @@ def derive_z_score_from_effect_and_standard_error(
 
     qc_info.update({
         "z_column": sample_column_dict["imp_z_col"],
-        "se_division_floor": division_floor,
         "total_variants": df.height,
     })
 

@@ -1260,7 +1260,6 @@ group_order:
     order: 16
     stage: dataset 02/07 / chromosome 10   declarations and the SE / BETA / Z gates
     keys:
-      - se_division_floor
       - se_invalid
       - se_from_clipped_pval
       - beta_invalid
@@ -4438,32 +4437,12 @@ policies:
         allow_none: false
         kind: enum
         members: [warn, fail]
-    se_division_floor:
-      default: 1.0e-12
-      help: |-
-        What it does: Sets the smallest positive standard error that can be used as the
-          denominator when calculating Z = BETA / SE.
-        When it applies: chromosome step 09 uses it as a calculation guard when producing
-          Z = BETA / SE; chromosome step 10 applies validation.se_invalid once to finite standard
-          errors at or below it. Step 09 leaves the calculated Z empty for an unsafe denominator
-          but does not remove the row.
-        Values: Any finite number greater than zero, on the same scale as the standard error.
-      origin: z_score.py:derive_z_score_from_effect_and_standard_error; effect_validation.py:_validate_basic_effect_statistics
-      recommendation: null
-      type: float
-      validator:
-        allow_none: false
-        exclusive_minimum: true
-        integer: false
-        kind: num
-        maximum: null
-        minimum: 0.0
-        number_kind: float
     se_invalid:
       default: reject
       help: |-
-        What it does: Decides what happens to a standard error that is missing, non-finite, or at
-          or below validation.se_division_floor.
+        What it does: Decides what happens to a standard error that is missing, non-finite, zero,
+          or negative. A finite standard error greater than zero passes this validity check;
+          there is no configurable positive cutoff.
         When it applies: exactly once at chromosome step 10 whenever a standard-error column is
           present. If no standard-error column is present, the check is skipped and a warning says
           every variant passed this part of the gate untested.

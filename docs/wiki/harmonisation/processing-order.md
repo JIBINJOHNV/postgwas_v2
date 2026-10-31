@@ -669,10 +669,11 @@ See [Authoritative input mappings](sample-sheet.md#authoritative-input-mappings)
    underflow/censoring, not an exact probability.
 
 9. **Chromosome step 9 — Produce the final Z score.** Keep a supplied Z;
-   otherwise calculate `Z = BETA / SE` only where BETA and SE are finite and SE
-   exceeds `validation.se_division_floor`. A finite negative BETA is valid, and
-   a valid zero BETA gives `Z = 0`. Unusable calculation inputs leave Z empty
-   for the single validation gate in the next step; this step removes no row.
+   otherwise calculate `Z = BETA / SE` only where BETA and SE are finite and
+   `SE > 0`. There is no configurable SE cutoff. A finite negative BETA is valid,
+   and a valid zero BETA gives `Z = 0`. Unusable calculation inputs leave Z empty;
+   a non-finite calculated Z is handled by the existing Z-validity gate in the
+   next step. This calculation step removes no row.
 
 10. **Chromosome step 10 — Check statistical agreement.** Apply the six
     basic SE, BETA, and Z checks; handle SE-from-clipped-p-value provenance;

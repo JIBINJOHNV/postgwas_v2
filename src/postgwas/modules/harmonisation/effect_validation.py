@@ -231,7 +231,6 @@ def _apply_rule(df, mask, reason, action, ctx, rejects, step_label,
 # =============================================================================
 
 _EFFECT_VALIDATION_POLICY_KEYS = [
-    "validation.se_division_floor",
     "validation.se_invalid",
     "validation.se_from_clipped_pval",
     "validation.beta_invalid",
@@ -254,8 +253,8 @@ def _validate_basic_effect_statistics(
     """Apply the six basic SE, BETA and Z checks exactly once.
 
     The three SE masks are mutually exclusive and intentionally ordered:
-    missing, non-finite, then finite but at or below the configured numerical
-    division floor. BETA missing/non-finite, BETA zero, and Z missing/non-finite
+    missing, non-finite, then finite but zero or negative. BETA missing/non-finite,
+    BETA zero, and Z missing/non-finite
     complete the shared gate. This function is called only by chromosome step
     10; step 09 performs calculation but no validation-policy action.
     """
@@ -276,7 +275,6 @@ def _validate_basic_effect_statistics(
         matched_by_reason[reason] = int(matched)
 
     se_action = pol.get("validation.se_invalid")
-    division_floor = float(pol.get("validation.se_division_floor"))
     if se_col is None:
         checks_skipped.append("se_invalid:no_se_column")
         ctx.warn(
@@ -294,15 +292,15 @@ def _validate_basic_effect_statistics(
             se.is_not_null() & ~se.is_finite(),
             "se_non_finite", se_action, "standard error not finite",
             "The standard error is infinite or not a number. Finiteness is checked "
-            "before the denominator threshold because positive infinity would pass "
+            "before positivity because positive infinity would pass "
             "a simple greater-than-zero test.",
         )
         apply(
-            se.is_not_null() & se.is_finite() & (se <= division_floor),
+            se.is_not_null() & se.is_finite() & (se <= 0),
             "se_non_positive", se_action,
-            "standard error large enough for stable division",
-            "The standard error is at or below validation.se_division_floor (%s), "
-            "so BETA / SE would be numerically unstable." % division_floor,
+            "standard error strictly positive",
+            "The standard error is zero or negative. A finite, strictly positive "
+            "standard error is required for Z = BETA / SE.",
             detail="column '{}'".format(se_col),
         )
 
@@ -374,7 +372,6 @@ def _validate_basic_effect_statistics(
         "variants_after_filter_invalid_beta_se": rows_out,
         "beta_zero_removed_flag": zero_action == "reject",
         "beta_zero_action": zero_action,
-        "se_division_floor": division_floor,
     }
     return df, metrics
 
