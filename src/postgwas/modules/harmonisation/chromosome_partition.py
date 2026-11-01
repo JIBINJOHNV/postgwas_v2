@@ -4,11 +4,13 @@ from pathlib import Path
 import tempfile
 from typing import Optional
 
+import numpy as np
 import polars as pl
 
 from postgwas.core.paths import configured_output_path
 
 from .rejects import SOURCE_INPUT_ROW_COLUMN
+from .shared.allele_join import unused_column_name
 from .shared.variant_columns import has_canonical_variant_columns
 
 
@@ -33,6 +35,22 @@ def _validate_source_row_ids(frame: pl.DataFrame, label: str) -> None:
             "%s stable source-row IDs must be non-null and unique before "
             "chromosome partitioning." % label
         )
+
+
+def _select_partition_rows(frame: pl.DataFrame, indices: pl.Series) -> pl.DataFrame:
+    """Select nonempty, unique physical positions in their requested order."""
+    start = indices.item(0)
+    length = len(indices)
+    # Uniqueness follows from the row-position/one-to-one source-ID contract.
+    # Ascending unique positions span exactly their length iff consecutive.
+    ordered = indices.is_sorted()
+    if ordered and indices.item(-1) - start + 1 == length:
+        return frame.slice(start, length)
+    if ordered:
+        mask = np.zeros(frame.height, dtype=bool)
+        mask[indices.to_numpy()] = True
+        return frame.filter(mask)
+    return frame[indices]
 
 
 def _write_parquet_atomically(
@@ -128,11 +146,6 @@ def write_chromosome_partitions(
             % null_chromosomes
         )
 
-    observed_chromosomes = [
-        str(value)
-        for value in df.get_column(chr_col).unique(maintain_order=True).to_list()
-    ]
-
     if source_snapshot is not None:
         _validate_source_row_ids(df, "Working data")
         _validate_source_row_ids(source_snapshot, "Source snapshot")
@@ -149,12 +162,51 @@ def write_chromosome_partitions(
                 )
             )
 
+    if df.is_empty():
+        return ChromosomePartitions(paths={}, rows={})
+
+    # Group physical row positions, not full scientific rows. Keep only these
+    # compact indices while writing one chromosome's wide subsets at a time.
+    working_position = unused_column_name("__postgwas_partition_row", df)
+    index_columns = [chr_col]
+    if source_snapshot is not None and SOURCE_INPUT_ROW_COLUMN not in index_columns:
+        index_columns.append(SOURCE_INPUT_ROW_COLUMN)
+    row_index = df.select(index_columns).with_row_index(working_position)
+    grouped_positions = [pl.col(working_position)]
+    if source_snapshot is not None:
+        source_position = unused_column_name(
+            "__postgwas_source_position", row_index, source_snapshot,
+        )
+        source_index = source_snapshot.select(SOURCE_INPUT_ROW_COLUMN).with_row_index(
+            source_position,
+        )
+        row_index = row_index.join(
+            source_index, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True,
+        )
+        # Join-order defaults vary across Polars versions. Restore physical
+        # order only when needed, after checking the actual native indices.
+        if not row_index.get_column(working_position).is_sorted():
+            row_index = row_index.sort(working_position)
+        del source_index
+        # Source IDs need not be physical offsets or arrive in sorted order.
+        source_positions = pl.col(source_position)
+        if not row_index.get_column(SOURCE_INPUT_ROW_COLUMN).is_sorted():
+            source_positions = source_positions.sort_by(SOURCE_INPUT_ROW_COLUMN)
+        grouped_positions.append(source_positions)
+    chromosome_indices = row_index.group_by(chr_col, maintain_order=True).agg(
+        grouped_positions,
+    )
+    del row_index
+
     output_files = {}
     rows_by_chromosome = {}
     working_rows_written = 0
     source_rows_written = 0
-    for chrom in observed_chromosomes:
-        working_subset = df.filter(pl.col(chr_col) == chrom)
+    for group_index, chrom in enumerate(chromosome_indices.get_column(chr_col)):
+        working_indices = chromosome_indices.get_column(working_position).item(
+            group_index,
+        )
+        working_subset = _select_partition_rows(df, working_indices)
         if working_subset.is_empty():
             raise ValueError(
                 "Observed chromosome %s produced an empty working partition."
@@ -162,21 +214,17 @@ def write_chromosome_partitions(
             )
 
         if source_snapshot is not None:
-            identifiers = working_subset.select(SOURCE_INPUT_ROW_COLUMN)
-            source_subset = (
-                source_snapshot.join(
-                    identifiers,
-                    on=SOURCE_INPUT_ROW_COLUMN,
-                    how="semi",
-                )
-                .sort(SOURCE_INPUT_ROW_COLUMN)
+            source_indices = chromosome_indices.get_column(source_position).item(
+                group_index,
             )
-            if source_subset.height != working_subset.height:
+            matching_rows = source_indices.len() - source_indices.null_count()
+            if matching_rows != working_subset.height:
                 raise ValueError(
                     "Chromosome %s has %d working rows but %d matching immutable "
                     "source rows; every retained row must match exactly once."
-                    % (chrom, working_subset.height, source_subset.height)
+                    % (chrom, working_subset.height, matching_rows)
                 )
+            source_subset = _select_partition_rows(source_snapshot, source_indices)
             source_path = configured_output_path(
                 output_folder,
                 output_layout["chromosome_source_snapshot"],

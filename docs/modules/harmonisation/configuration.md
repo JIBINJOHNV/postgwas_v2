@@ -521,10 +521,28 @@ and verifies the resulting pool in the child initializer. This order matters
 because [Polars documents the pool as immutable after process start](https://docs.pola.rs/api/python/stable/reference/api/polars.thread_pool_size.html).
 
 Dataset step 08 writes the validated study one chromosome at a time instead of
-materialising every chromosome partition together. For each chromosome, its
-working rows are filtered in their existing order and its immutable source rows
-are selected by the stable one-to-one input-row ID. Both are atomically written
-as typed Parquet before the next chromosome is selected. The worker therefore
+materialising every chromosome partition together. A compact lookup groups the
+working row positions once and matches immutable source positions once by the
+stable one-to-one input-row ID. It retains native position-index lists rather
+than copies of every chromosome's scientific columns. Each chromosome's working
+rows are selected in their existing order; its source rows are selected in
+stable source-ID order. IDs are never interpreted as physical row offsets.
+Actual index and ID order is checked before sorting, so already ordered data
+avoids redundant sorts without relying on a backend's default join order.
+Verified consecutive physical positions use a
+[slice](https://docs.pola.rs/api/python/version/0.20/reference/dataframe/api/polars.DataFrame.slice.html);
+ascending scattered positions use a temporary Boolean mask, and differently
+ordered positions use indexed gathering. The mask uses
+[NumPy](https://numpy.org/doc/stable/reference/generated/numpy.zeros.html)
+and Polars' order-preserving
+[filter](https://docs.pola.rs/api/python/version/0.20/reference/dataframe/api/polars.DataFrame.filter.html).
+Native bitmap filtering still materialises each chromosome, while chromosome
+assignment and source-ID matching are computed once. Only one chromosome's
+subsets and a temporary mask are materialised at a time.
+This uses Polars [row indices](https://docs.pola.rs/api/python/version/0.20/reference/dataframe/api/polars.DataFrame.with_row_index.html)
+and [ordered grouping](https://docs.pola.rs/api/python/version/0.20/reference/dataframe/api/polars.DataFrame.group_by.html)
+without changing row membership or scientific values. Both subsets are atomically
+written as typed Parquet before the next chromosome is selected. The worker therefore
 recovers the exact validated schema without a text round trip or a second type
 inference. `input.chromosome_partition_compression` controls only this internal
 storage compression (default `zstd`); it does not alter values, row order,
