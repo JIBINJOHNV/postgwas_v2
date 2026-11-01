@@ -696,6 +696,12 @@ in VCF provenance. Setting the policy to `false` disables only the p-based
 fallback and leaves remaining null cells for `validation.se_invalid`; literal
 input `p=0` continues to follow `pvalue.zero_missing_se`.
 
+When supplied SE is complete, or ordinary partial recovery is disabled and
+no missing-SE zero-P case needs attention, the SE step skips constructing
+log-P provenance. Input validation, numeric normalization and SE diagnostics
+still run. Missing-cell recovery and explicit zero-P handling retain their
+existing log-domain calculations, source provenance and policies.
+
 ## Logs and run metadata
 
 Every run writes `run_metadata/postgwas.log` and `resolved_config.yaml` at the

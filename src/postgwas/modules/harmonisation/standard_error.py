@@ -197,9 +197,6 @@ def derive_standard_error_from_effect_and_p_value(
     if has_se:
         numeric_columns.append(pl.col(se_col).cast(pl.Float64, strict=False))
     df = df.with_columns(numeric_columns)
-    df = df.with_columns(
-        _log_p_expression(df, pval_col, log_p_col).alias("__ln_p_provenance")
-    )
 
     # A raw zero is recorded by the p-value step before it raises the value to
     # pvalue.clip_low. Standalone callers that have not run that step yet still
@@ -223,6 +220,14 @@ def derive_standard_error_from_effect_and_p_value(
     )
     n_zero_rejected = 0
     n_zero_approximated = 0
+
+    skip_ordinary_recovery = has_se and (
+        n_missing_se_on_entry == 0 or not derive_partial_missing_se
+    )
+    if not skip_ordinary_recovery or n_zero_missing_se > 0:
+        df = df.with_columns(
+            _log_p_expression(df, pval_col, log_p_col).alias("__ln_p_provenance")
+        )
 
     if n_zero_missing_se and zero_missing_se_action == "fail":
         raise ValueError(
@@ -266,9 +271,7 @@ def derive_standard_error_from_effect_and_p_value(
     # -------------------------------------------------------
     # SKIP WHEN EVERY ROW HAS SE, OR PARTIAL RECOVERY IS OFF
     # -------------------------------------------------------
-    if has_se and (
-        n_missing_se_on_entry == 0 or not derive_partial_missing_se
-    ):
+    if skip_ordinary_recovery:
         if n_zero_missing_se and zero_missing_se_action == "approximate":
             df = df.with_columns(
                 [
@@ -386,7 +389,9 @@ def derive_standard_error_from_effect_and_p_value(
                 "variants_remaining": df.height,
             }
         )
-        return df.drop("__ln_p_provenance"), qc_info, sample_column_dict
+        if "__ln_p_provenance" in df.columns:
+            df = df.drop("__ln_p_provenance")
+        return df, qc_info, sample_column_dict
 
     se_tail = int(pol.get("pvalue.se_tail"))
 
