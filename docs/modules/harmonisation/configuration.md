@@ -319,6 +319,22 @@ chooses scientific data. The affected study row is then unmatched and follows
 the existing EAF or INFO missing-value policy. Duplicate-group and removed-row
 counts are recorded in the chromosome log.
 
+Frequency descriptions reuse earlier scalar statistics only within the current
+validation/harmonisation call. A cheap cloned Series retains the selected
+column's previous state. Reuse requires the same selected name, dtype, ordered
+values/nulls, chunk lengths and effective `eaf.clip_tolerance`. Changed rows,
+allele-frequency flips, clipping/nulling, source-column changes or rechunking
+therefore cause the existing summary helper to recalculate. Zero-valued
+frequencies are conservatively recalculated because numeric equality does not
+distinguish positive and negative zero in descriptive metadata. Independent
+before/after dictionaries, all scientific checks, decisions, warnings,
+rejection provenance and report labels remain intact. No summaries are cached
+across chromosomes, datasets or invocations, and no new tolerance is introduced.
+This uses the public Polars [Series clone](https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.clone.html),
+[equality](https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.equals.html)
+and [chunk-length](https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.chunk_lengths.html)
+contracts; a full-column hash or a second statistics implementation is not used.
+
 ### Effect scale before Z-based recovery
 
 The study-wide effect decision is passed unchanged to every chromosome. At

@@ -430,6 +430,40 @@ def summarise_allele_frequency(
     return stats_row
 
 
+def _summarise_frequency_after_changes(
+    df: pl.DataFrame,
+    colname: str,
+    *,
+    clip_tolerance: float,
+    previous_values: Optional[pl.Series],
+    previous_statistics: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Reuse local scalar facts only for the same ordered numeric state."""
+    if (
+        previous_values is not None
+        and previous_statistics is not None
+        and previous_values.name == colname
+        and previous_statistics.get("clip_tolerance") == clip_tolerance
+        # Numeric equality treats +0 and -0 as equal, but descriptive extrema
+        # can retain their different sign bits. Recalculate that boundary case.
+        and not previous_statistics.get("eq_0_rows")
+        and colname in df.columns
+    ):
+        current_values = df.get_column(colname)
+        if (
+            current_values.dtype == previous_values.dtype
+            and current_values.chunk_lengths() == previous_values.chunk_lengths()
+            and current_values.equals(
+                previous_values, check_dtypes=True, null_equal=True,
+            )
+        ):
+            # Before/after dictionaries are independently mutable public data.
+            return dict(previous_statistics)
+    return summarise_allele_frequency(
+        df, colname, clip_tolerance=clip_tolerance,
+    )
+
+
 # -------------------------------------------------------
 # 6. Helper: Validate + clean EAF stats
 # -------------------------------------------------------
@@ -501,6 +535,7 @@ def validate_allele_frequency(
         return False, False, 0, 0, df, 0.0, stats
 
     initial_stats = summarise_allele_frequency(df, colname, clip_tolerance=tolerance)
+    initial_values = df.get_column(colname).clone()
 
     # ``summarise_allele_frequency`` already calculated these values in one
     # aggregate pass over the untouched column; reuse them rather than scanning
@@ -609,7 +644,10 @@ def validate_allele_frequency(
         )
 
     # ---- missingness (null_count, not a row-count difference) ----------
-    final_stats = summarise_allele_frequency(cleaned_df, colname, clip_tolerance=tolerance)
+    final_stats = _summarise_frequency_after_changes(
+        cleaned_df, colname, clip_tolerance=tolerance,
+        previous_values=initial_values, previous_statistics=initial_stats,
+    )
     final_missing = int(final_stats.get("null_rows") or 0)
     missing_fraction = final_missing / total_before if total_before else 0.0
     if missing_fraction > missing_fraction_cutoff:
@@ -1604,6 +1642,8 @@ def harmonise_allele_frequency(
                 )
 
             final_eaf_col = None
+            validated_values = None
+            validated_statistics = None
             out_of_bound_df = df.head(0)
             study_says_maf = _study_decision_flag(study_decision)
             qc_info["study_decision_eaf_is_maf"] = study_says_maf
@@ -1637,6 +1677,11 @@ def harmonise_allele_frequency(
                         ),
                     )
 
+                validated_statistics = stats.get("final")
+                validated_values = (
+                    cleaned_df.get_column(internal_eaf).clone()
+                    if validated_statistics is not None else None
+                )
                 qc_info["Internal_AF"] = "present"
                 _add_prefixed_statistics(qc_info, "internal_af", stats)
                 qc_info["internal_af_valid_range"] = valid_range
@@ -2085,6 +2130,11 @@ def harmonise_allele_frequency(
                     rejects=rejects,
                 )
 
+                validated_statistics = stats.get("final")
+                validated_values = (
+                    cleaned_df.get_column(new_col_name).clone()
+                    if validated_statistics is not None else None
+                )
                 _add_prefixed_statistics(qc_info, "external_af", stats)
 
                 final_df = cleaned_df
@@ -2394,7 +2444,12 @@ def harmonise_allele_frequency(
                 )
                 qc_info["eaf_degenerate_removed"] = 0
 
-            final_stats = summarise_allele_frequency(final_df, final_eaf_col, policies=pol)
+            final_stats = _summarise_frequency_after_changes(
+                final_df, final_eaf_col,
+                clip_tolerance=float(pol.get("eaf.clip_tolerance")),
+                previous_values=validated_values,
+                previous_statistics=validated_statistics,
+            )
             _add_prefixed_statistics(qc_info, "final_eaf", final_stats)
 
             sample_column_dict["eaf_col"] = final_eaf_col
