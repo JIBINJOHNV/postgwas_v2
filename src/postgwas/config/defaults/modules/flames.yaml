@@ -87,6 +87,10 @@ result_schema:
   precision_column: estimated_cumulative_precision
   highest_column: FLAMES_highest
   causal_column: FLAMES_causal
+html_report:
+  page_size: 50
+  significant_digits: 4
+  null_value: NA
 output_layout:
   score_basename: 'results/{dataset_id}_FLAMES_scores'
   raw_score_suffix: .raw
@@ -98,3 +102,4 @@ output_layout:
   completion_manifest: 'run_metadata/{dataset_id}_flames_completion.yaml'
   service_log_file: 'logs/{dataset_id}_flames.log'
   annotation_api_log_file: 'logs/{dataset_id}_flames_api.jsonl'
+  html_report: 'reports/{dataset_id}_FLAMES_report.html'

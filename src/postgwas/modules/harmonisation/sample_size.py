@@ -16,24 +16,28 @@ sample_size.trait_type       case/control study or quantitative trait
 sample_size.controls_only    what a lone control count means
 sample_size.cases_only       what a lone case count means
 sample_size.min_value        smallest sample size accepted
+sample_size.fractional_count_action  round per-variant counts or fail
 sample_size.missing_action   remove, impute or fail on missing counts
 sample_size.max_missing_fraction  largest fraction eligible for that action
 """
 
+from decimal import Decimal, DecimalException, ROUND_HALF_UP
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 import polars as pl
 
 from postgwas.core.values import optional_text, parse_integer
 
 from .policies import default_policies
 from .shared.allele_join import unused_column_name
-from .shared.runtime import reject_rows, step_context
+from .shared.runtime import emit_message, reject_rows, step_context
 
 
 __all__ = [
     "effective_sample_size_expression",
     "sample_count_expression",
+    "normalise_sample_count_column",
     "prepare_missing_sample_sizes",
     "harmonise_sample_sizes",
 ]
@@ -46,6 +50,7 @@ POLICY_KEYS = [
     "sample_size.controls_only",
     "sample_size.cases_only",
     "sample_size.min_value",
+    "sample_size.fractional_count_action",
     "sample_size.missing_action",
     "sample_size.max_missing_fraction",
 ]
@@ -58,13 +63,122 @@ POLICY_KEYS = [
 _clean_name = optional_text
 _parse_count = parse_integer
 
+# These are representation invariants for the shared Int64 count contract.
+_COUNT_LIMITS = np.iinfo(np.int64)
+_COUNT_CONVERSION_DTYPE = pl.Struct({"count": pl.Int64, "fractional": pl.Boolean})
+
+
+def _decimal_sample_count(value):
+    """Round decimal text exactly, checking Int64 bounds before Python int()."""
+    invalid = {"count": None, "fractional": False}
+    try:
+        number = Decimal(value)
+        if not number.is_finite():
+            return invalid
+        rounded = number.to_integral_value(rounding=ROUND_HALF_UP)
+        if rounded < int(_COUNT_LIMITS.min) or rounded > int(_COUNT_LIMITS.max):
+            return invalid
+        return {"count": int(rounded), "fractional": number != rounded}
+    except (DecimalException, ValueError):
+        return invalid
+
+
+def _sample_count_conversion_expression(df, column):
+    """Return a count/fractional struct under the one shared count contract.
+
+    Ordinary integer inputs stay in native Polars. Only noninteger-looking
+    decimal/scientific text enters Decimal, avoiding Float64 precision loss
+    before rounding or auditing. Typed floats retain their supplied precision.
+    Half ties go away from zero across all supported Polars versions.
+    """
+    expr = pl.col(column)
+    dtype = df.schema[column]
+    if dtype.is_integer() or dtype == pl.Null:
+        return pl.struct(
+            expr.cast(pl.Int64, strict=False).alias("count"),
+            pl.lit(False).alias("fractional"),
+        )
+    if dtype == pl.String or dtype.base_type() == pl.Decimal:
+        text = expr.cast(pl.String).str.replace_all(r"[,\s_]", "")
+        plain_integer = text.str.contains(r"^[+-]?\d+$")
+        decimal = (
+            pl.when(~plain_integer).then(text).otherwise(None)
+            .map_elements(_decimal_sample_count, return_dtype=_COUNT_CONVERSION_DTYPE)
+        )
+        return pl.when(plain_integer).then(pl.struct(
+            text.cast(pl.Int64, strict=False).alias("count"),
+            pl.lit(False).alias("fractional"),
+        )).otherwise(decimal)
+    if not dtype.is_float():
+        return pl.repeat(None, pl.len(), dtype=_COUNT_CONVERSION_DTYPE)
+    numeric = expr.cast(pl.Float64, strict=False)
+    magnitude = numeric.abs()
+    whole = magnitude.floor()
+    # The half-unit comparison defines nearest-integer rounding; adding 0.5
+    # first could change large, already integral floating-point values.
+    nearest = (
+        whole + ((magnitude - whole) >= 0.5).cast(pl.Float64)
+    ) * numeric.sign()
+    return pl.struct(
+        pl.when(numeric.is_finite()).then(nearest).otherwise(None)
+        .cast(pl.Int64, strict=False).alias("count"),
+        (numeric.is_finite() & (numeric != whole * numeric.sign()))
+        .fill_null(False).alias("fractional"),
+    )
+
 
 def sample_count_expression(df, column):
-    """Read one sample-count column exactly as the chromosome step does."""
-    expr = pl.col(column)
-    if df.schema[column] == pl.String:
-        expr = expr.str.replace_all(r"[,\s_]", "")
-    return expr.cast(pl.Float64, strict=False).cast(pl.Int64, strict=False)
+    """Parse a count using the shared nearest-integer representation.
+
+    Consumers accepting provided data use ``normalise_sample_count_column``
+    as well, to enforce the configured action and separate invalid from missing.
+    """
+    return _sample_count_conversion_expression(df, column).struct.field("count")
+
+
+def normalise_sample_count_column(df, column, policies=None, logger=None):
+    """Return an integer Series and the audited per-variant count conversion.
+
+    Invalid supplied numbers fail before missing-N handling can impute them.
+    Zero/negative counts remain present for the existing worker rejection rule.
+    """
+    policies = default_policies() if policies is None else policies
+    action = str(policies.get("sample_size.fractional_count_action"))
+    values = df.select(
+        _sample_count_conversion_expression(df, column).alias("conversion")
+    ).unnest("conversion")
+    counts = values.get_column("count").rename(column)
+    original = df.get_column(column)
+    invalid = int((original.is_not_null() & counts.is_null()).sum())
+    rounded = int((counts.is_not_null() & values.get_column("fractional")).sum())
+    audit = {
+        "status": "assessed", "rows": df.height,
+        "non_missing": len(original) - original.null_count(),
+        "invalid": invalid, "rounded": rounded,
+        "fractional_count_action": action,
+    }
+    if invalid:
+        raise ValueError(
+            "Invalid sample counts in column '%s': %s provided values are nonnumeric, "
+            "nonfinite or outside the supported Int64 range. Correct these values; "
+            "they cannot be treated as missing sample sizes." % (column, invalid)
+        )
+    if rounded and action == "fail":
+        raise ValueError(
+            "Sample-count column '%s' has %s fractional values, but "
+            "sample_size.fractional_count_action = 'fail'. Correct the counts or "
+            "explicitly select 'round' for nearest-integer conversion."
+            % (column, rounded)
+        )
+    if rounded:
+        emit_message(
+            logger,
+            "Sample-count column '%s': sample_size.fractional_count_action = '%s'; "
+            "%s values rounded to the nearest whole number (half ties away from zero). "
+            "Original input values remain in source provenance."
+            % (column, action, rounded),
+        )
+    return counts, audit
 
 
 def effective_sample_size_expression(ncase, ncontrol):
@@ -92,31 +206,24 @@ def effective_sample_size_expression(ncase, ncontrol):
     )
 
 
-def _to_counts(df, column, ctx, what):
+def _to_counts(df, column, ctx, what, policies=None, conversion_counts=None):
     # type: (pl.DataFrame, str, Any, str) -> Tuple[pl.DataFrame, int]
     """Cast a count column to whole numbers, and say how many could not be read.
 
-    Text is cleaned of thousands separators first and goes through Float64, so
-    '50,000', '50000.0' and '5e4' all survive; a direct cast to Int64 turns all
-    three into nulls.
+    Text accepts thousands separators, decimal and scientific notation. Invalid
+    supplied values fail; missing cells stay missing and rounding is audited.
     """
-    before_null = int(df.select(pl.col(column).null_count()).item() or 0)
-    df = df.with_columns(
-        sample_count_expression(df, column).alias(column)
-    )
+    values, audit = normalise_sample_count_column(df, column, policies, ctx)
+    if conversion_counts is not None:
+        conversion_counts[column] = audit
+    df = df.with_columns(values)
     after_null = int(df.select(pl.col(column).null_count()).item() or 0)
-    unreadable = after_null - before_null
-    if unreadable > 0:
-        ctx.warn(
-            "%s of the %s values in '%s' could not be read as a number and are now empty."
-            % ("{:,}".format(unreadable), what, column)
-        )
     if after_null == df.height and df.height:
         ctx.warn(
             "Every value in the %s column '%s' is empty. Nothing that depends on it can be "
             "worked out." % (what, column)
         )
-    return df, unreadable
+    return df, audit["invalid"]
 
 
 def _configured_count_columns(df, sample_column_dict):
@@ -175,8 +282,12 @@ def prepare_missing_sample_sizes(
 
     expressions = []
     missing_terms = []
+    parsed_counts = df.select([
+        normalise_sample_count_column(df, column, policies)[0]
+        for column in columns
+    ])
     for index, column in enumerate(columns):
-        parsed = sample_count_expression(df, column)
+        parsed = pl.col(column)
         missing = parsed.is_null()
         missing_terms.append(missing)
         expressions.extend([
@@ -190,7 +301,7 @@ def prepare_missing_sample_sizes(
     expressions.append(
         pl.any_horizontal(missing_terms).sum().alias("__missing_variants")
     )
-    summary = df.select(expressions).to_dicts()[0]
+    summary = parsed_counts.select(expressions).to_dicts()[0]
     missing_variants = int(summary["__missing_variants"] or 0)
     missing_fraction = (float(missing_variants) / total) if total else 0.0
     missing_by_column = {
@@ -386,6 +497,7 @@ def _harmonise(
     min_value = None if min_value is None else int(min_value)
     qc_info["trait_type"] = trait_type
     qc_info["min_value"] = min_value
+    count_conversions = qc_info.setdefault("sample_count_conversion_by_column", {})
 
     if trait_type == "quantitative" and (
         ncase_col is not None or _clean_name(ncase_val) is not None
@@ -401,7 +513,9 @@ def _harmonise(
     # ------------------------------------------------------------------
     if ncontrol_col is not None and ncontrol_col in df.columns:
         ctx.info("Control counts come from the column '%s'." % ncontrol_col)
-        df, unreadable = _to_counts(df, ncontrol_col, ctx, "control count")
+        df, unreadable = _to_counts(
+            df, ncontrol_col, ctx, "control count", policies, count_conversions,
+        )
         qc_info["ncontrol_source"] = "column:%s" % ncontrol_col
         qc_info["ncontrol_unreadable"] = unreadable
     elif _clean_name(ncontrol_val) is not None:
@@ -429,7 +543,9 @@ def _harmonise(
     # ------------------------------------------------------------------
     if ncase_col is not None and ncase_col in df.columns:
         ctx.info("Case counts come from the column '%s'." % ncase_col)
-        df, unreadable = _to_counts(df, ncase_col, ctx, "case count")
+        df, unreadable = _to_counts(
+            df, ncase_col, ctx, "case count", policies, count_conversions,
+        )
         qc_info["ncase_source"] = "column:%s" % ncase_col
         qc_info["ncase_unreadable"] = unreadable
     elif _clean_name(ncase_val) is not None:

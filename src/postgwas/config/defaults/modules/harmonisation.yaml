@@ -493,7 +493,7 @@ module:
     external_info_partition: 'qc_summary/.external_reference/{dataset_id}_info_chr{chromosome}.parquet'
 
   gwas2vcf_input:
-    required_column_keys: [chr_col, pos_col, snp_id_col, ea_col, oa_col, eaf_col, beta_col, se_col, imp_z_col, pval_col, ncontrol_col]
+    required_column_keys: [chr_col, pos_col, snp_id_col, ea_col, oa_col, eaf_col, beta_col, se_col, imp_z_col, pval_col, ncontrol_col, neff_col]
     optional_column_keys: [ncase_col, imp_info_col]
     # Appended after every mapped scientific column. Audit columns remain in
     # the TSV for provenance but are deliberately absent from the positional
@@ -1247,6 +1247,7 @@ group_order:
     keys:
       - trait_type
       - min_value
+      - fractional_count_action
       - controls_only
       - cases_only
       - missing_action
@@ -4099,6 +4100,34 @@ policies:
         maximum: null
         minimum: 1
         number_kind: int
+    fractional_count_action:
+      default: round
+      help: |-
+        What it does: Controls fractional values in explicitly selected per-variant case,
+          control or total sample-count columns. Whole integer inputs retain their exact value.
+        When it applies: During the initial read, before duplicate ranking, missing-N planning
+          and chromosome splitting; direct sample-size calls use the same conversion contract.
+        Values:
+          round - round to the nearest whole number; exact half ties go away from zero, so
+            positive 100.5 becomes 101. This is an explicit input normalization decision.
+          fail - stop on a fractional provided count rather than changing it.
+        Example: 100.9 becomes 101, 1,000.9 becomes 1001 and 100.1 becomes 100. The reader audit
+          records the resolved action and the number of rounded cells per column. Source files
+          and immutable source-row snapshots retain the original values.
+        Note: Nonnumeric, nonfinite and out-of-range supplied counts fail instead of becoming
+          missing and eligible for imputation. Genuine missing cells use missing_action;
+          zero and negative rounded counts use the existing sample-size rejection rule.
+          This setting does not change fixed CSV counts, calculated Neff or imputation rounding.
+          Selected count tokens are read as text even with schema inference enabled. Decimal
+          notation is rounded exactly, without first passing through Float64.
+        Technical source: https://docs.python.org/3/library/decimal.html#decimal.ROUND_HALF_UP
+      origin: sample_size.py:normalise_sample_count_column
+      recommendation: null
+      type: enum
+      validator:
+        allow_none: false
+        kind: enum
+        members: [round, fail]
     controls_only:
       default: use_ncontrol_as_total
       help: |-

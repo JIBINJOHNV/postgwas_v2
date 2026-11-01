@@ -238,7 +238,7 @@ class Vcf:
                 if result.ncontrol is not None:
                     record.samples[trait_id]["NCO"] = round(result.ncontrol)
                 if result.neff is not None:
-                    record.samples[trait_id]["NEF"] = round(result.neff)
+                    record.samples[trait_id]["NEF"] = result.neff
                 if study_id is not None:
                     record.samples[trait_id]["ID"] = study_id
                 # write to file

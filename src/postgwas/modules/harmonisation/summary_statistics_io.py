@@ -24,7 +24,7 @@ from .rejects import (
 )
 from .sample_size import (
     effective_sample_size_expression,
-    sample_count_expression,
+    normalise_sample_count_column,
 )
 from .shared.runtime import emit_message, reject_rows, resolve_policies
 from .shared.column_mapping import COLUMN_CONFIG_KEYS, column_mapping_groups
@@ -135,15 +135,17 @@ def load_summary_statistics_table(file_path: str, sample_column_dict: dict, poli
     )
     sep = delimiter.value
     string_schema = study_string_schema(sample_column_dict)
-    pvalue_column = optional_text(sample_column_dict.get("pval_col"))
-    if pvalue_column:
-        # The source token is required to distinguish a literal zero from a
-        # positive probability below Float64 (for example 1e-400).
-        string_schema[pvalue_column] = pl.String
+    for key in ("pval_col", "ncase_col", "ncontrol_col"):
+        column = optional_text(sample_column_dict.get(key))
+        if column:
+            # Raw P and per-variant counts require exact source tokens even
+            # when optional schema inference is enabled. Float64 can underflow
+            # a positive P or erase a count's fraction before its audit.
+            string_schema[column] = pl.String
     if string_schema:
         _emit(
             logger,
-            "Variant identity and p-value source columns read as text to "
+            "Variant identity, p-value and selected sample-count columns read as text to "
             "preserve their exact tokens: %s."
             % ", ".join(string_schema),
         )
@@ -286,9 +288,10 @@ def normalise_summary_statistics_values(
 
     Scalar numeric values that cannot be parsed become null and are reported;
     the immutable source snapshot retains their original text for rejection
-    provenance. Sample-count columns reuse their whole-number parser, while
-    configured compound numeric columns such as delimited INFO lists remain
-    text for their field-specific parser.
+    provenance. Sample-count columns use the configured nearest-integer/fail
+    contract, audit rounded cells and fail on invalid provided counts before
+    missing-N handling. Configured compound numeric columns such as delimited
+    INFO lists remain text for their field-specific parser.
 
     When supplied, conversion_counts receives existing per-column conversion
     counters without another data scan or any change to the returned values.
@@ -328,11 +331,15 @@ def normalise_summary_statistics_values(
                 conversion_counts[col] = {"status": "compound_values_deferred", "rows": df.height}
             valid_cols.append(pl.col(col))
             continue
-        numeric_series = (
-            df.select(sample_count_expression(df, col).alias(col)).get_column(col)
-            if col in sample_counts
-            else original.cast(pl.Float64, strict=False)
-        )
+        if col in sample_counts:
+            numeric_series, count_audit = normalise_sample_count_column(
+                df, col, policies, logger,
+            )
+            if conversion_counts is not None:
+                conversion_counts[col] = count_audit
+            valid_cols.append(numeric_series)
+            continue
+        numeric_series = original.cast(pl.Float64, strict=False)
         new_nulls = numeric_series.null_count() - original.null_count()
         if conversion_counts is not None:
             conversion_counts[col] = {

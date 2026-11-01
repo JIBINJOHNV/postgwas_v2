@@ -149,6 +149,28 @@ def _final_optimisation(result: Mapping[str, Any], field: str) -> dict[str, Any]
     return values if isinstance(values, dict) else {}
 
 
+def _validated_optimisations(
+    result: Mapping[str, Any], label: str, error_type: Type[Exception],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    mixture = _final_optimisation(result, "optimize")
+    infinitesimal = _final_optimisation(result, "inft_optimize")
+    if mixture.get("success") is not True or infinitesimal.get("success") is not True:
+        raise error_type(
+            "%s mixture or infinitesimal optimisation did not converge" % label
+        )
+    if not all(
+        isinstance(value, (int, float)) and math.isfinite(float(value))
+        for value in (
+            mixture.get("AIC"), mixture.get("BIC"),
+            infinitesimal.get("AIC"), infinitesimal.get("BIC"),
+        )
+    ):
+        raise error_type(
+            "%s does not contain finite optimisation AIC/BIC values" % label
+        )
+    return mixture, infinitesimal
+
+
 def _model_assessment(
     fit: Mapping[str, Any], error_type: Type[Exception],
 ) -> dict[str, Any]:
@@ -173,19 +195,12 @@ def _model_assessment(
             "mixture_vs_infinitesimal_delta_aic": float(delta_aic),
             "mixture_vs_infinitesimal_delta_bic": float(delta_bic),
         }
-    mixture = _final_optimisation(fit, "optimize")
-    infinitesimal = _final_optimisation(fit, "inft_optimize")
-    if mixture.get("success") is not True or infinitesimal.get("success") is not True:
-        raise error_type("MiXeR mixture or infinitesimal optimisation did not converge")
+    mixture, infinitesimal = _validated_optimisations(
+        fit, "MiXeR fit result", error_type,
+    )
     mixture_aic, mixture_bic = mixture.get("AIC"), mixture.get("BIC")
     infinitesimal_aic = infinitesimal.get("AIC")
     infinitesimal_bic = infinitesimal.get("BIC")
-    values = (mixture_aic, mixture_bic, infinitesimal_aic, infinitesimal_bic)
-    if not all(
-        isinstance(value, (int, float)) and math.isfinite(float(value))
-        for value in values
-    ):
-        raise error_type("MiXeR fit result does not contain finite fit-model AIC/BIC values")
     return {
         "converged": True,
         "mixture_aic": float(mixture_aic),
@@ -278,8 +293,13 @@ def build_mixer_summary(
         _load_result(item["json"], "test replicate", "univariate", error_type)
         for item in test_replicates
     ]
-    for raw_fit in raw_fits:
-        _model_assessment(raw_fit, error_type)
+    for result_type, replicates in (("fit1", raw_fits), ("test1", raw_tests)):
+        for item, replicate in zip(fit_replicates, replicates):
+            _validated_optimisations(
+                replicate,
+                "MiXeR %s replicate %s" % (result_type, item["index"]),
+                error_type,
+            )
     fit_options = [value.get("options") or {} for value in raw_fits]
     test_options = [value.get("options") or {} for value in raw_tests]
     fit_seeds = [value.get("seed") for value in fit_options]
@@ -304,6 +324,18 @@ def build_mixer_summary(
 
     warnings = list(input_warnings)
     quality = reporting.quality
+    standard_replicates = (
+        configuration.modules.mixer.univariate.standard_replicate_count
+    )
+    replicate_mode = (
+        "standard" if len(fit_replicates) == standard_replicates else "exploratory"
+    )
+    if replicate_mode == "exploratory":
+        warnings.append(
+            "Exploratory MiXeR run used %d replicates instead of the configured "
+            "standard count of %d; do not use it for final inference"
+            % (len(fit_replicates), standard_replicates)
+        )
     if fit_seeds != test_seeds:
         _quality_issue(
             warnings, quality.seed_mismatch_action,
@@ -449,6 +481,8 @@ def build_mixer_summary(
                 if result["execution_backend"] == "docker" else None
             ),
             "replicates": len(fit_replicates),
+            "replicate_mode": replicate_mode,
+            "standard_replicate_count": standard_replicates,
             "replicate_indices": [item["index"] for item in fit_replicates],
             "replicate_seeds": fit_seeds,
             "threads_per_replicate": fit_options[0].get(

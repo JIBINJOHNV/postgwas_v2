@@ -100,11 +100,15 @@ the complete study and passed unchanged to every chromosome worker.
 
 Missing sample-sheet text is normalized from blank, `NA`, `N/A`, `NAN`,
 `NONE`, `NULL`, `-`, `.`, or `NOT_APPLICABLE`.
-Blank or unrecognized `trait_type`, `effect_type`, `p_value_type` and
-`delimiter` declarations are normalized to `auto` with a row warning; the
-subsequent complete-study detection and declaration checks still run.
-Unknown sample-sheet fields, duplicate normalized headers, duplicate dataset IDs,
-duplicate input files and incomplete source pairs fail before analysis. With no
+Missing `trait_type`, `effect_type`, `p_value_type` and `delimiter` declarations
+normalize to `auto`. Supported values and aliases are case-insensitive and
+stored in lowercase. An unknown provided value fails during sample-sheet
+validation with the row, field, original value and accepted choices; it never
+becomes `auto`. The same declaration contract applies to direct models and
+generated drafts. Subsequent complete-study detection and declaration checks
+still run for valid rows. Unrelated extra metadata columns remain ignored.
+Duplicate normalized headers, duplicate dataset IDs, duplicate input files
+and incomplete source pairs fail before analysis. With no
 INFO file source, `--fixed-info` must be supplied separately on the command
 line.
 
@@ -480,12 +484,13 @@ documentation rather than generated policy descriptions.
 </details>
 
 <details>
-<summary><code>sample_size</code> — dataset 04 / chromosome 05 missing sample size and effective N (6 settings)</summary>
+<summary><code>sample_size</code> — dataset 04 / chromosome 05 missing sample size and effective N (7 settings)</summary>
 
 | Setting | Default | Allowed values | Decision or action |
 |---|---|---|---|
 | `sample_size.trait_type` | `auto` | `auto`, `binary`, `quantitative` | Declares the study design and guards which sample-count inputs and effective sample-size calculation are scientifically valid for that design. Applies: During sample-sheet validation, before the summary-statistics file is analysed, and again at chromosome step 05 to protect direct library callers. |
 | `sample_size.min_value` | `1` | Integer ≥ `1` | Sets the smallest case count, control count or effective sample size that is allowed to survive. Applies: Three places. The configuration check at dataset step 01 tests the fixed ncase / ncontrol / n / total_n numbers written in the config; chromosome step 05 tests the per-variant case and control count columns and then Neff; chromosome step 06 tests Neff again before BETA and SE are derived from a Z score. |
+| `sample_size.fractional_count_action` | `round` | `round`, `fail` | Controls fractional values in explicitly selected per-variant case, control or total sample-count columns. Whole integer inputs retain their exact value. Applies: During the initial read, before duplicate ranking, missing-N planning and chromosome splitting; direct sample-size calls use the same conversion contract. |
 | `sample_size.controls_only` | `use_ncontrol_as_total` | `use_ncontrol_as_total`, `fail` | Says what a control count means when it is the only sample-size count the study provides. Applies: chromosome step 05, and only when a control count (a column or one fixed number) is configured and no case count is. When both are configured the case/control formula wins and this setting is never consulted. |
 | `sample_size.cases_only` | `fail` | `fail` | Says what a case count means when it is the only sample-size count the study provides. Applies: chromosome step 05, and only when a case count is configured and no control count is. When both are configured this setting is never consulted. |
 | `sample_size.missing_action` | `remove` | `remove`, `median`, `mean`, `fail` | Controls what happens to variants whose configured per-variant case, control or total sample-size value is missing. Applies: Dataset step 04 first measures missingness over the complete study. If the allowed fraction is not exceeded, chromosome step 05 applies this action before Neff is calculated. Fixed sample sizes from the sample sheet cannot be missing per row. |

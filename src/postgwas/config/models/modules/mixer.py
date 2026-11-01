@@ -54,7 +54,8 @@ class MixerOutputLayout(StrictModel):
     test_replicate_prefix: str
     summary_yaml: str
     summary_tsv: str
-    figure_prefix: str
+    fit_figure_prefix: str
+    test_figure_prefix: str
     gsa_split_pattern: str
     gsa_baseline_prefix: str
     gsa_full_prefix: str
@@ -151,6 +152,8 @@ class MixerGsaResultColumns(StrictModel):
 class MixerUnivariateConfig(StrictModel):
     fit_extract_file_pattern: str | None = None
     replicate_indices: list[int]
+    standard_replicate_count: int = Field(ge=1)
+    allow_exploratory_replicates: bool
 
     @field_validator("fit_extract_file_pattern")
     @classmethod
@@ -278,6 +281,18 @@ class MixerConfig(ModuleConfig):
     def validate_patterns(self):
         if not self.genome_build.strip():
             raise ValueError("genome_build must not be empty")
+        if (
+            self.analysis in {"univariate", "all"}
+            and len(self.univariate.replicate_indices)
+            != self.univariate.standard_replicate_count
+            and not self.univariate.allow_exploratory_replicates
+        ):
+            raise ValueError(
+                "univariate.replicate_indices must contain "
+                "univariate.standard_replicate_count entries; set "
+                "univariate.allow_exploratory_replicates: true only for "
+                "non-inferential workflow testing"
+            )
         placeholder = self.workflow.chromosome_placeholder
         for name, value in (
             ("bim_file_pattern", self.bim_file_pattern),
@@ -305,7 +320,8 @@ class MixerConfig(ModuleConfig):
             "test_replicate_prefix": ("{dataset_id}", "{replicate}"),
             "summary_yaml": ("{dataset_id}",),
             "summary_tsv": ("{dataset_id}",),
-            "figure_prefix": ("{dataset_id}",),
+            "fit_figure_prefix": ("{dataset_id}",),
+            "test_figure_prefix": ("{dataset_id}",),
             "gsa_split_pattern": ("{dataset_id}", placeholder),
             "gsa_baseline_prefix": ("{dataset_id}",),
             "gsa_full_prefix": ("{dataset_id}",),
@@ -320,6 +336,14 @@ class MixerConfig(ModuleConfig):
                     "output_layout.%s must contain %s"
                     % (name, ", ".join(repr(token) for token in missing))
                 )
+        if (
+            Path(self.output_layout.fit_figure_prefix)
+            == Path(self.output_layout.test_figure_prefix)
+        ):
+            raise ValueError(
+                "output_layout.fit_figure_prefix and "
+                "output_layout.test_figure_prefix must be different paths"
+            )
         if len(self.chromosomes) != len(set(self.chromosomes)):
             raise ValueError("chromosomes must not contain duplicate values")
         if (

@@ -345,6 +345,23 @@ These eight steps run once on the complete study.
    compared or deduplicated. For example, study `X` matches reference `23`
    under the packaged map, while study `1` matches reference `01`.
 
+   Selected per-variant sample counts use `sample_size.fractional_count_action`.
+   The default `round` converts to the nearest whole number, with exact half
+   ties away from zero: `100.9` becomes `101`, `1,000.9` becomes `1001`, and
+   `100.5` becomes `101`. `fail` refuses fractional provided counts instead.
+   This input normalization happens before duplicate ranking. Per-column
+   conversion evidence records the resolved action and number of rounded cells
+   in the log, completeness report and HTML report; source files and source-row
+   snapshots preserve the original values. Nonnumeric, nonfinite and
+   out-of-range supplied counts fail rather than being imputed as missing.
+   Zero and negative rounded counts still reach the existing count-rejection
+   rule. Fixed sample-sheet counts, calculated Neff and missing-value imputation
+   rounding retain their existing contracts. Selected count columns remain text
+   during the initial read even when schema inference is enabled. Integer
+   tokens use native integer parsing; decimal/scientific tokens use exact
+   [Decimal rounding](https://docs.python.org/3/library/decimal.html#decimal.ROUND_HALF_UP),
+   so Float64 cannot erase a fraction or change which integer is nearest.
+
 4. **Dataset step 4 — Check the parsed values.** PostGWAS verifies that the
    mapped columns contain usable data. It measures missing sample-size values
    across the whole study. If mean or median filling is configured, one

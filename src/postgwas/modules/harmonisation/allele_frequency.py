@@ -470,9 +470,9 @@ def _summarise_frequency_after_changes(
 def validate_allele_frequency(
     df: pl.DataFrame,
     colname: str,
-    maf_cutoff: float = 0.95,
-    invalid_fraction_cutoff: float = 0.05,
-    missing_fraction_cutoff: float = 0.05,
+    maf_cutoff: Optional[float] = None,
+    invalid_fraction_cutoff: Optional[float] = None,
+    missing_fraction_cutoff: Optional[float] = None,
     policies=None,
     logger=None,
     ctx=None,
@@ -486,6 +486,8 @@ def validate_allele_frequency(
 
     ``study_eaf_accepted`` reuses the whole-study decision without repeating
     MAF classification or its warning. Descriptive, range and missing QC remain.
+    Omitted thresholds use the resolved EAF policies; explicit arguments take
+    precedence, including zero-valued thresholds.
 
     Out-of-range values are counted *before* anything is modified, then handled
     according to ``eaf.out_of_range``:
@@ -515,6 +517,18 @@ def validate_allele_frequency(
     """
     emit = active_context(logger, ctx, df.height)
     resolved = resolve_policies(policies)
+    maf_cutoff = (
+        float(resolved.get("eaf.maf_decision_cutoff"))
+        if maf_cutoff is None else maf_cutoff
+    )
+    invalid_fraction_cutoff = (
+        float(resolved.get("eaf.invalid_fraction_cutoff"))
+        if invalid_fraction_cutoff is None else invalid_fraction_cutoff
+    )
+    missing_fraction_cutoff = (
+        float(resolved.get("eaf.missing_fraction_cutoff"))
+        if missing_fraction_cutoff is None else missing_fraction_cutoff
+    )
     tolerance = float(
         clip_tolerance
         if clip_tolerance is not None
@@ -1570,9 +1584,6 @@ def harmonise_allele_frequency(
     merge_stats = {}
 
     pol = resolve_policies(policies)
-    maf_cutoff = float(pol.get("eaf.maf_decision_cutoff"))
-    invalid_fraction_cutoff = float(pol.get("eaf.invalid_fraction_cutoff"))
-    missing_fraction_cutoff = float(pol.get("eaf.missing_fraction_cutoff"))
     degenerate_action = str(pol.get("eaf.degenerate"))
 
     # Create subdirectory for EAF QC outputs
@@ -1663,9 +1674,6 @@ def harmonise_allele_frequency(
                     validate_allele_frequency(
                         df,
                         internal_eaf,
-                        maf_cutoff,
-                        invalid_fraction_cutoff,
-                        missing_fraction_cutoff,
                         policies=pol,
                         logger=logger,
                         ctx=ctx,
@@ -2121,9 +2129,6 @@ def harmonise_allele_frequency(
                 _, _, _, _, cleaned_df, _, stats = validate_allele_frequency(
                     merged_df,
                     new_col_name,
-                    maf_cutoff,
-                    invalid_fraction_cutoff,
-                    missing_fraction_cutoff,
                     policies=pol,
                     logger=logger,
                     ctx=ctx,

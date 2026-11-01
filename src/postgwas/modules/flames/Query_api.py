@@ -27,8 +27,8 @@ class AnnotationAPIClient:
                 "timestamp": datetime.now(timezone.utc).isoformat(), **fields,
             }, allow_nan=False) + "\n")
 
-    def request(self, url):
-        """Retry only explicit throttling; preserve every response before parsing."""
+    def request(self, url, *, retry_empty_json=False):
+        """Retry throttling and configured empty responses; audit every attempt."""
         for attempt in range(self.settings.retry_count + 1):
             if self.last_request is not None:
                 delay = 1 / self.settings.requests_per_second - (time.monotonic() - self.last_request)
@@ -55,9 +55,24 @@ class AnnotationAPIClient:
                         response=response,
                     )
                 try:
-                    return response.json()
+                    decoded = response.json()
                 except ValueError as exc:
                     raise RuntimeError("Malformed annotation JSON; see %s" % self.audit_path) from exc
+                if retry_empty_json and decoded == []:
+                    self._record(
+                        url=url,
+                        attempt=attempt + 1,
+                        outcome="retryable_empty_json_response",
+                    )
+                    if attempt == self.settings.retry_count:
+                        raise RuntimeError(
+                            "Annotation response remained empty after %s attempts; "
+                            "missing values are not zero; see %s"
+                            % (attempt + 1, self.audit_path)
+                        )
+                    time.sleep(self.settings.retry_delay_seconds)
+                    continue
+                return decoded
             retry_after = response.headers.get("Retry-After")
             delay = self.settings.retry_delay_seconds
             if retry_after is not None:
@@ -112,7 +127,13 @@ class AnnotationAPIClient:
 
     def cadd(self, chromosome, position, a1, a2, build):
         server = self.settings.cadd_servers[build].rstrip("/")
-        decoded = self.request(f"{server}/{chromosome}:{position}")
+        # The public CADD API can transiently return HTTP 200 with an empty JSON
+        # array for a covered SNV. Retry that transport-level incompleteness
+        # under the configured bounded policy, then still require one exact
+        # allele match; a missing score is never imputed as zero.
+        decoded = self.request(
+            f"{server}/{chromosome}:{position}", retry_empty_json=True
+        )
         if not isinstance(decoded, list):
             raise RuntimeError("CADD response must be a list of variant scores")
         matches = []

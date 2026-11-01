@@ -37,6 +37,8 @@ import time
 import argparse
 import platform
 import traceback
+import shutil
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -45,6 +47,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from concurrent.futures import Future, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import get_context
+from tempfile import TemporaryDirectory
 
 import polars as pl
 import pandas as pd
@@ -74,6 +77,8 @@ from postgwas.core.pipeline_logging import (
 from postgwas.core.ui import MeasuredProgress, StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.core.paths import configured_output_matches, configured_output_path
+from postgwas.core.io.artifacts import publish_artifact_set
+from postgwas.core.io.reports import write_json_report
 from postgwas.modules.harmonisation.rejects import (
     RejectCollector,
     RejectOutputError,
@@ -763,6 +768,13 @@ def _field_completeness_block(report):
             if conversion["invalid"]:
                 text += "; could not become numbers; set to missing (not automatically removed here)"
             lines.extend(detail("Invalid numeric", text))
+            if "rounded" in conversion:
+                lines.extend(detail(
+                    "Rounded sample counts",
+                    counted(conversion["rounded"], conversion["non_missing"])
+                    + "; fractional_count_action = "
+                    + str(conversion["fractional_count_action"]),
+                ))
         elif conversion.get("status") == "compound_values_deferred":
             lines.extend(detail("Numeric conversion", "Contains multi-value cells; handled by the INFO-specific parser"))
         elif name == "pos":
@@ -1171,11 +1183,7 @@ def _log_resolved_policies(logger, policies):
 
 def _write_run_manifest(path, manifest):
     # type: (Any, Dict[str, Any]) -> str
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, default=str)
-    return str(path)
+    return str(write_json_report(manifest, path))
 
 
 def _finalise_failed_run_manifest(
@@ -1578,17 +1586,27 @@ def _log_tail(path, max_lines=400):
     returns nothing at all, but its log is complete up to the moment it died
     because every record is flushed as it is written.
     """
+    if isinstance(max_lines, bool) or not isinstance(max_lines, int) or max_lines < 1:
+        raise ValueError("max_lines must be a positive integer")
+    lines = deque(maxlen=max_lines)
+    total_lines = 0
     try:
         with open(str(path), "r", encoding="utf-8", errors="replace") as handle:
-            lines = handle.read().splitlines()
+            for record in handle:
+                # Preserve str.splitlines() separators as well as CR/LF.
+                for line in record.splitlines():
+                    lines.append(line)
+                    total_lines += 1
     except (IOError, OSError) as exc:
         return "(the log file %s could not be read: %s)" % (path, exc)
     if not lines:
         return "(the log file %s is empty: the worker died before its first record)" % (path,)
-    if len(lines) > max_lines:
-        omitted = len(lines) - max_lines
-        lines = ["(... %d earlier lines are in %s ...)" % (omitted, path)] + lines[-max_lines:]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if total_lines > max_lines:
+        text = "(... %d earlier lines are in %s ...)\n%s" % (
+            total_lines - max_lines, path, text,
+        )
+    return text
 
 
 def _record_chromosome_exception(
@@ -2814,6 +2832,7 @@ def _prepare_dataset_for_chromosome_processing(
             "info.multi_value_aggregation",
             "info.multi_value_output_column",
             "info.multi_value_invalid_token_action",
+            "sample_size.fractional_count_action",
             "duplicates.key", "duplicates.consistency_fields",
             "duplicates.quality_fields", "duplicates.selection_order",
             "duplicates.conflicting_action",
@@ -4958,14 +4977,6 @@ def _run_post_merge_stages(
                 reference_population=comparison_cols,
             )) + "\n",
         )
-        combined_log = _write_combined_log(
-            outdir,
-            sample_id,
-            dataset_extra.get("chromosomes") or {},
-            output_layout,
-        )
-        manifest["combined_log"] = combined_log
-
         removed_gwas2vcf_artifacts = []
         if status == "OK" and not keep_gwas2vcf_intermediate:
             removed_gwas2vcf_artifacts = remove_merged_gwas2vcf_intermediate(
@@ -5008,6 +5019,12 @@ def _run_post_merge_stages(
                 ),
             ]) + "\n",
         )
+
+    # The completed step writes its final STATUS/footer on context exit.
+    combined_log = _write_combined_log(
+        outdir, sample_id, dataset_extra.get("chromosomes") or {}, output_layout,
+    )
+    manifest["combined_log"] = combined_log
 
     return _PostMergeOutcome(
         primary_outputs=primary_outputs,
@@ -5511,25 +5528,34 @@ def _write_combined_log(
     combined = configured_output_path(
         output_dir, output_layout["combined_log"], dataset_id=sample_id,
     )
-    order = sorted(chromosome_statuses, key=_chromosome_sort_key)
+    sources = [dataset_log] + [
+        configured_output_path(
+            output_dir, output_layout["chromosome_log"],
+            dataset_id=sample_id, chromosome=chromosome,
+        )
+        for chromosome in sorted(chromosome_statuses, key=_chromosome_sort_key)
+    ]
     try:
-        with combined.open("w", encoding="utf-8") as out:
-            if dataset_log.is_file():
-                out.write("===== %s =====\n" % dataset_log.name)
-                out.write(dataset_log.read_text(encoding="utf-8", errors="replace"))
-                out.write("\n")
-            for chrom in order:
-                path = configured_output_path(
-                    output_dir,
-                    output_layout["chromosome_log"],
-                    dataset_id=sample_id,
-                    chromosome=chrom,
-                )
-                if not path.is_file():
-                    continue
-                out.write("===== %s =====\n" % path.name)
-                out.write(path.read_text(encoding="utf-8", errors="replace"))
-                out.write("\n")
-    except OSError:
+        # Streaming must never read its own output or replace a source log.
+        if combined.exists() and not combined.is_file():
+            return None
+        for source in sources:
+            if source == combined or (
+                source.exists() and combined.exists() and source.samefile(combined)
+            ):
+                return None
+        # Publish only a complete transcript; failed copies retain prior output.
+        with TemporaryDirectory(dir=combined.parent) as directory:
+            temporary = Path(directory) / combined.name
+            with temporary.open("w", encoding="utf-8") as out:
+                for source in sources:
+                    if not source.is_file():
+                        continue
+                    out.write("===== %s =====\n" % source.name)
+                    with source.open("r", encoding="utf-8", errors="replace") as handle:
+                        shutil.copyfileobj(handle, out)
+                    out.write("\n")
+            publish_artifact_set([(temporary, combined)])
+    except (OSError, RuntimeError):
         return None
     return str(combined)

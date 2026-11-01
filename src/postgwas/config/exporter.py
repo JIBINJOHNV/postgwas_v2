@@ -375,6 +375,12 @@ _MIXER_COMMENTS = {
     "univariate.replicate_indices": (
         "Replicate indices fitted, tested and combined by the official MiXeR utility.",
     ),
+    "univariate.standard_replicate_count": (
+        "Replicate count required for a standard inferential MiXeR run.",
+    ),
+    "univariate.allow_exploratory_replicates": (
+        "Allow a nonstandard count only for non-inferential workflow testing.",
+    ),
     "reporting.figure_statistics": (
         "Combined-result statistics requested from the official plotting utility.",
         "The first value is the architecture summary statistic; use mean first for the official workflow.",
@@ -414,11 +420,17 @@ _MIXER_COMMENTS = {
     "output_layout": (
         "Relative raw-result, summary, figure, metadata, and per-run log paths.",
     ),
+    "output_layout.fit_figure_prefix": (
+        "Official fit-report prefix for architecture and AIC/BIC evidence.",
+    ),
+    "output_layout.test_figure_prefix": (
+        "Official test-report prefix for QQ and power diagnostics.",
+    ),
     "reporting": (
         "Compact result files, official diagnostic figures, and quality actions.",
     ),
     "reporting.generate_figures": (
-        "Run official mixer_figures after test1 to create QQ and power diagnostics.",
+        "Run official mixer_figures separately for combined fit and test results.",
     ),
     "reporting.quality": (
         "Configured error, warning, or ignore actions for material validity checks.",

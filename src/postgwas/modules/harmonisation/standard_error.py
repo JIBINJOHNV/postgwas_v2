@@ -80,6 +80,7 @@ POLICY_KEYS = (
     "pvalue.se_tail",
     "pvalue.out_of_range",
     "pvalue.clip_low",
+    "pvalue.clip_high",
     "pvalue.derive_partial_missing_se",
     "pvalue.zero_missing_se",
     "validation.se_from_clipped_pval",
@@ -87,11 +88,6 @@ POLICY_KEYS = (
 
 #: The free-text step label recorded in the reject file.
 STEP_LABEL = "08 se_from_beta_pval"
-
-#: Numerical guard used only for invalid values above 1. A valid p-value equal
-#: to 1 is not clamped; when SE must be inferred it naturally yields z=0 and an
-#: undefined SE, which is handled as missing rather than fabricated.
-_PVAL_CLIP_HIGH = 0.999999999
 
 # Shared mechanics stay outside the scientific implementation.
 _info = log_info
@@ -182,6 +178,7 @@ def derive_standard_error_from_effect_and_p_value(
         )
 
     clip_low = float(pol.get("pvalue.clip_low"))
+    clip_high = float(pol.get("pvalue.clip_high"))
     zero_missing_se_action = str(pol.get("pvalue.zero_missing_se"))
     derive_partial_missing_se = bool(
         pol.get("pvalue.derive_partial_missing_se")
@@ -533,14 +530,15 @@ def derive_standard_error_from_effect_and_p_value(
                 step=STEP_LABEL,
             )
     else:
-        # Clip invalid values to the configured valid range.
+        # Clip only invalid values to the configured range. A valid P=1 is
+        # unchanged; for a two-sided test it yields Z=0 and undefined SE.
         df = df.with_columns(
             [
                 cond_high.fill_null(False).alias(SE_FROM_CLIPPED_PVAL_COL),
                 pl.when(cond_low)
                 .then(pl.lit(clip_low))
                 .when(cond_high)
-                .then(pl.lit(_PVAL_CLIP_HIGH))
+                .then(pl.lit(clip_high))
                 .otherwise(pl.col(pval_col))
                 .alias("_pval_safe"),
             ]
@@ -550,9 +548,9 @@ def derive_standard_error_from_effect_and_p_value(
                 "p-value inside (0, 1]",
                 "The p-value is not inside (0, 1]. Policy pvalue.out_of_range is "
                 "'clip', so it was forced back into range before the standard error "
-                "was derived. Standard errors built on a p-value above 1 are "
-                "fabricated - they come out around 8,000,000 - so those variants are "
-                "tagged and removed later under validation.se_from_clipped_pval.",
+                "was derived. The corrected probability does not recover the "
+                "original significance, so those variants are tagged for "
+                "validation.se_from_clipped_pval; undefined SE remains missing.",
                 df.height,
                 df.height,
                 changed=invalid_pval,

@@ -10,6 +10,8 @@ test_arguments: []
 univariate:
   fit_extract_file_pattern: null
   replicate_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  standard_replicate_count: 20
+  allow_exploratory_replicates: false
 gsa:
   annotation_file_pattern: null
   loadlib_file_pattern: null
@@ -64,7 +66,8 @@ output_layout:
   test_replicate_prefix: 'results/raw/univariate/replicates/{dataset_id}.test.rep{replicate}'
   summary_yaml: 'results/{dataset_id}_mixer_summary.yaml'
   summary_tsv: 'results/{dataset_id}_mixer_summary.tsv'
-  figure_prefix: 'plots/{dataset_id}'
+  fit_figure_prefix: 'plots/{dataset_id}.fit'
+  test_figure_prefix: 'plots/{dataset_id}.test'
   gsa_split_pattern: 'results/raw/gsa/input/{dataset_id}.chr@.sumstats.gz'
   gsa_baseline_prefix: 'results/raw/gsa/{dataset_id}.baseline'
   gsa_full_prefix: 'results/raw/gsa/{dataset_id}.full'

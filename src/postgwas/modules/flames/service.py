@@ -24,6 +24,7 @@ from postgwas.core.completion import (
     resolve_completion_resume,
     write_completion_manifest,
 )
+from postgwas.core.io.reports import collect_html_reports
 from postgwas.core.io.tables import require_table_columns
 from postgwas.core.input_validation import record_file_validation, validate_once
 from postgwas.core.paths import (
@@ -54,6 +55,7 @@ from postgwas.core.required_arguments import (
 from postgwas.core.ui import StageProgress
 from postgwas.core.validation_reporting import register_file_availability_bundle
 from postgwas.modules.flames.errors import FlamesError
+from postgwas.modules.flames.reporting import write_flames_html_report
 from postgwas.modules.flames.stages import FLAMES_STAGES
 
 
@@ -1028,7 +1030,10 @@ def _build_commands(
     return [str(value) for value in annotation], [str(value) for value in scoring]
 
 
-def _completion_inputs(resources: dict) -> dict[str, Path]:
+def _completion_inputs(
+    resources: dict,
+    upstream_reports=(),
+) -> dict[str, Path]:
     interchange = resources["interchange"]
     inputs = {
         "fine_mapping_index": interchange["index_path"],
@@ -1050,14 +1055,22 @@ def _completion_inputs(resources: dict) -> dict[str, Path]:
     if resources["cadd_file"] is not None:
         inputs["cadd_scores"] = resources["cadd_file"]
         inputs["cadd_index"] = resources["cadd_index"]
+    inputs.update({
+        "upstream_html_report_%d" % number: Path(report["path"])
+        for number, report in enumerate(upstream_reports, 1)
+        if Path(report["path"]).is_file()
+    })
     return inputs
 
 
-def _completion_configuration(configuration) -> str:
+def _completion_configuration(configuration, upstream_reports=()) -> str:
     return configuration_digest({
         "module": configuration.modules.flames.model_dump(mode="json"),
         "python": configuration.resources.executables.python,
         "tabix": configuration.resources.executables.tabix,
+        "upstream_html_report_paths": [
+            report["path"] for report in upstream_reports
+        ],
     })
 
 
@@ -1101,7 +1114,12 @@ def preflight_flames_pipeline(
     )
 
 
-def run_flames_direct(args: argparse.Namespace, ctx=None):
+def run_flames_direct(
+    args: argparse.Namespace,
+    ctx=None,
+    *,
+    upstream_results=None,
+):
     """Validate, execute, and publish one provenance-tracked FLAMES analysis."""
     try:
         configuration = _resolved_configuration(args)
@@ -1248,10 +1266,15 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
             output, module.output_layout.completion_manifest,
             error_type=FlamesError, dataset_id=dataset,
         )
+        html_report = configured_output_path(
+            output, module.output_layout.html_report,
+            error_type=FlamesError, dataset_id=dataset,
+        )
         expected = {
             "raw_scores": raw_path,
             "prioritized_genes": prediction_path,
             "flames_index": final_index,
+            "html_report": html_report,
         }
         if module.vep_mode == "api" or module.cadd_mode == "api":
             expected["annotation_api_provenance"] = api_log
@@ -1259,8 +1282,9 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
             "annotation_%d" % number: path
             for number, path in enumerate(final_annotations, 1)
         })
-        completion_inputs = _completion_inputs(resources)
-        digest = _completion_configuration(configuration)
+        upstream_reports = collect_html_reports(upstream_results)
+        completion_inputs = _completion_inputs(resources, upstream_reports)
+        digest = _completion_configuration(configuration, upstream_reports)
         if (
             configuration.run.resume
             and not configuration.run.overwrite
@@ -1367,6 +1391,7 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                     "flames_raw_file": str(raw_path),
                     "flames_predictions_file": str(prediction_path),
                     "flames_index": str(final_index),
+                    "html_report": str(html_report),
                     "annotations": [str(path) for path in final_annotations],
                     "completion_manifest": str(completion),
                     "published_files": [str(path) for path in expected.values()],
@@ -1382,6 +1407,7 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                         ("success", "Completion manifest", "validated and unchanged"),
                         ("info", "Raw FLAMES scores", raw_path),
                         ("info", "Prioritized genes", prediction_path),
+                        ("success", "Unified HTML report", html_report),
                     ]
                     step.set_rows(len(expected))
                     step.outcome(
@@ -1633,6 +1659,28 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                     sep=module.input_schema.table_delimiter,
                     index=False,
                 )
+                staged_html_report = work / html_report.name
+                report_outputs = {
+                    **expected,
+                    "resolved_configuration": resolved_path,
+                    "completion_manifest": completion,
+                    "service_log": log_path,
+                }
+                write_flames_html_report(
+                    module,
+                    destination=staged_html_report,
+                    dataset_id=dataset,
+                    raw_scores=staged_raw,
+                    prioritized_genes=staged_prediction,
+                    report_path=html_report,
+                    input_metrics=resources["input_metrics"],
+                    credible_set_metrics=interchange["credible_metrics"],
+                    annotation_metrics=annotation_metrics,
+                    score_metrics=score_metrics,
+                    resources=resources,
+                    output_paths=report_outputs,
+                    upstream_results=upstream_results,
+                )
                 if configuration.run.overwrite:
                     completion.unlink(missing_ok=True)
                     for path in expected.values():
@@ -1647,11 +1695,14 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                 staged_prediction.replace(prediction_path)
                 final_index.parent.mkdir(parents=True, exist_ok=True)
                 staged_published_index.replace(final_index)
+                html_report.parent.mkdir(parents=True, exist_ok=True)
+                staged_html_report.replace(html_report)
                 result = {
                     "status": "success",
                     "flames_raw_file": str(raw_path),
                     "flames_predictions_file": str(prediction_path),
                     "flames_index": str(final_index),
+                    "html_report": str(html_report),
                     "annotations": [str(path) for path in final_annotations],
                     "published_files": [str(path) for path in expected.values()],
                     "metrics": {
@@ -1682,6 +1733,7 @@ def run_flames_direct(args: argparse.Namespace, ctx=None):
                     ("count", "Published annotation files", len(final_annotations)),
                     ("info", "Raw FLAMES scores", raw_path),
                     ("info", "Prioritized genes", prediction_path),
+                    ("success", "Unified HTML report", html_report),
                     ("success", "Completion manifest", completion),
                 ]
                 step.set_rows(len(expected))

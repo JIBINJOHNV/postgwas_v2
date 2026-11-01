@@ -673,9 +673,10 @@ def _completeness_section(manifest: Mapping[str, Any]) -> str:
         rows.append((field.get("field"), column, field.get("source_label"),
                      _ratio(field.get("post_parse_missing"), field.get("input_rows"), "input rows"),
                      numeric.get("invalid") if numeric else "Not assessed as numeric",
+                     numeric.get("rounded", "Not a sample-count column"),
                      field.get("final_missing"), field.get("lifecycle_note")))
     return _section("Field completeness and recovery", _data_table(
-        ("Field", "Study column", "Source", "Missing after parsing", "Numeric conversion failures", "Missing at final check", "Handling"), rows,
+        ("Field", "Study column", "Source", "Missing after parsing", "Numeric conversion failures", "Rounded sample counts", "Missing at final check", "Handling"), rows,
     ) + _mapping_details("Per-field recovery and final-check evidence", evidence),
         subtitle="Missing after parsing and failed numeric conversion are separate measurements. Final missing counts apply only to the assessed chromosomes and fields; absent evidence is never replaced by zero.")
 

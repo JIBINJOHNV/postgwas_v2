@@ -210,6 +210,19 @@ class FlamesResultSchema(StrictModel):
         return self
 
 
+class FlamesHtmlReport(StrictModel):
+    page_size: int = Field(ge=1)
+    significant_digits: int = Field(ge=1, le=10)
+    null_value: str
+
+    @field_validator("null_value")
+    @classmethod
+    def nonempty_null_value(cls, value: str) -> str:
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
 class FlamesOutputLayout(StrictModel):
     score_basename: str
     raw_score_suffix: str
@@ -221,6 +234,7 @@ class FlamesOutputLayout(StrictModel):
     completion_manifest: str
     service_log_file: str
     annotation_api_log_file: str
+    html_report: str
 
     @field_validator("*")
     @classmethod
@@ -235,7 +249,7 @@ class FlamesOutputLayout(StrictModel):
         dataset_fields = (
             "score_basename", "annotation_file", "index_file",
             "staging_directory", "completion_manifest", "service_log_file",
-            "annotation_api_log_file",
+            "annotation_api_log_file", "html_report",
         )
         for field in dataset_fields:
             if "{dataset_id}" not in getattr(self, field):
@@ -272,6 +286,7 @@ class FlamesConfig(ModuleConfig):
     input_schema: FlamesInputSchema
     upstream: FlamesUpstreamResources
     result_schema: FlamesResultSchema
+    html_report: FlamesHtmlReport
     output_layout: FlamesOutputLayout
 
     @field_validator(

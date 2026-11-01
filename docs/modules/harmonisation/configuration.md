@@ -37,9 +37,15 @@ An input containing `{chromosome}`, and a run containing only one chromosome,
 remain on the existing direct-read path.
 
 `trait_type`, `effect_type`, `p_value_type`, and `delimiter` are inferable.
-Missing values become `auto`. Invalid values produce a normalization warning
-and become `auto`. Scientific inference and comparison with explicit values is
-a later preflight stage.
+Omitted or missing values become `auto`; explicit `auto` remains supported.
+Known values and aliases are case-insensitive and normalized to lowercase.
+An unknown provided declaration fails during sample-sheet input validation,
+with its row, field, original value and accepted choices. The CSV loader,
+direct model and generated drafts share that validation. See the
+[2026-10-31 behavior-change note](../../wiki/harmonisation/sample-sheet.md#behavior-change--2026-10-31)
+when updating a sheet that previously relied on invalid values becoming `auto`.
+Scientific inference and comparison with valid explicit values remain a later
+preflight stage.
 
 Explicit non-`auto` sample-sheet declarations have final precedence over the
 generic YAML values for `effect.type`, `pvalue.type`, and `input.delimiter`.
@@ -335,6 +341,11 @@ This uses the public Polars [Series clone](https://docs.pola.rs/api/python/stabl
 and [chunk-length](https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.chunk_lengths.html)
 contracts; a full-column hash or a second statistics implementation is not used.
 
+Standalone frequency validation uses the resolved `eaf.maf_decision_cutoff`,
+`eaf.invalid_fraction_cutoff` and `eaf.missing_fraction_cutoff` when threshold
+arguments are omitted or `None`. Explicit helper arguments, including zero,
+retain precedence. The chromosome workflow delegates to that same resolution.
+
 ### Effect scale before Z-based recovery
 
 The study-wide effect decision is passed unchanged to every chromosome. At
@@ -510,6 +521,15 @@ an explicitly quantitative study fails in both sample-sheet validation and the
 internal sample-size step. Every configured sample size and Neff must be at
 least one. The effective-N convention follows
 [Mallard et al.](https://onlinelibrary.wiley.com/doi/full/10.1002/gepi.22609).
+
+The resolved integer Neff is exported through the required `neff_col` adapter
+mapping and written unchanged to `FORMAT/NEF`. The adapter does not recalculate
+or round it again. The existing sample-size formula and PostGWAS rounding are
+unchanged; cases, controls and total N retain their separate fields. The
+selected Neff column and its statistics are included in the adapter export
+summary. Missing or invalid adapter Neff values fail rather than being replaced
+with a recalculation. This avoids a second rounding rule such as Python's
+[half-to-even `round`](https://docs.python.org/3/library/functions.html#round).
 
 At the current sample-sheet preflight stage, referenced data files are never
 opened or decompressed. Validation uses filesystem metadata only: the path must
@@ -702,6 +722,12 @@ log-P provenance. Input validation, numeric normalization and SE diagnostics
 still run. Missing-cell recovery and explicit zero-P handling retain their
 existing log-domain calculations, source provenance and policies.
 
+The standalone BETA/P-to-SE helper also uses `pvalue.clip_high` when the range
+action clips an invalid raw `P>1`. It does not replace a valid `P=1` with an
+independent approximation. In the default two-sided test, `P=1` gives `Z=0`,
+so a finite SE cannot be recovered and remains missing for the existing gate.
+Clipping provenance and the configured clipped-SE validation remain in force.
+
 ## Logs and run metadata
 
 Every run writes `run_metadata/postgwas.log` and `resolved_config.yaml` at the
@@ -745,6 +771,22 @@ Each dataset also receives its own run metadata and complete dataset/chromosome
 logs. Success, permanent failure, configuration failure, and user interruption
 all append an explicit final record; the screen remains limited to progress,
 warnings, failures, and result locations.
+
+Dataset run manifests retain their existing JSON format and are published by
+the shared atomic report writer. Serialization and writing finish in a
+temporary file in the destination directory before replacement; failure before
+publication preserves the last complete manifest and removes the temporary.
+
+Worker-failure displays read logs incrementally and retain only the requested
+tail (the existing default is 400 logical lines), with the exact omitted-line
+count. Complete diagnostics remain in the source logs; a long diagnostic line
+is retained intact, so tail memory includes the retained lines and the longest
+physical input line. The combined dataset/chromosome transcript uses streaming
+copy and the shared transactional publication helper. Source/output aliases
+are refused, and a failed copy preserves any previous complete transcript.
+The snapshot is written after the final post-merge step exits, including its
+cleanup messages and final `STATUS` record. Source logs remain authoritative
+for early failures and any later outer-finalization errors.
 
 Harmonisation chromosome logs use the same compact audit vocabulary throughout:
 

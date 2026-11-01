@@ -1460,7 +1460,22 @@ def run_flames_runner(args, ctx):
     args.pops_scores_file = ctx["pops_output"]
 
     try:
-        outputs = run_flames_direct(args)
+        upstream_results = {
+            name: value for name, value in ctx.items() if name != "flames"
+        }
+        magma_report = magma.get("magma_pipeline_summary_html")
+        if magma_report:
+            upstream_results["magma"] = {
+                **magma,
+                "html_report": magma_report,
+            }
+        pops_report = ctx.get("pops_integrated_report")
+        if pops_report:
+            upstream_results["pops"] = {"html_report": pops_report}
+        outputs = run_flames_direct(
+            args,
+            upstream_results=upstream_results,
+        )
         ctx["flames"] = outputs
         return outputs
     finally:

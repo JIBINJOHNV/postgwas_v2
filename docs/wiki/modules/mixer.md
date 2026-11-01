@@ -228,8 +228,9 @@ after its exit status and outputs validate successfully.
 
 Univariate combined fit/test JSON are under `results/raw/univariate/`; raw
 replicate JSON/log files are under `results/raw/univariate/replicates/`;
-summaries are `results/<dataset>_mixer_summary.yaml/.tsv`; figures are under
-`plots/`. GSA raw outputs are under `results/raw/gsa/`; summaries are
+summaries are `results/<dataset>_mixer_summary.yaml/.tsv`; separate fit and test
+reports are written under `plots/` so AIC/BIC is interpreted from fit and
+QQ/power from test. GSA raw outputs are under `results/raw/gsa/`; summaries are
 `<dataset>_gsa_mixer_summary.yaml` and
 `<dataset>_gsa_mixer_top_results.tsv`. Logs are run-ID scoped. See the
 [detailed output structure and interpretation](https://github.com/JIBINJOHNV/postgwas_v2/blob/main/docs/modules/mixer.md#output-structure)
@@ -255,7 +256,9 @@ from the wrong ancestry/build, missing chromosome, seed mismatch,
 native/container path differences, low power, non-convergence, or invalid GO
 schema. Twenty replicated fits are deliberately expensive; the upstream v1.3
 notes estimate about ten times the aggregate CPU of the old procedure, and two
-threads can require more than a day.
+threads can require more than a day. Nonstandard replicate counts are rejected
+unless explicitly enabled for an exploratory, non-inferential workflow test;
+the resulting log and summary retain that exploratory designation.
 
 ## Limitations
 

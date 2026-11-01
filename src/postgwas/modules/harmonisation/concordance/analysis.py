@@ -2071,7 +2071,24 @@ def combine_concordance_partitions(
         eaf_is_maf=eaf_is_maf,
         settings=settings,
     )
-    ordered_matches = matched.sort(["_match_priority", "input_row"])
+    ordered_matches = matched
+    if summary["matched_variants"]:
+        # These keys are nonnegative integers (priority 0/1 and source row ID).
+        # Equal-width decimal fields preserve their lexicographic integer order
+        # without an overflowing packed integer or the older backend's BinaryOffset
+        # multi-key spill column. The temporary String key can itself spill to disk.
+        match_order = unused_column_name(
+            "__concordance_match_order", reserved=matched.columns,
+        )
+        integer_width = len(str(np.iinfo(np.uint64).max))
+        ordered_matches = (
+            matched.with_columns(
+                pl.concat_str([
+                    pl.col(column).cast(pl.String).str.pad_start(integer_width, "0")
+                    for column in ("_match_priority", "input_row")
+                ], separator=":").alias(match_order)
+            ).sort(match_order).drop(match_order)
+        )
     result.matched = ordered_matches
     result.position_matches = position_matches.sort(["input_chrom", "input_pos"])
     # An empty report has no ordering requirement; avoid sorting its streamed plan.

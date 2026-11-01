@@ -1983,6 +1983,10 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
                 _append_run_log(top_log, "ERROR", "Row %s, dataset %s: %s" % (
                     item["row"], item["dataset_id"], item["problem"],
                 ))
+                if item["stage"] == "sample sheet":
+                    print(screen_field(
+                        "error", "Sample sheet", item["problem"], indent=4,
+                    ))
         global_problems = "; ".join(item["problem"] for item in failures
                                     if item["row"] is None and item["stage"] != "expected references")
         raise HarmonisationPreflightError(

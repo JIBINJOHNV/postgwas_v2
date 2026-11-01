@@ -176,6 +176,7 @@ def main():
             ("imp_info_col", json_data.get("imp_info_col")),
             ("ncontrol_col", json_data.get("ncontrol_col")),
             ("ncase_col", json_data.get("ncase_col")),
+            ("neff_col", json_data["neff_col"]),
         ]:
             if col_idx is not None and (col_idx < 0 or col_idx >= num_columns):
                 logging.error(
@@ -206,6 +207,7 @@ def main():
             json_data["pval_col"],
             json_data["delimiter"],
             json_data["header"],
+            neff_col_num=json_data["neff_col"],
             ncase_col_num=json_data.get("ncase_col"),
             study_id_col_num=json_data.get("snp_col"),
             ea_af_col_num=json_data.get("eaf_col"),

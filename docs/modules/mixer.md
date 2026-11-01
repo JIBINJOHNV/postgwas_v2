@@ -44,6 +44,11 @@ unique, one-token SNP identifiers. A filename cannot prove MAF/LD pruning or
 ancestry/build compatibility, so those properties must come from the same
 documented reference release as the BIM and LD files.
 
+The configured `standard_replicate_count` is 20. A different number is rejected
+unless `allow_exploratory_replicates: true` is set explicitly. Such a run is
+labelled exploratory in the log and summary and must not be used for final
+inference.
+
 The extract list is passed to `fit1` only. Each corresponding `test1` evaluates
 the fitted parameters without `--extract`, on all reference-compatible tag
 variants after MiXeR's other configured filters and range exclusions. Applying
@@ -196,6 +201,8 @@ With canonical output settings, `analysis: all` produces:
 │   ├── STUDY_gsa_mixer_summary.yaml
 │   └── STUDY_gsa_mixer_top_results.tsv
 ├── plots/
+│   ├── STUDY.fit.csv and fit figures
+│   └── STUDY.test.csv and test figures
 ├── logs/<UTC-run-id>/STUDY_mixer.log
 └── run_metadata/resolved_config.yaml
 ```
@@ -203,11 +210,20 @@ With canonical output settings, `analysis: all` produces:
 The fixed suffixes following each upstream `--out PREFIX` are MiXeR protocol
 invariants. Directories and prefixes remain configurable.
 
+PostGWAS runs the official figure utility separately on the combined fit and
+test JSON files. Architecture and AIC/BIC evidence must be interpreted from
+the `.fit` products; QQ and power diagnostics must be interpreted from the
+`.test` products.
+Configured fit and test figure destinations must resolve to different paths,
+including after dataset-name substitution and symlink resolution. Direct and
+pipeline preflight reject a collision before MiXeR analysis starts.
+
 The compact univariate summary uses the configured first aggregate statistic;
 the canonical value is `mean`, matching the upstream averaging procedure. It
-retains the full combined uncertainty structure, checks convergence for every
-raw fit, and reports both the pruned fit-tag counts and the full-data test-tag
-count. AIC/BIC model support comes from the combined fit result, not test data.
+retains the full combined uncertainty structure, checks convergence and finite
+optimizer criteria for every raw fit and test, and reports both the pruned
+fit-tag counts and the full-data test-tag count. AIC/BIC model support comes
+from the combined fit result, not test data.
 
 The complete upstream enrichment table is preserved. The compact GSA TSV
 contains at most the configured `top_results`, restricted to gene sets whose

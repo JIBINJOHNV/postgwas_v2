@@ -207,9 +207,34 @@ case and control counts instead.
 
 Missing `trait_type`, `effect_type`, `p_value_type`, and `delimiter` values
 normalize to `auto`. Common aliases such as `binary`, `OR`, `pvalue`, `-log10p`,
-and `csv` are normalized. An invalid inferable value becomes `auto` with a
-warning; later scientific preflight decides whether the data provide enough
-evidence to proceed.
+and `csv` are normalized. These four declarations are case-insensitive and
+stored in lowercase: `ODDS_RATIO`, `Odds_Ratio` and `odds_ratio` all mean
+`odds_ratio`. This normalization applies to declarations; source column names,
+dataset identifiers and file paths retain their supplied case.
+
+An unknown provided declaration fails during sample-sheet input validation.
+Every independently readable row is checked. Terminal input-validation output,
+the canonical log and the preflight report name the CSV row, dataset, field,
+original value and accepted choices. For example:
+
+```text
+Row 2: Invalid declaration effect_type='ODDS_RATO'. Accepted choices: 'auto', 'beta', 'odds_ratio'. Values are case-insensitive; recognized aliases are accepted.
+```
+
+Correct the spelling to `odds_ratio` (or a known alias such as `OR`), or choose
+`auto` explicitly when automatic interpretation is intended. An invalid
+declaration is never changed into permission to infer. Direct model validation
+and generated drafts use the same declaration contract. Later scientific
+preflight still checks whether valid automatic or explicit declarations are
+compatible with the study data.
+
+### Behavior change — 2026-10-31
+
+Unknown provided trait, effect, P-value and delimiter declarations now fail
+input validation instead of warning and becoming `auto`. Existing sheets with
+typos or unsupported declarations must be corrected. Known aliases, explicit
+`auto`, omitted/missing declarations and case-insensitive spelling remain
+supported. This change adds no configuration key or CLI option.
 
 ## Generate a draft from GWAS headers
 

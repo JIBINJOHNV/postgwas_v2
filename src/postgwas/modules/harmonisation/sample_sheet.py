@@ -87,16 +87,21 @@ def _missing(value: Any) -> bool:
     )
 
 
-def _normalise_inferable(field: str, value: Any, warnings: list[str], row_number: int) -> str:
+def _normalise_inferable(field: str, value: Any, row_number: int | None = None) -> str:
+    """Normalize a supported declaration; a typo never authorizes inference."""
     if _missing(value):
         return "auto"
-    text = _unicode(value).lower()
-    text = ENUM_ALIASES[field].get(text, text.replace("-", "_").replace(" ", "_"))
+    text = _unicode(value).lower() if isinstance(value, str) else None
+    if text is not None:
+        text = ENUM_ALIASES[field].get(text, text.replace("-", "_").replace(" ", "_"))
     if text not in ALLOWED_ENUMS[field]:
-        warnings.append(
-            "Row %d: invalid %s=%r was normalized to 'auto'." % (row_number, field, value)
+        location = "Row %d: " % row_number if row_number is not None else ""
+        choices = ", ".join(repr(choice) for choice in sorted(ALLOWED_ENUMS[field]))
+        raise ValueError(
+            "%sInvalid declaration %s=%r. Accepted choices: %s. "
+            "Values are case-insensitive; recognized aliases are accepted."
+            % (location, field, value, choices)
         )
-        return "auto"
     return text
 
 
@@ -185,7 +190,12 @@ class HarmonisationSampleSheetRow(BaseModel):
 
     @field_validator("*", mode="before")
     @classmethod
-    def normalise_missing_and_text(cls, value):
+    def normalise_missing_and_text(cls, value, info: ValidationInfo):
+        if info.field_name in INFERABLE_FIELDS:
+            return _normalise_inferable(
+                info.field_name, value,
+                row_number=(info.context or {}).get("row_number"),
+            )
         if _missing(value):
             return None
         return _unicode(value)
@@ -382,9 +392,6 @@ def load_harmonisation_sample_sheet(
     for row_number, raw in raw_records:
         record = {normalized_names[key]: value for key, value in raw.items()}
         row_problems = []
-        warnings: list[str] = []
-        for field in INFERABLE_FIELDS:
-            record[field] = _normalise_inferable(field, record.get(field), warnings, row_number)
         for field in ("control_count", "case_count"):
             try:
                 record[field] = _normalise_count(record.get(field), field, row_number)
@@ -436,7 +443,6 @@ def load_harmonisation_sample_sheet(
                 })
             continue
         row._row_number = row_number
-        row._normalisation_warnings.extend(warnings)
         if row.imputation_info_column and (row.external_info_file or row.external_info_column):
             row._normalisation_warnings.append(
                 "Row %d: internal INFO column %r has priority; the listed external INFO source will not be used."

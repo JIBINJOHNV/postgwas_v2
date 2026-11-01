@@ -37,6 +37,9 @@ class Param(Schema):
         required=False,
         description="Column number for number of controls (if case/control) or total sample size if continuous",
     )
+    neff_col = fields.Int(
+        required=True, description="Column number for resolved integer effective sample size",
+    )
     build = fields.Str(
         required=True,
         description="Name of the genome build i.e. GRCh36, GRCh37, GRCh38",

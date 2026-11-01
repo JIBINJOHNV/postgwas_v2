@@ -3,6 +3,7 @@ import logging
 import os
 import pickle
 import tempfile
+from decimal import Decimal, DecimalException
 from heapq import heappush
 
 try:
@@ -219,6 +220,7 @@ class Gwas:
         pval_col_num,
         delimiter,
         header,
+        neff_col_num,
         ncase_col_num=None,
         study_id_col_num=None,
         ea_af_col_num=None,
@@ -369,15 +371,18 @@ class Gwas:
                 logging.debug(f"Could not determine total sample size: {exception_name}")
                 n = None
 
+            # PostGWAS already resolved and rounded Neff for reconstruction.
+            # Consume that selected integer rather than calculate it again.
             try:
-                neff = (
-                    4 / (1/ncase + 1/ncontrol) if ncase is not None and ncontrol is not None
-                    else ncontrol if ncontrol is not None
-                    else ncase
-                )
-            except (TypeError, ValueError, ZeroDivisionError) as exception_name:
-                logging.debug(f"Could not calculate neff: {exception_name}")
-                neff = None
+                neff = Decimal(columns[neff_col_num])
+                if not neff.is_finite() or neff <= 0 or neff != neff.to_integral_value():
+                    raise ValueError("effective sample size must be a positive integer")
+                neff = int(neff)
+            except (DecimalException, IndexError, TypeError, ValueError) as exception_name:
+                raise ValueError(
+                    f"Invalid effective sample size in neff_col at input record "
+                    f"{metadata['TotalVariants']}: expected a positive integer"
+                ) from exception_name
 
 
             try:

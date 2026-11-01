@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from html import escape
 from html.parser import HTMLParser
 import os
@@ -378,6 +379,21 @@ def write_yaml_report(value: Mapping[str, Any], path: str | Path) -> Path:
     return destination
 
 
+def write_json_report(value: Mapping[str, Any], path: str | Path) -> Path:
+    """Write one JSON document without exposing an incomplete replacement."""
+    destination = Path(path)
+    temporary_path = None
+    try:
+        with _atomic_text_path(destination) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(dict(value), handle, indent=2, default=str)
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return destination
+
+
 def write_delimited_report(
     records: Sequence[Mapping[str, Any]],
     path: str | Path,
@@ -447,6 +463,7 @@ __all__ = [
     "collect_html_reports",
     "write_delimited_report",
     "write_html_report",
+    "write_json_report",
     "write_text_lines_report",
     "write_yaml_report",
 ]

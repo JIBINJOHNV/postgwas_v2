@@ -329,6 +329,30 @@ def _result_path(prefix: Path, suffix: str) -> Path:
     return Path("%s%s" % (prefix, suffix))
 
 
+def _figure_output_prefixes(module, output_directory, dataset_id) -> dict[str, Path]:
+    """Keep fit evidence and test diagnostics in distinct resolved outputs."""
+    prefixes = {
+        result_type: configured_output_path(
+            output_directory, pattern, error_type=MixerError, dataset_id=dataset_id,
+        )
+        for result_type, pattern in (
+            ("fit", module.output_layout.fit_figure_prefix),
+            ("test", module.output_layout.test_figure_prefix),
+        )
+    }
+    # MiXeR writes PREFIX.csv; also resolve a possible symlink on that file.
+    fit_report = _result_path(prefixes["fit"], ".csv").resolve()
+    test_report = _result_path(prefixes["test"], ".csv").resolve()
+    if fit_report == test_report:
+        raise MixerError(
+            "modules.mixer.output_layout.fit_figure_prefix and "
+            "modules.mixer.output_layout.test_figure_prefix resolve to the "
+            "same destination: %s. Configure distinct output paths."
+            % fit_report
+        )
+    return prefixes
+
+
 def expand_chromosome_pattern(
     pattern: str, chromosome: str, placeholder: str,
 ) -> Path:
@@ -751,6 +775,18 @@ def _run_univariate(
     fit_replicates = []
     test_replicates = []
     replicate_total = len(replicate_indices)
+    replicate_mode = (
+        "standard"
+        if replicate_total == module.univariate.standard_replicate_count
+        else "exploratory"
+    )
+    logger.record(
+        "PARAM",
+        "mixer_replicate_design",
+        replicate_mode=replicate_mode,
+        replicate_count=replicate_total,
+        standard_replicate_count=module.univariate.standard_replicate_count,
+    )
 
     progress.start(progress_first_step)
     fit_progress = MeasuredProgress(
@@ -1118,6 +1154,10 @@ def preflight_mixer_pipeline(
 
     run_univariate = module.analysis in {"univariate", "all"}
     run_gsa = module.analysis in {"gsa", "all"}
+    if run_univariate and module.reporting.generate_figures:
+        _figure_output_prefixes(
+            module, configuration.run.output_directory, configuration.run.dataset_id,
+        )
     placeholder = module.workflow.chromosome_placeholder
     bim_pattern = _absolute_pattern(module.bim_file_pattern)
     resource_files = list(validate_reference_pattern(
@@ -1436,6 +1476,8 @@ def _run_single_trait_mixer_impl(
     _require_mixer_pipeline_arguments(configuration)
     run_univariate = module.analysis in {"univariate", "all"}
     run_gsa = module.analysis in {"gsa", "all"}
+    if run_univariate and module.reporting.generate_figures:
+        _figure_output_prefixes(module, output_directory, dataset_id)
     if (run_univariate or (run_gsa and not module.gsa.loadlib_file_pattern)) and not module.ld_file_pattern:
         raise MixerError(
             "--ld-file-pattern is required for univariate MiXeR and for GSA-MiXeR "
@@ -1643,11 +1685,7 @@ def _generate_figures(
     expected_backend: str | None = None,
 ) -> list[str]:
     module = configuration.modules.mixer
-    prefix = configured_output_path(
-        output_directory, module.output_layout.figure_prefix,
-        error_type=MixerError, dataset_id=dataset_id,
-    )
-    prefix.parent.mkdir(parents=True, exist_ok=True)
+    prefixes = _figure_output_prefixes(module, output_directory, dataset_id)
     if figures_tool is None:
         resolved_tool, backend = _tool_command(
             configuration,
@@ -1659,27 +1697,34 @@ def _generate_figures(
         resolved_tool = list(figures_tool)
         backend = expected_backend or result["execution_backend"]
     if backend != result["execution_backend"]:
-        raise MixerError("MiXeR and mixer_figures resolved to different execution backends")
-    command = [
-        *resolved_tool, module.workflow.figure_command,
-        "--json", result["test"], "--trait1", dataset_id,
-        "--out", str(prefix), "--ext", *module.reporting.figure_extensions,
-        "--statistic", *module.reporting.figure_statistics,
-    ]
-    expected = _result_path(prefix, ".csv")
-    _run_step(
-        command,
-        "Generate official MiXeR diagnostic figures",
-        [expected],
-        configuration,
-        logger,
-        dry_run=False,
-    )
-    generated = sorted(
-        path for path in prefix.parent.glob("%s.*" % prefix.name)
-        if path.is_file() and path.stat().st_size > 0
-    )
-    logger.record("OUTPUT", "mixer_figures", files=[str(path) for path in generated])
+        raise MixerError(
+            "MiXeR and mixer_figures resolved to different execution backends"
+        )
+    generated = []
+    for result_type, prefix in prefixes.items():
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        _run_step(
+            [
+                *resolved_tool, module.workflow.figure_command,
+                "--json", result[result_type], "--trait1", dataset_id,
+                "--out", str(prefix), "--ext", *module.reporting.figure_extensions,
+                "--statistic", *module.reporting.figure_statistics,
+            ],
+            "Generate official MiXeR %s figures" % result_type,
+            [_result_path(prefix, ".csv")],
+            configuration,
+            logger,
+            dry_run=False,
+        )
+        files = sorted(
+            path for path in prefix.parent.glob("%s.*" % prefix.name)
+            if path.is_file() and path.stat().st_size > 0
+        )
+        generated.extend(files)
+        logger.record(
+            "OUTPUT", "mixer_%s_figures" % result_type,
+            files=[str(path) for path in files],
+        )
     return [str(path) for path in generated]
 
 

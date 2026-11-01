@@ -277,7 +277,7 @@ would require a separately validated model.
 6. Run upstream scoring; verify schemas, ranges, binary indicators, per-locus
    score normalization, and exact agreement between prioritized and causal rows.
 7. Rewrite staged annotation paths to published paths, publish validated files,
-   and write the completion manifest last.
+   build the unified HTML report, and write the completion manifest last.
 
 ## Outputs
 
@@ -286,6 +286,9 @@ Default YAML publishes:
 - `results/<dataset>_FLAMES_scores.raw`: all scored locus-gene rows.
 - `results/<dataset>_FLAMES_scores.pred`: prioritized rows; a header-only file is
   valid when FLAMES prioritizes no gene.
+- `reports/<dataset>_FLAMES_report.html`: unified, searchable FLAMES results,
+  scientific QC, all five FLAMES stages, provenance, and links to every
+  prerequisite HTML report explicitly recorded by pipeline execution.
 - `annotations/<dataset>/`: one validated annotation table per indexed locus.
 - `inputs/<dataset>_flames_index.tsv`: the final index pointing to published
   annotation files.
@@ -295,6 +298,13 @@ Default YAML publishes:
 - `logs/<dataset>_flames.log`: commands, decisions, counts, failures, and outputs.
 
 Files without a valid completion manifest are incomplete and are not resumed.
+
+The unified report is presentation-only: it reproduces the validated `.raw`
+and `.pred` rows without recalculating scores or applying an additional filter.
+In pipeline mode it links the recorded LD-clumping, formatter, MAGMA, PoPS and
+fine-mapping HTML reports when those modules published one. MAGMAcovar currently
+publishes validated tabular results and its canonical log rather than a separate
+HTML report; the FLAMES report records its consumed result file in provenance.
 
 ## QC and logs
 
@@ -348,11 +358,16 @@ allele scores. It never fabricates `MODIFIER` consequences or substitutes zero f
 an unavailable CADD score. A valid VEP intergenic/regulatory response without
 transcript consequences remains valid zero transcript-gene evidence. The published
 impact weights and CADD v1.6 release are unchanged. Requests use configured finite
-timeouts, rate limits and bounded throttling retries; HTTP 400 retains FLAMES'
-alternate-allele retry. Full response bodies, hashes, HTTP status and request URLs
-are saved in `output_layout.annotation_api_log_file`, including failed runs;
-credentials are prohibited in configured endpoints. This provenance log is not
-itself evidence of successful annotation.
+timeouts, rate limits and bounded retries; HTTP 400 retains FLAMES'
+alternate-allele retry. The public CADD API can transiently return an empty JSON
+array with HTTP 200 for a covered SNV. PostGWAS retries only that empty response
+using the YAML-configured retry count and delay, records every attempt, and still
+requires exactly one coordinate- and allele-matched finite score. Retry exhaustion
+fails the run and never converts the missing score to zero. Full response bodies,
+hashes, HTTP status and request URLs are saved in
+`output_layout.annotation_api_log_file`, including failed runs; credentials are
+prohibited in configured endpoints. This provenance log is not itself evidence of
+successful annotation.
 
 VEP transcript impacts retain the published `HIGH=1`, `MODERATE=0.6`, `LOW=0.4`,
 `MODIFIER=0.1` weights. For each gene/variant, the maximum transcript weight is
