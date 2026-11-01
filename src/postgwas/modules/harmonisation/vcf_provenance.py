@@ -16,6 +16,7 @@ from postgwas.modules.harmonisation.effect_from_z import (
     describe_effect_from_z_reconstruction,
 )
 from postgwas.modules.harmonisation.vcf_processing import CONSEQUENCE_ANNOTATION_MODE
+from postgwas.modules.harmonisation.study_properties import selected_eaf_replacement
 
 
 def _package_version() -> str:
@@ -49,6 +50,7 @@ def _decision_source(value: Any) -> str:
         "explicit_configuration": "explicit run configuration",
         "fixed_info": "fixed INFO value",
         "frequency_decision_missing": "frequency decision not available",
+        "replacement_reference": "reference EAF selected after study MAF support",
     }.get(str(value), str(value) if value is not None else "not available")
 
 
@@ -317,9 +319,10 @@ def build_harmonisation_vcf_provenance(
                 all_paths.append(path)
                 seen_paths.add(path)
 
+    replacement = selected_eaf_replacement(study_decisions)
     af_external = optional_text(sample.get("eaffile")) is not None
     af_internal = optional_text(sample.get("eaf_col")) is not None
-    if af_external == af_internal:
+    if replacement is None and af_external == af_internal:
         raise ValueError(
             "VCF provenance requires exactly one validated EAF source: a study "
             "column or an external file and column."
@@ -334,6 +337,36 @@ def build_harmonisation_vcf_provenance(
         if af_external else optional_text(sample.get("eaf_col"))
     )
     af_source = "external user-provided reference" if af_external else "study column"
+    af_reference_template = (
+        _resolved_path(sample.get("eaffile"), "the external EAF template")
+        if af_external else missing
+    )
+    af_reference_files = paths("user_eaf_file") if af_external else missing
+    af_harmonisation = "Frequency oriented to the final VCF ALT allele"
+    af_swapped_formula = "AF = 1 - input AF for an allele-swapped match"
+    if replacement is not None:
+        absent = [chromosome for chromosome in chromosomes
+                  if chromosome not in replacement["resolved_files"]]
+        if absent:
+            raise ValueError("EAF replacement provenance is missing resolved files for chromosome(s): %s."
+                             % ", ".join(absent))
+        af_source = "replacement reference proxy; not study-measured EAF"
+        af_column = optional_text(sample.get("eaf_col"))
+        af_reference_template = _resolved_path(replacement["file"], "the selected EAF replacement template")
+        replacement_paths = list(dict.fromkeys(
+            _resolved_path(replacement["resolved_files"][chromosome], "the selected EAF replacement file")
+            for chromosome in chromosomes
+        ))
+        af_reference_files = _joined_paths(replacement_paths, separator, missing)
+        all_paths.extend(path for path in replacement_paths if path not in seen_paths)
+        af_harmonisation = (
+            "Original study MAF preserved; selected reference column %s supplies "
+            "EAF aligned to the final VCF ALT allele" % replacement["column"]
+        )
+        af_swapped_formula = (
+            "Selected reference ALT frequency assigned after allele orientation; "
+            "original study MAF is not inverted"
+        )
 
     info_source = optional_text(sample.get("info_source")) or missing
     if info_source == "internal":
@@ -500,18 +533,16 @@ def build_harmonisation_vcf_provenance(
         "af_source": af_source,
         "af_input_column": af_column or missing,
         "af_input_type": str(
-            study_decisions.get("frequency_type") or missing
+            "minor_allele_frequency" if replacement is not None
+            else study_decisions.get("frequency_type") or missing
         ),
         "af_type_decision": _decision_source(
             study_decisions.get("eaf_is_maf_source")
         ),
-        "af_reference_template": (
-            _resolved_path(sample.get("eaffile"), "the external EAF template")
-            if af_external else missing
-        ),
-        "af_reference_files": paths("user_eaf_file") if af_external else missing,
-        "af_harmonisation": "Frequency oriented to the final VCF ALT allele",
-        "af_swapped_formula": "AF = 1 - input AF for an allele-swapped match",
+        "af_reference_template": af_reference_template,
+        "af_reference_files": af_reference_files,
+        "af_harmonisation": af_harmonisation,
+        "af_swapped_formula": af_swapped_formula,
         "af_output_field": str(output_fields["af"]),
         "info_source": info_source_label,
         "info_input_column": info_column,

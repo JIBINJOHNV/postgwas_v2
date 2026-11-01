@@ -447,8 +447,10 @@ def _attach_external_eaf_to_matches(
     external_eaf_frame: pl.DataFrame,
     external_eaf_mapping,
     policies,
+    *,
+    replacement_selected: bool = False,
 ) -> pl.DataFrame:
-    """Reconstruct source EAF from the full pre-normalisation allele pair."""
+    """Attach reference AF expectations using the full original allele pair."""
     if external_eaf_mapping is None or not row.external_eaf_column:
         raise ValueError(
             "External EAF data require a column mapping and frequency column."
@@ -506,27 +508,34 @@ def _attach_external_eaf_to_matches(
         duplicate_non_identical_action=policies.get(
             "external_reference.non_identical_duplicate_action"
         ),
-        orientations=("direct",),
-        swapped_value="same",
+        orientations=("direct", "swap") if replacement_selected else ("direct",),
+        swapped_value="one_minus" if replacement_selected else "same",
         prefer_non_null_value=True,
         study_columns_canonical=True,
         error_type=ValueError,
         reference_label="external EAF reference used by concordance",
+        screen_frequency=False,
+        require_biallelic_swap=replacement_selected,
     )
     # Harmonisation attaches the panel value before bcftools normalises the VCF.
     # Reproduce that allele-specific lookup with the full original strings,
     # oriented to reference ALT/REF by the independently matched final VCF.
     # Looking up the final minimal VCF strings is unsafe in tandem repeats: a
     # distinct panel variant can have that literal allele pair at the same
-    # coordinate. Convert the selected ALT frequency back to the source effect
-    # allele; the normal concordance step then independently returns it to final
-    # VCF ALT orientation and can detect an exported AF discrepancy.
-    return joined.with_columns(
-        pl.when(pl.col("_effect_is_alt"))
-        .then(pl.col(external_vcf_af))
-        .otherwise(1.0 - pl.col(external_vcf_af))
-        .alias("input_af")
-    ).drop(
+    # coordinate. Replacement expectations stay explicitly ALT-aligned; the
+    # original input MAF is never rewritten as a synthetic source EAF. Ordinary
+    # external sources retain their existing source-EAF reconstruction contract.
+    updates = [pl.col("input_af").alias("input_af_original")]
+    if replacement_selected:
+        updates.append(pl.col(external_vcf_af).alias("reference_expected_alt_af"))
+    else:
+        updates.append(
+            pl.when(pl.col("_effect_is_alt"))
+            .then(pl.col(external_vcf_af))
+            .otherwise(1.0 - pl.col(external_vcf_af))
+            .alias("input_af")
+        )
+    return joined.with_columns(updates).drop(
         orientation_column,
         external_vcf_af,
         reference_alt,
@@ -1002,6 +1011,7 @@ def _position_diagnostics(
     unmatched_vcf: pl.DataFrame,
     *,
     settings,
+    compare_frequency: bool = True,
 ) -> tuple[
     pl.DataFrame,
     pl.DataFrame,
@@ -1120,7 +1130,7 @@ def _position_diagnostics(
     position_pairs = _metric_columns(
         position_pairs,
         "allele_frequency",
-        pl.col("_position_expected_af"),
+        pl.col("_position_expected_af") if compare_frequency else pl.lit(None, dtype=pl.Float64),
         pl.col("observed_frequency"),
         orientation_unknown,
         settings.allele_frequency,
@@ -1530,6 +1540,7 @@ def compare_input_partition(
     se_scale: str | None = None,
     p_value_type: str,
     eaf_is_maf: bool | None,
+    input_eaf_is_maf: bool | None = None,
     strand_consensus: str | None = None,
     settings,
     policies,
@@ -1542,7 +1553,8 @@ def compare_input_partition(
     input_table = prepare_input_table(
         input_frame, row, effect_type=effect_type, se_scale=se_scale,
         p_value_type=p_value_type,
-        eaf_is_maf=eaf_is_maf, settings=settings, policies=policies,
+        eaf_is_maf=input_eaf_is_maf if input_eaf_is_maf is not None else eaf_is_maf,
+        settings=settings, policies=policies,
     )
     vcf_table = prepare_vcf_table(vcf_frame, policies)
     if strand_action_frame is not None:
@@ -1571,7 +1583,8 @@ def compare_input_partition(
             duplicate_report_frame, row,
             effect_type=effect_type, se_scale=se_scale,
             p_value_type=p_value_type,
-            eaf_is_maf=eaf_is_maf, settings=settings, policies=policies,
+            eaf_is_maf=input_eaf_is_maf if input_eaf_is_maf is not None else eaf_is_maf,
+            settings=settings, policies=policies,
         )
         input_unique, duplicate_input = _apply_duplicate_report(
             input_eligible, prepared_report,
@@ -1648,6 +1661,14 @@ def compare_input_partition(
         palindromic_effect_is_alt
     ).otherwise(listed_effect_is_alt)
     matched = matched.with_columns(effect_is_alt.alias("_effect_is_alt"))
+    # These are resolved semantic decisions, not the provisional MAF-like
+    # screen. Accepted study EAF is False/False; ordinary external EAF is
+    # None/False. Only an original MAF with selected EAF uses replacement lookup.
+    replacement_selected = (
+        external_eaf_frame is not None
+        and input_eaf_is_maf is True
+        and eaf_is_maf is False
+    )
     if external_eaf_frame is not None:
         matched = _attach_external_eaf_to_matches(
             matched,
@@ -1655,6 +1676,7 @@ def compare_input_partition(
             external_eaf_frame,
             external_eaf_mapping,
             policies,
+            replacement_selected=replacement_selected,
         )
 
     if global_palindromic_resolved:
@@ -1719,7 +1741,11 @@ def compare_input_partition(
         pl.col("input_se"), pl.col("vcf_se"), pl.lit(True),
         settings.standard_error,
     )
-    if eaf_is_maf is True:
+    if replacement_selected:
+        expected_af = pl.col("reference_expected_alt_af")
+        observed_af = pl.col("vcf_af")
+        af_orientation = pl.col("orientation_comparable")
+    elif eaf_is_maf is True:
         expected_af = pl.min_horizontal(pl.col("input_af"), 1.0 - pl.col("input_af"))
         observed_af = pl.min_horizontal(pl.col("vcf_af"), 1.0 - pl.col("vcf_af"))
         af_orientation = pl.lit(True)
@@ -1780,6 +1806,9 @@ def compare_input_partition(
         unmatched_unique,
         valid_vcf_only,
         settings=settings,
+        # An unmatched allele pair cannot establish the selected reference AF;
+        # its original study MAF is provenance, not the output expectation.
+        compare_frequency=not (external_eaf_frame is not None and input_eaf_is_maf is True),
     )
     unmatched_unique = unmatched_unique.with_columns(
         pl.lit("no_coordinate_and_allele_match").alias("not_retained_reason")
@@ -1934,6 +1963,7 @@ def compare_input_to_vcf(
     se_scale: str | None = None,
     p_value_type: str,
     eaf_is_maf: bool | None,
+    input_eaf_is_maf: bool | None = None,
     strand_consensus: str | None = None,
     settings,
     policies,
@@ -1947,6 +1977,7 @@ def compare_input_to_vcf(
         input_frame, vcf_frame, row,
         effect_type=effect_type, se_scale=se_scale, p_value_type=p_value_type,
         eaf_is_maf=eaf_is_maf, strand_consensus=strand_consensus,
+        input_eaf_is_maf=input_eaf_is_maf,
         settings=settings, policies=policies,
         external_eaf_frame=external_eaf_frame,
         external_eaf_mapping=external_eaf_mapping,

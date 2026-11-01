@@ -21,6 +21,7 @@ from postgwas.core.pipeline_logging import _elapsed
 from postgwas.modules.harmonisation.report_steps import (
     chromosome_steps, dataset_steps, post_merge_steps, summarise_chromosome_evidence,
 )
+from postgwas.modules.harmonisation.study_properties import selected_eaf_replacement
 
 
 _STATUS_STYLES = {
@@ -287,6 +288,8 @@ def _decision_section(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         ("Strand consensus", record.get("strand_consensus")),
         ("Strand consensus support", _fraction(strand_consensus.get("dominant_fraction"))),
         ("Initial MAF suspicion", decisions.get("eaf_is_maf_initial")),
+        ("Original input frequency", decisions.get("eaf_input_interpretation")),
+        ("Selected frequency source", decisions.get("eaf_selected_source")),
         ("Final frequency interpretation", decisions.get("frequency_type")),
     )
     return _section(
@@ -384,6 +387,7 @@ def _population_comparison_table(population: Mapping[str, Any], *, compact: bool
 
 def _frequency_section(record: Mapping[str, Any], manifest: Mapping[str, Any]) -> str:
     population = manifest.get("population_frequency_qc") or {}
+    replacement_selected = ((manifest.get("dataset") or {}).get("study_decisions") or {}).get("eaf_selected_source") == "replacement_reference"
     rows = (
         ("Frequency type", record.get("frequency_type")),
         ("Most similar reference population", record.get("closest_population")),
@@ -393,7 +397,7 @@ def _frequency_section(record: Mapping[str, Any], manifest: Mapping[str, Any]) -
         ("Concordance percentage", record.get("af_concordance_percent")),
         ("Mismatched variants", record.get("af_mismatched_variants")),
         ("Mismatch percentage", record.get("af_mismatch_percent")),
-        ("Missing study AF", record.get("study_af_missing")),
+        ("Missing selected output AF" if replacement_selected else "Missing study AF", record.get("study_af_missing")),
         ("Missing reference AF", record.get("reference_af_missing")),
         ("Absolute-difference cutoff", record.get("af_difference_cutoff")),
         ("Population-frequency QC status", population.get("status")),
@@ -867,6 +871,7 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
     consensus = decisions.get("strand_consensus") or {}
     source = manifest.get("config") or {}
     provenance = manifest.get("vcf_provenance") or {}
+    replacement = selected_eaf_replacement(decisions)
     ptype = record.get("p_value_type")
     reference_checks = decisions.get("eaf_reference_decisions")
     if (decisions.get("eaf_is_maf_initial") is False and isinstance(reference_checks, Mapping)
@@ -882,9 +887,18 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
         ("P-value harmonisation", {"raw": "Raw probability scale retained; range policies still apply", "neglog10": "−log10(P) converted to raw P; range policies still apply"}.get(ptype)),
         ("Final frequency interpretation", _text(record.get("frequency_type")) + " · " + _decision_source(record.get("frequency_type_source"))),
         ("Initially MAF-like", decisions.get("eaf_is_maf_initial")),
+        ("Original input frequency", decisions.get("eaf_input_interpretation")),
         ("Frequency reference-check outcomes", reference_checks),
         ("P-value VCF representation", provenance.get("pvalue_vcf_formula")),
     ]
+    frequency_validation = decisions.get("eaf_reference_validation") or {}
+    if frequency_validation.get("reference_effect_allele_minor_fraction") is not None:
+        rows.append((
+            "Reference frequency of listed effect allele ≤ 0.5",
+            _fraction(frequency_validation["reference_effect_allele_minor_fraction"])
+            + " of " + _text(frequency_validation.get("comparable_variants"))
+            + " comparable non-palindromic pairs (ties included)",
+        ))
     strand = [
         ("Strand reference", _text(record.get("strand_reference_panel")) + " / " + _text(record.get("strand_reference_population"))),
         ("Study strand consensus", record.get("strand_consensus")),
@@ -902,10 +916,25 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
         ("Total removed at strand alignment", "strand_removed_total"),
     ))
     frequency = evidence.get("frequency") or {}
+    if replacement is not None:
+        frequency_source = "reference proxy · " + replacement["column"]
+        reference_file = replacement["file"]
+        reference_column = replacement["column"]
+        input_frequency = decisions.get("eaf_evidence") or {}
+        strand.extend([
+            ("Original input frequencies usable for evidence", input_frequency.get("usable")),
+            ("Original input frequencies excluded from evidence", input_frequency.get("unusable")),
+        ])
+    else:
+        frequency_source = _text(decisions.get("eaf_provenance")) + " · " + _text(source.get("eaf_col") or source.get("eafcolumn"))
+        reference_file = source.get("eaffile") or ("Not used" if decisions.get("eaf_provenance") == "study_supplied" else None)
+        reference_column = source.get("eafcolumn") if source.get("eaffile") else ("Not used" if decisions.get("eaf_provenance") == "study_supplied" else None)
     strand.extend([
-        ("EAF source", _text(decisions.get("eaf_provenance")) + " · " + _text(source.get("eaf_col") or source.get("eafcolumn"))),
-        ("External EAF file / template", source.get("eaffile") if source.get("eaffile") else "Not used" if decisions.get("eaf_provenance") == "study_supplied" else None),
-        ("External EAF column", source.get("eafcolumn") if source.get("eaffile") else "Not used" if decisions.get("eaf_provenance") == "study_supplied" else None),
+        ("EAF source", frequency_source),
+        ("External EAF file / template", reference_file),
+        ("External EAF column", reference_column),
+        ("Original study frequency column", source.get("eaf_col")),
+        ("Reference EAF values retained", _evidence_count(frequency, "eaf_replacement_rows")),
         ("Non-palindromic AF comparisons", _evidence_count(frequency, "strand_non_palindromic_af_comparable")),
         ("Non-palindromic AF disagreements", _evidence_count(frequency, "strand_non_palindromic_af_discordant")),
         ("Non-palindromic disagreement action", _evidence_sources(frequency, "strand_af_discordance_action")),
@@ -1021,6 +1050,7 @@ def _overview_export(record: Mapping, manifest: Mapping, evidence: Mapping) -> s
 
 def _overview_final_qc(record: Mapping, manifest: Mapping) -> list[tuple[str, str, int]]:
     population = manifest.get("population_frequency_qc") or {}
+    replacement_selected = ((manifest.get("dataset") or {}).get("study_decisions") or {}).get("eaf_selected_source") == "replacement_reference"
     selected = (population.get("populations") or {}).get(record.get("closest_population")) or {}
     assessment = manifest.get("qc_assessment") or {}
     detail = (manifest.get("report_context") or {}).get("qc_assessment") or {}
@@ -1032,7 +1062,7 @@ def _overview_final_qc(record: Mapping, manifest: Mapping) -> list[tuple[str, st
         ("AF agreement criterion", "Absolute AF difference ≤ " + _text(record.get("af_difference_cutoff"))),
         ("Concordant AF", _ratio(record.get("af_concordant_variants"), record.get("af_comparable_variants"), "comparable variants")),
         ("Discordant AF", _ratio(record.get("af_mismatched_variants"), record.get("af_comparable_variants"), "comparable variants")),
-        ("Missing study AF", _ratio(record.get("study_af_missing"), record.get("final_vcf_variants"), "assessed VCF records")),
+        ("Missing selected output AF" if replacement_selected else "Missing study AF", _ratio(record.get("study_af_missing"), record.get("final_vcf_variants"), "assessed VCF records")),
         ("Missing reference AF", _ratio(record.get("reference_af_missing"), record.get("final_vcf_variants"), "assessed VCF records")),
         ("Most similar reference population", record.get("closest_population")),
         ("Reference-population AF correlation", selected.get("pearson_correlation")),

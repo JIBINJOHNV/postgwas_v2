@@ -112,7 +112,7 @@ def resolve_screen_settings(
     command: str,
     arguments: Sequence[str],
 ) -> ScreenSettings | None:
-    """Resolve screen settings before importing or running a scientific module."""
+    """Resolve presentation and effective run settings before scientific execution."""
     if (
         command in _NON_SCIENTIFIC_COMMANDS
         or not arguments
@@ -137,11 +137,23 @@ def resolve_screen_settings(
             module_output = None
         else:
             canonical_module = canonical_module_name(command)
-            configuration = load_run_configuration_for_module(
-                canonical_module,
-                config_file,
-                global_overrides=global_overrides,
+            from postgwas.pipeline.registry import REGISTRY, resolve_reference
+
+            specification = REGISTRY.commands().get(command)
+            resolver = (
+                specification.direct_configuration_resolver
+                if specification is not None else None
             )
+            if resolver is not None:
+                # Conditional schema requirements must see explicit CLI values
+                # before this configuration determines checkpoint eligibility.
+                configuration = resolve_reference(resolver)(arguments)
+            else:
+                configuration = load_run_configuration_for_module(
+                    canonical_module,
+                    config_file,
+                    global_overrides=global_overrides,
+                )
             module = getattr(configuration.modules, canonical_module)
             module_output = getattr(module, "output_directory", None)
         resolved_configuration = configuration

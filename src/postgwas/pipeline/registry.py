@@ -51,6 +51,8 @@ class ModuleSpec:
     direct_checkpoint: Literal[
         "orchestrated", "native", "not_applicable"
     ] = "orchestrated"
+    direct_configuration_resolver: str | None = None
+    direct_input_discovery: str | None = None
 
 
 def _options(*names: str) -> tuple[RequiredOption, ...]:
@@ -240,6 +242,8 @@ MODULES = (
         "harmonisation",
         "Standardise raw summary statistics and create GWAS-VCF artifacts.",
         cli_entrypoint="postgwas.modules.harmonisation.cli:main",
+        direct_configuration_resolver="postgwas.modules.harmonisation.cli:resolve_harmonisation_configuration",
+        direct_input_discovery="postgwas.modules.harmonisation.cli:harmonisation_checkpoint_inputs",
         pipeline_enabled=False,
         unavailable_reason="full-pipeline adapter is not implemented; use `postgwas harmonisation`",
     ),

@@ -53,6 +53,8 @@ from typing import Any, Dict, Optional, Tuple
 import polars as pl
 
 from postgwas.core.paths import configured_output_path
+from postgwas.core.errors import MissingRequiredArgumentsError
+from postgwas.core.required_arguments import RequiredArgument, require_resolved_arguments
 
 from postgwas.core.values import (
     format_count,
@@ -155,7 +157,7 @@ class StudyAlleleFrequencyError(AlleleFrequencyError):
 
 def validate_study_allele_frequency(
     df, sample_columns, study_decisions, resource_maps, reference_mapping,
-    policies=None, logger=None,
+    policies=None, logger=None, *, eaf_replacement_file=None, eaf_replacement_column=None,
 ):
     """Return the AF decision and study frame with reusable reference matches.
 
@@ -168,11 +170,24 @@ def validate_study_allele_frequency(
     pol = resolve_policies(policies)
     emit = active_context(logger)
     decisions = dict(study_decisions)
+    replacement_file = optional_text(eaf_replacement_file)
+    replacement_column = optional_text(eaf_replacement_column)
+    replacement_requirements = [
+        RequiredArgument("--eaf-replacement-file", "modules.harmonisation.eaf_replacement_file", replacement_file),
+        RequiredArgument("--eaf-replacement-column", "modules.harmonisation.eaf_replacement_column", replacement_column),
+    ]
+    if replacement_file is not None or replacement_column is not None:
+        try:
+            require_resolved_arguments(replacement_requirements)
+        except MissingRequiredArgumentsError as exc:
+            raise StudyAlleleFrequencyError(str(exc)) from exc
     if any(key in df.columns for key in (PREPARED_MATCHES_COLUMN, PREPARED_INPUT_COLUMN)):
         raise StudyAlleleFrequencyError("Study input contains reserved reference-preparation columns.")
     column = decisions.get("eaf_column")
     initial = decisions.get("eaf_is_maf")
     evidence = {"status": "not_applicable", "decision_reason": "no_study_frequency"}
+    decisions["eaf_selected_source"] = "study_supplied" if column is not None else "external_eaf"
+    decisions["eaf_input_interpretation"] = "eaf" if column is not None else None
     if column is not None:
         if initial is not True and initial is not False:
             raise StudyAlleleFrequencyError(
@@ -192,6 +207,7 @@ def validate_study_allele_frequency(
                 )
                 references.setdefault(key, []).append(str(chromosome))
             pairs, prepared = [], []
+            diagnostic_excluded = 0
             prepared_references = {}
             projected = df.select([SOURCE_INPUT_ROW_COLUMN] + [
                 sample_columns[key + "_col"] for key in ("chr", "pos", "ea", "oa")
@@ -208,6 +224,7 @@ def validate_study_allele_frequency(
                     sample_columns, column, path, population, reference_mapping,
                     pol, warn=emit.warn,
                 )
+                diagnostic_excluded += metadata["diagnostic_statistics"]["excluded_non_biallelic_rows"]
                 pairs.append(paired)
                 prepared.append(matches)
                 prepared_references.update({chromosome: metadata for chromosome in chromosomes})
@@ -217,53 +234,56 @@ def validate_study_allele_frequency(
                     "__expected_effect_frequency": pl.Float64,
                 }
             )
-            study = pl.col("__study_frequency")
-            reference = pl.col("__expected_effect_frequency")
-            method = str(pol.get("eaf.maf_reference_correlation_method"))
-            statistics = paired.select([
-                pl.corr(study, reference, method=method).alias("correlation"),
-                (study - reference).abs().mean().alias("mean_absolute_difference"),
-                (reference <= 0.5).mean().alias("reference_effect_allele_minor_fraction"),
-            ]).to_dicts()[0]
+            interpretation, comparison = _compare_frequency_pairs(
+                paired, "__study_frequency", "__expected_effect_frequency", pol, emit,
+                accept_direct_eaf=True,
+            )
+            reason = comparison["direct_eaf_acceptance_reason"]
             evidence = {
-                "status": "failed",
-                "comparable_variants": paired.height,
-                "minimum_overlap": int(pol.get("eaf.maf_reference_min_overlap")),
-                "correlation_method": method,
-                "minimum_correlation": float(pol.get("eaf.maf_reference_min_correlation")),
-                "maximum_mean_absolute_difference": float(
-                    pol.get("eaf.maf_reference_max_mean_absolute_difference")
-                ),
-                **{
-                    key: float(value) if value is not None and math.isfinite(value) else None
-                    for key, value in statistics.items()
-                },
+                **comparison,
+                "status": "passed" if comparison["direct_eaf_accepted"] else "failed",
+                "correlation_method": comparison["maf_correlation_method"],
+                "minimum_correlation": comparison["minimum_maf_correlation"],
+                "maximum_mean_absolute_difference": comparison["maximum_mean_absolute_maf_difference"],
+                "correlation": comparison["direct_eaf_correlation"],
+                "mean_absolute_difference": comparison["mean_eaf_error"],
+                "diagnostic_excluded_non_biallelic_rows": diagnostic_excluded,
+                "reference_site_membership_assumption": "the selected reference represents all alleles at each listed site",
+                "decision_reason": reason,
+                "maf_reference_decision": interpretation,
             }
-            if paired.height < evidence["minimum_overlap"]:
-                reason = "insufficient_overlap"
-            elif evidence["correlation"] is None:
-                reason = "correlation_unavailable"
-            elif evidence["correlation"] < evidence["minimum_correlation"]:
-                reason = "correlation_below_minimum"
-            elif (
-                evidence["mean_absolute_difference"] is None
-                or evidence["mean_absolute_difference"] > evidence["maximum_mean_absolute_difference"]
-            ):
-                reason = "mean_absolute_difference_above_maximum"
-            else:
-                reason = "allele_aligned_frequency_agreement"
-                evidence["status"] = "passed"
-            evidence["decision_reason"] = reason
+            if not comparison["direct_eaf_accepted"] and interpretation == "maf":
+                try:
+                    require_resolved_arguments(replacement_requirements)
+                except MissingRequiredArgumentsError as exc:
+                    message = ("Input MAF supported, not aligned to the listed effect allele "
+                               "(direct EAF agreement failed: %s). " % reason) + str(exc)
+                    emit.error(message)
+                    raise StudyAlleleFrequencyError(message) from exc
+                evidence.update(status="replacement_selected", decision_reason="maf_interpretation_supported")
+                decisions.update(
+                    eaf_selected_source="replacement_reference", eaf_input_interpretation="maf",
+                    eaf_replacement={"file": replacement_file, "column": replacement_column},
+                )
+                emit.info("Input MAF supported by the pooled reference comparison; selecting the supplied reference EAF. "
+                          "This is a whole-column QC inference, not proof of every row's provenance.")
+            elif comparison["direct_eaf_accepted"]:
+                emit.info("Study EAF source retained: allele-aligned reference agreement passed. "
+                          "A MAF-like distribution does not invalidate EAF. Reference frequency of the original "
+                          "listed effect allele at or below 0.5: %s of %s diagnostic pairs."
+                          % (_fmt_pct(evidence["reference_effect_allele_minor_fraction"]), paired.height))
+            emit.info("Frequency diagnostic exclusions: %s study rows at non-biallelic or unsupported reference sites; "
+                      "source rows and complete orientation candidates were retained." % diagnostic_excluded)
             emit.decide("Whole-study AF acceptance", evidence, evidence["status"])
-            if evidence["status"] != "passed":
+            if evidence["status"] not in ("passed", "replacement_selected"):
                 message = (
-                    "Study frequency column '%s' cannot be accepted as EAF: %s. "
+                    "Study frequency column '%s' cannot be accepted as EAF: %s; MAF interpretation is inconclusive. "
                     "Comparable non-palindromic variants: %s (minimum %s); %s correlation: %s "
                     "(minimum %s); mean absolute allele-aligned AF difference: %s (maximum %s). "
                     "No AF values were changed. Check the study AF/allele mapping, reference "
                     "population and genome build, or supply a valid external EAF source. "
                     "This dataset stopped before chromosome analysis; no dataset retry will be attempted."
-                    % (column, reason, paired.height, evidence["minimum_overlap"], method,
+                    % (column, reason, paired.height, evidence["minimum_overlap"], evidence["correlation_method"],
                        _fmt_metric(evidence["correlation"]), evidence["minimum_correlation"],
                        _fmt_metric(evidence["mean_absolute_difference"]),
                        evidence["maximum_mean_absolute_difference"])
@@ -288,8 +308,10 @@ def validate_study_allele_frequency(
             )
         decisions["eaf_is_maf_initial"] = initial
         decisions["eaf_is_maf_initial_source"] = decisions.get("eaf_is_maf_source")
-        decisions["eaf_is_maf"] = False
+        replacement_selected = decisions["eaf_selected_source"] == "replacement_reference"
+        decisions["eaf_is_maf"] = replacement_selected
         decisions["eaf_is_maf_source"] = (
+            "dataset_reference_maf_support" if replacement_selected else
             "dataset_reference_concordance" if initial else "study_level_statistic"
         )
     decisions["eaf_reference_validation"] = evidence
@@ -325,6 +347,24 @@ def _maf_reference_suitability_text(evidence: Dict[str, Any]) -> str:
                 "maximum_mean_absolute_maf_difference"
             )),
         )
+    )
+
+
+def same_frequency_reference_source(path, column, mapping, reference_path, reference_column, reference_mapping):
+    """Identify one declared AF source across aliases without comparing frequencies."""
+    if (optional_text(path) is None or optional_text(reference_path) is None
+            or optional_text(column) != optional_text(reference_column)
+            or mapping is None or reference_mapping is None):
+        return False
+    try:
+        same_file = os.path.samefile(path, reference_path)
+    except OSError:
+        same_file = os.path.realpath(path) == os.path.realpath(reference_path)
+    delimiter, reference_delimiter = mapping.get("delimiter"), reference_mapping.get("delimiter")
+    return (
+        same_file
+        and (delimiter == reference_delimiter or "auto" in (delimiter, reference_delimiter))
+        and all(mapping.get(key) == reference_mapping.get(key) for key in ("chr", "pos", "a1", "a2"))
     )
 
 
@@ -722,6 +762,93 @@ def validate_allele_frequency(
 # -------------------------------------------------------
 # 7. Confirm a MAF-like frequency column against default EAF
 # -------------------------------------------------------
+def _compare_frequency_pairs(
+    paired, study_column, reference_column, policies, emit, *, accept_direct_eaf=False,
+):
+    """Compare one eligible paired set once, retaining original EA direction.
+
+    Folding as min(AF, 1-AF) is an allele-direction invariant for biallelic
+    evidence. It cannot identify EAF. Whole-study callers first preserve the
+    established unfolded EAF agreement contract, including minor effect alleles.
+    Other callers retain the existing suitability and directional-margin rules.
+    """
+    minimum = int(policies.get("eaf.maf_reference_min_overlap"))
+    method = str(policies.get("eaf.maf_reference_correlation_method"))
+    minimum_correlation = float(policies.get("eaf.maf_reference_min_correlation"))
+    maximum_difference = float(policies.get("eaf.maf_reference_max_mean_absolute_difference"))
+    minor_cutoff = float(policies.get("eaf.reference_minor_fraction_cutoff"))
+    margin = float(policies.get("eaf.maf_reference_error_margin"))
+    study = pl.col(study_column).cast(pl.Float64, strict=False)
+    reference = pl.col(reference_column).cast(pl.Float64, strict=False)
+    study_maf = pl.min_horizontal(study, 1.0 - study)
+    reference_maf = pl.min_horizontal(reference, 1.0 - reference)
+    measured = paired.select([
+        pl.corr(study, reference, method=method).alias("direct_eaf_correlation"),
+        pl.corr(study_maf, reference_maf, method=method).alias("maf_correlation"),
+        (study_maf - reference_maf).abs().mean().alias("mean_absolute_maf_difference"),
+        (study - reference).abs().mean().alias("mean_eaf_error"),
+        (study - reference_maf).abs().mean().alias("mean_maf_error"),
+        (reference <= 0.5).mean().alias("reference_effect_allele_minor_fraction"),
+    ]).to_dicts()[0]
+    stats = {
+        "comparable_variants": paired.height, "minimum_overlap": minimum,
+        "maf_correlation_method": method, "minimum_maf_correlation": minimum_correlation,
+        "maximum_mean_absolute_maf_difference": maximum_difference,
+        "reference_minor_fraction_cutoff": minor_cutoff, "minimum_error_margin": margin,
+        **{key: float(value) if value is not None and math.isfinite(value) else None
+           for key, value in measured.items()},
+    }
+    eaf_error, maf_error = stats["mean_eaf_error"], stats["mean_maf_error"]
+    stats["absolute_error_difference"] = (
+        abs(eaf_error - maf_error) if eaf_error is not None and maf_error is not None else None
+    )
+    if paired.height < minimum:
+        direct_reason = "insufficient_overlap"
+    elif stats["direct_eaf_correlation"] is None:
+        direct_reason = "correlation_unavailable"
+    elif stats["direct_eaf_correlation"] < minimum_correlation:
+        direct_reason = "correlation_below_minimum"
+    elif eaf_error is None or eaf_error > maximum_difference:
+        direct_reason = "mean_absolute_difference_above_maximum"
+    else:
+        direct_reason = "allele_aligned_frequency_agreement"
+    stats["direct_eaf_acceptance_reason"] = direct_reason
+    stats["direct_eaf_accepted"] = direct_reason == "allele_aligned_frequency_agreement"
+    if accept_direct_eaf and stats["direct_eaf_accepted"]:
+        stats.update(reference_suitability_status="not_required",
+                     reference_suitability_reason="direct_eaf_agreement",
+                     decision_reason=direct_reason)
+        return "eaf", stats
+    if paired.height < minimum:
+        suitability_reason = "insufficient_overlap"
+    elif stats["maf_correlation"] is None:
+        suitability_reason = "maf_correlation_unavailable"
+    elif stats["maf_correlation"] < minimum_correlation:
+        suitability_reason = "maf_correlation_below_minimum"
+    elif (stats["mean_absolute_maf_difference"] is None
+          or stats["mean_absolute_maf_difference"] > maximum_difference):
+        suitability_reason = "maf_difference_above_maximum"
+    else:
+        suitability_reason = "maf_correlation_and_difference_passed"
+    suitable = suitability_reason == "maf_correlation_and_difference_passed"
+    stats["reference_suitability_status"] = "suitable" if suitable else "inconclusive"
+    stats["reference_suitability_reason"] = suitability_reason
+    if not suitable:
+        decision, reason = "inconclusive", suitability_reason
+    elif stats["reference_effect_allele_minor_fraction"] > minor_cutoff:
+        decision, reason = "inconclusive", "reference_effect_allele_mostly_minor"
+    elif eaf_error + margin < maf_error:
+        decision, reason = "eaf", "eaf_error_lower_by_required_margin"
+    elif maf_error + margin < eaf_error:
+        decision, reason = "maf", "maf_error_lower_by_required_margin"
+    else:
+        decision, reason = "inconclusive", "error_difference_below_required_margin"
+    stats["decision_reason"] = reason
+    emit.decide("Default EAF reference suitability", stats,
+                "suitable for directional confirmation" if suitable else "inconclusive")
+    return decision, stats
+
+
 def confirm_eaf_with_reference(
     df: pl.DataFrame,
     input_af_col: str,
@@ -752,22 +879,6 @@ def confirm_eaf_with_reference(
     """
     emit = active_context(logger, ctx, df.height)
     resolved = resolve_policies(policies)
-    minimum = int(resolved.get("eaf.maf_reference_min_overlap"))
-    correlation_method = str(
-        resolved.get("eaf.maf_reference_correlation_method")
-    )
-    minimum_maf_correlation = float(
-        resolved.get("eaf.maf_reference_min_correlation")
-    )
-    maximum_maf_difference = float(
-        resolved.get("eaf.maf_reference_max_mean_absolute_difference")
-    )
-    reference_minor_cutoff = float(
-        resolved.get("eaf.reference_minor_fraction_cutoff")
-    )
-    minimum_error_margin = float(
-        resolved.get("eaf.maf_reference_error_margin")
-    )
     keys = [std_cols[name] for name in ("chr", "pos", "ea", "oa")]
     palindromic = palindromic_snp_expression(
         pl.col(std_cols["ea"]), pl.col(std_cols["oa"])
@@ -834,26 +945,6 @@ def confirm_eaf_with_reference(
         )
     matched = merged.filter(pl.col(reference_col).is_not_null())
 
-    stats = {
-        "direct_matches": merge_stats["direct_match_rows"],
-        "swapped_matches": merge_stats["flip_match_rows"],
-        "comparable_variants": matched.height,
-        "minimum_overlap": minimum,
-        "maf_correlation_method": correlation_method,
-        "maf_correlation": None,
-        "minimum_maf_correlation": minimum_maf_correlation,
-        "mean_absolute_maf_difference": None,
-        "maximum_mean_absolute_maf_difference": maximum_maf_difference,
-        "reference_suitability_status": "not_evaluated",
-        "reference_suitability_reason": None,
-        "reference_effect_allele_minor_fraction": None,
-        "reference_minor_fraction_cutoff": reference_minor_cutoff,
-        "mean_eaf_error": None,
-        "mean_maf_error": None,
-        "absolute_error_difference": None,
-        "minimum_error_margin": minimum_error_margin,
-        "decision_reason": None,
-    }
     reference_value = pl.col(reference_col).cast(pl.Float64, strict=False)
     invalid_reference = int(matched.select(
         (
@@ -868,117 +959,14 @@ def confirm_eaf_with_reference(
             "0 to 1 in column '%s'."
             % (reference_file, _fmt_int(invalid_reference), population_col)
         )
-    if matched.height < minimum:
-        stats["decision_reason"] = "insufficient_overlap"
-        stats["reference_suitability_status"] = "inconclusive"
-        stats["reference_suitability_reason"] = "insufficient_overlap"
-        emit.warn(
-            "The MAF-like column '%s' had only %s non-palindromic matches to the default EAF table; "
-            "%s are required by eaf.maf_reference_min_overlap."
-            % (input_af_col, _fmt_int(matched.height), _fmt_int(minimum))
-        )
-        return "inconclusive", stats
-
-    study_value = pl.col("_study_af").cast(pl.Float64, strict=False)
-    study_maf = pl.min_horizontal(study_value, 1.0 - study_value)
-    reference_maf = pl.min_horizontal(
-        reference_value, 1.0 - reference_value
+    decision, stats = _compare_frequency_pairs(
+        matched, "_study_af", reference_col, resolved, emit,
     )
-    comparison = matched.select([
-        pl.corr(
-            study_maf, reference_maf, method=correlation_method
-        ).alias("maf_correlation"),
-        (study_maf - reference_maf).abs().mean().alias("maf_difference"),
-        (study_value - reference_value).abs().mean().alias("eaf"),
-        (
-            study_value - reference_maf
-        ).abs().mean().alias("maf"),
-        (reference_value <= 0.5).mean().alias("minor_fraction"),
-    ]).to_dicts()[0]
-
-    eaf_error = float(comparison["eaf"])
-    maf_error = float(comparison["maf"])
-    maf_difference = float(comparison["maf_difference"])
-    correlation_value = comparison["maf_correlation"]
-    maf_correlation = None
-    if correlation_value is not None:
-        candidate_correlation = float(correlation_value)
-        if math.isfinite(candidate_correlation):
-            maf_correlation = candidate_correlation
-    error_difference = abs(eaf_error - maf_error)
-    reference_minor_fraction = float(comparison["minor_fraction"])
-    stats["maf_correlation"] = maf_correlation
-    stats["mean_absolute_maf_difference"] = maf_difference
-    stats["mean_eaf_error"] = eaf_error
-    stats["mean_maf_error"] = maf_error
-    stats["absolute_error_difference"] = error_difference
-    stats["reference_effect_allele_minor_fraction"] = reference_minor_fraction
-
-    if maf_correlation is None:
-        suitability_reason = "maf_correlation_unavailable"
-    elif maf_correlation < minimum_maf_correlation:
-        suitability_reason = "maf_correlation_below_minimum"
-    elif maf_difference > maximum_maf_difference:
-        suitability_reason = "maf_difference_above_maximum"
-    else:
-        suitability_reason = "maf_correlation_and_difference_passed"
-    reference_suitable = (
-        suitability_reason == "maf_correlation_and_difference_passed"
+    stats.update(
+        direct_matches=merge_stats["direct_match_rows"],
+        swapped_matches=merge_stats["flip_match_rows"],
     )
-    stats["reference_suitability_status"] = (
-        "suitable" if reference_suitable else "inconclusive"
-    )
-    stats["reference_suitability_reason"] = suitability_reason
-    emit.decide(
-        "Default EAF reference suitability",
-        {
-            "non-palindromic matches": _fmt_int(matched.height),
-            "folded-MAF correlation method": correlation_method,
-            "folded-MAF correlation": _fmt_metric(maf_correlation),
-            "minimum correlation": minimum_maf_correlation,
-            "mean absolute folded-MAF difference": maf_difference,
-            "maximum mean absolute difference": maximum_maf_difference,
-        },
-        (
-            "suitable for directional MAF/EAF confirmation"
-            if reference_suitable
-            else "inconclusive; the default panel is not proven suitable"
-        ),
-    )
-    if not reference_suitable:
-        stats["decision_reason"] = suitability_reason
-        return "inconclusive", stats
-
-    if reference_minor_fraction > reference_minor_cutoff:
-        decision = "inconclusive"
-        reason = "reference_effect_allele_mostly_minor"
-    elif eaf_error + minimum_error_margin < maf_error:
-        decision = "eaf"
-        reason = "eaf_error_lower_by_required_margin"
-    elif maf_error + minimum_error_margin < eaf_error:
-        decision = "maf"
-        reason = "maf_error_lower_by_required_margin"
-    else:
-        decision = "inconclusive"
-        reason = "error_difference_below_required_margin"
-    stats["decision_reason"] = reason
-    emit.decide(
-        "MAF-like frequency column '%s'" % input_af_col,
-        {
-            "non-palindromic reference matches": _fmt_int(matched.height),
-            "mean error as EAF": eaf_error,
-            "mean error as MAF": maf_error,
-            "absolute error difference": error_difference,
-            "required error margin": minimum_error_margin,
-            "reference effect allele is minor": _fmt_pct(reference_minor_fraction),
-            "uninformative-panel cutoff": _fmt_pct(reference_minor_cutoff),
-        },
-        {
-            "eaf": "EAF aligned to the effect allele",
-            "maf": "MAF not aligned to the effect allele",
-            "inconclusive": "inconclusive; PostGWAS will not guess",
-        }[decision],
-    )
+    emit.decide("MAF-like frequency column '%s'" % input_af_col, stats, decision)
     return decision, stats
 
 
@@ -1001,6 +989,7 @@ def merge_external_allele_frequencies(
     validation_reference_col: Optional[str] = None,
     validation_reference_file: Optional[str] = None,
     validation_reference_column: Optional[str] = None,
+    declared_alt_frequency: bool = False,
 ) -> Tuple[pl.DataFrame, str, Dict[str, Any]]:
     """Take the frequency from an external panel.
 
@@ -1135,6 +1124,8 @@ def merge_external_allele_frequencies(
         error_type=AlleleFrequencyError,
         warn=emit.warn,
         reference_label="external frequency file '%s'" % load_path,
+        screen_frequency=not declared_alt_frequency,
+        require_biallelic_swap=declared_alt_frequency,
     )
     if join_stats["reference_duplicate_groups"]:
         emit.info(
@@ -1161,7 +1152,8 @@ def merge_external_allele_frequencies(
     stats["maf_reference_decision"] = "not_required"
     stats["maf_reference_validation"] = {}
     if (
-        raw_frequency_screen.get("maf_like") is True
+        not declared_alt_frequency
+        and raw_frequency_screen.get("maf_like") is True
         and validation_reference_col is not None
     ):
         if validation_reference_col not in matched_all.columns:
@@ -1581,6 +1573,12 @@ def harmonise_allele_frequency(
                    the whole study and then applied consistently to each chromosome.
     default_eaf_*  the raw chromosome REF/ALT/population-AF reference used for
                    strand orientation and independent MAF/EAF confirmation.
+
+    A selected replacement is a whole-column source decision, supported by the
+    dataset's MAF evidence. Its declared ALT frequencies govern numerical QC;
+    missing/invalid original MAF values remain unchanged as provenance and do
+    not independently reject a row with a valid replacement EAF. An invalid
+    individual input cell never activates replacement by itself.
     """
     gwas_outputname = sample_column_dict["gwas_outputname"]
     output_dir = sample_column_dict["output_folder"]
@@ -1649,6 +1647,26 @@ def harmonise_allele_frequency(
             qc_info["strand_orientation"] = strand_qc
 
             internal_eaf = optional_text(sample_column_dict.get("eaf_col"))
+            replacement_selected = (
+                isinstance(study_decision, dict)
+                and study_decision.get("eaf_selected_source") == "replacement_reference"
+            )
+            replacement = study_decision.get("eaf_replacement", {}) if replacement_selected else {}
+            if replacement_selected and (
+                study_decision.get("eaf_input_interpretation") != "maf"
+                or study_decision.get("eaf_reference_validation", {}).get("status") != "replacement_selected"
+                or study_decision.get("eaf_is_maf") is not True
+                or optional_text(replacement.get("column")) is None
+            ):
+                raise AlleleFrequencyError("Selected reference EAF replacement lacks a validated whole-study MAF decision.")
+            qc_info.update(
+                eaf_selected_source="replacement_reference" if replacement_selected else
+                "study_supplied" if internal_eaf else "external_eaf",
+                eaf_input_interpretation=(study_decision.get("eaf_input_interpretation")
+                    if isinstance(study_decision, dict) else None),
+            )
+            if replacement_selected:
+                qc_info["eaf_replacement"] = dict(replacement)
 
             if external_eaf_colmap is None:
                 raise AlleleFrequencyError(
@@ -1665,7 +1683,7 @@ def harmonise_allele_frequency(
             # ------------------------------
             # STEP 1: Internal EAF
             # ------------------------------
-            if internal_eaf and internal_eaf in df.columns:
+            if internal_eaf and internal_eaf in df.columns and not replacement_selected:
                 emit.info("The study supplies its own frequency column '%s'." % internal_eaf)
                 qc_info["eaf_provenance"] = "study_supplied"
 
@@ -1808,8 +1826,9 @@ def harmonise_allele_frequency(
                         % internal_eaf
                     )
             else:
-                qc_info["Internal_AF"] = "Absent"
-                emit.info("The study has no frequency column of its own.")
+                qc_info["Internal_AF"] = "MAF retained as input provenance" if replacement_selected else "Absent"
+                emit.info("Original input MAF retained; assigning the selected reference EAF after independent orientation."
+                          if replacement_selected else "The study has no frequency column of its own.")
 
             # ------------------------------
             # STEP 2: Dataset-supplied external source
@@ -1820,7 +1839,10 @@ def harmonise_allele_frequency(
                     "external frequency file."
                 )
 
-                external_file = optional_text(eaffile)
+                original_replacement_file = optional_text(
+                    replacement.get("resolved_files", {}).get(str(chromosome))
+                ) if replacement_selected else None
+                external_file = optional_text(eaffile) or original_replacement_file
                 if external_file is None or not os.path.exists(external_file):
                     raise AlleleFrequencyError(
                         "No usable effect-allele-frequency source remains. Provide either "
@@ -1828,39 +1850,26 @@ def harmonise_allele_frequency(
                         "external_eaf_column in the sample sheet."
                     )
                 target_file = external_file
-                target_col = optional_text(sample_column_dict.get("eafcolumn"))
+                target_col = optional_text(replacement.get("column")) if replacement_selected else optional_text(sample_column_dict.get("eafcolumn"))
                 if target_col is None:
                     raise AlleleFrequencyError("external_eaf_column is required with external_eaf_file.")
                 target_map = external_eaf_colmap
                 qc_info["external_eaf_file"] = os.path.basename(target_file)
                 qc_info["external_eaf_column"] = target_col
 
-                mapping_keys = ("chr", "pos", "a1", "a2")
-                target_delimiter = target_map.get("delimiter")
-                default_delimiter = (
-                    default_eaf_colmap.get("delimiter")
-                    if default_eaf_colmap
-                    else None
+                prepared_reference = (
+                    study_decision.get("eaf_prepared_references", {}).get(str(chromosome), {})
+                    if isinstance(study_decision, dict) else {}
                 )
-                compatible_delimiter = (
-                    target_delimiter == default_delimiter
-                    or target_delimiter == "auto"
-                    or default_delimiter == "auto"
+                default_original = prepared_reference.get("contract", {}).get("reference", {}).get("path") or default_eaf_file
+                source_identity_path = original_replacement_file or target_file
+                same_reference_file = same_frequency_reference_source(
+                    source_identity_path, target_col, target_map,
+                    default_original, target_col, target_map,
                 )
-                same_reference_file = (
-                    optional_text(default_eaf_file) is not None
-                    and os.path.realpath(target_file)
-                    == os.path.realpath(str(default_eaf_file))
-                )
-                same_reference_source = (
-                    same_reference_file
-                    and optional_text(default_eaf_column) == target_col
-                    and default_eaf_colmap is not None
-                    and compatible_delimiter
-                    and all(
-                        target_map.get(key) == default_eaf_colmap.get(key)
-                        for key in mapping_keys
-                    )
+                same_reference_source = same_frequency_reference_source(
+                    source_identity_path, target_col, target_map,
+                    default_original, default_eaf_column, default_eaf_colmap,
                 )
                 if same_reference_source:
                     if REFERENCE_AF_COLUMN not in df.columns:
@@ -1869,9 +1878,7 @@ def harmonise_allele_frequency(
                             "external EAF source is identical to the strand reference, but its "
                             "validated aligned frequency column is unavailable."
                         )
-                    raw_frequency_screen = strand_qc.get(
-                        "raw_frequency_screen"
-                    )
+                    raw_frequency_screen = {} if replacement_selected else strand_qc.get("raw_frequency_screen")
                     if not isinstance(raw_frequency_screen, dict):
                         raise AlleleFrequencyError(
                             "Internal PostGWAS execution-order error: the raw "
@@ -1997,11 +2004,12 @@ def harmonise_allele_frequency(
                         study_columns_canonical=True,
                         validation_reference_col=(
                             None
-                            if same_reference_file
+                            if same_reference_file or replacement_selected
                             else REFERENCE_AF_COLUMN
                         ),
                         validation_reference_file=default_eaf_file,
                         validation_reference_column=default_eaf_column,
+                        declared_alt_frequency=replacement_selected,
                     )
 
                 merge_stats.update(
@@ -2136,7 +2144,16 @@ def harmonise_allele_frequency(
                     logger=logger,
                     ctx=ctx,
                     rejects=rejects,
+                    study_eaf_accepted=replacement_selected,
                 )
+                if replacement_selected:
+                    # Selected output frequency has a separate column; original
+                    # MAF remains unchanged for provenance and checkpoint binding.
+                    destination = unused_column_name(target_col, cleaned_df)
+                    cleaned_df = cleaned_df.with_columns(pl.col(new_col_name).alias(destination))
+                    new_col_name = destination
+                    qc_info["eaf_replacement_source_column"] = target_col
+                    qc_info["eaf_replacement_source_file"] = original_replacement_file or target_file
 
                 validated_statistics = stats.get("final")
                 validated_values = (
@@ -2148,7 +2165,7 @@ def harmonise_allele_frequency(
                 final_df = cleaned_df
                 final_eaf_col = new_col_name
                 if qc_info["decision_source"] != "internal_eaf_rejected_inconclusive":
-                    qc_info["decision_source"] = "external_eaf"
+                    qc_info["decision_source"] = "replacement_reference" if replacement_selected else "external_eaf"
                 qc_info["eaf_provenance"] = "reference_imputed"
 
             # ------------------------------
@@ -2216,7 +2233,7 @@ def harmonise_allele_frequency(
             # the final EAF source are aligned. It must not arbitrate a column
             # that remains only provisionally accepted as possible MAF.
             frequency_is_aligned = (
-                not study_says_maf
+                replacement_selected or not study_says_maf
                 or qc_info.get("maf_reference_decision") == "eaf"
             )
             if REFERENCE_AF_COLUMN in final_df.columns and frequency_is_aligned:
@@ -2459,6 +2476,8 @@ def harmonise_allele_frequency(
                 previous_statistics=validated_statistics,
             )
             _add_prefixed_statistics(qc_info, "final_eaf", final_stats)
+            if replacement_selected:
+                qc_info["eaf_replacement_rows"] = int(final_stats["non_null_rows"])
 
             sample_column_dict["eaf_col"] = final_eaf_col
             qc_info["final_eaf_col"] = final_eaf_col

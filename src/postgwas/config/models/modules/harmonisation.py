@@ -9,6 +9,7 @@ from pydantic import Field, RootModel, field_validator, model_validator
 
 from postgwas.config.models.common import ModuleConfig, StrictModel
 from postgwas.core.paths import validate_filename_component
+from postgwas.core.required_arguments import RequiredArgument, require_resolved_arguments
 
 
 class FrequencyReferenceConfig(StrictModel):
@@ -883,6 +884,8 @@ class ConcordanceValidationConfig(StrictModel):
 class HarmonisationConfig(ModuleConfig):
     comparison_af: ComparisonAFConfig
     default_eaf: FrequencyReferenceConfig
+    eaf_replacement_file: str | None
+    eaf_replacement_column: str | None
     default_eaf_mapping: VariantReferenceMappingConfig
     reference: HarmonisationReferenceConfig
     external_eaf_mapping: VariantReferenceMappingConfig
@@ -900,6 +903,33 @@ class HarmonisationConfig(ModuleConfig):
     external_reference_staging: ExternalReferenceStagingConfig
     concordance_validation: ConcordanceValidationConfig
     policies: dict[str, Any]
+
+    @field_validator("eaf_replacement_file", "eaf_replacement_column")
+    @classmethod
+    def nonempty_replacement_value(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be empty; use null when no replacement is supplied")
+        return value
+
+    @model_validator(mode="after")
+    def complete_replacement_source(self):
+        if self.eaf_replacement_file is not None or self.eaf_replacement_column is not None:
+            require_resolved_arguments((
+                RequiredArgument(
+                    "--eaf-replacement-file",
+                    "modules.harmonisation.eaf_replacement_file",
+                    self.eaf_replacement_file,
+                ),
+                RequiredArgument(
+                    "--eaf-replacement-column",
+                    "modules.harmonisation.eaf_replacement_column",
+                    self.eaf_replacement_column,
+                ),
+            ))
+        return self
 
     @model_validator(mode="after")
     def supported_preflight_builds(self):

@@ -82,6 +82,7 @@ _OBSERVED = {
     "strand": "Study strand", "reason": "Reason", "pvalue_type": "P-value type",
     "se_scale": "SE scale", "frequency_type": "Frequency interpretation",
     "eaf_is_maf_initial": "Initial MAF suspicion", "effect_type_source": "Effect decision source",
+    "eaf_input_interpretation": "Original input frequency", "eaf_selected_source": "Selected frequency source",
     "pvalue_type_source": "P-value decision source", "action": "Configured action",
     "merge_status": "Merge outcome", "closest_population": "Most similar reference population",
     "decision_reason": "Decision explanation", "definition": "QC definition",
@@ -168,7 +169,10 @@ def _chromosome_groups(number: int, payload: Mapping, actions: list) -> list[dic
             ("palindromic_ambiguous", "Palindromic ambiguous removed"),
             ("reference_ambiguous", "Reference ambiguous removed"), ("final_variants", "Retained after strand alignment"),
         ), "Palindromic conflicts mean study-wide strand and allele-frequency evidence supported opposite orientations.")
-        fields = [("final_eaf_col", "Final EAF column"), ("strand_af_tolerance", "Maximum absolute AF difference")]
+        fields = [("final_eaf_col", "Final EAF column"), ("strand_af_tolerance", "Maximum absolute AF difference"),
+                  ("eaf_replacement_rows", "Reference EAF values retained"),
+                  ("eaf_replacement_source_column", "Replacement reference column"),
+                  ("eaf_replacement_source_file", "Replacement reference file")]
         notes = []
         for label, prefix, action_key in (
             ("Non-palindromic", "strand_non_palindromic_af", "strand_af_discordance_action"),
@@ -382,8 +386,10 @@ def summarise_chromosome_evidence(manifest: Mapping[str, Any]) -> dict:
                      "beta_computed", "se_computed", "effect_estimate_method_label", "effect_estimate_beta_formula",
                      "effect_estimate_se_formula", "effect_estimate_scale", "effect_estimate_citation", "z_source")),
         "frequency": (("strand_non_palindromic_af_comparable", "strand_non_palindromic_af_discordant",
-                       "strand_palindromic_af_comparable", "strand_palindromic_af_discordant", "missing_eaf_count", "eaf_degenerate_removed"),
-                      ("eaf_provenance", "final_eaf_col", "strand_af_discordance_action", "strand_palindromic_af_discordance_action")),
+                       "strand_palindromic_af_comparable", "strand_palindromic_af_discordant", "missing_eaf_count", "eaf_degenerate_removed",
+                       "eaf_replacement_rows"),
+                      ("eaf_provenance", "final_eaf_col", "strand_af_discordance_action", "strand_palindromic_af_discordance_action",
+                       "eaf_replacement_source_column", "eaf_replacement_source_file")),
         "pvalues": (("variants_with_pvalues_clipped_low", "variants_with_pvalues_clipped_high", "variants_with_zero_pvalues_replaced",
                      "pvalues_preserved_below_float64", "variants_with_null_pvalues_removed", "variants_with_lt0_pvalues_removed",
                      "variants_with_non_finite_pvalues_removed", "variants_with_gt1_05_pvalues_removed"),

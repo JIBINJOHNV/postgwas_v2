@@ -406,6 +406,53 @@ the run manifest supplies the forward/reverse study consensus that harmonisation
 used to orient them. A missing consensus is reported and never replaced by an
 allele-frequency strand guess; SE remains directly comparable.
 
+When the whole-study comparison supports the original frequency column as MAF
+and selects an explicitly supplied replacement reference, the sample-sheet
+mapping and original MAF values remain provenance. The run manifest records
+`eaf_input_interpretation: maf`, `eaf_selected_source: replacement_reference`,
+and `eaf_replacement` with the selected file template, value column, and original
+resolved chromosome files. Only completed chromosomes with validated
+`reference_imputed` frequency provenance establish the final EAF output type.
+The report labels this output as a reference proxy and shows recorded replacement
+counts with their chromosome coverage; it does not describe the panel values as
+study-measured EAF.
+
+Replacement selects one source for the whole output frequency column after
+supported whole-study MAF evidence; an isolated bad input cell never triggers
+it. Numerical and missing-value QC then applies to the selected reference EAF.
+Original MAF cells, including missing or invalid values excluded from the
+classification evidence, remain preserved. A row with missing original MAF can
+remain when its selected reference EAF and other required fields pass validation.
+An entirely unusable original frequency column cannot establish MAF and stops
+before replacement selection. Reports keep original evidence usability counts
+separate from retained replacement values and output-frequency missingness.
+
+Automatic and standalone concordance read that manifest selection and reuse the
+existing full-allele reference lookup. Expected AF comes from the selected
+reference, while `input_af_original` preserves the original MAF in matched-row
+audits. Selected replacement also leaves working `input_af` as original MAF and
+records its independent ALT expectation as `reference_expected_alt_af`. A
+replacement with reversed REF/ALT uses the same shared biallelic `1-AF` guard as
+production; known third-allele sites cannot supply an inferred opposite-allele
+frequency. Direct listed ALT frequencies remain usable at those sites. Ordinary
+CSV external sources retain their existing direct reference lookup contract.
+The comparison API's `input_eaf_is_maf` describes the confirmed original
+interpretation, not initial distribution suspicion; accepted MAF-looking EAF
+therefore does not activate replacement lookup. Exact-match AF comparisons remain
+in final VCF ALT orientation without minor-frequency folding, so an erroneous
+`1-AF` export remains detectable.
+Allele-unmatched position-only pairs cannot establish the selected reference
+value; their AF comparison is unavailable, while effect, SE, Z and P diagnostic
+comparisons remain. The selected reference never supplies study-strand evidence.
+
+Merged-VCF AF provenance keeps the original study column and input type separate
+from the selected reference source. Reference template/files refer to the original
+selection even when workers consumed projected Parquet partitions. The AF
+harmonisation description identifies the selected column and final ALT EAF;
+the original input MAF is not described as inverted. This follows the
+[GWAS-VCF ALT-oriented association-field contract](https://github.com/MRCIEU/gwas-vcf-specification)
+and the [VCF allele-specific AF definition](https://samtools.github.io/hts-specs/VCFv4.5.pdf).
+
 ## Logs and provenance
 
 The output root has `run_metadata/` with the run log, resolved configuration,

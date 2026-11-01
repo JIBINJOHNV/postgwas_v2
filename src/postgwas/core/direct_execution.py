@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from rich.console import Console
 
@@ -85,6 +85,7 @@ def run_direct_with_checkpoint(
     configuration,
     output_directory: str | Path,
     console: Console | None = None,
+    additional_inputs: Mapping[str, str | Path] | None = None,
 ) -> Any:
     """Run or safely resume one complete direct-command scientific boundary."""
     validate_filename_component(public_command, "direct command")
@@ -113,6 +114,7 @@ def run_direct_with_checkpoint(
         list(arguments),
         module_configuration,
         configuration.resources,
+        list((additional_inputs or {}).values()),
         excluded_paths=(output_root,),
         excluded_roots=(checkpoint_root,),
     )

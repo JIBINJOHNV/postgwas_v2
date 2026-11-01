@@ -22,6 +22,24 @@ def unused_column_name(
     return name
 
 
+def biallelic_reference_site_expression(columns):
+    """Recognize one DNA allele pair across all listed records at a site.
+
+    Frequency inversion requires two alleles. A reference table's declared
+    complete site membership remains an input assumption; this rejects known
+    extra alleles before matching can hide them, while retaining sequence indels.
+    """
+    first, second = pl.col(columns["ea"]), pl.col(columns["oa"])
+    return (
+        (pl.struct([columns["ea"], columns["oa"]]).n_unique().over(
+            [columns["chr"], columns["pos"]],
+        ) == 1)
+        & first.str.contains(r"^[ACGT]+$")
+        & second.str.contains(r"^[ACGT]+$")
+        & (first != second)
+    ).fill_null(False)
+
+
 def deduplicate_reference_values(
     reference: pl.DataFrame,
     keys: Sequence[str],
@@ -148,7 +166,7 @@ def deduplicate_reference_values(
 def prepare_reference_values(
     reference, columns, value_column, policies, *, exact_action,
     non_identical_action, error_type=RuntimeError, warn=None, label="reference table",
-    output_columns=None,
+    output_columns=None, site_eligibility_column=None,
 ):
     """Normalize allele keys and resolve duplicates before AF screening/joining."""
     keys = [columns[key] for key in ("chr", "pos", "ea", "oa")]
@@ -160,12 +178,22 @@ def prepare_reference_values(
     if output_columns is not None:
         reference = reference.rename({columns[key]: output_columns[key] for key in ("chr", "pos", "ea", "oa")})
         keys = [output_columns[key] for key in ("chr", "pos", "ea", "oa")]
+    site_eligibility = None
+    if site_eligibility_column is not None:
+        site_columns = output_columns if output_columns is not None else columns
+        site_eligibility = reference.select(
+            site_columns["chr"], site_columns["pos"],
+            biallelic_reference_site_expression(site_columns).alias(site_eligibility_column),
+        ).unique()
     rows_before = reference.height
     reference, statistics = deduplicate_reference_values(
         reference, keys, value_column, exact_action=exact_action,
         non_identical_action=non_identical_action, reference_label=label,
         error_type=error_type,
     )
+    if site_eligibility is not None:
+        reference = reference.join(site_eligibility,
+            on=[site_columns["chr"], site_columns["pos"]], how="left", coalesce=True)
     return reference, statistics, rows_before
 
 
@@ -187,6 +215,8 @@ def allele_oriented_left_join(
     error_type: Type[Exception] = RuntimeError,
     warn: Callable[[str], None] | None = None,
     reference_label: str = "reference table",
+    screen_frequency: bool = True,
+    require_biallelic_swap: bool = False,
 ) -> tuple[pl.DataFrame, str, dict[str, object]]:
     """Attach one numeric annotation using direct and/or swapped alleles.
 
@@ -253,13 +283,15 @@ def allele_oriented_left_join(
             label="study",
         )
 
+    site_column = unused_column_name("__postgwas_reference_biallelic", study, reference) if require_biallelic_swap else None
     reference, duplicate_stats, rows_before_deduplication = prepare_reference_values(
         reference, reference_columns, value_column, policies,
         exact_action=duplicate_exact_action, non_identical_action=duplicate_non_identical_action,
         error_type=error_type, warn=warn, label=reference_label, output_columns=study_columns,
+        site_eligibility_column=site_column,
     )
     rows_after_deduplication = reference.height
-    if swapped_value == "one_minus":
+    if swapped_value == "one_minus" and screen_frequency:
         duplicate_stats["raw_frequency_screen"] = frequency_maf_screen(
             reference,
             value_column,
@@ -294,6 +326,7 @@ def allele_oriented_left_join(
             pl.col(study_columns["oa"]).alias(study_columns["ea"]),
             pl.col(study_columns["ea"]).alias(study_columns["oa"]),
             swapped_expression.alias(value_name),
+            *([pl.col(site_column)] if site_column is not None else []),
             pl.lit(1, dtype=pl.Int8).alias(orientation_name),
         ]))
 
@@ -340,6 +373,18 @@ def allele_oriented_left_join(
             % (reference_label, rows_before_join, joined.height)
         )
 
+    if site_column is not None:
+        incompatible = joined.filter(
+            (pl.col(orientation_name) == 1) & ~pl.col(site_column).fill_null(False)
+        ).height
+        if incompatible:
+            raise error_type(
+                "%s matched %s frequency assignments requiring 1-AF at a non-biallelic "
+                "or unsupported reference site; REF frequency cannot be inferred in the presence "
+                "of a third allele. Supply explicitly aligned ALT frequencies."
+                % (reference_label, incompatible)
+            )
+        joined = joined.drop(site_column)
     counts = joined.select([
         (pl.col(orientation_name) == 0).sum().alias("direct_key_matches"),
         (pl.col(orientation_name) == 1).sum().alias("swapped_key_matches"),

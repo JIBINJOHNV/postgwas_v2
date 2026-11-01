@@ -88,6 +88,7 @@ branches, conditional dependencies and current limitations.
 - [Harmonisation Overview](harmonisation/overview.md)
 - [Harmonisation Sample Sheet](harmonisation/sample-sheet.md)
 - [Harmonisation Configuration](../modules/harmonisation/configuration.md)
+- [Optional EAF Replacement Source](../modules/harmonisation/eaf_replacement.md)
 - [Harmonisation Workflow and Policy Reference](harmonisation/policies.md)
 - [How Harmonisation Processes Your Data](harmonisation/processing-order.md)
 - [Harmonisation Outputs and QC](harmonisation/outputs-and-qc.md)

@@ -61,6 +61,10 @@ wiki:
       slug: Harmonisation-Configuration
       source: docs/modules/harmonisation/configuration.md
       section: Harmonisation
+    - title: Optional EAF Replacement Source
+      slug: Harmonisation-EAF-Replacement
+      source: docs/modules/harmonisation/eaf_replacement.md
+      section: Harmonisation
     - title: Harmonisation Workflow and Policy Reference
       slug: Harmonisation-Policies
       source: docs/wiki/harmonisation/policies.md

@@ -12,6 +12,7 @@ import re
 import shutil
 import sys
 import traceback
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from postgwas.modules.harmonisation.sample_sheet import (
     load_harmonisation_sample_sheet,
     to_harmonisation_input,
 )
+from postgwas.modules.harmonisation.resource_paths import validate_external_resource_spec
 from postgwas.modules.harmonisation.policies import POLICIES, load_policies
 from postgwas.modules.harmonisation.allele_frequency import StudyAlleleFrequencyError
 from postgwas.modules.harmonisation.qc_reporting import (
@@ -182,6 +184,8 @@ CLI_OVERRIDE_PATHS = {
     "output_directory": "run.output_directory",
     "comparison_af_source": "modules.harmonisation.comparison_af.source",
     "comparison_af_column": "modules.harmonisation.comparison_af.column",
+    "eaf_replacement_file": "modules.harmonisation.eaf_replacement_file",
+    "eaf_replacement_column": "modules.harmonisation.eaf_replacement_column",
     "threads": "execution.threads",
     "memory_gb": "execution.memory_gb",
     "seed": "execution.random_seed",
@@ -503,6 +507,29 @@ def get_harmonisation_parser(add_help: bool = False) -> argparse.ArgumentParser:
     )
     frequency = parser.add_argument_group("Reference frequency check")
     frequency.add_argument(
+        "--eaf-replacement-file",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help=help_with_default(
+            "Optional ALT-frequency table used only after the selected internal "
+            "frequency column is confirmed as MAF against default_eaf. Accepts "
+            "{build} and {chromosome}; supply --eaf-replacement-column together. "
+            "Accepted study EAF and ordinary sample-sheet external EAF stay unchanged",
+            defaults.modules.harmonisation.eaf_replacement_file,
+        ),
+    )
+    frequency.add_argument(
+        "--eaf-replacement-column",
+        default=argparse.SUPPRESS,
+        metavar="COLUMN",
+        help=help_with_default(
+            "ALT-frequency column in --eaf-replacement-file. Both replacement "
+            "options must be supplied together; the replacement is never used "
+            "as comparison evidence",
+            defaults.modules.harmonisation.eaf_replacement_column,
+        ),
+    )
+    frequency.add_argument(
         "--comparison-af-source",
         default=argparse.SUPPRESS,
         metavar="SOURCE",
@@ -588,6 +615,56 @@ def get_harmonisation_parser(add_help: bool = False) -> argparse.ArgumentParser:
     return parser
 
 
+def _eaf_replacement_input_files(config) -> dict[str, Path]:
+    """Resolve declared replacement dependencies without reading table contents."""
+    specification = config.modules.harmonisation.eaf_replacement_file
+    if specification is None:
+        return {}
+    try:
+        files = validate_external_resource_spec(Path(specification).expanduser())
+    except (OSError, ValueError) as exc:
+        raise ConfigurationError(
+            "Invalid argument --eaf-replacement-file "
+            "(modules.harmonisation.eaf_replacement_file): %s" % exc
+        ) from exc
+    return {str(path): path for path in files}
+
+
+def _load_harmonisation_configuration(args):
+    """Resolve canonical YAML and explicit overrides before paired validation."""
+    return load_run_configuration_for_module(
+        "harmonisation", getattr(args, "run_config", None),
+        module_overrides=explicit_overrides(args, CLI_OVERRIDE_PATHS),
+    )
+
+
+def resolve_harmonisation_configuration(arguments):
+    """Share effective CLI/YAML settings with display and direct checkpoints."""
+    # Discovery is exploratory: the real CLI owns parse diagnostics inside the
+    # screen recorder, including errors under --hide-screen.
+    diagnostics = io.StringIO()
+    try:
+        with redirect_stderr(diagnostics):
+            args = get_harmonisation_parser().parse_args(arguments)
+    except SystemExit as exc:
+        raise ConfigurationError(diagnostics.getvalue().strip()) from exc
+    return _load_harmonisation_configuration(args)
+
+
+def harmonisation_checkpoint_inputs(arguments, configuration) -> dict[str, Path]:
+    """Expand replacement dependencies from the effective resolved configuration."""
+    if not arguments or "--help" in arguments or "-h" in arguments:
+        return {}
+    try:
+        return _eaf_replacement_input_files(configuration)
+    except ConfigurationError as exc:
+        _append_run_log(
+            _top_run_log(configuration, configuration.run.output_directory),
+            "ERROR", str(exc),
+        )
+        raise
+
+
 def _module_policy_block(config) -> dict[str, Any]:
     # Canonical execution settings already include explicit CLI overrides.
     # Exported module templates retain null library-call budgets, which must
@@ -641,6 +718,8 @@ def _engine_defaults(config, resolved_executables=None) -> dict[str, Any]:
         "compression_executable": config.resources.executables.pigz,
         "default_eaf_reference_source": harmonisation.default_eaf.source,
         "default_eaf_reference_column": harmonisation.default_eaf.column,
+        "eaf_replacement_file": harmonisation.eaf_replacement_file,
+        "eaf_replacement_column": harmonisation.eaf_replacement_column,
         "default_comparison_af_file": harmonisation.comparison_af.source,
         "default_comparison_af_column": harmonisation.comparison_af.column,
         "default_dbsnp": harmonisation.reference.dbsnp_source,
@@ -1931,6 +2010,10 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
     )
     defaults = _engine_defaults(config, resolved_executables=resolved_executables)
     records = list(issues)
+    try:
+        _eaf_replacement_input_files(config)
+    except ConfigurationError as exc:
+        records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "configuration", "status": "failed", "problem": str(exc)})
     engine_inputs = {}
     try:
         fixed_info = _fixed_info_cli_value(args, config)
@@ -2033,10 +2116,7 @@ def run_harmonisation(
     if not hasattr(args, "sample_sheet"):
         raise ConfigurationError("--sample-sheet is required")
 
-    overrides = explicit_overrides(args, CLI_OVERRIDE_PATHS)
-    config = configuration or load_run_configuration_for_module(
-        "harmonisation", getattr(args, "run_config", None), module_overrides=overrides,
-    )
+    config = configuration or _load_harmonisation_configuration(args)
     preflight_log = _top_run_log(config, config.run.output_directory)
     rows: list[HarmonisationSampleSheetRow] = []
     issues = []
@@ -2108,6 +2188,17 @@ def main() -> int:
                 ),
             ),
             (
+                "Replace confirmed internal MAF using a declared ALT-frequency table:",
+                "postgwas harmonisation",
+                (
+                    "--sample-sheet studies.csv",
+                    "--resource-directory resources",
+                    "--output-directory results",
+                    "--eaf-replacement-file 'panel_{build}_{chromosome}.tsv.gz'",
+                    "--eaf-replacement-column EUR",
+                ),
+            ),
+            (
                 "Export a reusable harmonisation configuration:",
                 "postgwas config export",
                 (
@@ -2129,10 +2220,7 @@ def main() -> int:
     args = parser.parse_args()
     configuration = None
     try:
-        configuration = load_run_configuration_for_module(
-            "harmonisation", getattr(args, "run_config", None),
-            module_overrides=explicit_overrides(args, CLI_OVERRIDE_PATHS),
-        )
+        configuration = _load_harmonisation_configuration(args)
         run_harmonisation(args, configuration=configuration)
     except KeyboardInterrupt:
         try:

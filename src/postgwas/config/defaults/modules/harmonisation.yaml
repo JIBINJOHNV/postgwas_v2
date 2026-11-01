@@ -43,6 +43,12 @@ module:
       1000G: GRCh37_1000G_freq_chr[1..22].tsv.gz
       fingen: GRCh37_fingen_freq_chr[1..22].tsv.gz
 
+  # Explicit ALT-frequency source used only after the selected internal column
+  # is confirmed as MAF against default_eaf. Both values must be supplied together.
+  # Literal files and {build}/{chromosome} templates use the external EAF mapping.
+  eaf_replacement_file: null
+  eaf_replacement_column: null
+
   # Frequencies in the selected default_eaf population column are ALT-allele
   # frequencies.
   default_eaf_mapping:
@@ -732,7 +738,7 @@ export_layout:
     - 'Archive this file together with the resolved configuration and software version from the run.'
   sections:
     - title: Reference selection and input declarations
-      fields: [enabled, default_eaf, comparison_af, reference, resource_preflight, fixed_info]
+      fields: [enabled, default_eaf, eaf_replacement_file, eaf_replacement_column, comparison_af, reference, resource_preflight, fixed_info]
     - title: Dataset preparation and chromosome processing
       fields: [policies]
     - title: Post-merge frequency QC and optional input-to-VCF validation
@@ -747,6 +753,8 @@ export_layout:
     - enabled
     - default_eaf.source
     - default_eaf.column
+    - eaf_replacement_file
+    - eaf_replacement_column
     - comparison_af.source
     - comparison_af.column
     - reference.dbsnp_source
@@ -776,6 +784,8 @@ export_layout:
   comments:
     enabled: ['Used when selecting modules in a pipeline; the direct harmonisation command runs the selected module.']
     default_eaf: ['Strand orientation and EAF/MAF validation table for chromosome step 04.', 'This panel does not fill missing study EAF; an external source is declared separately in the sample sheet.']
+    eaf_replacement_file: ['Optional ALT-frequency table used only when default_eaf confirms the selected internal frequency column is MAF.', 'Supply together with eaf_replacement_column; accepts a literal file or {build}/{chromosome} template. This source is never comparison evidence.']
+    eaf_replacement_column: ['ALT-frequency column in eaf_replacement_file; both replacement values must be supplied together.']
     comparison_af: ['Reference VCF for population annotation and post-merge QC.', 'This panel does not determine the study strand or supply its EAF.']
     reference: ['dbSNP annotation used during chromosome VCF processing.']
     resource_preflight: ['Expected reference inventory checked before study interpretation, including when build.mode is auto.', 'Both configured builds and every listed chromosome are required; this does not infer the study build or filter study chromosomes.']

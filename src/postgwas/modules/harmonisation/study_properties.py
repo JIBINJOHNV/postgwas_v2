@@ -55,6 +55,7 @@ from .shared.statistics import valid_frequency_mask
 __all__ = [
     "resolve_study_properties",
     "finalise_eaf_decision_from_chromosomes",
+    "selected_eaf_replacement",
     "StudyPropertyError",
     "EFFECT_COLUMN_KEYS",
     "PVALUE_COLUMN_KEYS",
@@ -992,7 +993,8 @@ def _decide_eaf_is_maf(df, sample_column_dict, pol, ctx, decisions, statistics):
             "median": evidence["median"],
         },
         ("MAF-like; requires whole-study allele-aligned reference agreement before "
-         "chromosome analysis. The distribution alone does not prove MAF."
+         "chromosome analysis, with EAF agreement tested first and MAF support "
+         "tested only if EAF agreement fails. The distribution alone does not prove MAF."
          if suspected else
          "accepted as declared EAF; no additional frequency comparison required."),
     )
@@ -1110,6 +1112,33 @@ def resolve_study_properties(
     return decisions
 
 
+def selected_eaf_replacement(study_decisions):
+    """Return the validated selected source descriptor, never infer activation.
+
+    This records a previously resolved decision; it does not read the replacement
+    or determine frequency semantics from its numerical distribution.
+    """
+    decisions = study_decisions or {}
+    if decisions.get("eaf_selected_source") != "replacement_reference":
+        return None
+    evidence = decisions.get("eaf_reference_validation") or {}
+    if decisions.get("eaf_input_interpretation") != "maf" or evidence.get("status") != "replacement_selected":
+        raise StudyPropertyError("Selected EAF replacement lacks a recorded whole-study MAF decision.")
+    descriptor = decisions.get("eaf_replacement")
+    if not isinstance(descriptor, dict):
+        raise StudyPropertyError("Selected EAF replacement descriptor is missing.")
+    for key in ("file", "column"):
+        if optional_text(descriptor.get(key)) is None:
+            raise StudyPropertyError("Selected EAF replacement %s is missing." % key)
+    resolved = descriptor.get("resolved_files")
+    if not isinstance(resolved, dict) or not resolved or any(
+        optional_text(value) is None for value in resolved.values()
+    ):
+        raise StudyPropertyError("Selected EAF replacement resolved_files are missing or incomplete.")
+    return {"file": str(descriptor["file"]), "column": str(descriptor["column"]),
+            "resolved_files": {str(key): str(value) for key, value in resolved.items()}}
+
+
 def finalise_eaf_decision_from_chromosomes(
     study_decisions,
     chromosome_summaries,
@@ -1123,6 +1152,7 @@ def finalise_eaf_decision_from_chromosomes(
     consensus; the distribution screen alone must never become final EAF evidence.
     """
     result = dict(study_decisions or {})
+    replacement = selected_eaf_replacement(result)
     has_initial_decision = (
         "eaf_is_maf_initial" in result or "eaf_is_maf" in result
     )
@@ -1162,7 +1192,7 @@ def finalise_eaf_decision_from_chromosomes(
             provenance_counts["missing"] += 1
     dataset_validation = result.get("eaf_reference_validation", {})
     dataset_accepted = dataset_validation.get("status") in ("passed", "not_required")
-    if initial is True and not dataset_accepted:
+    if initial is True and not dataset_accepted and replacement is None:
         for chromosome in completed:
             summary = summaries.get(chromosome, summaries.get(str(chromosome), {}))
             stage_qc = summary.get("stage_qc", {}) if isinstance(summary, dict) else {}
@@ -1178,7 +1208,15 @@ def finalise_eaf_decision_from_chromosomes(
                 counts["missing"] += 1
 
     completed_count = len(completed)
-    if dataset_accepted:
+    if replacement is not None:
+        result["eaf_input_interpretation"] = "maf"
+        if completed_count and provenance_counts["reference_imputed"] == completed_count:
+            final = False
+            source = "replacement_reference"
+        else:
+            final = None
+            source = "replacement_reference_unavailable"
+    elif dataset_accepted:
         final = False
         source = result["eaf_is_maf_source"]
     elif not has_initial_decision:

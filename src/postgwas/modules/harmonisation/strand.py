@@ -39,7 +39,7 @@ from postgwas.core.input_validation import capture_preflight_file_identities
 
 from .chromosome_partition import _validate_source_row_ids
 from .rejects import SOURCE_INPUT_ROW_COLUMN
-from .shared.allele_join import deduplicate_reference_values
+from .shared.allele_join import biallelic_reference_site_expression, deduplicate_reference_values
 from .shared.runtime import reject_rows, resolve_policies
 from .shared.statistics import frequency_maf_screen, valid_frequency_mask
 from .shared.variant_columns import (
@@ -73,7 +73,7 @@ PREPARED_MATCHES_COLUMN = "__postgwas_reference_matches"
 PREPARED_INPUT_COLUMN = "__postgwas_reference_input"
 _MATCH_COLUMNS = (
     STRAND_ACTION_COLUMN, "__strand_swapped", "__strand_ref", "__strand_alt",
-    "__strand_af", "__strand_palindromic", "__strand_candidates",
+    "__strand_af", "__strand_palindromic", "__strand_candidates", "__strand_biallelic",
 )
 STEP_LABEL = "04 strand_orientation"
 RESOLVED_STRAND_ACTIONS = (
@@ -211,9 +211,17 @@ def _load_reference(
         warn=warn,
         label="strand reference",
     )
-    reference = reference.with_columns(
-        pl.col("__strand_af").cast(pl.Float64, strict=False)
-    )
+    # One-minus AF and folded MAF require two alleles. Inspect site membership
+    # before incompatible ALT records disappear in orientation filtering. A
+    # custom reference must declare complete site membership; absent records
+    # cannot establish biological absence. Valid sequence indels remain eligible.
+    reference = reference.with_columns([
+        pl.col("__strand_af").cast(pl.Float64, strict=False),
+        biallelic_reference_site_expression({
+            "chr": "__strand_chr", "pos": "__strand_pos",
+            "ea": "__strand_alt", "oa": "__strand_ref",
+        }).alias("__strand_biallelic"),
+    ])
     invalid = reference.filter(
         pl.col("__strand_af").is_not_null()
         & ((pl.col("__strand_af") < 0.0) | (pl.col("__strand_af") > 1.0))
@@ -223,6 +231,9 @@ def _load_reference(
             "The strand reference '%s' contains %s values outside 0 to 1 in column '%s'."
             % (path, "{:,}".format(invalid), population_col)
         )
+    site_eligibility = reference.select(
+        "__strand_chr", "__strand_pos", "__strand_biallelic",
+    ).unique()
     reference, duplicate_stats = deduplicate_reference_values(
         reference,
         ["__strand_chr", "__strand_pos", "__strand_ref", "__strand_alt"],
@@ -236,6 +247,7 @@ def _load_reference(
         reference_label="strand reference '%s'" % path,
         error_type=StrandOrientationError,
     )
+    reference = reference.join(site_eligibility, on=["__strand_chr", "__strand_pos"], how="left", coalesce=True)
     duplicate_stats["raw_frequency_screen"] = frequency_maf_screen(
         reference,
         "__strand_af",
@@ -335,6 +347,11 @@ def _reference_orientation_candidates(study, reference, columns, row_col, mode):
 
 def _study_reference_frequency_pairs(candidates, row_column, frequency_column):
     """Return valid, uniquely matched non-palindromic diagnostic pairs only."""
+    if "__strand_biallelic" not in candidates.columns:
+        raise StrandOrientationError(
+            "Frequency comparison requires biallelic reference-site eligibility "
+            "established before allele filtering."
+        )
     counted_candidates = (
         candidates
         if "__strand_candidates" in candidates.columns
@@ -345,6 +362,7 @@ def _study_reference_frequency_pairs(candidates, row_column, frequency_column):
     unique_non_palindromic = counted_candidates.filter(
         ~pl.col("__strand_palindromic")
         & (pl.col("__strand_candidates") == 1)
+        & pl.col("__strand_biallelic")
     )
     study_frequency = pl.col(frequency_column).cast(pl.Float64, strict=False)
     reference_alt_frequency = pl.col("__strand_af").cast(
@@ -435,7 +453,9 @@ def prepare_study_reference_matches(
     )
     return (
         _study_reference_frequency_pairs(candidates, row_col, frequency_column),
-        packed, {"contract": contract, "duplicate_statistics": duplicates},
+        packed, {"contract": contract, "duplicate_statistics": duplicates,
+                 "diagnostic_statistics": {"excluded_non_biallelic_rows":
+                     candidates.filter(~pl.col("__strand_biallelic")).select(row_col).n_unique()}},
     )
 
 
@@ -792,7 +812,13 @@ def harmonise_strand_orientation(
     prepared = _study_value(study_decision, "eaf_prepared_references", {}).get(str(chromosome))
     prepared_columns = (PREPARED_MATCHES_COLUMN, PREPARED_INPUT_COLUMN)
     if prepared is not None:
-        accepted = _study_value(study_decision, "eaf_reference_validation", {}).get("status") == "passed"
+        status = _study_value(study_decision, "eaf_reference_validation", {}).get("status")
+        accepted = status == "passed" or (
+            status == "replacement_selected"
+            and _study_value(study_decision, "eaf_selected_source") == "replacement_reference"
+            and _study_value(study_decision, "eaf_input_interpretation") == "maf"
+            and eaf_is_maf
+        )
         if not accepted or not all(column in df.columns for column in prepared_columns):
             raise StrandOrientationError("Prepared reference matches are incomplete or lack study AF acceptance.")
         if prepared["contract"] != _reference_match_contract(

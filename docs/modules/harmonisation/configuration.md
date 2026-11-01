@@ -11,6 +11,9 @@ postgwas harmonisation \
 Explicit CLI values override the user YAML, which overrides packaged YAML.
 Argparse does not own configurable defaults.
 
+For an internal frequency column confirmed as MAF, see the paired
+[optional EAF replacement options](eaf_replacement.md).
+
 ## Sample sheet
 
 The version-2 sample sheet contains dataset-specific paths, identifiers, and
@@ -263,12 +266,17 @@ remain unchanged. Study AF acceptance now happens once, before chromosome proces
 The whole-study screen triggers a reference check only when more than
 `eaf.maf_decision_cutoff` (default 95%) of usable study AF values are at or below
 0.5. Otherwise the declared EAF contract is accepted without another frequency
-concordance check. For a MAF-like distribution, reference AF must agree with the
-study's original effect-allele frequencies across the dataset; see the detailed
-thresholds below. Chromosome workers reuse that decision and apply ordinary
-allele swaps exactly once. The manifest keeps the initial screen and the final
-`eaf_reference_validation` evidence separately. The comparison neither filters
-study rows nor replaces their frequencies. A palindromic A/T
+concordance check. For a MAF-like distribution, PostGWAS first tests the study's
+original effect-allele frequencies against `default_eaf` across the dataset.
+Accepted EAF stays unchanged. Otherwise the same eligible pairs may support a
+MAF interpretation; supported MAF requires the paired
+[explicit EAF replacement source](eaf_replacement.md), while insufficient or
+conflicting evidence stops the dataset. Chromosome workers reuse that decision
+and apply ordinary allele swaps exactly once. The manifest keeps the initial
+screen and final `eaf_reference_validation` evidence separately. The default
+comparison itself neither filters rows nor changes their frequencies; an
+explicitly selected replacement supplies the working EAF while preserving the
+original input MAF and source snapshots. A palindromic A/T
 or C/G SNP in `strand.mode: auto` first follows a strong full-study
 non-palindromic strand consensus.
 When that consensus is mixed, unresolved, or insufficient, a true internal EAF
@@ -297,11 +305,15 @@ through `strand.palindromic_af_discordance_action`. These decisions follow the
 [GWAS Catalog summary-statistics harmonisation method](https://www.ebi.ac.uk/gwas/docs/methods/summary-statistics).
 
 External EAF and INFO annotations use the same row-preserving direct/swapped
-allele matcher after strand orientation. Before external EAF alignment, the
-deduplicated raw frequency column is screened with
+allele matcher after strand orientation. Before alignment of an ordinary
+sample-sheet external EAF source, its deduplicated raw frequency column is screened with
 `eaf.maf_decision_cutoff`. This screen does not prove allele meaning and never
 auto-converts MAF: a non-MAF-like result retains the declared external ALT/EAF
 contract, while a MAF-like result must pass the independent comparison below.
+An explicitly selected MAF replacement instead uses its declared ALT-frequency
+semantics and bypasses this raw-frequency classifier; numerical, coverage and
+allele-matching safeguards still apply. `default_eaf` remains the sole source
+of comparison and orientation evidence.
 The matcher normalizes the four join keys,
 gives direct matches precedence, performs one Polars left join and preserves
 the study row count and order. On an ordinary swapped match, EAF becomes

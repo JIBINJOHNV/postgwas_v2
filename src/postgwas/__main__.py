@@ -196,6 +196,11 @@ def main():
             return entrypoint()
         from postgwas.core.direct_execution import run_direct_with_checkpoint
 
+        additional_inputs = None
+        if spec.direct_input_discovery is not None:
+            additional_inputs = resolve_reference(spec.direct_input_discovery)(
+                arguments, screen_settings.configuration,
+            )
         return run_direct_with_checkpoint(
             entrypoint,
             module_name=spec.name,
@@ -204,6 +209,7 @@ def main():
             configuration=screen_settings.configuration,
             output_directory=screen_settings.output_directory,
             console=console,
+            additional_inputs=additional_inputs,
         )
 
     def run_command():

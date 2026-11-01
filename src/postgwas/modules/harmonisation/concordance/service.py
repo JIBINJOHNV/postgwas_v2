@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from copy import copy
 import gzip
 import json
 from pathlib import Path
@@ -33,6 +34,7 @@ from postgwas.modules.harmonisation.resource_paths import (
 )
 from postgwas.modules.harmonisation.study_properties import (
     finalise_eaf_decision_from_chromosomes,
+    selected_eaf_replacement,
 )
 from postgwas.modules.harmonisation.strand import STRAND_ACTION_COLUMN
 
@@ -640,6 +642,17 @@ def _stage_duplicate_report(
     return destination
 
 
+def _selected_eaf_row(row, decisions):
+    """Keep original input mappings while selecting the resolved reference source."""
+    replacement = selected_eaf_replacement(decisions)
+    if replacement is None:
+        return row
+    selected = copy(row)
+    selected.external_eaf_file = Path(replacement["file"])
+    selected.external_eaf_column = replacement["column"]
+    return selected
+
+
 def _stage_external_eaf(
     row,
     mapping,
@@ -651,7 +664,7 @@ def _stage_external_eaf(
     batch_rows: int | None = None,
     compression: str | None = None,
 ) -> Path | None:
-    if row.effect_allele_frequency_column:
+    if row.effect_allele_frequency_column and not row.external_eaf_file:
         return None
     if not row.external_eaf_file or not row.external_eaf_column or mapping is None:
         raise ConcordanceValidationError(
@@ -917,6 +930,7 @@ def _compare_staged_partitions(
     se_scale: str | None = None,
     p_value_type: str,
     eaf_is_maf: bool | None,
+    input_eaf_is_maf: bool | None = None,
     strand_consensus: str | None = None,
     settings,
     policies,
@@ -956,8 +970,7 @@ def _compare_staged_partitions(
         if external_eaf_path is not None:
             external_eaf_frame = _read_partition(external_eaf_path, partition)
         elif (
-            not row.effect_allele_frequency_column
-            and row.external_eaf_file
+            row.external_eaf_file
             and input_frame.height
             and partition is not None
         ):
@@ -982,6 +995,7 @@ def _compare_staged_partitions(
             se_scale=se_scale,
             p_value_type=p_value_type,
             eaf_is_maf=eaf_is_maf,
+            input_eaf_is_maf=input_eaf_is_maf,
             strand_consensus=strand_consensus,
             settings=settings,
             policies=policies,
@@ -1723,6 +1737,8 @@ def run_concordance_validation(
                     "effect.se_scale to 'log_odds' or 'as_given'."
                 )
         eaf_is_maf = decisions.get("eaf_is_maf")
+        input_eaf_is_maf = {"maf": True, "eaf": False}.get(decisions.get("eaf_input_interpretation"))
+        selected_eaf_row = _selected_eaf_row(row, decisions)
         strand_consensus = decisions.get("strand")
         if eaf_is_maf is None:
             log.warning(
@@ -1813,7 +1829,7 @@ def run_concordance_validation(
             )
 
         external_eaf_path = _stage_external_eaf(
-            row,
+            selected_eaf_row,
             external_eaf_mapping,
             external_eaf_path,
             policies,
@@ -1842,10 +1858,11 @@ def run_concordance_validation(
             external_eaf_path=external_eaf_path,
             strand_action_path=strand_action_path,
             workspace=workspace,
-            row=row,
+            row=selected_eaf_row,
             effect_type=effect_type, se_scale=se_scale,
             p_value_type=p_value_type,
             eaf_is_maf=eaf_is_maf,
+            input_eaf_is_maf=input_eaf_is_maf,
             strand_consensus=strand_consensus,
             settings=settings,
             policies=policies,
@@ -1869,6 +1886,8 @@ def run_concordance_validation(
                     if eaf_is_maf is False
                     else "unresolved"
                 ),
+                "input_frequency_interpretation": decisions.get("eaf_input_interpretation"),
+                "selected_frequency_source": decisions.get("eaf_selected_source"),
                 "status": analysis.status,
             }), summary_path, vcf_config["table_delimiter"], vcf_config["table_null_output"]),
             "mismatches": _write_frame(
@@ -1925,6 +1944,9 @@ def run_concordance_validation(
                 analysis.position_metric_summary_by_variant_type
             ),
             "reports": reports,
+            "input_frequency_interpretation": decisions.get("eaf_input_interpretation"),
+            "selected_frequency_source": decisions.get("eaf_selected_source"),
+            "eaf_replacement": selected_eaf_replacement(decisions),
         }
         log.info("Validation result: %s" % analysis.status)
         log.info("Validation summary: %s" % json.dumps(analysis.summary, sort_keys=True))

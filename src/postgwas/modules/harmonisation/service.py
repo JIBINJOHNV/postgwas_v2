@@ -116,6 +116,7 @@ from postgwas.modules.harmonisation.study_properties import (
 )
 from postgwas.modules.harmonisation.allele_frequency import (
     harmonise_allele_frequency,
+    same_frequency_reference_source,
     validate_study_allele_frequency,
 )
 from postgwas.modules.harmonisation.sample_size import (
@@ -1967,6 +1968,89 @@ def preflight_configured_reference_scope(defaults, resource_folder, scope, *, sa
         raise ResourcePreflightError(issues)
 
 
+def _activate_eaf_replacement_resources(
+    resource_maps, study_decisions, *, grch_version, default_eaf_colmap,
+    external_eaf_colmap, executables, vcf_config, policies, logger=None,
+):
+    """Resolve a selected replacement after the default-panel decision.
+
+    The existing external-reference worker role supplies staging and memory
+    accounting. Identical default references instead reuse their prepared AF;
+    they must not be read and staged again merely to supply replacement values.
+    """
+    if study_decisions.get("eaf_selected_source") != "replacement_reference":
+        return resource_maps, None
+    if (
+        study_decisions.get("eaf_input_interpretation") != "maf"
+        or study_decisions.get("eaf_reference_validation", {}).get("status")
+        != "replacement_selected"
+    ):
+        raise PipelineError("EAF replacement requires a supported internal MAF decision.")
+    replacement = dict(study_decisions.get("eaf_replacement") or {})
+    specification = optional_text(replacement.get("file"))
+    column = optional_text(replacement.get("column"))
+    if specification is None or column is None:
+        raise PipelineError("Selected EAF replacement is missing its file or frequency column.")
+
+    selected = {str(chromosome): dict(resources) for chromosome, resources in resource_maps.items()}
+    resolved_files, replacement_maps, reused = {}, {}, []
+    for chromosome, resources in selected.items():
+        try:
+            path = resolve_resource_file(
+                str(Path(specification).expanduser()), grch_version,
+                chromosome, must_exist=False,
+            )
+        except ValueError as exc:
+            raise PipelineError("Invalid EAF replacement path: %s" % exc) from exc
+        path = str(Path(path).resolve())
+        resolved_files[chromosome] = path
+        identical = same_frequency_reference_source(
+            path, column, external_eaf_colmap,
+            resources.get("default_eaf_file"),
+            resources.get("default_eaf_reference_column"), default_eaf_colmap,
+        )
+        if identical:
+            reused.append(chromosome)
+        resources["user_eaf_file"] = None if identical else path
+        resources["user_eaf_column"] = None if identical else column
+        replacement_maps[chromosome] = {
+            "user_eaf_file": resources["user_eaf_file"],
+            "user_eaf_column": resources["user_eaf_column"],
+        }
+
+    if reused and len(reused) < len(selected):
+        # A shared file needed by other chromosomes is projected once for the
+        # existing staging group. Reused chromosomes still consume prepared AF,
+        # not this projection; staging must not see a partly absent shared role.
+        for chromosome in reused:
+            selected[chromosome]["user_eaf_file"] = resolved_files[chromosome]
+            selected[chromosome]["user_eaf_column"] = column
+            replacement_maps[chromosome] = {
+                "user_eaf_file": resolved_files[chromosome], "user_eaf_column": column,
+            }
+
+    # Only new source structure is checked here. In particular, this declared
+    # ALT-frequency source never becomes MAF/EAF comparison evidence.
+    summary = validate_harmonisation_resource_maps(
+        replacement_maps, grch_version=grch_version,
+        bcftools=executables["bcftools"], vcf_config=vcf_config,
+        default_eaf_colmap=default_eaf_colmap,
+        external_eaf_colmap=external_eaf_colmap,
+        external_info_colmap={}, policies=policies, require_default_eaf=False,
+        resource_keys=(), validate_frequency_semantics=False, logger=logger,
+    )
+    summary["reused_default_chromosomes"] = sorted(reused, key=_chromosome_sort_key)
+    replacement["resolved_files"] = resolved_files
+    study_decisions["eaf_replacement"] = replacement
+    if logger is not None:
+        logger.info(
+            "EAF replacement selected after default-reference MAF confirmation: "
+            "%s; frequency column %r; reusing the default reference on %d of %d chromosomes."
+            % (specification, column, len(reused), len(selected))
+        )
+    return selected, summary
+
+
 # ===============================================================
 # 2️⃣ Per-Chromosome Harmonization Pipeline  (16 steps)
 # ===============================================================
@@ -2805,6 +2889,8 @@ def _prepare_dataset_for_chromosome_processing(
     policies,
     logger,
     input_line_count,
+    eaf_replacement_file=None,
+    eaf_replacement_column=None,
 ):
     # type: (...) -> _DatasetPreparation
     """Run dataset steps 03-08 and return only chromosome-worker inputs.
@@ -3302,7 +3388,34 @@ def _prepare_dataset_for_chromosome_processing(
     study_decisions, df = validate_study_allele_frequency(
         df, sample_column_dict, study_decisions, resource_maps,
         default_eaf_colmap, policies=policies, logger=logger,
+        eaf_replacement_file=eaf_replacement_file,
+        eaf_replacement_column=eaf_replacement_column,
     )
+    resource_maps, replacement_preflight = _activate_eaf_replacement_resources(
+        resource_maps, study_decisions, grch_version=grch_version,
+        default_eaf_colmap=default_eaf_colmap,
+        external_eaf_colmap=external_eaf_colmap, executables=executables,
+        vcf_config=vcf_config, policies=policies, logger=logger,
+    )
+    if replacement_preflight is not None:
+        resource_preflight["eaf_replacement"] = replacement_preflight
+        resource_preflight["file_identities"] = list({
+            item["path"]: item
+            for item in (
+                *resource_preflight["file_identities"],
+                *replacement_preflight["file_identities"],
+            )
+        }.values())
+        resource_preflight["resources_by_chromosome"] = {
+            chromosome: dict(resources)
+            for chromosome, resources in resource_maps.items()
+        }
+        needs_external_source = any(
+            resources.get("user_eaf_file") is not None
+            for resources in resource_maps.values()
+        )
+        user_eaf_file = study_decisions["eaf_replacement"]["file"] if needs_external_source else None
+        user_eaf_column = study_decisions["eaf_replacement"]["column"] if needs_external_source else None
     dataset_study_decisions.update({
         key: value for key, value in study_decisions.items() if key.startswith("eaf_")
     })
@@ -3590,6 +3703,8 @@ def harmonise_chromosomes(
     progress=None,
     preparation_only=False,
     prepared=None,
+    eaf_replacement_file=None,
+    eaf_replacement_column=None,
 ):
     """Dataset steps 03-08, then the per-chromosome fan-out with retry rounds.
 
@@ -3671,6 +3786,8 @@ def harmonise_chromosomes(
             policies=pol,
             logger=logger,
             input_line_count=input_line_count,
+            eaf_replacement_file=eaf_replacement_file,
+            eaf_replacement_column=eaf_replacement_column,
         )
     if preparation_only:
         return prepared
@@ -5142,6 +5259,8 @@ def run_harmonisation_pipeline(
     external_reference_staging = default_cfg_obj[
         "external_reference_staging"
     ]
+    eaf_replacement_file = default_cfg_obj.get("eaf_replacement_file")
+    eaf_replacement_column = default_cfg_obj.get("eaf_replacement_column")
     terminal_progress = default_cfg_obj.get("terminal_progress")
     if not isinstance(terminal_progress, dict):
         raise ConfigError(
@@ -5385,6 +5504,8 @@ def run_harmonisation_pipeline(
                 progress=progress,
                 preparation_only=preparation_only,
                 prepared=prepared.dataset if prepared is not None else None,
+                eaf_replacement_file=eaf_replacement_file,
+                eaf_replacement_column=eaf_replacement_column,
             )
             if preparation_only:
                 require_unchanged_preflight_files(initial_identities, error_type=PipelineError)
