@@ -5084,12 +5084,12 @@ def run_harmonisation_pipeline(
 ):
     """Full harmonisation + gwas2vcf + merge + cleanup pipeline for one dataset.
 
-    Restructured to plan Part 2: the configuration and the file header are
-    checked together *before* the ten-million-row parse. ``preparation_only``
+    The configuration and file header are checked together before the large
+    input parse. ``preparation_only``
     returns invocation-local evidence and partitions; ``prepared`` reuses that
     evidence only with identical configuration and unchanged files. The CLI
-    prepares all rows before executing any. Nothing here calls ``sys.exit``;
-    failures are collected by that all-row boundary.
+    prepares and executes each dataset before reading the next. Nothing here
+    calls ``sys.exit``; the CLI records failures at the dataset boundary.
     Once the run manifest has been created, every ordinary exception records a
     terminal ``FAILED`` or ``PARTIAL`` state before it is re-raised; a user
     interruption records ``INTERRUPTED``.
@@ -5345,7 +5345,7 @@ def run_harmonisation_pipeline(
             )
 
         else:
-            logger.info("Reusing validated dataset preparation after the all-row preflight.")
+            logger.info("Reusing validated preparation for the current dataset.")
 
         # ---------------------------------------------------------
         # STEPS 03-08 + the per-chromosome fan-out

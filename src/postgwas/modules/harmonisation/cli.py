@@ -46,7 +46,6 @@ from postgwas.modules.harmonisation.service import (
     ConfigError,
     PipelineError,
     run_harmonisation_pipeline,
-    validate_harmonisation_inputs,
     preflight_configured_reference_scope,
 )
 from postgwas.modules.harmonisation.concordance.errors import (
@@ -81,6 +80,8 @@ _RUN_SUMMARY_FIELDS = (
     "input_file",
     "status",
     "failure_reason",
+    "failure_stage",
+    "dataset_log",
     # Dataset step 3: initial input validation.
     "input_variants",
     "input_ready_variants",
@@ -901,6 +902,9 @@ def _run_summary_record(
     failure_reason = failure
     if failure_reason is None and isinstance(manifest_failure, dict):
         failure_reason = manifest_failure.get("message")
+    failed_chromosomes = manifest.get("failed_chromosomes") or dataset.get("failed")
+    if failure_reason is None and str(status).upper() == "PARTIAL" and failed_chromosomes:
+        failure_reason = "Failed chromosomes: %s." % ", ".join(map(str, failed_chromosomes))
 
     record.update({
         "status": str(status).upper(),
@@ -1095,7 +1099,7 @@ def _run_summary_block(
         not in {"OK", "PARTIAL", "NOT_RUN", "RUNNING"}
         for record in records
     )
-    return "\n".join([
+    lines = [
         screen_line("decision", "Harmonisation run summary", indent=4),
         screen_field(
             "count", "Datasets",
@@ -1111,7 +1115,22 @@ def _run_summary_block(
             "info", "HTML", html_path,
             indent=8, label_width=18,
         ),
-    ])
+    ]
+    for record in records:
+        status = str(record.get("status") or "NOT_RUN").upper()
+        if status == "OK":
+            continue
+        lines.append(screen_field(
+            "warning" if status in {"PARTIAL", "NOT_RUN", "RUNNING"} else "error",
+            str(record.get("dataset_id") or "Dataset"), status,
+            indent=8, label_width=18,
+        ))
+        for label, key in (("Stage", "failure_stage"), ("Reason", "failure_reason"), ("Log", "dataset_log")):
+            if record.get(key):
+                lines.append(screen_field(
+                    "info", label, record[key], indent=12, label_width=14,
+                ))
+    return "\n".join(lines)
 
 
 def _write_preflight_failure_run_summary(
@@ -1135,6 +1154,7 @@ def _write_preflight_failure_run_summary(
         record.update({
             "status": "PREFLIGHT_FAILED",
             "failure_reason": _single_line(failure),
+            "failure_stage": "initial preflight",
             "screen_report": str(report_paths[row.dataset_id]),
             "html_report": str(html_paths[row.dataset_id]),
         })
@@ -1313,7 +1333,6 @@ def _run_validated_rows(
     rows: list[HarmonisationSampleSheetRow],
     resolved_executables=None,
     screen_router: _DatasetScreenRouter | None = None,
-    prepared_runs=None,
 ):
     if screen_router is None:
         report_paths = _screen_report_paths(config, rows)
@@ -1327,7 +1346,6 @@ def _run_validated_rows(
                 rows,
                 resolved_executables=resolved_executables,
                 screen_router=managed_router,
-                prepared_runs=prepared_runs,
             )
 
     fixed_info_from_cli = _fixed_info_cli_value(args, config)
@@ -1369,13 +1387,6 @@ def _run_validated_rows(
     top_metadata = _runtime_path(
         config, output_root, "top_metadata_directory",
     )
-    if prepared_runs is None:
-        write_resolved_configuration(
-            config,
-            _runtime_path(config, top_metadata, "resolved_config_file"),
-            modules=("harmonisation", "qc_summary"),
-            resource_paths=_RESOLVED_RESOURCE_PATHS,
-        )
     run_summary_path = _runtime_path(
         config, top_metadata, "run_summary_file",
     )
@@ -1384,6 +1395,9 @@ def _run_validated_rows(
     run_summary_manifests: dict[str, dict[str, Any]] = {}
     for row in rows:
         record = _initial_run_summary_record(row)
+        record["dataset_log"] = str(_runtime_path(
+            config, output_root, "metadata_directory", dataset_id=row.dataset_id,
+        ) / config.logging.filename)
         record["screen_report"] = str(screen_router.report_path(row.dataset_id))
         record["html_report"] = str(html_report_paths[row.dataset_id])
         run_summary_records[row.dataset_id] = record
@@ -1415,6 +1429,7 @@ def _run_validated_rows(
         *,
         manifest: dict[str, Any] | None = None,
         failure: Any = None,
+        failure_stage: str | None = None,
     ) -> None:
         """Persist one dataset state while retaining all other selected rows."""
         manifest_document = (
@@ -1437,6 +1452,11 @@ def _run_validated_rows(
         )
         record["screen_report"] = str(screen_router.report_path(row.dataset_id))
         record["html_report"] = str(html_report_paths[row.dataset_id])
+        record["dataset_log"] = run_summary_records[row.dataset_id]["dataset_log"]
+        if status != "OK":
+            record["failure_stage"] = (
+                (manifest_document.get("failure") or {}).get("stage") or failure_stage
+            )
         run_summary_records[row.dataset_id] = record
         run_summary_manifests[row.dataset_id] = {
             **manifest_document,
@@ -1476,10 +1496,7 @@ def _run_validated_rows(
             % (dataset_index, dataset_count, row.dataset_id, row.input_file)
         )
         _append_run_log(top_log, "INFO", start_log_message)
-        metadata = _runtime_path(
-            config, output_root, "metadata_directory", dataset_id=row.dataset_id,
-        )
-        dataset_log = metadata / config.logging.filename
+        dataset_log = Path(run_summary_records[row.dataset_id]["dataset_log"])
         dataset_output = configured_output_path(
             output_root,
             defaults["output_layout"]["dataset_directory"],
@@ -1493,6 +1510,7 @@ def _run_validated_rows(
             dataset_id=row.dataset_id,
         )
         active_manifest_path = manifest_path
+        active_stage = "dataset setup"
         try:
             _write_run_metadata(config, args, row)
             for warning in row.normalisation_warnings:
@@ -1509,6 +1527,13 @@ def _run_validated_rows(
                 fixed_info=fixed_info_from_cli,
                 fixed_info_column=config.modules.harmonisation.fixed_info.column,
             )
+            if engine_input.get("eaffile") or engine_input.get("infofile"):
+                active_stage = "external reference preflight"
+                preflight_configured_reference_scope(
+                    defaults, resource_root,
+                    config.modules.harmonisation.resource_preflight,
+                    sample_columns=engine_input,
+                )
             if (
                 fixed_info_from_cli is not None
                 and engine_input["info_source"] != "fixed_cli"
@@ -1540,6 +1565,7 @@ def _run_validated_rows(
             record_dataset(
                 row, "INTERRUPTED", manifest_path,
                 failure="Run interrupted by the user during dataset setup.",
+                manifest={}, failure_stage=active_stage,
             )
             _append_run_log(
                 top_log,
@@ -1551,7 +1577,10 @@ def _run_validated_rows(
         except (RunSummaryError, ScreenReportError):
             raise
         except Exception as exc:
-            record_dataset(row, "FAILED", manifest_path, failure=exc)
+            record_dataset(
+                row, "FAILED", manifest_path, failure=exc,
+                manifest={}, failure_stage=active_stage,
+            )
             _append_run_log(
                 dataset_log,
                 "ERROR",
@@ -1571,12 +1600,23 @@ def _run_validated_rows(
         for attempt in range(1, attempts + 1):
             if attempt > 1:
                 gc.collect()
+            prepared_run = None
             try:
+                # Keep the existing input/reference/work identity contract, but
+                # finish this dataset before another study is read or prepared.
+                active_stage = "dataset preparation"
+                prepared_run = run_harmonisation_pipeline(
+                    sample_column_dict=engine_input,
+                    default_cfg=defaults,
+                    threads=config.execution.threads,
+                    preparation_only=True,
+                )
+                active_stage = "harmonisation pipeline"
                 result = run_harmonisation_pipeline(
                     sample_column_dict=engine_input,
                     default_cfg=defaults,
                     threads=config.execution.threads,
-                    **({"prepared": prepared_runs[row.dataset_id]} if prepared_runs is not None else {}),
+                    prepared=prepared_run,
                 )
                 validation_manifest = result.get("manifest") or str(manifest_path)
                 reported_manifest = Path(validation_manifest).expanduser().resolve()
@@ -1585,6 +1625,7 @@ def _run_validated_rows(
                     reported_manifest, required=True,
                 )
                 if config.modules.harmonisation.concordance_validation.enabled:
+                    active_stage = "concordance validation"
                     from postgwas.modules.harmonisation.concordance.service import run_concordance_validation
 
                     dataset_context = manifest_document.get("dataset") or {}
@@ -1637,6 +1678,7 @@ def _run_validated_rows(
                     dataset_status,
                     reported_manifest,
                     manifest=manifest_document,
+                    failure_stage="harmonisation pipeline" if dataset_status == "PARTIAL" else None,
                 )
                 result["screen_report"] = str(
                     screen_router.report_path(row.dataset_id)
@@ -1681,6 +1723,7 @@ def _run_validated_rows(
                 try:
                     record_dataset(
                         row, "FAILED", active_manifest_path, failure=exc,
+                        failure_stage=active_stage,
                     )
                 except RunSummaryError as update_exc:
                     _append_run_log(
@@ -1701,6 +1744,7 @@ def _run_validated_rows(
                     record_dataset(
                         row, "INTERRUPTED", active_manifest_path,
                         failure="Run interrupted by the user.",
+                        failure_stage=active_stage,
                     )
                 except RunSummaryError as summary_exc:
                     _append_run_log(
@@ -1717,14 +1761,21 @@ def _run_validated_rows(
                 )
                 raise
             except StudyAlleleFrequencyError as exc:
-                record_dataset(row, "FAILED", active_manifest_path, failure=exc)
-                message = "Study AF preflight failed; stopping the entire run without retry: %s" % exc
+                record_dataset(
+                    row, "FAILED", active_manifest_path, failure=exc,
+                    failure_stage=active_stage,
+                )
+                message = "Dataset %s failed study AF validation without retry: %s" % (row.dataset_id, exc)
                 _append_run_log(dataset_log, "ERROR", message)
                 _append_run_log(top_log, "ERROR", message)
                 print(screen_field("error", "Study AF preflight", str(exc), indent=4))
-                raise
+                failures.append(row.dataset_id)
+                break
             except ConfigError as exc:
-                record_dataset(row, "FAILED", active_manifest_path, failure=exc)
+                record_dataset(
+                    row, "FAILED", active_manifest_path, failure=exc,
+                    failure_stage=active_stage,
+                )
                 _append_run_log(dataset_log, "ERROR", "Configuration failure: %s" % exc)
                 _append_run_log(
                     top_log,
@@ -1737,6 +1788,7 @@ def _run_validated_rows(
             except ConcordanceValidationError as exc:
                 record_dataset(
                     row, "CONCORDANCE_FAILED", active_manifest_path, failure=exc,
+                    failure_stage=active_stage,
                 )
                 _append_run_log(
                     dataset_log,
@@ -1761,6 +1813,7 @@ def _run_validated_rows(
                 if attempt == attempts:
                     record_dataset(
                         row, "FAILED", active_manifest_path, failure=exc,
+                        failure_stage=active_stage,
                     )
                     _append_run_log(
                         dataset_log,
@@ -1774,6 +1827,10 @@ def _run_validated_rows(
                         % (row.dataset_id, attempts, dataset_log),
                     )
                     failures.append(row.dataset_id)
+            finally:
+                # Never retain a previous study's partitions/reference frames
+                # through a success, failure, interruption or retry boundary.
+                prepared_run = None
     gc.collect()
     screen_router.select(None)
     summary_block = _run_summary_block(
@@ -1810,8 +1867,8 @@ def _run_validated_rows(
     if failures:
         _append_run_log(
             top_log,
-            "WARNING",
-            "Run completed with %d OK, %d partial, and %d failed dataset(s)."
+            "ERROR",
+            "Run finished with %d OK, %d partial, and %d failed dataset(s)."
             % (ok_count, partial_count, len(failures)),
         )
         print(screen_field(
@@ -1826,8 +1883,8 @@ def _run_validated_rows(
     elif partial_count:
         _append_run_log(
             top_log,
-            "WARNING",
-            "Run completed with %d OK and %d partial dataset(s)."
+            "ERROR",
+            "Run finished with %d OK and %d partial dataset(s)."
             % (ok_count, partial_count),
         )
         print(screen_field(
@@ -1840,10 +1897,21 @@ def _run_validated_rows(
             "INFO",
             "Run completed successfully: %d dataset(s)." % ok_count,
         )
-    print(screen_line(
-        "success", "Harmonisation complete — %d dataset(s)" % len(results),
-        indent=4,
-    ))
+    if failures or partial_count:
+        print(screen_line(
+            "warning", "Harmonisation finished — %d OK, %d partial, %d failed"
+            % (ok_count, partial_count, len(failures)), indent=4,
+        ))
+        raise PipelineError(
+            "Harmonisation finished with %d failed and %d partial dataset(s); "
+            "the batch is incomplete. See %s"
+            % (len(failures), partial_count, top_log)
+        )
+    else:
+        print(screen_line(
+            "success", "Harmonisation complete — %d dataset(s)" % len(results),
+            indent=4,
+        ))
     return results
 
 
@@ -1852,7 +1920,7 @@ class HarmonisationPreflightError(ConfigurationError, RuntimeError):
 
 
 def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavailable_tools=None):
-    """Prepare every independently valid row before allowing any worker launch."""
+    """Validate declarations and shared resources without reading study variants."""
     output_root = Path(config.run.output_directory).expanduser().resolve()
     metadata = _runtime_path(config, output_root, "top_metadata_directory")
     report_path = _runtime_path(config, metadata, "preflight_report_file")
@@ -1862,7 +1930,6 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
         modules=("harmonisation", "qc_summary"), resource_paths=_RESOLVED_RESOURCE_PATHS,
     )
     defaults = _engine_defaults(config, resolved_executables=resolved_executables)
-    prepared_runs = {}
     records = list(issues)
     engine_inputs = {}
     try:
@@ -1872,8 +1939,8 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
         records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "configuration", "status": "failed", "problem": str(exc)})
     if unavailable_tools:
         records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "executables", "status": "failed", "problem": unavailable_tools})
-    # Resolve declarations and inspect the configured reference inventory before
-    # any study variants are read or any build/AF interpretation is attempted.
+    # Resolve every row's declarations before any study variants are read. Its
+    # input table and active external values are checked when that dataset runs.
     for row in rows:
         try:
             engine_inputs[row.dataset_id] = to_harmonisation_input(
@@ -1889,25 +1956,14 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
     reference_blocked = bool(unavailable_tools)
     if not unavailable_tools:
         scope = config.modules.harmonisation.resource_preflight
-        inventories = [(None, None)] + [
-            (row, engine_inputs[row.dataset_id]) for row in rows
-            if row.dataset_id in engine_inputs and any(
-                engine_inputs[row.dataset_id].get(key) for key in ("eaffile", "infofile")
-            )
-        ]
-        for row, engine_input in inventories:
-            try:
-                preflight_configured_reference_scope(
-                    defaults, config.resources.root, scope, sample_columns=engine_input,
-                )
-            except Exception as exc:
-                reference_blocked = True
-                records.append({
-                    "row": row._row_number if row is not None else None,
-                    "dataset_id": row.dataset_id if row is not None else "",
-                    "input_file": str(row.input_file if row is not None else config.resources.root),
-                    "stage": "expected references", "status": "failed", "problem": str(exc),
-                })
+        try:
+            preflight_configured_reference_scope(defaults, config.resources.root, scope)
+        except Exception as exc:
+            reference_blocked = True
+            records.append({
+                "row": None, "dataset_id": "", "input_file": str(config.resources.root),
+                "stage": "expected references", "status": "failed", "problem": str(exc),
+            })
         inventory_message = "Builds: %s; chromosomes: %s. %s" % (
             ", ".join(scope.builds), ", ".join(scope.chromosomes),
             "Failed; details will be included in the preflight report." if reference_blocked
@@ -1918,50 +1974,22 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
     for row in rows:
         if row.dataset_id not in engine_inputs:
             continue
-        gc.collect()
         record = {
             "row": row._row_number, "dataset_id": row.dataset_id,
-            "input_file": str(row.input_file), "stage": "dataset preparation",
+            "input_file": str(row.input_file), "stage": "sample sheet and resolved configuration",
             "status": "passed", "problem": "",
         }
-        try:
-            engine_input = engine_inputs[row.dataset_id]
-            if reference_blocked:
-                validate_harmonisation_inputs(engine_input, defaults)
-                record.update(status="blocked", problem="Header/configuration checked; study interpretation is blocked by the executable/reference preflight failures.")
-            else:
-                prepared_runs[row.dataset_id] = run_harmonisation_pipeline(
-                    sample_column_dict=engine_input, default_cfg=defaults,
-                    threads=config.execution.threads, preparation_only=True,
-                )
-        except Exception as exc:
-            record.update(status="failed", problem=str(exc))
-            _append_run_log(top_log, "ERROR", "Preflight row %s, dataset %s: %s" % (
-                row._row_number, row.dataset_id, exc,
-            ))
+        if reference_blocked:
+            record.update(status="blocked", problem="Declarations checked; dataset execution is blocked by the executable/reference preflight failures.")
         records.append(record)
         record_file_validation(
             row.input_file, "Harmonisation dataset preflight",
-            checks=("sample sheet and resolved configuration", "dataset preparation"),
+            checks=("sample sheet and resolved configuration",),
             status=record["status"], message=record["problem"],
             metrics={"dataset_id": row.dataset_id, "sample_sheet_row": row._row_number},
         )
         for warning in row.normalisation_warnings:
             records.append({**record, "stage": "sample sheet", "status": "warning", "problem": warning})
-    # Validate earlier preparations again after the final row. Changes while
-    # another dataset was being checked must block the whole invocation.
-    gc.collect()
-    for row in rows:
-        prepared = prepared_runs.get(row.dataset_id)
-        if prepared is None:
-            continue
-        try:
-            prepared.validate(engine_inputs[row.dataset_id], defaults)
-        except Exception as exc:
-            records.append({
-                "row": row._row_number, "dataset_id": row.dataset_id, "input_file": str(row.input_file),
-                "stage": "unchanged inputs", "status": "failed", "problem": str(exc),
-            })
     failures = [item for item in records if item["status"] == "failed"]
     failed_rows = {item["row"] for item in failures if item["row"] is not None}
     checked_rows = {item["row"] for item in records if item["row"] is not None}
@@ -1976,7 +2004,7 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
     writer.writerows(records)
     _write_text(report_path, buffer.getvalue())
     _append_run_log(top_log, "ERROR" if failures else "INFO", summary)
-    print(screen_field("error" if failures else "success", "All-row preflight", summary, indent=4))
+    print(screen_field("error" if failures else "success", "Initial preflight", summary, indent=4))
     if failures:
         for item in records:
             if item["status"] == "failed":
@@ -1994,7 +2022,6 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
             "All detected problems are in %s; dependent checks on failed rows remain blocked.%s"
             % (len(failures), report_path, " Global errors: " + global_problems if global_problems else "")
         )
-    return prepared_runs
 
 
 def run_harmonisation(
@@ -2014,7 +2041,9 @@ def run_harmonisation(
     rows: list[HarmonisationSampleSheetRow] = []
     issues = []
     try:
-        rows = load_harmonisation_sample_sheet(args.sample_sheet, issues=issues)
+        rows = load_harmonisation_sample_sheet(
+            args.sample_sheet, issues=issues, validate_files=False,
+        )
         if hasattr(args, "dataset_id"):
             rows = [row for row in rows if row.dataset_id == args.dataset_id]
             if not rows and not issues:
@@ -2030,7 +2059,7 @@ def run_harmonisation(
                 )
             except Exception as exc:
                 unavailable_tools = str(exc)
-        prepared_runs = _preflight_rows(
+        _preflight_rows(
             args, config, rows, issues, resolved_executables, unavailable_tools=unavailable_tools,
         )
     except Exception as exc:
@@ -2043,7 +2072,7 @@ def run_harmonisation(
                 _append_run_log(preflight_log, "ERROR", "Cannot save preflight failure reports: %s" % summary_exc)
         raise
     return _run_validated_rows(
-        args, config, rows, resolved_executables=resolved_executables, prepared_runs=prepared_runs,
+        args, config, rows, resolved_executables=resolved_executables,
     )
 
 
@@ -2098,11 +2127,16 @@ def main() -> int:
         parser.print_help()
         return 0
     args = parser.parse_args()
+    configuration = None
     try:
-        run_harmonisation(args)
+        configuration = load_run_configuration_for_module(
+            "harmonisation", getattr(args, "run_config", None),
+            module_overrides=explicit_overrides(args, CLI_OVERRIDE_PATHS),
+        )
+        run_harmonisation(args, configuration=configuration)
     except KeyboardInterrupt:
         try:
-            fallback = load_configuration()
+            fallback = configuration or load_configuration()
             output = Path(getattr(args, "output_directory", fallback.run.output_directory))
             interruption_log = _top_run_log(fallback, output)
             _append_run_log(
@@ -2120,7 +2154,7 @@ def main() -> int:
         return 130
     except (ConfigurationError, ConfigError) as exc:
         try:
-            fallback = load_configuration()
+            fallback = configuration or load_configuration()
             output = Path(getattr(args, "output_directory", fallback.run.output_directory))
             _append_run_log(
                 _top_run_log(fallback, output),
@@ -2136,7 +2170,7 @@ def main() -> int:
         return 2
     except Exception as exc:
         try:
-            fallback = load_configuration()
+            fallback = configuration or load_configuration()
             output = Path(getattr(args, "output_directory", fallback.run.output_directory))
             failure_log = _top_run_log(fallback, output)
             _append_run_log(

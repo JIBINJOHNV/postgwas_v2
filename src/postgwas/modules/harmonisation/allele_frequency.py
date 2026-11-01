@@ -147,7 +147,10 @@ class AlleleFrequencyError(RuntimeError):
 
 
 class StudyAlleleFrequencyError(AlleleFrequencyError):
-    """Fatal dataset AF preflight failure; never retry or start another dataset."""
+    """Stop the owning dataset's AF preflight without retrying it.
+
+    The batch runner may continue with independent datasets.
+    """
 
 
 def validate_study_allele_frequency(
@@ -259,7 +262,7 @@ def validate_study_allele_frequency(
                     "(minimum %s); mean absolute allele-aligned AF difference: %s (maximum %s). "
                     "No AF values were changed. Check the study AF/allele mapping, reference "
                     "population and genome build, or supply a valid external EAF source. "
-                    "The run stopped before chromosome analysis; no dataset retry will be attempted."
+                    "This dataset stopped before chromosome analysis; no dataset retry will be attempted."
                     % (column, reason, paired.height, evidence["minimum_overlap"], method,
                        _fmt_metric(evidence["correlation"]), evidence["minimum_correlation"],
                        _fmt_metric(evidence["mean_absolute_difference"]),

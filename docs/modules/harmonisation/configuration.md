@@ -531,9 +531,18 @@ summary. Missing or invalid adapter Neff values fail rather than being replaced
 with a recalculation. This avoids a second rounding rule such as Python's
 [half-to-even `round`](https://docs.python.org/3/library/functions.html#round).
 
-At the current sample-sheet preflight stage, referenced data files are never
-opened or decompressed. Validation uses filesystem metadata only: the path must
-exist, identify a regular file, and have nonzero size.
+Initial command preflight validates all sheet declarations, required source
+pairs, path-template syntax, duplicate identities and shared setup without
+opening the study tables. Each dataset's input availability, header, values
+and active external EAF/INFO resources are checked when its turn begins.
+The dataset then completes the full harmonisation pipeline before the next
+study is read. A dataset-specific failure is recorded while independent later
+datasets continue. Invalid configuration or sheet declarations, shared resource
+failures, mandatory reporting failures and user interruption stop the batch.
+After all independent datasets have been attempted, any failed or partial
+dataset makes the command exit nonzero. Successful dataset outputs remain
+available, but the incomplete batch cannot receive a completed checkpoint.
+The direct sample-sheet loader retains its strict default file-metadata checks.
 
 ## Execution defaults
 
@@ -733,7 +742,8 @@ Clipping provenance and the configured clipped-SE validation remain in force.
 Every run writes `run_metadata/postgwas.log` and `resolved_config.yaml` at the
 output root. It also writes the configured `runtime.run_summary_file` (packaged
 default `harmonisation_run_summary.csv`) with one row per selected dataset.
-Its columns follow pipeline order. This run-level CSV records final status;
+Its columns follow pipeline order. This run-level CSV records final status,
+failure reason, recorded failure stage and dataset log path;
 input-QC-ready SNP and indel/other counts; resolved and detected build/effect/P
 types, with explicit automatic-detection flags; the harmonised effect scale;
 combined completed-chromosome strand counts and reference files; final-VCF SNP
@@ -746,6 +756,10 @@ persisted QC assessment JSON, and perform no additional GWAS or VCF scan. A
 command-level preflight failure after the sample sheet has been parsed records
 every selected dataset as `PREFLIGHT_FAILED` with the shared reason; property
 and chromosome fields remain blank because no scientific analysis occurred.
+The final terminal summary names failed, partial and unreached datasets with
+their recorded reasons and available logs. The stage names describe the
+observed orchestration boundary; they do not infer a scientific failure stage
+from exception wording. No configuration key or scientific default is added.
 
 The configured `output_layout.html_report` writes one standalone HTML report
 for each selected dataset (packaged pattern

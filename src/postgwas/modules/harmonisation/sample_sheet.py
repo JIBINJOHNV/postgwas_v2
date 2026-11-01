@@ -27,6 +27,7 @@ from postgwas.core.errors import ConfigurationError
 from postgwas.core.paths import configured_output_path
 from postgwas.core.values import MISSING_TEXT
 from postgwas.modules.harmonisation.resource_paths import (
+    external_resource_template_fields,
     validate_external_resource_spec,
 )
 
@@ -144,10 +145,13 @@ def _require_nonempty_file(path: Path, field: str, row_number: int) -> None:
         raise ConfigurationError("Row %d: %s is empty: %s" % (row_number, field, path))
 
 
-def _require_external_resource(path: Path, field: str, row_number: int) -> None:
-    """Accept one non-empty file or an explicit chromosome/build template."""
+def _require_external_resource(
+    path: Path, field: str, row_number: int, *, validate_files: bool = True,
+) -> None:
+    """Validate path syntax, and optionally its matching non-empty files."""
     try:
-        validate_external_resource_spec(path)
+        validator = validate_external_resource_spec if validate_files else external_resource_template_fields
+        validator(path)
     except ValueError as exc:
         raise ConfigurationError(
             "Row %d: %s is invalid. %s" % (row_number, field, exc)
@@ -371,11 +375,14 @@ def _validation_error_text(exc: ValidationError) -> str:
 
 def load_harmonisation_sample_sheet(
     path: str | Path, *, issues: list[dict] | None = None,
+    validate_files: bool = True,
 ) -> list[HarmonisationSampleSheetRow]:
     """Check every row; optionally collect issues for the full-run preflight.
 
     Without a collector, preserve the public fail-on-invalid-sheet contract,
     but raise only after every independently readable row has been checked.
+    The batch runner defers file availability to each dataset's own validation;
+    row declarations and duplicate identities are always checked here.
     """
     collected = [] if issues is None else issues
     sample_sheet = Path(path).expanduser().resolve()
@@ -409,15 +416,18 @@ def load_harmonisation_sample_sheet(
         except ValidationError as exc:
             row = None
             row_problems.append(_validation_error_text(exc))
-        # File availability and duplicate identities do not depend on a valid
-        # scientific mapping. Check them even when another cell is invalid.
+        # Path syntax and duplicate identities do not depend on a valid mapping.
+        # Batch execution defers only availability to the owning dataset.
         for field in ("input_file", "external_eaf_file", "external_info_file"):
             value = record.get(field)
             if value is None or (field == "external_info_file" and not _missing(record.get("imputation_info_column"))):
                 continue
             try:
-                check = _require_nonempty_file if field == "input_file" else _require_external_resource
-                check(Path(value), field, row_number)
+                if field == "input_file":
+                    if validate_files:
+                        _require_nonempty_file(Path(value), field, row_number)
+                else:
+                    _require_external_resource(Path(value), field, row_number, validate_files=validate_files)
             except (ConfigurationError, OSError, ValueError, RuntimeError) as exc:
                 row_problems.append(str(exc))
         for field, seen, identity in (

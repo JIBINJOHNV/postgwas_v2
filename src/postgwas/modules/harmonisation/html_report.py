@@ -545,6 +545,7 @@ def _output_paths(record: Mapping[str, Any], manifest: Mapping[str, Any]) -> lis
     rows: list[tuple[str, Any]] = [
         ("Dataset manifest", record.get("manifest")),
         ("Screen report", record.get("screen_report")),
+        ("Dataset log", record.get("dataset_log")),
         ("Combined log", manifest.get("combined_log")),
         ("Rejected variants", dataset.get("rejected_variants_file")),
         ("Reject-reason table", dataset.get("reject_reason_table")),
@@ -598,12 +599,23 @@ def _outputs_section(record: Mapping[str, Any], manifest: Mapping[str, Any], rep
     )
 
 
-def _attention(record: Mapping[str, Any], manifest: Mapping[str, Any]) -> str:
+def _attention(
+    record: Mapping[str, Any], manifest: Mapping[str, Any],
+    report_path: str | Path | None = None,
+) -> str:
     """Surface observed findings without creating new scientific QC rules."""
     messages = []
     failure = record.get("failure_reason") or (manifest.get("failure") or {}).get("message")
+    failure_context = ""
     if failure:
-        messages.append(("error", "Processing failure", str(failure)))
+        failure_context = (
+            '<div class="callout error"><strong>Processing failure</strong><p>%s</p>%s%s</div>'
+            % (
+                escape(str(failure)),
+                _key_value_table([("Failure stage", record.get("failure_stage"))]),
+                _output_links([("Dataset log", record.get("dataset_log"))], report_path),
+            )
+        )
     status = _status(record.get("status") or manifest.get("status"))
     if not failure and status not in {"OK", "PARTIAL", "COMPLETED"}:
         messages.append(("warning", "Completion not established",
@@ -638,8 +650,8 @@ def _attention(record: Mapping[str, Any], manifest: Mapping[str, Any]) -> str:
         messages.append(("warning", "Review input–VCF concordance",
             f"Recorded outcome: {_text(validation['status'])}. Review the comparison below; input-only variants and statistical disagreements have different meanings."))
     if not messages:
-        return '<p class="section-note">No headline alert is recorded here. Review stage evidence and chromosome warnings; this is not a statement that every scientific check passed.</p>'
-    return "".join('<div class="callout %s"><strong>%s</strong><p>%s</p></div>' % (
+        return failure_context or '<p class="section-note">No headline alert is recorded here. Review stage evidence and chromosome warnings; this is not a statement that every scientific check passed.</p>'
+    return failure_context + "".join('<div class="callout %s"><strong>%s</strong><p>%s</p></div>' % (
         kind, escape(title), escape(message),
     ) for kind, title, message in messages)
 
@@ -1062,7 +1074,7 @@ def _results_overview(record: Mapping, manifest: Mapping, report_path: str | Pat
     blocks.append(("Input–VCF concordance", _concordance_section(manifest, compact=True), 7))
     links = _output_paths(record, manifest)
     downloads = [(label, path) for label, path in links if label in {"Dataset manifest", "Rejected variants", "Reject-reason table", "VCF QC — html"} or label.startswith("Merged output — ")]
-    blocks.append(("Final takeaway", _attention(record, manifest) + '<h5>Outputs and supporting evidence</h5>' + _output_links(downloads, report_path), 8))
+    blocks.append(("Final takeaway", _attention(record, manifest, report_path) + '<h5>Outputs and supporting evidence</h5>' + _output_links(downloads, report_path), 8))
     prefix = "dataset-" + _safe_id(record.get("dataset_id") or manifest.get("sample_id") or "Dataset")
     cards = _metric_cards((
         ("Processing status", record.get("status") or manifest.get("status"), "status"),

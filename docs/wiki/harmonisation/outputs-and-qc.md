@@ -109,8 +109,9 @@ records `not_applied` because consequence annotation has not been run on it.
 
 ## Run-level dataset summary
 
+For a valid sample sheet,
 `<output>/run_metadata/harmonisation_run_summary.csv` contains exactly one row
-for every dataset selected from the sample sheet, in sample-sheet order. The
+for every selected dataset, in sample-sheet order. The
 file is initialized before the first dataset starts and is atomically updated
 after each dataset, so preflight-failed, failed, interrupted, partial, running,
 and not-yet-run datasets remain visible rather than disappearing from the run
@@ -121,7 +122,9 @@ status, initial input validation, build inference, study-wide decisions,
 chromosome harmonisation, population-frequency comparison, final VCF/QC, and
 output provenance. Each row includes:
 
-- final dataset status and a single-line failure reason;
+- final dataset status, a single-line failure reason, the recorded orchestration
+  failure stage and the dataset log path when available; a dataset not started
+  because initial preflight failed has no dataset log;
 - resolved and independently detected genome build, effect type, and P-value
   type, together with the source of each applied decision and explicit booleans
   showing whether effect and P-value types were selected automatically;
@@ -159,6 +162,13 @@ another VCF query. Percent columns contain numeric percentage values, not text
 with a percent sign. If any expected chromosome is missing, the strand status
 is `partial` and its coverage fields show the incomplete denominator. Therefore
 a partial total is never presented as a complete whole-study total.
+
+The final terminal summary names unsuccessful datasets with their recorded
+stage, reason and available log. Dataset-specific failures allow independent
+later datasets to run. Once all have been attempted, any failed or partial
+dataset makes the command exit nonzero, retaining successful outputs without
+creating a completed batch checkpoint. Invalid sheet rows remain detailed in
+the initial preflight CSV.
 
 ## HTML reports
 

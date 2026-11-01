@@ -6,20 +6,25 @@ allele-aligned, build-resolved GWAS-VCFs with QC and rejection evidence.
 First, PostGWAS checks the configured expected reference inventory: by default,
 GRCh37 and GRCh38, chromosomes 1–22. This structural check does not infer the study
 build or read study variants, even with `build.mode: auto`. Missing or invalid
-resources block study interpretation while independent CSV/header checks continue.
+shared resources stop the command after independent sheet declarations are checked.
 
-Before chromosome processing, PostGWAS completes dataset preparation for every
-usable selected sample-sheet row. Errors from all rows are collected in the configured
-preflight CSV and canonical log. If any row fails, no dataset enters chromosome
-harmonisation. On success, the existing prepared partitions and decisions are reused;
-the original summary-statistics files are not parsed again. This changes scheduling,
-not the order or thresholds of the scientific checks within a dataset.
+After initial configuration and sample-sheet validation, PostGWAS prepares and
+completes each selected dataset before reading the next. A dataset-specific
+failure is recorded and later datasets continue. Shared setup failures,
+mandatory reporting failures and user interruption stop the batch. The current
+dataset's prepared partitions and decisions are reused without parsing its raw
+summary-statistics file again. Scientific checks and thresholds within each
+dataset keep their existing order.
+After all independent datasets have been attempted, any failed or partial
+dataset makes the command exit nonzero and prevents a completed batch
+checkpoint. Successful dataset outputs remain available.
 
 Dataset preparation and analysis share one parent process. Failure accounting
 retains dataset IDs rather than exception objects, whose tracebacks can keep
 study dataframes alive ([Python exception semantics](https://docs.python.org/3.10/reference/compound_stmts.html#the-try-statement)).
-Unreachable objects are collected between preparations, datasets and retries,
-and after the final preparation or dataset; error details remain in the existing
+Only the current dataset's preparation is retained. Unreachable objects are
+collected between datasets and retries, and after the final dataset;
+error details remain in the existing
 logs and reports. This does not guarantee that the process returns all allocated
 RAM to the operating system. The memory-budget guard remains enforced and, on
 failure, reports the configured budget, measured parent RSS, reserved headroom
@@ -233,18 +238,20 @@ PostGWAS performs these checks first:
 4. Check the resource root, output directory, required executables, and the
    configured bcftools liftover plugin. Save the resolved configuration and start
    the canonical logs.
-5. Validate the expected resource paths for every build and chromosome in
-   `resource_preflight` (defaults: GRCh37, GRCh38 and 1–22). This uses YAML and CSV
-   source declarations only; it does not infer the study build. Check file
+5. Validate the common expected resource paths for every build and chromosome in
+   `resource_preflight` (defaults: GRCh37, GRCh38 and 1–22). This uses configured
+   resource declarations; it does not infer the study build. Check file
    availability, headers, indexes and structural compatibility before preparation.
-6. Prepare every usable selected dataset and collect failures across rows. Save
-   the preflight CSV. If any prerequisite fails, stop before chromosome processing
-   for all datasets. Otherwise initialize the per-dataset reports, normalized
-   sample-sheet rows, command records and run summary with `NOT_RUN` rows.
-   Process datasets one at a time using their existing preparation; each analysis
-   summary changes to `RUNNING` when execution begins.
+6. Save the initial preflight CSV. Invalid sheet declarations or shared setup
+   failures stop the batch. Otherwise initialize the run summary with `NOT_RUN`
+   rows. For each dataset, write its metadata, check active external EAF/INFO
+   resources, prepare its input and immediately execute the full pipeline using
+   that preparation. Its summary changes to `RUNNING` when its turn starts.
+   Record a dataset-specific failure and proceed to the next dataset; complete
+   required output validation before reporting any dataset as `OK`.
 
-If one of these checks fails, chromosome analysis has not started.
+If initial configuration, sheet or shared-setup validation fails, chromosome
+analysis has not started. Dataset checks run only in that dataset's turn.
 
 The screen report is an output-routing step, not a second analysis. PostGWAS
 copies each emitted stdout message to the active dataset report and optionally
@@ -1023,8 +1030,8 @@ resolved and detected genome build, effect type, P-value type, final frequency
 type, population result, key variant counts, and the final manifest. Failed or
 partial rows retain the evidence that was available before failure, including
 the count of rows explicitly unprocessed because a chromosome failed, and
-include an actionable failure reason; datasets not reached after an
-interruption remain `NOT_RUN`.
+include an actionable failure reason, recorded failure stage and dataset log
+where available; datasets not reached after an interruption remain `NOT_RUN`.
 
 For strand orientation, PostGWAS sums the already-recorded chromosome counters
 for completed chromosomes only. It also writes expected, completed, and
@@ -1040,7 +1047,8 @@ The CSV is marked `partial`, `mixed`, or `inconsistent` when chromosome
 coverage, status, or arithmetic does not support a complete result. No summary
 statistics or VCF is rescanned. After all selected datasets have been handled,
 the terminal shows the CSV location and the numbers that are OK, partial,
-failed, or not finished.
+failed, or not finished, followed by the named unsuccessful datasets and their
+recorded reasons and available logs.
 
 ## What can happen to one input row?
 

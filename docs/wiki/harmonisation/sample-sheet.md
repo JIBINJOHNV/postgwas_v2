@@ -5,18 +5,18 @@ normalized for case, whitespace, Unicode compatibility, and hyphens. Extra
 columns, such as `phenotype`, `pubmed_id`, or custom review notes, are allowed
 and ignored during harmonisation. They remain in your source sheet and are
 not included in the normalized analysis row. Required fields and the values
-of recognized fields are still validated. Referenced data files are checked for existence and size
-during sample-sheet validation and opened during dataset preparation. All selected
-datasets finish preflight before any chromosome harmonisation starts.
+of recognized fields are still validated. The command validates the sheet and
+shared setup first, then reads, validates and completes one dataset before
+starting the next. Input availability and content are checked when that
+dataset's turn begins.
 
-## All-row preflight
+## Initial preflight and sequential datasets
 
 PostGWAS collects sample-sheet errors across all readable rows, then validates the
 expected reference inventory from YAML before any study interpretation. The default
 `modules.harmonisation.resource_preflight` scope is both `GRCh37` and `GRCh38`,
 chromosomes `1` through `22`, including when `policies.build.mode` is `auto` or a
-declared build. It expands the configured resource templates, checks common
-references and active external EAF/INFO sources, and validates their file structures,
+declared build. It expands the configured common resource templates and validates their file structures,
 columns and indexes. It does not read study variants, infer a study build, or classify
 AF values at this stage. Every file in the configured inventory is required, even
 if a later study uses fewer chromosomes or only one source build.
@@ -26,24 +26,35 @@ The scope is configurable through `resource_preflight.builds` and
 not filter study variants or set the study build. Reference files for additional
 observed chromosomes, such as X, are still checked during dataset preparation.
 
-After the inventory passes, PostGWAS checks the headers and content, resolves the
-build and study properties once per usable selected dataset, and validates its exact
-resource compatibility. Successful static reference reads are reused. Extra metadata columns remain
-allowed. A bad row does not prevent later rows from being checked. Checks that depend
-on a failed prerequisite cannot be completed and remain blocked; an unreadable YAML
-or ambiguous CSV header must be repaired before dependent checks can run.
+After the shared inventory passes, PostGWAS checks the current dataset's input
+availability, headers and content, resolves its build and study properties,
+and validates exact resource compatibility. Active external EAF/INFO files are
+checked in that dataset's turn, using the same configured inventory scope.
+The dataset then proceeds through chromosome processing, VCF creation,
+annotation, liftover, final merges and required validation before the next
+dataset is read.
+Successful unchanged reference checks are reused under the same contract.
 
 The terminal reports counts; `run_metadata/harmonisation_preflight.csv` contains
 row numbers, dataset IDs, input paths, stages, status and detailed problems. Its
 filename is controlled by `modules.harmonisation.runtime.preflight_report_file`.
-The canonical log also records failures. Any fatal preflight error stops the entire
-invocation with a nonzero exit before chromosome workers or GWAS-VCF generation.
-Validation logs and prepared Parquet work files may exist; they do not indicate a
-completed analysis.
+The canonical log also records failures. Invalid configuration, invalid sheet
+declarations or identities, and missing shared tools or references stop the
+invocation before dataset analysis. A dataset-specific input, external-source
+or scientific validation failure remains a failure for that dataset; later
+independent datasets still run. Mandatory report failures and user interruption
+stop the batch. The final terminal summary names unsuccessful datasets, with
+the recorded stage, reason and dataset log where available. The run-summary
+CSV and HTML retain every selected dataset, including those not reached.
+After all independent datasets have been attempted, any failure or partial
+result makes the command exit nonzero; successful dataset outputs are retained.
+The incomplete batch is not checkpointed as completed.
+Prepared work files alone do not indicate a completed analysis.
 
 Successful preparation is reused within the same invocation. Full study frames are
-released after partitioning; the selected datasets' work files use disk space until
-execution/cleanup. Configuration and input identities are checked again
+released after partitioning, and only the current dataset's preparation is
+retained for execution. Work files follow the existing cleanup policy.
+Configuration and input identities are checked again
 before execution. Prepared work files must retain their SHA-256 content fingerprints;
 metadata-only changes do not establish a data change. Successful read-only reference checks are reused only for unchanged
 files under the same validation contract. Runtime scientific and output checks remain
