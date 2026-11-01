@@ -390,7 +390,7 @@ and replace all placeholder values.
 | Identity and file | `config_version` set to `2`, a unique `dataset_id`, and `input_file`; relative file paths resolve from the sample-sheet directory. |
 | Coordinates and alleles | Chromosome/position columns (or a combined column), effect allele and other allele. Check that the effect and frequency refer to the declared effect allele. |
 | Effect and P value | An effect estimate or Z score, a P-value column and its representation (`raw`, `neglog10` or `auto`). Map supplied SE when available; recovery of missing statistics is conditional. |
-| Allele frequency | Exactly one internal `effect_allele_frequency_column` or external file/column pair. The default comparison AF panel does not replace this study-frequency source. |
+| Allele frequency | Exactly one internal `effect_allele_frequency_column` or external file/column pair. The default comparison AF panel does not replace this study-frequency source automatically; [explicit EAF replacement](docs/modules/harmonisation/eaf_replacement.md) is available when the internal column is confirmed as MAF. |
 | Imputation quality | Internal INFO takes priority over an external INFO file/column pair. With neither source, explicitly choose `--fixed-info VALUE`; an external proxy or fixed value is not study-measured quality. |
 | Study design and effect scale | Review `trait_type`, `effect_type` and any automatic decisions against the publication; an odds ratio is not a linear-trait beta. See the sample-sheet guide before using an Neff-only compatibility route. |
 | Sample size | For quantitative traits, `control_count_column` or `control_count` represents total N. For case-control traits, provide real control and case counts through their corresponding column or fixed-count fields. |
@@ -425,6 +425,32 @@ merges and assesses the outputs. Study-wide decisions—including build, strand
 consensus, effect type, OR SE scale, P-value scale and EAF/MAF interpretation—are
 recorded as `DECIDE` entries in the log. Dataset rows currently run sequentially;
 chromosome work uses bounded parallelism.
+
+#### Optional: replace a confirmed MAF column with reference EAF
+
+Keep the study's internal frequency column mapped in the sample sheet.
+Harmonisation screens it and, when needed, checks it against `default_eaf`.
+Accepted study EAF stays in use,
+including MAF-looking values when the listed effect alleles are minor.
+If direct EAF agreement fails and the same comparison supports MAF, supply
+both replacement options:
+
+```bash
+postgwas harmonisation \
+  --sample-sheet studies.csv \
+  --dataset-id STUDY \
+  --resource-directory reference/harmonisation \
+  --output-directory results/harmonisation \
+  --eaf-replacement-file '/references/{build}/eaf_chr{chromosome}.tsv.gz' \
+  --eaf-replacement-column EUR
+```
+
+Comparisons continue to use `default_eaf`; the replacement file only supplies
+the selected frequencies after MAF is supported. Original study values are
+preserved, and output EAF is labelled as a reference proxy. Supported MAF
+without a replacement stops that dataset with an actionable error. Inconclusive
+evidence also stops that dataset. See the [replacement guide](docs/modules/harmonisation/eaf_replacement.md)
+for source mapping, population/build requirements, YAML settings and provenance.
 
 #### Review the results before continuing
 

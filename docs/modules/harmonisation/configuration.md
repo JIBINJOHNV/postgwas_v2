@@ -721,9 +721,12 @@ row missing several final fields is counted under the first configured rule
 only. With `keep`, the table instead labels the counts as independent and
 potentially overlapping; `fail` is labelled as fail-fast. Chromosome coverage
 is recorded so a partial run is not presented as a complete genome-wide
-assessment. An external EAF source is selected only when no internal EAF column
-is selected; it does not silently fill individual nulls in an internal study
-column. SE has no external-file source. When no SE column is selected, it is
+assessment. An ordinary sample-sheet external EAF source is selected only when
+no internal EAF column is selected; it does not silently fill individual nulls
+in an internal study column. The separate
+[explicit EAF replacement](eaf_replacement.md) can replace the working frequency
+source only after whole-study reference evidence supports MAF. SE has no
+external-file source. When no SE column is selected, it is
 derived from usable Z or from BETA and P under the configured scientific
 policies. When a selected study SE column is only partly populated, the
 pipeline preserves every populated value, first recovers eligible null cells
@@ -1206,9 +1209,13 @@ swapped matches use `1-AF`.
 For a study-supplied AF column, additional reference comparison is required only
 when the whole-study share of usable values at or below 0.5 is **greater than 95%**
 (or the configured `eaf.maf_decision_cutoff`). The paired diagnostic set contains
-finite, uniquely allele-matched, non-palindromic variants across all chromosomes.
-Reference AF is aligned to the **original study effect allele** before comparing;
-neither frequency vector is folded to MAF. All three configurable gates must pass:
+finite, uniquely allele-matched, non-palindromic variants across all chromosomes
+at reference sites eligible for biallelic frequency inference. Known extra
+alleles exclude a site from these diagnostics; complete site membership in the
+supplied reference remains an input assumption. Reference AF is aligned to the
+**original study effect allele** before comparing. PostGWAS tests direct EAF
+agreement first, without folding either vector to MAF. All three configurable
+gates must pass to retain the declared internal EAF source:
 
 | Policy under `modules.harmonisation.policies.eaf` | Default | Acceptance |
 |---|---:|---|
@@ -1219,18 +1226,35 @@ neither frequency vector is folded to MAF. All three configurable gates must pas
 `maf_reference_correlation_method` remains `pearson` by default; the existing
 `spearman` override is also supported. These are dataset QC heuristics, not
 validated universal cutoffs or proof that every frequency is correctly labelled.
-A constant vector, too few matches, or either failed agreement threshold stops
-the entire invocation before chromosome analysis, without retrying this dataset
-or starting subsequent datasets. Logs record the measured evidence and failure.
-Missing and invalid values remain subject to the existing range/missing policies.
-No individual variant is selected, removed, imputed or replaced by this decision.
-In particular, a mean difference limit of 0.10 is not a per-variant filter.
+When direct EAF agreement passes, that source stays in use even if a replacement
+was supplied. If it fails, the same eligible pairs are tested for MAF support:
+folded MAF must pass the overlap, correlation and mean-difference gates, the
+reference must pass `reference_minor_fraction_cutoff`, and the MAF error must
+beat the EAF error by more than `maf_reference_error_margin`. Only supported
+MAF can select the paired [explicit EAF replacement source](eaf_replacement.md).
+Its frequencies are a population-reference proxy; the replacement file never
+supplies evidence for its own selection or palindrome orientation.
+
+Supported MAF without a replacement, insufficient overlap, constant diagnostic
+vectors or otherwise inconclusive evidence stops that dataset before chromosome
+analysis, without retrying it. Independent later datasets continue under the
+existing batch failure policy; the command ultimately exits nonzero if any
+dataset failed. Logs record the measured evidence and failure. Missing and
+invalid values remain subject to the existing range/missing policies. These
+aggregate gates do not select or remove individual variants, and a mean
+difference limit of 0.10 is not a per-variant filter. When replacement is
+selected, the original study MAF and source snapshots remain preserved while
+the working EAF is obtained from the declared replacement.
 
 When this study-level comparison reads a reference, PostGWAS also retains its
 allele matches, including ambiguous and palindromic candidates. Compact matches
 are bound to the original source-row IDs in the existing chromosome Parquet work
 files. Workers reuse them without rereading the original frequency table or
-repeating allele matching or MAF classification. No extra CLI option is needed.
+repeating allele matching or MAF classification. Prepared comparison evidence
+does not require an extra CLI option. If the selected replacement is the same
+physical reference, population column and structural mapping, workers reuse
+its prepared AF instead of reading and staging it again. Other replacements
+use the existing external-reference staging and worker memory accounting.
 The preparation contract checks reference identity, population, column mappings,
 matching policies and unchanged study keys/frequencies. Incomplete or changed
 preparation stops instead of silently reusing stale evidence. Preparation is
@@ -1241,18 +1265,18 @@ scientific outputs. A study that does not trigger the comparison continues to
 read its reference normally for chromosome orientation.
 
 The aligned reference's share at or below 0.5 is reported but **does not veto
-acceptance**. If effect alleles are minor, their EAF legitimately equals MAF.
-The `reference_minor_fraction_cutoff` and `maf_reference_error_margin` vetoes
-therefore do not apply to this whole-study acceptance step. A passing result
-means reference-consistent declared EAF, not proof of the original column's
-provenance. Allele semantics follow the
+direct EAF acceptance**. If effect alleles are minor, their EAF legitimately
+equals MAF. The `reference_minor_fraction_cutoff` and
+`maf_reference_error_margin` gates apply only to the fallback MAF classification
+after direct EAF agreement fails, and to the separate external-file classifier.
+A passing direct result means reference-consistent declared EAF, not proof of
+the original column's provenance. Allele semantics follow the
 [GWAS-SSF contract](https://www.ebi.ac.uk/gwas/docs/summary-statistics-format/);
 subsequent swaps follow the
 [GWAS Catalog harmonisation rules](https://ebispot.github.io/gwas-sumstats-harmoniser-documentation/Introduction/Harmonising-the-variants/).
 
-The **separate external-file classifier is unchanged**. An external frequency is
-screened on its
-deduplicated raw values before this swap operation. A non-MAF-like result
+The **ordinary sample-sheet external-file classifier is unchanged**. Its
+frequency is screened on its deduplicated raw values before this swap operation. A non-MAF-like result
 retains the sample sheet's declared ALT/EAF meaning. A MAF-like result requires
 an independent default panel; if `external_eaf_file` and the resource selected
 by `modules.harmonisation.default_eaf.source` resolve to the same physical file,
