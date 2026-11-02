@@ -34,6 +34,7 @@ Python 3.8 compatible.  Imports polars and the standard library at module level.
 """
 
 import math
+from copy import deepcopy
 from typing import Any, Dict, Optional
 
 import polars as pl
@@ -1082,21 +1083,27 @@ def resolve_study_properties(
 
         statistics = _collect_study_statistics(df, sample_column_dict, pol)
 
-        _decide_effect_type(
-            df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
-        )
-        _decide_beta_z_sign_consistency(
-            df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
-        )
-        _decide_pvalue_type(
-            df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
-        )
-        _decide_or_se_scale(
-            df, sample_column_dict, pol, ctx, decisions, logger=logger,
-        )
-        _decide_eaf_is_maf(
-            df, sample_column_dict, pol, ctx, decisions, statistics,
-        )
+        try:
+            _decide_effect_type(
+                df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
+            )
+            _decide_beta_z_sign_consistency(
+                df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
+            )
+            _decide_pvalue_type(
+                df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
+            )
+            _decide_or_se_scale(
+                df, sample_column_dict, pol, ctx, decisions, logger=logger,
+            )
+            _decide_eaf_is_maf(
+                df, sample_column_dict, pol, ctx, decisions, statistics,
+            )
+
+        except StudyPropertyError as exc:
+            # Preserve the evidence already measured before the original failure.
+            exc.study_decisions = deepcopy(decisions)
+            raise
 
         ctx.set_rows(df.height, removed=0)
         ctx.extra["study_properties"] = {

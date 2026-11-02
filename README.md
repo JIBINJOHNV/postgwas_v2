@@ -467,6 +467,12 @@ materialises later QC-based exclusions.
 `--validate` adds an original-input versus same-build output concordance check.
 Review that result and the dataset/run completion status before continuing.
 
+Before chromosome processing, the detailed study-wide report explains the
+selected build, effect/P representations, SE scale, frequency source and strand
+consensus using their recorded evidence and configured acceptance rules. It
+reuses existing calculations; unavailable or unneeded checks are labelled
+explicitly. The same evidence is retained in the dataset log and run manifest.
+
 A confirmed input-read or decompression failure immediately stops that dataset
 with its full file path, reason and repair guidance. Other sample-sheet entries
 continue; the final command returns nonzero if any dataset failed. See

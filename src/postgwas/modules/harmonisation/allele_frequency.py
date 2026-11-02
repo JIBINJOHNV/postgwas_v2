@@ -48,6 +48,7 @@ defaults"; ``eaf.degenerate`` defaults to ``reject`` as documented there.
 
 import math
 import os
+from copy import deepcopy
 from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
@@ -151,8 +152,15 @@ class AlleleFrequencyError(RuntimeError):
 class StudyAlleleFrequencyError(AlleleFrequencyError):
     """Stop the owning dataset's AF preflight without retrying it.
 
-    The batch runner may continue with independent datasets.
+    The batch runner may continue with independent datasets. Optional measured
+    study evidence is copied so failure reporting never needs another analysis.
     """
+
+    def __init__(self, *args, study_decisions=None):
+        super().__init__(*args)
+        self.study_decisions = (
+            deepcopy(study_decisions) if study_decisions is not None else None
+        )
 
 
 def validate_study_allele_frequency(
@@ -252,14 +260,18 @@ def validate_study_allele_frequency(
                 "decision_reason": reason,
                 "maf_reference_decision": interpretation,
             }
+            decisions["eaf_reference_validation"] = evidence
             if not comparison["direct_eaf_accepted"] and interpretation == "maf":
                 try:
                     require_resolved_arguments(replacement_requirements)
                 except MissingRequiredArgumentsError as exc:
+                    evidence["failure_reason"] = "replacement_arguments_missing"
                     message = ("Input MAF supported, not aligned to the listed effect allele "
                                "(direct EAF agreement failed: %s). " % reason) + str(exc)
                     emit.error(message)
-                    raise StudyAlleleFrequencyError(message) from exc
+                    raise StudyAlleleFrequencyError(
+                        message, study_decisions=decisions,
+                    ) from exc
                 evidence.update(status="replacement_selected", decision_reason="maf_interpretation_supported")
                 decisions.update(
                     eaf_selected_source="replacement_reference", eaf_input_interpretation="maf",
@@ -290,12 +302,15 @@ def validate_study_allele_frequency(
                 )
                 emit.warn(message)
                 emit.error(message)
-                raise StudyAlleleFrequencyError(message)
+                raise StudyAlleleFrequencyError(message, study_decisions=decisions)
             # Preparation adds internal evidence only; preserve all source rows
             # and their order, including rows without diagnostic AF matches.
             matches = pl.concat(prepared, rechunk=False)
             if matches.height != df.height or matches[SOURCE_INPUT_ROW_COLUMN].n_unique() != df.height:
-                raise StudyAlleleFrequencyError("Reference preparation did not cover every study row exactly once.")
+                raise StudyAlleleFrequencyError(
+                    "Reference preparation did not cover every study row exactly once.",
+                    study_decisions=decisions,
+                )
             order_column = unused_column_name("__postgwas_preparation_order", df)
             df = df.with_row_index(order_column).join(
                 matches, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True,

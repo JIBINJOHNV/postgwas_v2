@@ -418,6 +418,25 @@ These eight steps run once on the complete study.
    detected evidence. Automatic beta/OR inference produces a warning because
    an all-positive beta column can resemble odds ratios.
 
+   After the conditional whole-study frequency decision, one detailed
+   **Study-wide decisions and evidence** report brings together the build,
+   effect/P representations, SE scale, BETA/Z direction for missing-SE recovery,
+   frequency acceptance/source and strand consensus. It shows observed counts,
+   the relevant denominators, resolved policy limits, the decision source and
+   the planned action. The renderer reuses already-computed scalar evidence;
+   it adds no study/reference scan or scientific comparison. Warnings remain
+   immediate, and scientific decisions are unchanged.
+
+   A frequency comparison not required by the distribution screen is labelled
+   accordingly, rather than reference-confirmed. A replacement source is
+   selected for later assignment, not reported as delivered output EAF. Explicit
+   reference-aligned strand declarations are distinguished from inferred
+   consensus. Missing inputs and empty eligible subsets receive a reason, not
+   fabricated passing counts. On study-property or frequency failure, the
+   completed evidence is displayed before the original error propagates and
+   is retained in the failed manifest. Successful runs retain the same evidence
+   in their existing study-decision metadata for later inspection.
+
 Immediately after dataset step 4, PostGWAS applies the **chromosome-X Z-only reconstruction
 guard**. If X is present and the study supplies Z but neither BETA nor SE, the
 default `effect_from_z.x_chromosome_z_only_action: fail` stops the dataset

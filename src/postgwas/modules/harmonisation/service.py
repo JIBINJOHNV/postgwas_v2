@@ -113,12 +113,15 @@ from postgwas.modules.harmonisation.strand import resolve_strand_consensus
 from postgwas.modules.harmonisation.study_properties import (
     finalise_eaf_decision_from_chromosomes,
     resolve_study_properties,
+    StudyPropertyError,
 )
 from postgwas.modules.harmonisation.allele_frequency import (
     harmonise_allele_frequency,
     same_frequency_reference_source,
     validate_study_allele_frequency,
+    StudyAlleleFrequencyError,
 )
+from postgwas.modules.harmonisation.study_reporting import render_study_decisions
 from postgwas.modules.harmonisation.sample_size import (
     harmonise_sample_sizes,
     prepare_missing_sample_sizes,
@@ -177,6 +180,7 @@ from postgwas.modules.harmonisation.qc_results import qc_results_to_dataframe
 from postgwas.core.completion import file_fingerprint, configuration_digest
 from postgwas.core.input_validation import (
     capture_preflight_file_identities, require_unchanged_preflight_files, validate_once,
+    current_validation_recorder,
 )
 from postgwas.core.values import optional_text
 
@@ -471,46 +475,41 @@ def _announce(logger, message, marker="", indent=0):
     sys.stdout.flush()
 
 
-def _study_decisions_block(study_decisions):
-    """Render resolved study properties in a short, aligned screen summary."""
-    frequency_type = (
-        "MAF-like; reference confirmation required"
-        if study_decisions.get("eaf_is_maf") is True
-        else "effect allele frequency"
-        if study_decisions.get("eaf_is_maf") is False
-        else "not decided"
-    )
-    se_scale = (
-        study_decisions.get("se_scale") or "not decided"
-        if study_decisions.get("effect_type") == "odds_ratio"
-        else "not applicable to beta"
-    )
-    return "\n".join([
-        screen_line("decision", "Study-wide decisions", indent=4),
-        screen_field(
-            "analysis", "Effect type",
-            study_decisions.get("effect_type") or "not decided",
-            indent=8, label_width=16,
-        ),
-        screen_field(
-            "analysis", "SE scale", se_scale,
-            indent=8, label_width=16,
-        ),
-        screen_field(
-            "analysis", "P-value type",
-            study_decisions.get("pvalue_type") or "not decided",
-            indent=8, label_width=16,
-        ),
-        screen_field(
-            "genetic", "Frequency type", frequency_type,
-            indent=8, label_width=16,
-        ),
-        screen_field(
-            "genetic", "Strand consensus",
-            study_decisions.get("strand") or "not decided",
-            indent=8, label_width=16,
-        ),
-    ])
+def _study_decisions_block(study_decisions, **context):
+    """Present existing study evidence through the shared detailed renderer."""
+    display = getattr(current_validation_recorder(), "display", None)
+    if display is not None:
+        def reference(path):
+            try:
+                return display.file_reference(str(path))
+            except ValueError:
+                return path  # An unrecorded source must retain its exact identity.
+
+        context["build_reference_files"] = {
+            build: reference(path)
+            for build, path in (context.get("build_reference_files") or {}).items()
+        }
+        context["resource_maps"] = {
+            chromosome: {**resources, "default_eaf_file": reference(resources["default_eaf_file"])}
+            if resources.get("default_eaf_file") else resources
+            for chromosome, resources in (context.get("resource_maps") or {}).items()
+        }
+        replacement = (study_decisions or {}).get("eaf_replacement")
+        if replacement and replacement.get("file"):
+            study_decisions = {**study_decisions, "eaf_replacement": {
+                **replacement, "file": reference(replacement["file"]),
+            }}
+    return render_study_decisions(study_decisions, **context)
+
+
+def _report_study_failure(logger, error, study_decisions, **context):
+    """Retain and present only the evidence available at the failing boundary."""
+    decisions = getattr(error, "study_decisions", None) or study_decisions
+    error.study_decisions = dict(decisions)
+    error.genome_build_info = context.get("genome_build_info")
+    _announce(logger, "\n" + _study_decisions_block(
+        {**decisions, "report_failure": str(error)}, **context,
+    ))
 
 
 def _population_frequency_block(result):
@@ -1224,6 +1223,12 @@ def _finalise_failed_run_manifest(
     }
     manifest["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
     manifest["elapsed_seconds"] = round(time.time() - started_at, 2)
+    decisions = getattr(error, "study_decisions", None)
+    if decisions is not None:
+        manifest.setdefault("dataset", {})["study_decisions"] = decisions
+    build_evidence = getattr(error, "genome_build_info", None)
+    if build_evidence is not None:
+        manifest.setdefault("dataset", {})["genome_build_info"] = build_evidence
 
     try:
         _write_run_manifest(manifest_path, manifest)
@@ -3113,75 +3118,20 @@ def _prepare_dataset_for_chromosome_processing(
         step_total=DATASET_STEP_TOTAL,
     )
     grch_version = genome_build_info["inferred_build"]
-    build_label_width = 26
-    build_match_lines = [
-        screen_field(
-            "genetic",
-            "%s matches" % build,
-            "%s (%s%% input; %s%% testable)" % (
-                _count(genome_build_info["matches"][build]),
-                genome_build_info["input_percentages"][build],
-                genome_build_info["percentages"][build],
-            ),
-            indent=8,
-            label_width=build_label_width,
-        )
-        for build in build_reference_files
-    ]
-    build_reference_lines = [
-        screen_field(
-            "genetic",
-            "%s reference coverage" % build,
-            "%s / %s markers (%s%%)" % (
-                _count(
-                    genome_build_info["matched_reference_marker_counts"][build]
-                ),
-                _count(genome_build_info["reference_marker_counts"][build]),
-                genome_build_info["reference_percentages"][build],
-            ),
-            indent=8,
-            label_width=build_label_width,
-        )
-        for build in build_reference_files
-    ]
-    _announce(
-        logger,
-        "\n" + "\n".join([
-            screen_line("genetic", "Genome-build inference", indent=4),
-            screen_field(
-                "success", "Selected build", grch_version,
-                indent=8, label_width=build_label_width,
-            ),
-            screen_field(
-                "count", "Input variants",
-                _count(genome_build_info["input_variants"]),
-                indent=8, label_width=build_label_width,
-            ),
-            screen_field(
-                "count", "Coordinate-testable",
-                _count(genome_build_info["testable_variants"]),
-                indent=8, label_width=build_label_width,
-            ),
-            screen_field(
-                "info", "Not build-testable",
-                _count(genome_build_info["untestable_variants"]),
-                indent=8, label_width=build_label_width,
-            ),
-            screen_field(
-                "info", "Reference file",
-                build_reference_files.get(grch_version, "not selected"),
-                indent=8, label_width=build_label_width,
-            ),
-        ] + build_match_lines + build_reference_lines),
-    )
     if grch_version == "Ambiguous":
-        raise PipelineError(
+        error = PipelineError(
             "❌ Genome build inference failed (Ambiguous).\n"
             "   Reason: %s\n"
             "   Set 'build.mode' to one of the configured genome builds in YAML.\n"
             "   Aborting pipeline to avoid invalid gwas2vcf resource usage."
             % genome_build_info["ambiguous_reason"]
         )
+
+        _report_study_failure(
+            logger, error, {}, genome_build_info=genome_build_info,
+            build_reference_files=build_reference_files, policies=policies,
+        )
+        raise error
 
     # ------------------------------------------------------------------
     # 06/08  strand_detection
@@ -3213,51 +3163,36 @@ def _prepare_dataset_for_chromosome_processing(
     # ------------------------------------------------------------------
     # 07/08  resolve_study_properties
     # ------------------------------------------------------------------
-    study_decisions = resolve_study_properties(
-        df,
-        sample_column_dict,
-        policies=policies,
-        logger=logger,
-        step_number=7,
-        step_total=DATASET_STEP_TOTAL,
-    )
+    try:
+        study_decisions = resolve_study_properties(
+            df,
+            sample_column_dict,
+            policies=policies,
+            logger=logger,
+            step_number=7,
+            step_total=DATASET_STEP_TOTAL,
+        )
+    except StudyPropertyError as exc:
+        decisions = {**(getattr(exc, "study_decisions", None) or {}), **strand_decision}
+        exc.study_decisions = decisions
+        _report_study_failure(
+            logger, exc, decisions, genome_build_info=genome_build_info,
+            build_reference_files=build_reference_files, policies=policies,
+        )
+        raise
     study_decisions.update(strand_decision)
+    # Retain already-computed scalar evidence for manifest reconstruction.
     dataset_study_decisions = {
-        "effect_type": study_decisions.get("effect_type"),
-        "effect_type_source": study_decisions.get("effect_type_source"),
-        "effect_type_detected": study_decisions.get("effect_type_detected"),
-        "effect_type_matches_declaration": study_decisions.get(
-            "effect_type_matches_declaration"
-        ),
-        "se_scale": study_decisions.get("se_scale"),
-        "se_scale_source": study_decisions.get("se_scale_source"),
-        "se_scale_detected": study_decisions.get("se_scale_detected"),
-        "se_scale_matches_declaration": study_decisions.get(
-            "se_scale_matches_declaration"
-        ),
-        "se_scale_evidence": study_decisions.get("se_scale_evidence") or {},
-        "pvalue_type": study_decisions.get("pvalue_type"),
-        "pvalue_type_source": study_decisions.get("pvalue_type_source"),
-        "pvalue_type_detected": study_decisions.get("pvalue_type_detected"),
-        "pvalue_type_matches_declaration": study_decisions.get(
-            "pvalue_type_matches_declaration"
-        ),
-        "declaration_mismatches": list(
-            study_decisions.get("declaration_mismatches") or []
-        ),
-        "eaf_is_maf": study_decisions.get("eaf_is_maf"),
-        "eaf_is_maf_source": study_decisions.get("eaf_is_maf_source"),
-        "strand_mode": study_decisions.get("strand_mode"),
-        "strand": study_decisions.get("strand"),
-        "strand_consensus": {
-            key: study_decisions.get(key)
-            for key in (
-                "forward", "reverse", "ambiguous", "informative",
-                "dominant_fraction", "consensus_threshold", "reason",
-            )
-        },
+        # These optional fields were always present in the manifest contract.
+        **dict.fromkeys((
+            "effect_type_detected", "effect_type_matches_declaration",
+            "se_scale_detected", "se_scale_matches_declaration",
+            "pvalue_type_detected", "pvalue_type_matches_declaration",
+        )),
+        **study_decisions,
+        "declaration_mismatches": list(study_decisions.get("declaration_mismatches") or []),
+        "strand_consensus": dict(strand_decision),
     }
-    _announce(logger, "\n" + _study_decisions_block(study_decisions))
     _announce(
         logger,
         "\n" + _validated_column_mapping_block(
@@ -3332,7 +3267,12 @@ def _prepare_dataset_for_chromosome_processing(
             indent=8, label_width=26,
         ))
         _announce(logger, "\n" + "\n".join(failure_lines), marker="ERROR")
-        raise ConfigError([], message=message) from exc
+        error = ConfigError([], message=message)
+        _report_study_failure(
+            logger, error, study_decisions, genome_build_info=genome_build_info,
+            build_reference_files=build_reference_files, policies=policies,
+        )
+        raise error from exc
 
     logger.info(
         "Chromosome resource preflight passed: %s"
@@ -3385,18 +3325,36 @@ def _prepare_dataset_for_chromosome_processing(
         ]),
     )
 
-    study_decisions, df = validate_study_allele_frequency(
-        df, sample_column_dict, study_decisions, resource_maps,
-        default_eaf_colmap, policies=policies, logger=logger,
-        eaf_replacement_file=eaf_replacement_file,
-        eaf_replacement_column=eaf_replacement_column,
-    )
-    resource_maps, replacement_preflight = _activate_eaf_replacement_resources(
-        resource_maps, study_decisions, grch_version=grch_version,
-        default_eaf_colmap=default_eaf_colmap,
-        external_eaf_colmap=external_eaf_colmap, executables=executables,
-        vcf_config=vcf_config, policies=policies, logger=logger,
-    )
+    try:
+        study_decisions, df = validate_study_allele_frequency(
+            df, sample_column_dict, study_decisions, resource_maps,
+            default_eaf_colmap, policies=policies, logger=logger,
+            eaf_replacement_file=eaf_replacement_file,
+            eaf_replacement_column=eaf_replacement_column,
+        )
+    except StudyAlleleFrequencyError as exc:
+        decisions = getattr(exc, "study_decisions", None) or study_decisions
+        exc.study_decisions = decisions
+        _report_study_failure(
+            logger, exc, decisions, genome_build_info=genome_build_info,
+            build_reference_files=build_reference_files,
+            policies=policies, resource_maps=resource_maps,
+        )
+        raise
+    try:
+        resource_maps, replacement_preflight = _activate_eaf_replacement_resources(
+            resource_maps, study_decisions, grch_version=grch_version,
+            default_eaf_colmap=default_eaf_colmap,
+            external_eaf_colmap=external_eaf_colmap, executables=executables,
+            vcf_config=vcf_config, policies=policies, logger=logger,
+        )
+    except (ResourcePreflightError, PipelineError) as exc:
+        _report_study_failure(
+            logger, exc, study_decisions, genome_build_info=genome_build_info,
+            build_reference_files=build_reference_files,
+            policies=policies, resource_maps=resource_maps,
+        )
+        raise
     if replacement_preflight is not None:
         resource_preflight["eaf_replacement"] = replacement_preflight
         resource_preflight["file_identities"] = list({
@@ -3421,6 +3379,11 @@ def _prepare_dataset_for_chromosome_processing(
     })
     logger.info("Dataset AF decision: %s" % json.dumps(
         dataset_study_decisions["eaf_reference_validation"], sort_keys=True,
+    ))
+    _announce(logger, "\n" + _study_decisions_block(
+        study_decisions, genome_build_info=genome_build_info,
+        build_reference_files=build_reference_files,
+        policies=policies, resource_maps=resource_maps,
     ))
 
     # ------------------------------------------------------------------
