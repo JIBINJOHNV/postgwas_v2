@@ -16,6 +16,36 @@ Check path resolution, container mounts, permissions, file size, compression,
 and required companion indexes. Relative harmonisation sample-sheet paths are
 relative to the sheet, not the current terminal directory.
 
+## Incomplete or unreadable compressed input
+
+Harmonisation stops the affected dataset as soon as a confirmed stream-read or
+decompression failure is observed. The message identifies the full input path,
+preserves the native reason, and explains what to check. The failed dataset is
+recorded in the run summary and manifest without retrying the same input;
+remaining sample-sheet entries continue. The overall command returns nonzero
+if any dataset failed.
+
+An error such as `Compressed file ended before the end-of-stream marker was
+reached` means the gzip stream could not be read to completion. Possible causes
+include an incomplete transfer, damaged compressed data, or selecting only one
+binary part of a file distributed in pieces. The error alone does not establish
+which cause occurred. Check the publisher's instructions and all required parts;
+PostGWAS does not infer assembly order or join files automatically.
+
+For a complete gzip input, verify integrity before rerunning:
+
+```bash
+gzip -t /path/to/complete_summary_statistics.tsv.gz
+```
+
+Reading the header successfully does not establish full-stream integrity. A
+passing compression check also does not prove that every expected variant was
+included before compression. Disabling `input.check_truncation` disables optional
+last-line warnings; actual read failures remain fatal for that dataset. A final
+line ending in a full stop remains a heuristic warning, not a proven read failure.
+Exception handling follows the documented [Python gzip errors](https://docs.python.org/3.10/library/gzip.html)
+and [LZMA errors](https://docs.python.org/3.10/library/lzma.html).
+
 ## No variants or genes remain
 
 Inspect the preceding QC/rejection report. Typical causes are build/population

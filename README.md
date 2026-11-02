@@ -467,6 +467,11 @@ materialises later QC-based exclusions.
 `--validate` adds an original-input versus same-build output concordance check.
 Review that result and the dataset/run completion status before continuing.
 
+A confirmed input-read or decompression failure immediately stops that dataset
+with its full file path, reason and repair guidance. Other sample-sheet entries
+continue; the final command returns nonzero if any dataset failed. See
+[compressed-input errors](docs/wiki/help/error-messages.md#incomplete-or-unreadable-compressed-input).
+
 [All processing steps](docs/wiki/harmonisation/processing-order.md) ·
 [Outputs and QC](docs/wiki/harmonisation/outputs-and-qc.md) ·
 [Concordance validation](docs/wiki/reference/validation.md)

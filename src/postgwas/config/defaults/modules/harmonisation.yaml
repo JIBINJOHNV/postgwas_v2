@@ -1584,25 +1584,26 @@ policies:
     check_truncation:
       default: true
       help: |-
-        What it does: Checks that the study file looks complete before the pipeline commits to a
-          long run.
-        When it applies: once per dataset, after the header check (dataset step 02) and before the
-          file is read (dataset step 03).
+        What it does: Enables heuristic warnings about the last readable line. Confirmed input
+          read or decompression failures always stop that dataset, independently of this setting.
+        When it applies: once per dataset, during input readability checking (dataset step 02),
+          before table parsing (dataset step 03).
         Values:
           true - the complete input stream is read in bounded binary chunks using
             vcf_processing.io_buffer_bytes. This validates gzip/BGZF, bzip2, xz/lzma and ZIP
             streams while avoiding one Python operation per variant; the final readable line is
-            also checked for an abrupt trailing full stop.
+            also checked for an abrupt trailing full stop. Confirmed read failures report the
+            full input path, native reason and repair guidance without retrying the dataset.
           false - the same chunked pass still counts physical data records for input-versus-parser
-            reconciliation, but decompression and final-line observations are not reported as
-            preliminary truncation warnings; the decision is recorded in the log and the normal
-            table reader remains responsible for accepting or rejecting the file.
-        Example: a damaged compressed download produces a warning naming the decompression error;
-          a final line ending 'rs99 1 1000 A G 0.' is flagged as possibly incomplete.
-        Note: this check warns; the normal table reader still decides whether the dataset can run.
-          A missing or empty file always raises a clear error. The trailing-period heuristic is
-          intentionally conservative and may flag a legitimate value ending in '0.'.
-      origin: summary_statistics_io.py:check_file_truncation
+            reconciliation, but optional final-line warnings are disabled. A confirmed read or
+            decompression failure still stops that dataset; this setting cannot accept partial data.
+        Example: an incomplete gzip stream immediately fails that dataset with an actionable
+          message. Other sample-sheet datasets continue. A readable final line ending
+          'rs99 1 1000 A G 0.' receives only a heuristic warning when this setting is true.
+        Note: the compressed-file error alone does not distinguish a failed transfer, damaged
+          data or one part of a binary-split file; the message lists these as possible causes.
+          PostGWAS never joins files automatically. A missing or empty file remains invalid.
+      origin: summary_statistics_io.py:inspect_summary_statistics_file; summary_statistics_io.py:check_file_truncation
       recommendation: null
       type: bool
       validator:

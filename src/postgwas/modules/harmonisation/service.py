@@ -5444,25 +5444,23 @@ def run_harmonisation_pipeline(
                 )
                 ctx.info("Configuration, input header and build resources passed together.")
             with logger.step(
-                2, DATASET_STEP_TOTAL, "Confirm the file header", "validator.validate_header",
+                2, DATASET_STEP_TOTAL, "Confirm the file header and input readability",
+                "summary_statistics_io.inspect_summary_statistics_file",
             ) as ctx:
                 ctx.info("All mapped columns were checked with the configuration; the header is not reread.")
-            if preparation_only:
-                initial_identities = capture_preflight_file_identities(
-                    [sample_column_dict["sumstat_file"], *build_reference_files.values()],
-                    error_type=PipelineError,
+                if preparation_only:
+                    initial_identities = capture_preflight_file_identities(
+                        [sample_column_dict["sumstat_file"], *build_reference_files.values()],
+                        error_type=PipelineError,
+                    )
+                # Keep the existing single stream inspection inside this step
+                # so a read failure immediately records FAILED and ACTION.
+                _truncation_warnings, input_line_count = inspect_summary_statistics_file(
+                    file_path=sample_column_dict["sumstat_file"],
+                    io_buffer_bytes=vcf_config["io_buffer_bytes"],
+                    policies=policies,
+                    logger=logger,
                 )
-
-            # --------------------------------------------------------
-            # Truncation check, before a long run
-            # ---------------------------------------------------------
-            _truncation_warnings, input_line_count = inspect_summary_statistics_file(
-                file_path=sample_column_dict["sumstat_file"],
-                io_buffer_bytes=vcf_config["io_buffer_bytes"],
-                policies=policies,
-                logger=logger,
-            )
-
         else:
             logger.info("Reusing validated preparation for the current dataset.")
 

@@ -270,10 +270,13 @@ These eight steps run once on the complete study.
    sources, sample-size declarations, file headers and required build-check files.
    The full study file is not read yet.
 
-2. **Dataset step 2 — Confirm the file header.** It records that every configured
-   column was checked in the previous step, without rereading the header. The
-   following stream inspection checks that the input is readable and not
-   obviously truncated, and counts the data rows for later accounting.
+2. **Dataset step 2 — Confirm the file header and input readability.** It records
+   that every configured column was checked in the previous step, without
+   rereading the header. A single complete stream inspection counts the data
+   rows for later accounting. Any confirmed read or decompression failure stops
+   that dataset immediately with the input path, native reason and repair
+   guidance; other sample-sheet entries continue. Optional last-line warnings
+   remain separate from confirmed read failures.
 
 3. **Dataset step 3 — Read and clean the study.** Polars reads the study table;
    the sample-sheet mappings select its raw scientific inputs. Empty mappings

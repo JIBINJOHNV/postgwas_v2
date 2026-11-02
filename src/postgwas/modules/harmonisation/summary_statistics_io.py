@@ -3,7 +3,6 @@ import json
 import os
 import re
 import sys
-import zipfile
 from functools import partial
 from pathlib import Path
 
@@ -15,6 +14,7 @@ from postgwas.core.io.delimiters import open_binary, open_text, resolve_delimite
 from postgwas.core.values import missing_tokens, optional_text
 
 from .coordinates import harmonise_coordinates_and_alleles
+from .errors import SUMMARY_STATISTICS_READ_ERRORS, SummaryStatisticsReadError
 from .policies import FIELD_LIFECYCLE
 from .p_values import preserve_pvalue_source_text
 from .rejects import (
@@ -110,11 +110,14 @@ def _materialise_mask(df, expr):
 # ----------------------------------------------------------------------
 def count_data_lines(path: str, skip_hash: bool = True) -> int:
     """Count text records without shell commands or temporary files."""
-    with open_text(path) as handle:
-        return sum(
-            1 for line in handle
-            if not (skip_hash and line.startswith("##"))
-        )
+    try:
+        with open_text(path) as handle:
+            return sum(
+                1 for line in handle
+                if not (skip_hash and line.startswith("##"))
+            )
+    except SUMMARY_STATISTICS_READ_ERRORS as exc:
+        raise SummaryStatisticsReadError(path, exc) from exc
 
 def load_summary_statistics_table(file_path: str, sample_column_dict: dict, policies=None, logger=None):
     policies = resolve_policies(policies)
@@ -2137,7 +2140,9 @@ def inspect_summary_statistics_file(
     The count follows :func:`count_data_lines` exactly: double-hash metadata
     records are excluded and one header record is subtracted.  Returning that
     count lets the normal pipeline avoid decompressing the complete study file
-    a second time immediately before the Polars parse.
+    a second time immediately before the Polars parse. Confirmed read failures
+    raise an actionable input error regardless of the optional last-line warning
+    policy; a partial count is never passed to the parser.
     """
     policies = resolve_policies(policies)
     source = Path(file_path)
@@ -2153,9 +2158,10 @@ def inspect_summary_statistics_file(
             source,
             io_buffer_bytes=io_buffer_bytes,
         )
-    except (OSError, EOFError, ValueError, zipfile.BadZipFile) as exc:
-        if bool(policies.get("input.check_truncation")):
-            warnings.append("The file could not be read completely: %s" % exc)
+    except SUMMARY_STATISTICS_READ_ERRORS as exc:
+        # A confirmed read failure is fatal regardless of the optional
+        # last-line heuristic. Do not reread the same incomplete stream.
+        raise SummaryStatisticsReadError(source, exc) from exc
     else:
         if bool(policies.get("input.check_truncation")):
             if not last_line:

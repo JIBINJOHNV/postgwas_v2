@@ -35,6 +35,7 @@ from postgwas.modules.harmonisation.sample_sheet import (
 from postgwas.modules.harmonisation.resource_paths import validate_external_resource_spec
 from postgwas.modules.harmonisation.policies import POLICIES, load_policies
 from postgwas.modules.harmonisation.allele_frequency import StudyAlleleFrequencyError
+from postgwas.modules.harmonisation.errors import SummaryStatisticsReadError
 from postgwas.modules.harmonisation.qc_reporting import (
     effect_scale_description,
     summarise_strand_orientation,
@@ -1839,15 +1840,20 @@ def _run_validated_rows(
                     % row.dataset_id,
                 )
                 raise
-            except StudyAlleleFrequencyError as exc:
+            except (StudyAlleleFrequencyError, SummaryStatisticsReadError) as exc:
                 record_dataset(
                     row, "FAILED", active_manifest_path, failure=exc,
                     failure_stage=active_stage,
                 )
-                message = "Dataset %s failed study AF validation without retry: %s" % (row.dataset_id, exc)
+                failure_kind, screen_label = (
+                    ("input file reading", "Input file read")
+                    if isinstance(exc, SummaryStatisticsReadError)
+                    else ("study AF validation", "Study AF preflight")
+                )
+                message = "Dataset %s failed %s without retry: %s" % (row.dataset_id, failure_kind, exc)
                 _append_run_log(dataset_log, "ERROR", message)
                 _append_run_log(top_log, "ERROR", message)
-                print(screen_field("error", "Study AF preflight", str(exc), indent=4))
+                print(screen_field("error", screen_label, str(exc), indent=4))
                 failures.append(row.dataset_id)
                 break
             except ConfigError as exc:
@@ -1862,6 +1868,7 @@ def _run_validated_rows(
                     "Dataset %s failed configuration validation; see %s."
                     % (row.dataset_id, dataset_log),
                 )
+                print(screen_field("error", "Input validation", str(exc), indent=4))
                 failures.append(row.dataset_id)
                 break
             except ConcordanceValidationError as exc:

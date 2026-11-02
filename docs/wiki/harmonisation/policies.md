@@ -400,7 +400,7 @@ documentation rather than generated policy descriptions.
 | `input.null_values` | `[NA, NAN, "", .]` | possibly empty list of text values | Lists the exact text values that are read as 'missing' rather than as data. Applies: dataset step 03, on every read attempt (first read, low-memory retry, whitespace-repaired read), and at chromosome step 12 to spot an identifier that must be rebuilt. |
 | `input.schema_inference_rows` | `0` | Integer ≥ `0` and ≤ `10000000` | Sets how many rows are examined before each column's data type is fixed. Applies: dataset step 03, on every read of the study file. |
 | `input.chromosome_partition_compression` | `zstd` | `zstd`, `lz4`, `snappy`, `gzip`, `brotli`, `uncompressed` | Selects compression for typed internal chromosome work files and immutable source snapshots. Applies: dataset step 08, before chromosome workers start. |
-| `input.check_truncation` | `true` | `true` or `false` | Checks that the study file looks complete before the pipeline commits to a long run. Applies: once per dataset, after the header check (dataset step 02) and before the file is read (dataset step 03). |
+| `input.check_truncation` | `true` | `true` or `false` | Enables heuristic warnings about the last readable line. Confirmed input read or decompression failures always stop that dataset, independently of this setting. Applies: once per dataset, during input readability checking (dataset step 02), before table parsing (dataset step 03). |
 
 </details>
 

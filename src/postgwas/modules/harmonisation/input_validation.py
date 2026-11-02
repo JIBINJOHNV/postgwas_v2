@@ -19,6 +19,7 @@ import bz2
 import csv
 import difflib
 import gzip
+import io
 import lzma
 import os
 import zipfile
@@ -36,6 +37,10 @@ from postgwas.core.io.delimiters import (
 )
 from postgwas.core.values import MISSING_TEXT
 
+from postgwas.modules.harmonisation.errors import (
+    SUMMARY_STATISTICS_READ_ERRORS,
+    SummaryStatisticsReadError,
+)
 from postgwas.modules.harmonisation.policies import (
     Policies,
     PolicyError,
@@ -295,15 +300,18 @@ def read_summary_statistics_header(
     policies=None,
     *,
     configured_delimiter: Optional[str] = None,
+    header_line: Optional[str] = None,
 ) -> Tuple[List[str], str]:
     """Return ``(header_names, separator)`` having read a single line.
 
     The names are the *raw* names as written in the file, so a repeated name is
     visible.  Polars renames the second occurrence to ``NAME_duplicated_0``,
     which is exactly the silent substitution the header stage exists to catch.
+    Callers that already read the raw header can provide ``header_line`` to
+    reuse it without reopening the source.
     """
     policies = policies if policies is not None else default_policies()
-    line = _first_data_line(path)
+    line = _first_data_line(path) if header_line is None else header_line
     if not line:
         return [], "\t"
     delimiter = (
@@ -323,13 +331,11 @@ def read_summary_statistics_header(
     return [name.strip() for name in header], separator
 
 
-def _polars_header(path: str, separator: str) -> Optional[List[str]]:
-    """What polars will actually call the columns, read with ``n_rows=0``."""
-    if path.lower().endswith(".zip"):
-        return None
+def _polars_header(header_line: str, separator: str) -> Optional[List[str]]:
+    """Cross-check the already-read header without parsing a compressed body."""
     try:
         frame = pl.read_csv(
-            path,
+            io.StringIO(header_line + "\n"),
             separator=separator,
             n_rows=0,
             has_header=True,
@@ -485,6 +491,8 @@ def _first_bytes_readable(path):
         else:
             with open(path, "rb") as handle:
                 handle.read(4096)
+    except SUMMARY_STATISTICS_READ_ERRORS as exc:
+        return str(SummaryStatisticsReadError(path, exc))
     except Exception as exc:                       # noqa: BLE001 - reported, not raised
         return "could not be read (%s: %s)" % (type(exc).__name__, exc)
     return None
@@ -872,57 +880,66 @@ def validate_header(cfg, sumstat_path, policies=None, logger=None):
         )
         return False, problems
 
-    declared_delimiter = _clean(cfg.get("delimiter"))
-    if declared_delimiter and declared_delimiter.lower() != "auto":
-        detected = detect_delimiter(
-            path,
-            candidates=list(policies.get("input.delimiter_candidates")),
-            minimum_columns=int(policies.get("input.delimiter_min_columns")),
-            maximum_columns=int(policies.get("input.delimiter_max_columns")),
-            sample_lines=int(policies.get("input.delimiter_sample_rows")),
-            comment_prefix=(
-                "##" if bool(policies.get("input.strip_double_hash_lines")) else None
-            ),
-            fail_policy="unknown",
-        )
-        if (
-            detected.kind == "delimiter"
-            and detected.value != delimiter_character(declared_delimiter.lower())
-        ):
-            action = str(policies.get("validation.declaration_mismatch_action"))
-            message = (
-                "DECLARATION MISMATCH: sample sheet declares delimiter %r, but "
-                "automatic detection found %r. Policy "
-                "validation.declaration_mismatch_action=%r; the declared delimiter "
-                "remains authoritative."
-                % (declared_delimiter.lower(), detected.value, action)
-            )
-            emit_high_visibility_warning(logger, message)
-            if action == "fail":
-                problems.append(
-                    Problem(
-                        config_key="delimiter",
-                        configured_value=declared_delimiter,
-                        issue="disagrees with automatic delimiter detection",
-                        suggestion=(
-                            "Correct the sample-sheet delimiter, or set "
-                            "validation.declaration_mismatch_action to 'warn' to "
-                            "continue with the declaration."
-                        ),
-                        category="bad_value",
-                        stage="header",
-                    )
-                )
-
     try:
-        header, separator = read_summary_statistics_header(path, policies)
+        declared_delimiter = _clean(cfg.get("delimiter"))
+        if declared_delimiter and declared_delimiter.lower() != "auto":
+            detected = detect_delimiter(
+                path,
+                candidates=list(policies.get("input.delimiter_candidates")),
+                minimum_columns=int(policies.get("input.delimiter_min_columns")),
+                maximum_columns=int(policies.get("input.delimiter_max_columns")),
+                sample_lines=int(policies.get("input.delimiter_sample_rows")),
+                comment_prefix=(
+                    "##" if bool(policies.get("input.strip_double_hash_lines")) else None
+                ),
+                fail_policy="unknown",
+            )
+            if (
+                detected.kind == "delimiter"
+                and detected.value != delimiter_character(declared_delimiter.lower())
+            ):
+                action = str(policies.get("validation.declaration_mismatch_action"))
+                message = (
+                    "DECLARATION MISMATCH: sample sheet declares delimiter %r, but "
+                    "automatic detection found %r. Policy "
+                    "validation.declaration_mismatch_action=%r; the declared delimiter "
+                    "remains authoritative."
+                    % (declared_delimiter.lower(), detected.value, action)
+                )
+                emit_high_visibility_warning(logger, message)
+                if action == "fail":
+                    problems.append(
+                        Problem(
+                            config_key="delimiter",
+                            configured_value=declared_delimiter,
+                            issue="disagrees with automatic delimiter detection",
+                            suggestion=(
+                                "Correct the sample-sheet delimiter, or set "
+                                "validation.declaration_mismatch_action to 'warn' to "
+                                "continue with the declaration."
+                            ),
+                            category="bad_value",
+                            stage="header",
+                        )
+                    )
+
+        header_line = _first_data_line(path)
+        header, separator = read_summary_statistics_header(
+            path, policies, header_line=header_line,
+        )
     except Exception as exc:
+        read_error = (
+            SummaryStatisticsReadError(path, exc)
+            if isinstance(exc, SUMMARY_STATISTICS_READ_ERRORS) else None
+        )
         problems.append(
             Problem(
                 config_key="sumstat_file",
                 configured_value=path,
-                issue="header could not be read (%s)" % exc,
-                suggestion="The file may be truncated, corrupt or compressed oddly.",
+                issue=(read_error.plain_english if read_error is not None
+                       else "header could not be read (%s)" % exc),
+                suggestion=(read_error.what_to_do if read_error is not None
+                            else "Check the declared delimiter and input table format."),
                 category="file_unreadable",
                 stage="header",
             )
@@ -1049,7 +1066,10 @@ def validate_header(cfg, sumstat_path, policies=None, logger=None):
         )
 
     # ---- cross-check what polars will actually see ------------------
-    effective = _polars_header(path, separator)
+    effective = (
+        None if path.lower().endswith(".zip")
+        else _polars_header(header_line, separator)
+    )
     if effective is not None and len(effective) != len(header):
         problems.append(
             Problem(
