@@ -15,7 +15,7 @@ from postgwas.core.completion import configuration_digest
 from postgwas.core.direct_execution import _checkpoint_configuration
 from postgwas.core.errors import ConfigurationError
 from postgwas.modules.harmonisation import cli
-from postgwas.modules.harmonisation.policies import POLICIES, PolicyError, load_policies
+from postgwas.modules.harmonisation.policies import POLICIES, load_policies
 
 
 def test_exclude_x_default_preserves_x_and_argparse_owns_no_default():
@@ -58,7 +58,7 @@ def test_exclude_x_yaml_true_survives_omitted_flag(tmp_path, nested):
 def test_exclude_x_rejects_non_boolean_policy_values(tmp_path, invalid):
     run = tmp_path / "invalid.yaml"
     run.write_text(yaml.safe_dump({"policies": {"chromosome": {"exclude_x": invalid}}}))
-    with pytest.raises(PolicyError, match="chromosome.exclude_x.*must be true or false"):
+    with pytest.raises(ConfigurationError, match="chromosome.exclude_x.*must be true or false"):
         cli._engine_defaults(load_run_configuration_for_module("harmonisation", run))
 
 

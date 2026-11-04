@@ -120,9 +120,11 @@ POLICY_KEYS = (
     "eaf.degenerate",
     "eaf.maf_decision_cutoff",
     "eaf.maf_reference_min_overlap",
+    "eaf.maf_reference_min_overlap_fraction",
     "eaf.maf_reference_correlation_method",
     "eaf.maf_reference_min_correlation",
     "eaf.maf_reference_max_mean_absolute_difference",
+    "eaf.study_reference_min_minor_fraction",
     "eaf.reference_minor_fraction_cutoff",
     "eaf.maf_reference_error_margin",
     "eaf.external_min_match_fraction",
@@ -245,7 +247,7 @@ def validate_study_allele_frequency(
             )
             interpretation, comparison = _compare_frequency_pairs(
                 paired, "__study_frequency", "__expected_effect_frequency", pol, emit,
-                accept_direct_eaf=True,
+                accept_direct_eaf=True, study_variant_count=df.height,
             )
             reason = comparison["direct_eaf_acceptance_reason"]
             evidence = {
@@ -291,13 +293,19 @@ def validate_study_allele_frequency(
             if evidence["status"] not in ("passed", "replacement_selected"):
                 message = (
                     "Study frequency column '%s' cannot be accepted as EAF: %s; MAF interpretation is inconclusive. "
-                    "Comparable non-palindromic variants: %s (minimum %s); %s correlation: %s "
-                    "(minimum %s); mean absolute allele-aligned AF difference: %s (maximum %s). "
+                    "Comparable non-palindromic variants: %s (required >= %s); usable coverage: %s "
+                    "of %s study rows (required >= %s); %s correlation: %s "
+                    "(required >= %s); reference EA AF <= 0.5 fraction: %s (required > %s); "
+                    "mean absolute allele-aligned AF difference: %s (required <= %s). "
                     "No AF values were changed. Check the study AF/allele mapping, reference "
                     "population and genome build, or supply a valid external EAF source. "
                     "This dataset stopped before chromosome analysis; no dataset retry will be attempted."
-                    % (column, reason, paired.height, evidence["minimum_overlap"], evidence["correlation_method"],
+                    % (column, reason, paired.height, evidence["minimum_overlap"],
+                       _fmt_pct(evidence["observed_overlap_fraction"]), evidence["study_variant_count"],
+                       _fmt_pct(evidence["minimum_overlap_fraction"]), evidence["correlation_method"],
                        _fmt_metric(evidence["correlation"]), evidence["minimum_correlation"],
+                       _fmt_pct(evidence["reference_effect_allele_minor_fraction"]),
+                       _fmt_pct(evidence["minimum_reference_effect_allele_minor_fraction"]),
                        _fmt_metric(evidence["mean_absolute_difference"]),
                        evidence["maximum_mean_absolute_difference"])
                 )
@@ -780,15 +788,32 @@ def validate_allele_frequency(
 # -------------------------------------------------------
 def _compare_frequency_pairs(
     paired, study_column, reference_column, policies, emit, *, accept_direct_eaf=False,
+    study_variant_count=None,
 ):
     """Compare one eligible paired set once, retaining original EA direction.
 
     Folding as min(AF, 1-AF) is an allele-direction invariant for biallelic
     evidence. It cannot identify EAF. Whole-study callers first preserve the
-    established unfolded EAF agreement contract, including minor effect alleles.
+    unfolded EAF agreement contract and whole-study coverage/minor-fraction gates.
     Other callers retain the existing suitability and directional-margin rules.
     """
     minimum = int(policies.get("eaf.maf_reference_min_overlap"))
+    minimum_fraction = None
+    minimum_minor_fraction = None
+    overlap_fraction = None
+    if accept_direct_eaf:
+        if (isinstance(study_variant_count, bool)
+                or not isinstance(study_variant_count, int) or study_variant_count <= 0):
+            raise StudyAlleleFrequencyError(
+                "Whole-study AF comparison requires a positive integer study variant count."
+            )
+        if paired.height > study_variant_count:
+            raise StudyAlleleFrequencyError(
+                "Whole-study AF comparison pair count cannot exceed the study variant count."
+            )
+        minimum_fraction = float(policies.get("eaf.maf_reference_min_overlap_fraction"))
+        minimum_minor_fraction = float(policies.get("eaf.study_reference_min_minor_fraction"))
+        overlap_fraction = paired.height / study_variant_count
     method = str(policies.get("eaf.maf_reference_correlation_method"))
     minimum_correlation = float(policies.get("eaf.maf_reference_min_correlation"))
     maximum_difference = float(policies.get("eaf.maf_reference_max_mean_absolute_difference"))
@@ -798,9 +823,19 @@ def _compare_frequency_pairs(
     reference = pl.col(reference_column).cast(pl.Float64, strict=False)
     study_maf = pl.min_horizontal(study, 1.0 - study)
     reference_maf = pl.min_horizontal(reference, 1.0 - reference)
+    # Correlation is undefined for a constant paired vector. Range checks
+    # prevent finite zero-variance backend artifacts, including after folding.
+    direct_variable = (
+        (study.min() != study.max()) & (reference.min() != reference.max())
+    ).fill_null(False)
+    folded_variable = (
+        (study_maf.min() != study_maf.max()) & (reference_maf.min() != reference_maf.max())
+    ).fill_null(False)
     measured = paired.select([
-        pl.corr(study, reference, method=method).alias("direct_eaf_correlation"),
-        pl.corr(study_maf, reference_maf, method=method).alias("maf_correlation"),
+        pl.when(direct_variable).then(pl.corr(study, reference, method=method))
+        .otherwise(None).alias("direct_eaf_correlation"),
+        pl.when(folded_variable).then(pl.corr(study_maf, reference_maf, method=method))
+        .otherwise(None).alias("maf_correlation"),
         (study_maf - reference_maf).abs().mean().alias("mean_absolute_maf_difference"),
         (study - reference).abs().mean().alias("mean_eaf_error"),
         (study - reference_maf).abs().mean().alias("mean_maf_error"),
@@ -814,18 +849,28 @@ def _compare_frequency_pairs(
         **{key: float(value) if value is not None and math.isfinite(value) else None
            for key, value in measured.items()},
     }
+    if accept_direct_eaf:
+        stats.update(study_variant_count=study_variant_count,
+                     observed_overlap_fraction=overlap_fraction,
+                     minimum_overlap_fraction=minimum_fraction,
+                     minimum_reference_effect_allele_minor_fraction=minimum_minor_fraction)
     eaf_error, maf_error = stats["mean_eaf_error"], stats["mean_maf_error"]
     stats["absolute_error_difference"] = (
         abs(eaf_error - maf_error) if eaf_error is not None and maf_error is not None else None
     )
     if paired.height < minimum:
         direct_reason = "insufficient_overlap"
+    elif accept_direct_eaf and overlap_fraction < minimum_fraction:
+        direct_reason = "insufficient_overlap_fraction"
     elif stats["direct_eaf_correlation"] is None:
         direct_reason = "correlation_unavailable"
     elif stats["direct_eaf_correlation"] < minimum_correlation:
         direct_reason = "correlation_below_minimum"
     elif eaf_error is None or eaf_error > maximum_difference:
         direct_reason = "mean_absolute_difference_above_maximum"
+    elif (accept_direct_eaf
+          and stats["reference_effect_allele_minor_fraction"] <= minimum_minor_fraction):
+        direct_reason = "reference_minor_fraction_not_above_minimum"
     else:
         direct_reason = "allele_aligned_frequency_agreement"
     stats["direct_eaf_acceptance_reason"] = direct_reason
@@ -835,6 +880,15 @@ def _compare_frequency_pairs(
                      reference_suitability_reason="direct_eaf_agreement",
                      decision_reason=direct_reason)
         return "eaf", stats
+    if accept_direct_eaf and direct_reason in (
+        "insufficient_overlap", "insufficient_overlap_fraction",
+        "reference_minor_fraction_not_above_minimum",
+    ):
+        # Coverage cannot support either interpretation. A failed minor-fraction
+        # acceptance gate alone provides no independent evidence for MAF.
+        stats.update(reference_suitability_status="inconclusive",
+                     reference_suitability_reason=direct_reason, decision_reason=direct_reason)
+        return "inconclusive", stats
     if paired.height < minimum:
         suitability_reason = "insufficient_overlap"
     elif stats["maf_correlation"] is None:

@@ -317,17 +317,29 @@ def _frequency_fields(decisions, policies, resources):
         )
         for path, population in references:
             fields.append(("info", "Comparison reference", "%s; population %s" % (path, _text(population))))
+        minor_fraction_text = format_fraction_percentage(comparison.get("reference_effect_allele_minor_fraction"))
+        if comparison.get("minimum_reference_effect_allele_minor_fraction") is not None:
+            minor_fraction_text += "; required > %s" % format_fraction_percentage(
+                comparison["minimum_reference_effect_allele_minor_fraction"]
+            )
         fields.extend([
-            ("count", "Comparable variants", "%s; minimum %s" % (format_count(comparison["comparable_variants"]), format_count(comparison.get("minimum_overlap"), missing="not available"))),
+            ("count", "Comparable variants", "%s; required >= %s" % (format_count(comparison["comparable_variants"]), format_count(comparison.get("minimum_overlap"), missing="not available"))),
             ("info", "Correlation method", _text(comparison.get("correlation_method", comparison.get("maf_correlation_method")))),
-            ("info", "Direct EAF correlation", "%s; minimum %s" % (format_number(comparison.get("direct_eaf_correlation", comparison.get("correlation"))), format_number(comparison.get("minimum_correlation", comparison.get("minimum_maf_correlation"))))),
-            ("info", "Mean absolute EAF difference", "%s; maximum %s" % (format_number(comparison.get("mean_eaf_error", comparison.get("mean_absolute_difference"))), format_number(comparison.get("maximum_mean_absolute_difference", comparison.get("maximum_mean_absolute_maf_difference"))))),
-            ("info", "Reference EA at or below 0.5", format_fraction_percentage(comparison.get("reference_effect_allele_minor_fraction"))),
+            ("info", "Direct EAF correlation", "%s; required >= %s" % (format_number(comparison.get("direct_eaf_correlation", comparison.get("correlation"))), format_number(comparison.get("minimum_correlation", comparison.get("minimum_maf_correlation"))))),
+            ("info", "Mean absolute EAF difference", "%s; required <= %s" % (format_number(comparison.get("mean_eaf_error", comparison.get("mean_absolute_difference"))), format_number(comparison.get("maximum_mean_absolute_difference", comparison.get("maximum_mean_absolute_maf_difference"))))),
+            ("info", "Reference EA at or below 0.5", minor_fraction_text),
         ])
+        if comparison.get("study_variant_count") is not None:
+            fields.extend([
+                ("info", "Usable diagnostic coverage", "%s; required >= %s" % (
+                    _pair(comparison["comparable_variants"], comparison["study_variant_count"]),
+                    format_fraction_percentage(comparison.get("minimum_overlap_fraction")),
+                )),
+            ])
         if comparison.get("direct_eaf_accepted") is False:
             fields.extend([
-                ("info", "Folded-MAF correlation", "%s; minimum %s" % (format_number(comparison.get("maf_correlation")), format_number(comparison.get("minimum_maf_correlation", comparison.get("minimum_correlation"))))),
-                ("info", "Mean absolute folded-MAF difference", "%s; maximum %s" % (format_number(comparison.get("mean_absolute_maf_difference")), format_number(comparison.get("maximum_mean_absolute_maf_difference", comparison.get("maximum_mean_absolute_difference"))))),
+                ("info", "Folded-MAF correlation", "%s; required >= %s" % (format_number(comparison.get("maf_correlation")), format_number(comparison.get("minimum_maf_correlation", comparison.get("minimum_correlation"))))),
+                ("info", "Mean absolute folded-MAF difference", "%s; required <= %s" % (format_number(comparison.get("mean_absolute_maf_difference")), format_number(comparison.get("maximum_mean_absolute_maf_difference", comparison.get("maximum_mean_absolute_difference"))))),
                 ("info", "Input-versus-MAF error", format_number(comparison.get("mean_maf_error"))),
                 ("info", "Required error separation", format_number(comparison.get("minimum_error_margin"))),
                 ("info", "Directional MAF limit", "A reference EA-at-or-below-0.5 fraction strictly above %s makes MAF support inconclusive." % format_fraction_percentage(comparison.get("reference_minor_fraction_cutoff", policies.get("eaf.reference_minor_fraction_cutoff")))),

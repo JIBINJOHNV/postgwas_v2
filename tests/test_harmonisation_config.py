@@ -989,7 +989,7 @@ class HarmonisationConfigTests(unittest.TestCase):
             defaults.get("eaf.maf_reference_correlation_method"), "pearson"
         )
         self.assertEqual(
-            defaults.get("eaf.maf_reference_min_correlation"), 0.80
+            defaults.get("eaf.maf_reference_min_correlation"), 0.90
         )
         self.assertEqual(
             defaults.get("eaf.maf_reference_max_mean_absolute_difference"),

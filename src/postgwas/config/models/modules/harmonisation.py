@@ -904,6 +904,18 @@ class HarmonisationConfig(ModuleConfig):
     concordance_validation: ConcordanceValidationConfig
     policies: dict[str, Any]
 
+    @field_validator("policies")
+    @classmethod
+    def valid_policy_overrides(cls, values: dict[str, Any]) -> dict[str, Any]:
+        """Validate with the canonical registry while preserving override shape."""
+        from postgwas.modules.harmonisation.policies import PolicyError, load_policies
+
+        try:
+            load_policies(values)
+        except PolicyError as exc:
+            raise ValueError(str(exc)) from exc
+        return values
+
     @field_validator("eaf_replacement_file", "eaf_replacement_column")
     @classmethod
     def nonempty_replacement_value(cls, value: str | None) -> str | None:

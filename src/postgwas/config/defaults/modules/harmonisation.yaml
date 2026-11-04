@@ -855,6 +855,9 @@ common:
   - effect_from_z.phenotype_standard_deviation
   - effect_from_z.minimum_effective_variance
   - effect_from_z.low_effective_variance_action
+  - eaf.maf_reference_min_overlap
+  - eaf.maf_reference_min_overlap_fraction
+  - eaf.study_reference_min_minor_fraction
   - eaf.maf_reference_correlation_method
   - eaf.maf_reference_min_correlation
   - eaf.maf_reference_max_mean_absolute_difference
@@ -1252,6 +1255,8 @@ group_order:
       - non_effect_frequency_error_margin
       - maf_decision_cutoff
       - maf_reference_min_overlap
+      - maf_reference_min_overlap_fraction
+      - study_reference_min_minor_fraction
       - maf_reference_correlation_method
       - maf_reference_min_correlation
       - maf_reference_max_mean_absolute_difference
@@ -3999,6 +4004,56 @@ policies:
         maximum: null
         minimum: 2
         number_kind: int
+    maf_reference_min_overlap_fraction:
+      default: 0.50
+      help: |-
+        What it does: Sets the minimum usable AF-comparison coverage for whole-study preflight.
+        When it applies: A MAF-like study AF column is compared with the pooled reference matches
+          across all chromosomes. Divide the valid diagnostic-pair count by all study rows entering
+          preflight after upstream preparation, before diagnostic exclusions. Missing, invalid,
+          palindromic, ambiguous and non-biallelic rows remain in that fixed denominator.
+        Values: Finite proportion from 0 to 1, not a percentage. Exactly the minimum passes.
+          The absolute eaf.maf_reference_min_overlap floor must also pass. Insufficient coverage is
+          inconclusive and cannot authorize MAF replacement. Ordinary external-source comparisons
+          keep their existing absolute count gate, without this whole-study fraction gate.
+        Scientific basis: A user-selected QC heuristic, not a validated proof of EAF semantics.
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs
+      recommendation: null
+      type: float
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: false
+        kind: num
+        maximum: 1.0
+        minimum: 0.0
+        number_kind: float
+    study_reference_min_minor_fraction:
+      default: 0.90
+      help: |-
+        What it does: Sets the strict minimum reference effect-allele minor fraction for direct
+          whole-study acceptance of a MAF-like supplied AF column.
+        When it applies: After adequate whole-study coverage, direct correlation and mean absolute
+          difference pass. The numerator counts aligned reference effect-allele AF <= 0.5, including
+          exactly 0.5, and the denominator is the pooled usable diagnostic-pair count.
+        Values: Finite proportion from 0 to 1; the observed fraction must be strictly greater.
+          Equality fails. This gate alone cannot establish MAF or authorize replacement. It does
+          not apply to ordinary external-source classification. The separate upper directional
+          eaf.reference_minor_fraction_cutoff remains in effect for conditional MAF support.
+        Scientific basis: A user-selected QC heuristic, not a validated semantic classifier.
+          A supplied MAF control can pass when 94% of reference effect alleles are minor; see the
+          harmonisation configuration documentation for this synthetic-control limitation.
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs
+      recommendation: null
+      type: float
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: false
+        kind: num
+        maximum: 1.0
+        minimum: 0.0
+        number_kind: float
     maf_reference_correlation_method:
       default: pearson
       help: |-
@@ -4020,7 +4075,7 @@ policies:
         kind: enum
         members: [pearson, spearman]
     maf_reference_min_correlation:
-      default: 0.80
+      default: 0.90
       help: |-
         What it does: Sets the minimum correlation for the paired frequency comparison.
         When it applies: Whole-study preflight compares supplied AF with allele-aligned reference AF
@@ -4028,8 +4083,10 @@ policies:
           external-file classifier use folded MAF for panel suitability.
         Values: From 0 to 1; exactly the configured minimum passes. Missing or non-finite direct
           correlation prevents direct EAF acceptance; missing folded correlation prevents MAF support.
-          Constant diagnostic vectors stop study preflight. Mean absolute difference and overlap
-          must also pass. The default 0.80 is a configurable QC heuristic.
+          Constant direct vectors prevent direct acceptance; constant folded vectors prevent MAF
+          support. Mean absolute difference and overlap
+          must also pass. The shared default 0.90 is a configurable QC heuristic for direct
+          study EAF acceptance, conditional MAF support and ordinary external-source classification.
         Example: Correlation 0.92 passes this gate, but does not compensate for an excessive mean
           absolute difference or insufficient overlap.
       origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference
@@ -4073,10 +4130,12 @@ policies:
           MAF because the reference effect alleles are predominantly minor.
         When it applies: Conditional study MAF support after direct EAF agreement fails, the ordinary
           external-file classifier, and direct chromosome helpers without a whole-study decision.
-          It does not veto direct study EAF acceptance after whole-study allele-aligned agreement.
+          Its upper-limit purpose is distinct from the strict lower bound in
+          eaf.study_reference_min_minor_fraction for direct whole-study EAF acceptance.
         Values: A share strictly above this cutoff makes the directional classification inconclusive.
         Example: Reference-aligned EAF with 98.70% at or below 0.5 is permitted for study AF if the
-          overlap, direct correlation and mean absolute difference gates all pass.
+          absolute/fractional overlap, direct correlation, strict reference-minor fraction and
+          mean absolute difference gates all pass.
       origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference
       recommendation: null
       type: float
@@ -4096,7 +4155,9 @@ policies:
         When it applies: Conditional study MAF support after direct EAF agreement fails, ordinary
           external-file classification, and direct chromosome helpers without a whole-study decision,
           after overlap and reference suitability pass.
-        Values: EAF error plus this margin must be less than MAF error to confirm EAF; the reverse
+        Values: The existing default 0.02 is unchanged. It is an aggregate mean-error separation,
+          not a per-variant tolerance or a maximum error. EAF error plus this margin must be less
+          than MAF error to confirm EAF; the reverse
           confirms MAF. Otherwise the directional result is inconclusive. Direct study EAF acceptance
           checks allele-aligned agreement first without requiring EAF and MAF errors to differ.
         Example: A study whose effect alleles are minor can pass concordance even when EAF and MAF

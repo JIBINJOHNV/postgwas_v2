@@ -48,6 +48,47 @@ orientation. An ordinary sample-sheet external EAF source keeps its existing
 source-selection and comparison rules; frequency attachment uses the same
 validated allele-frequency join described below.
 
+For a MAF-like study column, direct whole-study acceptance requires pooled
+usable pairs to satisfy both the existing 1,000-pair floor and at least 50% of
+all rows entering AF preflight after upstream preparation, correlation >= 0.90,
+mean absolute allele-aligned difference <= 0.10, and a reference effect-allele
+minor fraction strictly > 0.90. The minor fraction counts aligned reference
+AF <= 0.5, including exactly 0.5. Diagnostic exclusions stay in the fixed study
+coverage denominator. Failure of coverage, or failure of the new minor-fraction
+gate alone on otherwise passing direct agreement, is inconclusive and cannot
+select replacement. Replacement still requires independent MAF support when
+direct agreement itself fails and coverage is sufficient.
+
+All gates are configured under `modules.harmonisation.policies.eaf`:
+
+```yaml
+modules:
+  harmonisation:
+    policies:
+      eaf:
+        maf_reference_min_overlap: 1000
+        maf_reference_min_overlap_fraction: 0.50
+        maf_reference_min_correlation: 0.90
+        maf_reference_max_mean_absolute_difference: 0.10
+        study_reference_min_minor_fraction: 0.90
+        maf_reference_error_margin: 0.02
+```
+
+Use proportions from 0 to 1, not `90`. Correlation and overlap equality pass;
+reference-minor-fraction equality fails. The shared correlation default also
+applies to folded MAF support and ordinary external-source classification.
+The existing directional error margin remains 0.02; it compares aggregate
+mean errors, is not a per-variant tolerance or maximum error, and is not used
+for direct EAF acceptance. The separate upper directional
+`eaf.reference_minor_fraction_cutoff: 0.95` remains unchanged.
+
+These are user-selected QC heuristics. A deterministic 10,000-variant MAF
+control with 94% minor reference effect alleles passes the gates (correlation
+0.9523683946; minor fraction 0.94; direct mean absolute difference 0.012).
+Passing does not prove the semantic provenance of the supplied column. See the
+[method and configuration discussion](configuration.md) for the fixed-denominator
+contract and this limitation.
+
 Messages distinguish three outcomes: study EAF retained; input MAF supported
 and the supplied replacement selected; or unresolved evidence and the dataset
 stopped. Supported MAF without a replacement reports both required options and
