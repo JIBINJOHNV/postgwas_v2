@@ -3685,9 +3685,16 @@ policies:
           direct - the study's effect allele is matched to the panel's ALT and the other allele to
             the panel's REF; the panel frequency is used as it stands.
           swap - the study's effect allele is matched to the panel's REF instead, and the panel
-            frequency is replaced by one minus itself.
-          Order does not matter: 'direct' is always tried first and 'swap' only on what direct left
-          unmatched. Naming just one of them turns the other pass off; the list may not be empty.
+            supplies its validated REF frequency. A single valid allele pair uses 1-AF. Complete
+            common-REF SNP sites use 1 minus the sum of all distinct ALT frequencies, calculated
+            once per reference site before matching study rows. Missing, conflicting or invalid
+            components and unsupported allele sets leave the generated frequency missing for the
+            configured final_check.on_missing action; they remain in the original coverage denominator.
+          This calculation applies to reference-frequency attachment. The bundled VCF adapter
+          remains unchanged and still uses 1-AF when it reverses alleles.
+          Order does not matter: a populated finite direct match is preferred; a valid swapped
+          match may fill an empty or non-finite direct value. Naming just one orientation turns
+          the other off; the list may not be empty.
         Example: a study row chr1:12345 with EA=A, OA=G against a panel row REF=G, ALT=A carrying
           EAF 0.30 matches on the direct pass and takes 0.30. A study row with EA=G, OA=A does not
           match directly; the swap pass matches it and gives 1 - 0.30 = 0.70.

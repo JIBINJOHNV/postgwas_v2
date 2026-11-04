@@ -45,7 +45,8 @@ an explicit replacement stops that dataset. Insufficient or conflicting evidence
 continues to stop the dataset. The replacement table supplies EAF after this
 decision and never supplies evidence for its own selection or palindrome
 orientation. An ordinary sample-sheet external EAF source keeps its existing
-behavior.
+source-selection and comparison rules; frequency attachment uses the same
+validated allele-frequency join described below.
 
 Messages distinguish three outcomes: study EAF retained; input MAF supported
 and the supplied replacement selected; or unresolved evidence and the dataset
@@ -59,9 +60,47 @@ The [GWAS-SSF field definitions](https://github.com/gwas-catalog/summary-statist
 define frequency relative to the listed effect allele; the effect allele need
 not be minor. [1000 Genomes](https://www.internationalgenome.org/faq/how-do-i-find-out-information-about-a-single-variant/)
 reports ALT frequencies, including separate values for multiple ALT alleles.
-Diagnostic folding and a swapped `1-AF` assignment require biallelic reference
-sites. Known extra alleles prevent that inference; complete site membership in
-the supplied reference remains a declared input assumption.
+The [VCF specification](https://samtools.github.io/hts-specs/VCFv4.5.pdf) defines
+one AF value per ALT allele. Diagnostic MAF folding remains restricted to
+biallelic reference sites and does not change when replacement is selected.
+
+Direct matches retain the listed frequency. A validated single allele pair
+retains the existing swapped `1-AF` calculation, including supported sequence
+indels. For a complete SNP site with one common REF and distinct A/C/G/T ALT
+alleles, the shared join can calculate the REF frequency once as
+`1 - sum(all distinct ALT frequencies)` and use it for swapped matches. For
+example, `REF=A`, `ALT=G,T`, and ALT frequencies `0.30,0.10` give REF frequency
+`0.60`; subtracting only `0.30` would give the incorrect `0.70`.
+
+Complete site membership in the supplied reference remains a declared input
+assumption. All components must describe the same allele set and population.
+Each required frequency must be present, finite and within 0 to 1, and the
+sum must leave a valid REF frequency. Exact duplicates follow the configured
+duplicate policy and count once when retained. A discarded or conflicting
+component cannot silently disappear from the sum. Different REF alleles,
+unsupported alleles, and multiple overlapping indel records do not establish
+an eligible SNP allele set merely by sharing a chromosome and position.
+
+An unresolved swapped assignment receives a missing generated EAF; original
+study MAF and reference values remain unchanged. It stays in the denominator
+of `eaf.external_min_match_fraction` and follows the existing required-field
+missing policy. With the packaged `final_check.on_missing: reject`, it is
+removed and recorded rather than assigned a guessed frequency. The existing
+coverage, rejection and explicit duplicate-failure policies still apply.
+Reference I/O or configuration failures remain errors.
+
+This calculation applies to reference-frequency attachment. The bundled
+GWAS2VCF adapter remains unchanged and still uses `1-AF` when it reverses
+alleles. At a multiallelic site, that complement can include other alleles
+rather than the required opposite allele. No additional export check is made,
+so complete-site attachment does not provide unrestricted multiallelic VCF
+allele-swap support. The existing `vcf.liftover_swap` policy remains unchanged.
+
+Site calculation reuses the loaded reference and existing study join. It does
+not rerun the study-wide MAF/EAF decision or read the reference again for the
+calculation. The aggregation adds CPU and temporary-memory work. Runtime and
+memory impact require measurement on the intended data and environment. This
+calculation does not create or rewrite reference files.
 
 A supplied replacement specification must match at least one existing nonempty
 file, even if a particular dataset later retains its internal EAF. Exact active

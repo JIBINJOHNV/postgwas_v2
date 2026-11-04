@@ -141,6 +141,17 @@ def _dataset_id(path: Path, suffixes: Sequence[str]) -> str:
 
 def _delimiter_name(path: Path, policies) -> tuple[str, str]:
     candidates = list(policies.get("input.delimiter_candidates"))
+    header_problems = []
+
+    def usable_header(fields):
+        problem = _header_problem(fields)
+        if problem is not None:
+            # Space splitting can turn separator tabs into apparent empty
+            # names. Only that artifact authorizes the existing guarded rescue.
+            recoverable = any(not value.strip() and "\t" in value for value in fields)
+            header_problems.append((len(fields), problem, recoverable))
+        return problem is None
+
     result = detect_delimiter(
         path,
         candidates=candidates,
@@ -151,8 +162,15 @@ def _delimiter_name(path: Path, policies) -> tuple[str, str]:
         comment_prefix=(
             "##" if bool(policies.get("input.strip_double_hash_lines")) else None
         ),
+        header_check=usable_header,
     )
     if result.kind == "unknown":
+        if header_problems:
+            # Retain the original widest candidate's actionable header failure;
+            # distinguish tab-only artifacts from genuine empty/duplicate names.
+            _, problem, recoverable = max(header_problems, key=lambda item: item[0])
+            error = DelimiterPreparationError if recoverable else ConfigurationError
+            raise error("%s: %s" % (problem, path))
         raise DelimiterPreparationError("No configured delimiter produced a consistent table: %s" % path)
     for name in candidates:
         if delimiter_character(name) == result.value:
@@ -162,26 +180,43 @@ def _delimiter_name(path: Path, policies) -> tuple[str, str]:
     )
 
 
+def _header_problem(headers: Sequence[str]) -> str | None:
+    """One header contract for candidate selection and selected-name mappings."""
+    if not headers or any(not value.strip() for value in headers):
+        return "The detected header contains an empty column name"
+    normalized = [_normalise_column_name(value) for value in headers]
+    if any(not value for value in normalized):
+        return "The detected header contains a column name empty after normalization"
+    duplicates = sorted({
+        value for value in normalized if normalized.count(value) > 1
+    })
+    if duplicates:
+        return (
+            "The header contains ambiguous duplicate column names after "
+            "normalization (%s)" % ", ".join(duplicates)
+        )
+    return None
+
+
 def _read_header(path: Path, delimiter: str, strip_double_hash: bool) -> list[str]:
     with open_text(path) as handle:
         for raw_line in handle:
             line = raw_line.rstrip("\r\n")
             if not line.strip() or (strip_double_hash and line.startswith("##")):
                 continue
-            headers = [value.strip() for value in next(csv.reader([line], delimiter=delimiter))]
-            if not headers or any(not value for value in headers):
-                raise ConfigurationError(
-                    "The detected header contains an empty column name: %s" % path
-                )
-            normalized = [_normalise_column_name(value) for value in headers]
-            duplicates = sorted({
-                value for value in normalized if normalized.count(value) > 1
-            })
-            if duplicates:
-                raise ConfigurationError(
-                    "The header contains ambiguous duplicate column names after "
-                    "normalization (%s): %s"
-                    % (", ".join(duplicates), path)
+            raw_headers = next(csv.reader([line], delimiter=delimiter))
+            problem = _header_problem(raw_headers)
+            if problem is not None:
+                raise ConfigurationError("%s: %s" % (problem, path))
+            headers = [value.strip() for value in raw_headers]
+            # The reader requires literal selected names. Merely stripping a
+            # padded whitespace header would produce mappings absent upstream.
+            if delimiter in ("\t", " ") and headers != raw_headers:
+                raise DelimiterPreparationError(
+                    "Whitespace-padded header names require validated whitespace "
+                    "preparation before column mapping: %s. Enable "
+                    "sample_sheet_generator.convert_mixed_whitespace, or provide "
+                    "an input with exact unpadded header names." % path
                 )
             return headers
     raise ConfigurationError("No header line was found in %s" % path)

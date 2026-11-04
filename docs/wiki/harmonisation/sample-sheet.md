@@ -348,11 +348,21 @@ both coordinate roles, and a Z-score can satisfy the effect role. This is a
 file-screening heuristic, not scientific validation. The normal harmonisation
 loader still requires complete mappings before analysis.
 
-If normal delimiter detection fails, the generator can rescue mixed tabs and
-spaces by writing a separate, validated copy. For example,
+Delimiter candidates must produce consistent sampled field counts and usable
+header names; a wider interpretation with empty or normalized-duplicate names
+cannot displace a valid candidate. This header check applies to the generator;
+general and headerless table readers retain their existing detection contract.
+
+If normal delimiter detection fails, or a whitespace-delimited header has
+surrounding padding that prevents exact selected-name matching in the reader,
+the generator can rescue mixed tabs and spaces by writing a separate,
+validated copy. For example,
 `ILAE3_CAE_final.tbl` becomes `prepared_inputs/ILAE3_CAE_final.tbl.converted.txt`
 beside the output CSV. The CSV records its **absolute path**, keeps the original
 dataset ID, and uses `delimiter: space`. Originals are never modified.
+This also handles consistent space-tab-space separators, such as the fetal and
+maternal NG2019 tables: simply choosing tabs would leave padded source names
+that differ from the selected names. Clean tab headers are read directly.
 
 The fallback applies to all discovered supported extensions, including
 compressed inputs, which are streamed through decompression first. It performs
@@ -362,6 +372,9 @@ and inconsistent converted field counts are rejected. Files failing only
 column-name mapping or other non-delimiter checks are not converted. Normal
 files retain the existing sampled delimiter detection; this is not a full-file
 structural audit of every input.
+True empty or normalized-duplicate headers remain errors. When conversion is
+disabled, padded whitespace headers are rejected with an actionable preparation
+message instead of producing a draft that fails at the reader.
 
 The terminal reports conversions attempted, accepted and rejected on one line.
 The review TSV retains the original `input_file` and adds `prepared_input_file`,

@@ -342,8 +342,18 @@ def build_harmonisation_vcf_provenance(
         if af_external else missing
     )
     af_reference_files = paths("user_eaf_file") if af_external else missing
-    af_harmonisation = "Frequency oriented to the final VCF ALT allele"
-    af_swapped_formula = "AF = 1 - input AF for an allele-swapped match"
+    af_harmonisation = (
+        "Reference frequency aligned to the working effect allele"
+        if af_external else "Frequency oriented to the final VCF ALT allele"
+    )
+    reference_af_formula = (
+        "Reference REF AF = 1 - sum(all distinct ALT AF) at supported complete "
+        "sites; bundled converter allele swaps retain 1-AF"
+    )
+    af_swapped_formula = (
+        reference_af_formula if af_external
+        else "AF = 1 - input AF for an allele-swapped match"
+    )
     if replacement is not None:
         absent = [chromosome for chromosome in chromosomes
                   if chromosome not in replacement["resolved_files"]]
@@ -361,12 +371,9 @@ def build_harmonisation_vcf_provenance(
         all_paths.extend(path for path in replacement_paths if path not in seen_paths)
         af_harmonisation = (
             "Original study MAF preserved; selected reference column %s supplies "
-            "EAF aligned to the final VCF ALT allele" % replacement["column"]
+            "EAF aligned to the working effect allele" % replacement["column"]
         )
-        af_swapped_formula = (
-            "Selected reference ALT frequency assigned after allele orientation; "
-            "original study MAF is not inverted"
-        )
+        af_swapped_formula = reference_af_formula + "; original study MAF is preserved"
 
     info_source = optional_text(sample.get("info_source")) or missing
     if info_source == "internal":

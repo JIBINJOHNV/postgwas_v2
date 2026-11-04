@@ -432,10 +432,32 @@ existing full-allele reference lookup. Expected AF comes from the selected
 reference, while `input_af_original` preserves the original MAF in matched-row
 audits. Selected replacement also leaves working `input_af` as original MAF and
 records its independent ALT expectation as `reference_expected_alt_af`. A
-replacement with reversed REF/ALT uses the same shared biallelic `1-AF` guard as
-production; known third-allele sites cannot supply an inferred opposite-allele
-frequency. Direct listed ALT frequencies remain usable at those sites. Ordinary
-CSV external sources retain their existing direct reference lookup contract.
+replacement with reversed REF/ALT uses the same validated reference-frequency
+calculation as production. A single valid allele pair retains `1-AF`; eligible
+complete SNP sites with one common REF use
+`1 - sum(all distinct ALT frequencies)`. Direct listed ALT frequencies remain
+unchanged. All components must belong to the same complete site and population;
+missing, conflicting, discarded or invalid components cannot be ignored when
+forming a sum. Multiple overlapping indel records or different REF alleles at
+one coordinate do not establish an eligible SNP allele set.
+
+Unresolved generated EAF remains missing with recorded assignment diagnostics.
+It counts as unusable in the original reference-coverage denominator and follows
+the configured required-field missing action; the packaged
+`final_check.on_missing: reject` records and removes the row. Coverage and
+rejection limits remain active. Original MAF and reported reference values are
+preserved. Diagnostic MAF/EAF comparison remains restricted to its existing
+biallelic set, and the replacement is not used to reclassify the input.
+Ordinary CSV external sources retain their existing direct concordance lookup
+contract.
+
+The complete-site calculation applies to reference-frequency attachment. The
+bundled GWAS2VCF adapter remains unchanged and still uses `1-AF` for allele
+reversal. At a multiallelic site, that complement can include other alleles
+rather than the required opposite allele. No additional export check is made;
+this change does not establish unrestricted multiallelic VCF allele-swap
+support. The existing `vcf.liftover_swap` policy remains unchanged.
+
 The comparison API's `input_eaf_is_maf` describes the confirmed original
 interpretation, not initial distribution suspicion; accepted MAF-looking EAF
 therefore does not activate replacement lookup. Exact-match AF comparisons remain

@@ -11,7 +11,7 @@ import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator, Literal, Sequence, TextIO
+from typing import BinaryIO, Callable, Iterator, Literal, Sequence, TextIO
 
 
 NAMED_DELIMITERS = {
@@ -128,8 +128,14 @@ def detect_delimiter(
     sample_lines: int,
     comment_prefix: str | None = "##",
     fail_policy: Literal["raise", "unknown"] = "raise",
+    header_check: Callable[[Sequence[str]], bool] | None = None,
 ) -> DelimiterDetectionResult:
-    """Select the candidate producing the widest consistent valid table."""
+    """Select the widest consistent table accepted by an optional header check.
+
+    Header validation is opt-in: general and headerless readers retain their
+    existing contract. The check uses the sampled first record, without another
+    file read.
+    """
     if minimum_columns < 1 or maximum_columns < minimum_columns:
         raise ValueError("Invalid delimiter column-count bounds")
     if sample_lines < 1:
@@ -144,14 +150,19 @@ def detect_delimiter(
     )
     best = None
     for separator in separators:
-        counts = [
-            len(next(csv.reader([line], delimiter=separator)))
-            for line in lines
-        ]
+        header = []
+        counts = []
+        for line in lines:
+            fields = next(csv.reader([line], delimiter=separator))
+            if not counts:
+                header = fields
+            counts.append(len(fields))
         if not counts or len(set(counts)) != 1:
             continue
         columns = counts[0]
         if minimum_columns <= columns <= maximum_columns:
+            if header_check is not None and not header_check(header):
+                continue
             if best is None or columns > best.column_count:
                 best = DelimiterDetectionResult(
                     "delimiter", separator, columns, "configured_candidates",

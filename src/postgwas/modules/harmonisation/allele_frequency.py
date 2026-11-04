@@ -12,7 +12,8 @@ What this module does, in order:
     out-of-range action without silently clipping under other policies, and follow
     the dataset AF acceptance decision. Before chromosome workers,
     a MAF-like study distribution is checked against the configured default EAF table:
-    direct matches use ALT frequency and swapped matches use ``1-AF``. This follows
+    biallelic diagnostic matches use ALT frequency or its opposite-allele
+    complement. This follows
     the GWAS-SSF requirement that frequency is aligned to the listed effect allele
     (https://www.ebi.ac.uk/gwas/docs/methods/summary-statistics).
 3.  Otherwise take the frequency from an external panel, matching each variant in
@@ -24,8 +25,8 @@ What this module does, in order:
     MAF, or inconclusive evidence stops rather than guessing or auto-converting.
     Strand orientation has already been validated against reference REF/ALT. The
     external file's configured allele mapping determines whether its frequency
-    is used as listed or as ``1-AF``; it never re-decides strand or changes study
-    beta, Z, or ``strand_action``.
+    is used as listed or reconstructed from the complete supported allele set;
+    it never re-decides strand or changes study beta, Z, or ``strand_action``.
 4.  Re-run the configured duplicate validation after REF/ALT and EAF alignment,
     catching opposite-strand representations that now identify the same
     physical variant.
@@ -1117,6 +1118,18 @@ def merge_external_allele_frequencies(
         "__postgwas_external_eaf_row", df, reserved=(eaf_col,),
     )
     study_for_join = df.with_row_index(row_col)
+    assignment_reason_col = unused_column_name(
+        "__postgwas_external_eaf_assignment_reason", study_for_join, ext_df,
+        reserved=(eaf_col,),
+    )
+    biallelic_col = (
+        unused_column_name(
+            "__postgwas_external_eaf_biallelic", study_for_join, ext_df,
+            reserved=(eaf_col, assignment_reason_col),
+        )
+        if not declared_alt_frequency and validation_reference_col is not None
+        else None
+    )
     matched_all, orientation_col, join_stats = allele_oriented_left_join(
         study_for_join,
         ext_df,
@@ -1140,7 +1153,9 @@ def merge_external_allele_frequencies(
         warn=emit.warn,
         reference_label="external frequency file '%s'" % load_path,
         screen_frequency=not declared_alt_frequency,
-        require_biallelic_swap=declared_alt_frequency,
+        require_complete_frequency_site=True,
+        frequency_reason_column=assignment_reason_col,
+        frequency_biallelic_column=biallelic_col,
     )
     if join_stats["reference_duplicate_groups"]:
         emit.info(
@@ -1184,7 +1199,14 @@ def merge_external_allele_frequencies(
             reserved=(candidate_col,),
         )
         swapped = pl.col(orientation_col) == 1
-        semantic_frame = matched_all.select([
+        # The existing EAF/MAF diagnostic complements the opposite allele.
+        # This comparison is defined only for two-allele sites; at a known
+        # multiallelic site 1-EAF includes all remaining alleles, not just OA.
+        semantic_rows = matched_all.filter(pl.col(biallelic_col))
+        stats["maf_reference_multiallelic_or_unresolved_rows_excluded"] = (
+            matched_all.height - semantic_rows.height
+        )
+        semantic_frame = semantic_rows.select([
             *[pl.col(std_cols[name]) for name in ("chr", "pos", "ea", "oa")],
             pl.when(swapped)
             .then(1.0 - pl.col(eaf_col).cast(pl.Float64, strict=False))
@@ -1222,7 +1244,7 @@ def merge_external_allele_frequencies(
 
     # The study row is already reference-oriented. The external mapping declares
     # which columns are REF and ALT/effect allele, so the shared direct/swap join
-    # has already put its frequency on the final study EA (= reference ALT).
+    # has already put its frequency on the final study EA.
     # A palindrome is retained only when upstream strand_action proves that this
     # orientation was resolved; a reference-panel frequency must never be used
     # to infer the missing study strand.
@@ -1384,6 +1406,7 @@ def merge_external_allele_frequencies(
         orientation_col,
         row_col,
         state_col,
+        *([biallelic_col] if biallelic_col is not None else []),
     ])
 
     emit.info("Direct allele-key matches  : %s" % _fmt_int(stats["direct_match_rows"]))

@@ -515,7 +515,7 @@ def _attach_external_eaf_to_matches(
         error_type=ValueError,
         reference_label="external EAF reference used by concordance",
         screen_frequency=False,
-        require_biallelic_swap=replacement_selected,
+        require_complete_frequency_site=replacement_selected,
     )
     # Harmonisation attaches the panel value before bcftools normalises the VCF.
     # Reproduce that allele-specific lookup with the full original strings,
