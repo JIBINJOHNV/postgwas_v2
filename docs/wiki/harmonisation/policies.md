@@ -126,7 +126,7 @@ completed dataset.
 
 Important controls at this boundary are the selected reference sources and
 their mappings, `input.*`, `logging.*`, `execution.*`, and the explicit CLI
-controls `--dataset-id`, `--fixed-info`, `--validate`, `--resume`,
+controls `--dataset-id`, `--fixed-info`, `--exclude-chr-x`, `--validate`, `--resume`,
 `--overwrite`, `--hide-screen`, and
 `--keep_gwas2vcf_intermediate`.
 
@@ -136,7 +136,7 @@ controls `--dataset-id`, `--fixed-info`, `--validate`, `--resume`,
 |---:|---|---|
 | 1 | Validate column alternatives, EAF/INFO/sample-size sources, paths, resources, and cross-policy compatibility without reading the full table. | `columns.*`, reference mappings, source selections, `sample_size.*` |
 | 2 | Read the header, verify every configured column, determine one delimiter, test readability/truncation, and count rows for later accounting. | `input.delimiter*`, `input.check_truncation`, `input.strip_double_hash_lines` |
-| 3 | Read the study; assign stable source-row IDs; preserve raw rejection provenance; normalize exact integer coordinates, chromosome labels and uppercase alleles; coerce configured scientific numeric columns; reject missing mandatory values, malformed positions, unsupported chromosomes and invalid alleles; aggregate configured multi-value INFO; then resolve input duplicates deterministically. The packaged chromosome scope is autosomes 1–22 plus X. | `input.*`, `columns.mandatory`, `chromosome.*`, `position.*`, `allele.pattern`, `info.multi_value_*`, `duplicates.*` |
+| 3 | Read the study; assign stable source-row IDs; preserve raw rejection provenance; resolve chromosome identity and apply explicit X exclusion before missingness or scientific QC; normalize coordinates and alleles; coerce configured scientific numeric columns; reject missing mandatory values, malformed positions, unsupported chromosomes and invalid alleles; aggregate configured multi-value INFO; then resolve input duplicates deterministically. The packaged chromosome scope is autosomes 1–22 plus X. | `input.*`, `columns.mandatory`, `chromosome.*`, `position.*`, `allele.pattern`, `info.multi_value_*`, `duplicates.*` |
 | 4 | Validate parsed content, quantify missing sample size, and calculate one study-wide mean/median fill value when requested. The input ledger must reconcile exactly. Apply the chromosome-X Z-only guard before expensive reference work. | `sample_size.missing_action`, `sample_size.max_missing_fraction`, `effect_from_z.x_chromosome_z_only_action` |
 | 5 | Infer or verify GRCh37 versus GRCh38 from allele-compatible, coordinate-testable variants. Automatic selection must pass the absolute match count, study-testable fraction, reference-panel coverage and winning-share thresholds together; weak or ambiguous evidence fails. | `build.mode`, `build.min_match_count`, `build.min_match_fraction`, `build.min_reference_match_fraction`, `build.confidence_ratio`, `build.deduplicate_reference` |
 | 6 | Infer whole-study forward versus reverse-complement strand consensus from informative non-palindromic SNVs, or accept an explicit reference-aligned declaration. Palindromic variants never vote. | `strand.mode`, `strand.consensus_threshold`, `strand.min_informative_variants` |
@@ -147,6 +147,19 @@ Dataset step 4 stops a Z-only chromosome-X reconstruction by default because
 pooled EAF and Neff do not identify male dosage coding, sex composition, or PAR
 status. `effect_from_z.x_chromosome_z_only_action` permits either the safe
 `fail` default or the explicit expert choice `allow_autosomal_assumption`.
+
+The direct-command flag `--exclude-chr-x` sets
+`modules.harmonisation.policies.chromosome.exclude_x: true`; the packaged
+default is `false`, and an omitted flag preserves YAML. Under the packaged
+normalization/rename policies, `X`, `chrX`, `23`, `25`, `XY`, `PAR1`, and `PAR2`
+all resolve to X. Explicit exclusion occurs before scientific QC or study-wide
+decisions, preserves original row provenance, and records the separate
+`chromosome_excluded_by_user` reason. X contributes neither to scientific
+denominators nor to reference/worker planning or optional concordance. An
+X-only dataset fails instead of producing an empty successful result. Shared
+resources for retained chromosomes remain required. Changing this policy
+changes checkpoint identity under the global resume policy. See the
+[complete command and YAML example](../../modules/harmonisation/configuration.md#chromosome-scope-and-plink-aliases).
 
 After dataset step 7 and before dataset step 8, an unnumbered fail-fast resource
 gate resolves every exact file required by the observed chromosomes and inferred
@@ -414,12 +427,13 @@ documentation rather than generated policy descriptions.
 </details>
 
 <details>
-<summary><code>chromosome</code> — dataset 03; reference readers throughout — chromosome naming and filtering (6 settings)</summary>
+<summary><code>chromosome</code> — dataset 03; reference readers throughout — chromosome naming and filtering (7 settings)</summary>
 
 | Setting | Default | Allowed values | Decision or action |
 |---|---|---|---|
+| `chromosome.exclude_x` | `false` | `true` or `false` | Explicitly excludes rows whose resolved chromosome label is X. Applies: dataset step 03, after immutable source-row IDs exist and chromosome identity can be extracted and normalized, before missing-value or scientific QC. The same scope is used by reference preflight, staging, workers and optional validation. |
 | `chromosome.drop_mt` | `true` | `true` or `false` | Whether mitochondrial variants are thrown away. Applies: chromosome step 02 and the same coordinate step inside dataset step 03, after chromosome.rename_map has run, on whatever then carries the label MT. |
-| `chromosome.allowed_after_split` | `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, X]` | Unique chromosome list selected from `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10`, `11`, `12`, `13`, `14`, `15`, `16`, `17`, `18`, `19`, `20`, `21`, `22`, `X`, `Y`, `XY`, `MT` | The chromosome labels that survive the coordinate step; every other non-empty label is removed with the separate unsupported_chromosome rejection reason. Applies: chromosome step 02, and the same coordinate step run inside dataset step 03. It is consulted after chromosome.rename_map has renamed labels, and chromosome.drop_mt can remove MT from this list but never adds an unlisted chromosome. Registry recommendation: `same as chromosome.allowed`. |
+| `chromosome.allowed_after_split` | `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, X]` | Unique chromosome list selected from `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10`, `11`, `12`, `13`, `14`, `15`, `16`, `17`, `18`, `19`, `20`, `21`, `22`, `X`, `Y`, `XY`, `MT` | The chromosome labels that survive the coordinate step; every other non-empty label is removed with the separate unsupported_chromosome rejection reason. Applies: chromosome step 02, and the same coordinate step run inside dataset step 03. It is consulted after chromosome.rename_map has renamed labels, and chromosome.drop_mt can remove MT and chromosome.exclude_x can remove X from this list; neither switch adds an unlisted chromosome. Registry recommendation: `same as chromosome.allowed`. |
 | `chromosome.strip_chr_prefix` | `true` | `true` or `false` | Whether a leading 'chr' is taken off the chromosome label before anything is compared. Applies: Every study, genome-build, strand, external EAF, external INFO, concordance-reference and extracted-VCF chromosome key before matching. |
 | `chromosome.strip_leading_zero` | `true` | `true` or `false` | Removes leading zeroes from chromosome labels made entirely of digits. Applies: Every study, genome-build, strand, external EAF, external INFO, concordance-reference and extracted-VCF chromosome key before matching. |
 | `chromosome.rename_map` | `{23: X, 24: Y, 25: X, 26: MT, XY: X, PAR1: X, PAR2: X, M: MT}` | String map whose values are selected from `1`, `2`, `3`, `4`, `5`, `6`, `7`, `8`, `9`, `10`, `11`, `12`, `13`, `14`, `15`, `16`, `17`, `18`, `19`, `20`, `21`, `22`, `X`, `Y`, `XY`, `MT` | Renames non-standard chromosome labels to standard ones. Applies: Every study, genome-build, strand, external EAF, external INFO, concordance-reference and extracted-VCF chromosome key, after prefix, integral-suffix and leading-zero normalization. Study labels are then checked against chromosome.allowed_after_split. |

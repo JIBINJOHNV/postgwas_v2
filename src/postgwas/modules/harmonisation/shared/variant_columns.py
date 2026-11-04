@@ -15,6 +15,7 @@ import polars as pl
 from postgwas.core.dataframes import count_non_null, validate_cast_retention
 from postgwas.core.io.delimiters import DelimiterDetectionResult
 from postgwas.core.io.tables import read_delimited_table, read_parquet_table
+from postgwas.core.input_validation import record_file_validation
 
 
 CANONICAL_VARIANT_COLUMNS_KEY = "_variant_columns_canonical"
@@ -23,6 +24,9 @@ CANONICAL_VARIANT_COLUMNS_KEY = "_variant_columns_canonical"
 # pairs that equal their own reverse complement.  This is a biological
 # invariant, not a user-selectable analysis threshold.
 PALINDROMIC_SNP_PAIRS = ("AT", "TA", "CG", "GC")
+
+# Supported combined-coordinate syntax, in the established splitter priority.
+COMBINED_COORDINATE_SEPARATORS = (":", "-", "_")
 
 # A combined variant identifier may carry alleles or an interval after its
 # position. Capture the complete leading numeric token so exact integer-valued
@@ -267,13 +271,100 @@ def canonical_position_expression(expression: pl.Expr) -> pl.Expr:
     return canonical
 
 
+def excluded_chromosome_labels(policies) -> tuple[str, ...]:
+    """Return explicit exclusions in canonical human chromosome notation.
+
+    X is the chromosome identity targeted by the named exclude-X policy, not
+    an independently configured analysis chromosome list.
+    """
+    return ("X",) if policies.get("chromosome.exclude_x") else ()
+
+
+def retained_chromosome_scope(chromosomes, policies) -> list[str]:
+    """Apply explicit exclusions to a small inventory, preserving its labels/order."""
+    labels = list(chromosomes)
+    excluded = excluded_chromosome_labels(policies)
+    if not excluded or not labels:
+        return labels
+    values = pl.DataFrame({"chromosome": [str(value) for value in labels]})
+    canonical = values.select(canonical_chromosome_expression(
+        pl.col("chromosome"), policies,
+    )).to_series().to_list()
+    return [label for label, resolved in zip(labels, canonical) if resolved not in excluded]
+
+
+def reference_schema_inference_rows(policies) -> int:
+    """Keep excluded reference cells out of numeric parsing and scientific QC."""
+    return 0 if excluded_chromosome_labels(policies) else int(
+        policies.get("input.schema_inference_rows")
+    )
+
+
 def allowed_coordinate_chromosomes(policies, drop_mt: bool) -> list[str]:
     """Return the resolved study-coordinate scope used by validation and audit."""
     allowed = [
         str(value).strip().upper()
         for value in policies.get("chromosome.allowed_after_split") or []
     ]
-    return [value for value in allowed if value != "MT"] if drop_mt else allowed
+    excluded = set(excluded_chromosome_labels(policies))
+    if drop_mt:
+        excluded.add("MT")
+    return [value for value in allowed if value not in excluded]
+
+
+def combined_coordinate_expressions(
+    expression: pl.Expr, policies, *, require_position: bool = True,
+) -> tuple[pl.Expr, pl.Expr]:
+    """Extract existing combined-coordinate roles without guessing a separator.
+
+    Scope exclusion needs only the chromosome, even when the position token is
+    empty. Scientific coordinate validation retains the existing requirement
+    for a nonempty position token by default.
+    """
+    combined = expression.cast(pl.String, strict=False)
+    if not require_position:
+        # Match declared aliases as complete chromosome labels, including
+        # separator characters inside an alias. Prefer the longest declared
+        # label rather than mistaking part of it for a position. The fallback
+        # uses the coordinate splitter's existing separator priority.
+        pairs = [
+            combined.str.split_exact(separator, 1)
+            for separator in COMBINED_COORDINATE_SEPARATORS
+        ]
+        chromosomes = [pair.struct.field("field_0") for pair in pairs]
+        positions = [pair.struct.field("field_1") for pair in pairs]
+        aliases = [str(source).strip().upper() for source in (
+            policies.get("chromosome.rename_map") or {}
+        )]
+        alias_lengths = [
+            pl.when(position.is_not_null() & canonical_chromosome_expression(
+                chromosome, policies, apply_rename_map=False,
+            ).is_in(aliases))
+            .then(chromosome.str.len_chars()).otherwise(None)
+            for chromosome, position in zip(chromosomes, positions)
+        ]
+        longest = pl.max_horizontal(alias_lengths)
+        selected = [length.is_not_null() & (length == longest) for length in alias_lengths]
+        chromosome = pl.coalesce([
+            *[pl.when(mask).then(value) for mask, value in zip(selected, chromosomes)],
+            *[pl.when(position.is_not_null()).then(value)
+              for value, position in zip(chromosomes, positions)],
+        ])
+        position = pl.coalesce([
+            *[pl.when(mask).then(value) for mask, value in zip(selected, positions)],
+            *positions,
+        ])
+        return chromosome, position_text_expression(
+            position, str(policies.get("position.extraction")),
+        )
+    pattern = r"(?i)^(?:chr)?([^:_\-]+)[:_\-]+(.+)$"
+    return (
+        combined.str.extract(pattern, 1),
+        position_text_expression(
+            combined.str.extract(pattern, 2),
+            str(policies.get("position.extraction")),
+        ),
+    )
 
 
 def validate_coordinate_agreement(
@@ -526,10 +617,26 @@ def read_reference_variant_table(
             maximum_columns=int(policies.get("input.delimiter_max_columns")),
             sample_lines=int(policies.get("input.delimiter_sample_rows")),
             null_values=list(policies.get("input.null_values")),
-            infer_schema_length=int(policies.get("input.schema_inference_rows")),
+            infer_schema_length=reference_schema_inference_rows(policies),
             columns=required_columns,
             error_type=error_type,
             description=description,
+        )
+    excluded = excluded_chromosome_labels(policies)
+    if excluded:
+        before = frame.height
+        frame = frame.filter(~canonical_chromosome_expression(
+            pl.col(str(column_mapping["chr"])), policies,
+        ).is_in(excluded).fill_null(False))
+        record_file_validation(
+            path, description,
+            checks=("explicit reference chromosome exclusion",),
+            metrics={
+                "excluded_chromosomes": list(excluded),
+                "reference_rows_before_chromosome_exclusion": before,
+                "reference_chromosome_excluded_rows": before - frame.height,
+                "reference_rows_after_chromosome_exclusion": frame.height,
+            },
         )
     return frame, detected
 
@@ -576,6 +683,7 @@ def mark_canonical_variant_columns(column_mapping: dict) -> None:
 
 __all__ = [
     "CANONICAL_VARIANT_COLUMNS_KEY",
+    "COMBINED_COORDINATE_SEPARATORS",
     "PALINDROMIC_SNP_PAIRS",
     "allowed_coordinate_chromosomes",
     "canonical_allele_expression",
@@ -583,12 +691,16 @@ __all__ = [
     "canonical_position_expression",
     "canonicalize_variant_frame",
     "canonical_variant_schema",
+    "combined_coordinate_expressions",
+    "excluded_chromosome_labels",
     "has_canonical_variant_columns",
     "mark_canonical_variant_columns",
     "minimal_allele_representation_series",
     "palindromic_snp_expression",
     "position_text_expression",
     "read_reference_variant_table",
+    "reference_schema_inference_rows",
+    "retained_chromosome_scope",
     "reverse_complement_expression",
     "study_string_schema",
     "validate_coordinate_agreement",

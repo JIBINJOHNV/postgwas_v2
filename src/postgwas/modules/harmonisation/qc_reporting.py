@@ -294,6 +294,7 @@ def harmonisation_qc_takeaway_lines(
 
     input_rows = pre_vcf.get("total_variant_infile")
     rows_read = pre_vcf.get("total_variant_read")
+    excluded_chromosomes = pre_vcf.get("total_variant_removed_excluded_chromosomes")
     sent = pre_vcf.get("total_variant_in_vcf_input")
     final_records = raw.get("num_records")
     total_snps = raw.get("num_snps")
@@ -328,6 +329,10 @@ def harmonisation_qc_takeaway_lines(
                 "VCF creation",
                 "%s variants used → %s variants in final VCF"
                 % (format_metric_count(sent), format_metric_count(final_records)),
+            ),
+            *(
+                [("loss", "User-excluded chromosomes", format_metric_count(excluded_chromosomes))]
+                if metric_available(excluded_chromosomes) else []
             ),
             (
                 "genetic",

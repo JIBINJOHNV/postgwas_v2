@@ -106,6 +106,10 @@ logging:
       contigs: Contigs
       chromosomes: Chromosomes
       chromosome: Chromosome
+      excluded_chromosomes: Explicitly excluded chromosomes
+      reference_rows_before_chromosome_exclusion: Reference rows before exclusion
+      reference_chromosome_excluded_rows: Reference rows excluded
+      reference_rows_after_chromosome_exclusion: Reference rows in analysis scope
       identifier_type: Variant ID type
       rsids: rsIDs
       unique_ids: Coordinate IDs

@@ -7,6 +7,9 @@ First, PostGWAS checks the configured expected reference inventory: by default,
 GRCh37 and GRCh38, chromosomes 1–22. This structural check does not infer the study
 build or read study variants, even with `build.mode: auto`. Missing or invalid
 shared resources stop the command after independent sheet declarations are checked.
+With `--exclude-chr-x` (YAML `chromosome.exclude_x: true`), X-specific resources
+are excluded from this inventory even when it explicitly lists X. Shared files
+needed for retained chromosomes remain required.
 
 After initial configuration and sample-sheet validation, PostGWAS prepares and
 completes each selected dataset before reading the next. A dataset-specific
@@ -108,7 +111,7 @@ The 29 numbered steps inside stages 2, 3 and 5 are the ones named in the logs:
 |---|---|---|
 | 2 | Dataset step 1 | Check configuration, header mappings and build resources together. |
 | 2 | Dataset step 2 | Confirm the completed header check, then inspect the input stream and count data rows. |
-| 2 | Dataset step 3 | Read and clean the study; reject unusable rows. |
+| 2 | Dataset step 3 | Read the study, apply explicit X exclusion, then clean and reject unusable retained rows. |
 | 2 | Dataset step 4 | Check parsed values and plan missing sample sizes. |
 | — | *chromosome-X reconstruction guard* | Stop before further dataset work when X would require assumption-based Z-only BETA/SE reconstruction. |
 | 2 | Dataset step 5 | Determine the genome build from the data. |
@@ -287,6 +290,12 @@ These eight steps run once on the complete study.
    rename. PostGWAS then assigns a stable source-row number and preserves the
    raw values for rejection provenance. It then, in order:
 
+   - resolves chromosome identity from the configured separate or combined
+     coordinate fields using the shared normalization and rename map, and,
+     when `chromosome.exclude_x` is true, excludes canonical X immediately.
+     Under packaged policies this includes `X`, `chrX`, `23`, `25`, `XY`,
+     `PAR1`, and `PAR2`. Original rows remain in the audit with the distinct
+     `chromosome_excluded_by_user` reason; an X-only dataset stops here;
    - reports post-parse missingness for every configured study column, then
      rejects rows missing a read-stage mandatory value or every value in a
      mandatory alternative group such as BETA-or-Z;
@@ -327,7 +336,8 @@ These eight steps run once on the complete study.
      same-orientation duplicates.
 
    The reported input counts are explicitly measured after missing-token
-   parsing and before numeric normalization. They therefore do not claim that
+   parsing, after explicit chromosome exclusion and before numeric normalization.
+   They therefore do not claim that
    a later numeric conversion has already succeeded. The configured
    `output_layout.field_completeness` TSV and the run manifest distinguish
    each field's input column, selected alternative source, recovery step, and
@@ -341,7 +351,8 @@ These eight steps run once on the complete study.
    them.
 
    The input ledger is fail-closed and disjoint: variants read must equal rows
-   removed for read-stage mandatory values, invalid coordinates, unsupported
+   removed by explicit chromosome exclusion, read-stage mandatory values,
+   invalid coordinates, unsupported
    chromosomes, unusable alleles, and duplicates, plus rows ready for
    harmonisation. PostGWAS stops if those counts do not reconcile. Coordinate
    and chromosome-scope validation runs once; it is not repeated after numeric
@@ -354,6 +365,12 @@ These eight steps run once on the complete study.
    external EAF, external INFO and concordance reference before keys are
    compared or deduplicated. For example, study `X` matches reference `23`
    under the packaged map, while study `1` matches reference `01`.
+
+   Excluded X rows do not enter missingness or allele/statistic validation,
+   duplicates, build inference, strand consensus, study-property or frequency
+   decisions, partitions, workers, or final variants. Malformed scientific cells
+   only on excluded rows cannot fail retained-row QC. Readability, header,
+   structural, and mapping checks still apply to the source table.
 
    Selected per-variant sample counts use `sample_size.fractional_count_action`.
    The default `round` converts to the nearest whole number, with exact half
@@ -1014,6 +1031,8 @@ This stage runs only with `--validate`, after required VCFs and QC are complete.
 
 1. Select the merged VCF in the inferred input build.
 2. Stage the original input, duplicate evidence, and VCF values.
+   Apply the same resolved explicit chromosome exclusion to the original input;
+   excluded X rows are outside concordance comparison and its reference scope.
 3. Confirm that the VCF header build agrees with the inferred input build.
 4. Prepare an optional external EAF source. A single all-chromosome file is
    staged once. A path containing `{chromosome}` is resolved with the confirmed
@@ -1078,6 +1097,7 @@ recorded reasons and available logs.
 |---|---|---|
 | Retained unchanged | The row was already usable and correctly oriented. | Chromosome log and final VCF. |
 | Retained after correction | OR conversion, a validated allele swap (including its required `1-EAF` update), or statistic derivation was applied and counted. A suspected non-effect-frequency column is never corrected automatically. | Chromosome log and final VCF. |
+| User-excluded chromosome | `--exclude-chr-x` or YAML `chromosome.exclude_x: true` excluded canonical X before scientific QC. Original values remain traceable. | Dataset rejected-variant file, `chromosome_excluded_by_user` reason, exclusion counts. |
 | Rejected during harmonisation | An explicit policy removed the row. Original input values and the reason are preserved. | Dataset rejected-variant file and reason report. |
 | Unprocessed after chromosome failure | No variant-level rule rejected the row, but its chromosome did not complete. This outcome is permitted only for an explicitly allowed partial dataset. | Dataset manifest reconciliation ledger and run summary. |
 | Adapter accounting failure | One or more exported rows were not emitted; the chromosome fails instead of silently continuing. | Adapter transcript and chromosome log. |

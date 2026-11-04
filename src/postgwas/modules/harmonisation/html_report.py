@@ -246,6 +246,7 @@ def _input_section(record: Mapping[str, Any], manifest: Mapping[str, Any]) -> st
     rows = (
         ("Input variants", values.get("total_variant_infile", record.get("input_variants"))),
         ("Rows read", values.get("total_variant_read", record.get("parsed_variants"))),
+        ("User-excluded chromosomes", values.get("total_variant_removed_excluded_chromosomes", record.get("excluded_chromosome_variants"))),
         ("Missing required values", values.get("total_variant_removed_missing_values")),
         ("Invalid coordinates", values.get("total_variant_removed_null_coords")),
         ("Unsupported chromosomes", values.get("total_variant_removed_unsupported_chromosomes")),
@@ -850,6 +851,7 @@ def _overview_inputs(record: Mapping, manifest: Mapping) -> list[tuple[str, str,
     ready = pre.get("total_variant_remaining_for_harmonisation", record.get("input_ready_variants"))
     rows = [("Input variants", record.get("input_variants")), ("Rows read", input_rows)]
     rows.extend((label, _ratio(pre.get(key), input_rows, "rows read")) for label, key in (
+        ("User-excluded chromosomes", "total_variant_removed_excluded_chromosomes"),
         ("Missing mandatory values — removed", "total_variant_removed_missing_values"),
         ("Invalid coordinates — removed", "total_variant_removed_null_coords"),
         ("Unsupported chromosomes — removed", "total_variant_removed_unsupported_chromosomes"),

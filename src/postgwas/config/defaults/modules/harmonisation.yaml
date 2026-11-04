@@ -788,7 +788,7 @@ export_layout:
     eaf_replacement_column: ['ALT-frequency column in eaf_replacement_file; both replacement values must be supplied together.']
     comparison_af: ['Reference VCF for population annotation and post-merge QC.', 'This panel does not determine the study strand or supply its EAF.']
     reference: ['dbSNP annotation used during chromosome VCF processing.']
-    resource_preflight: ['Expected reference inventory checked before study interpretation, including when build.mode is auto.', 'Both configured builds and every listed chromosome are required; this does not infer the study build or filter study chromosomes.']
+    resource_preflight: ['Expected reference inventory checked before study interpretation, including when build.mode is auto.', 'Both configured builds and every listed chromosome are required, except chromosomes explicitly excluded by policy; this does not infer the study build.']
     fixed_info: ['Explicit fallback for datasets with no internal or external INFO; provenance marks it as user-assigned.']
     population_frequency_qc: ['Post-merge step 02: compare population frequencies and report supporting evidence.']
     concordance_validation: ['Optional stage 6: compare original input with the same-build final VCF.', 'Enabled through this setting or --validate; discrepancies are subject to the configured failure limits.']
@@ -814,7 +814,7 @@ export_layout:
   policy_summaries:
     input: 'Read and partition the study. Delimiter and missing-token choices affect how original values are interpreted.'
     columns: 'Validate mandatory input fields; missing requirements stop processing before analysis.'
-    chromosome: 'Normalize labels and reject chromosomes outside the configured scope.'
+    chromosome: 'Normalize labels and apply explicit X exclusion before scientific QC, then reject chromosomes outside the configured scope.'
     position: 'Validate coordinates and reject invalid positions before reference matching.'
     allele: 'Validate allele representations; unsupported allele codes are rejected.'
     duplicates: 'Select one consistent duplicate or apply the conflict action; record every removed row. Recheck after allele orientation.'
@@ -875,6 +875,7 @@ common:
   - sample_size.missing_action
   - sample_size.max_missing_fraction
   - chromosome.drop_mt
+  - chromosome.exclude_x
   - position.min_value
   - build.mode
   - build.min_match_count
@@ -1135,6 +1136,7 @@ group_order:
     order: 3
     stage: dataset 03; reference readers throughout — chromosome naming and filtering
     keys:
+      - exclude_x
       - drop_mt
       - allowed_after_split
       - strip_chr_prefix
@@ -1553,6 +1555,11 @@ policies:
           as null while every valid P value remains numeric.
         Note: With a positive inference limit, an unexpected non-numeric token beyond the sampled rows
           can still make Polars stop during the initial read. Keep 0 for heterogeneous public GWAS files.
+          With chromosome.exclude_x = true, mapped positions and scientific numeric columns are
+          read as text regardless of this limit so malformed cells confined to excluded X rows
+          cannot stop parsing. Retained rows still use the normal explicit conversion and QC.
+          Projected reference-table and streaming reference reads also use text before exclusion.
+          Delimiter, row-width, header and other structural read errors still fail.
       origin: summary_statistics_io.py:load_summary_statistics_table
       recommendation: null
       type: int
@@ -1666,6 +1673,29 @@ policies:
   # dataset 03 / reference readers   chromosome naming and filtering
   # =================================================================
   chromosome:
+    exclude_x:
+      default: false
+      help: |-
+        What it does: Explicitly excludes rows whose resolved chromosome label is X.
+        When it applies: dataset step 03, after immutable source-row IDs exist and chromosome
+          identity can be extracted and normalized, before missing-value or scientific QC.
+          The same scope is used by reference preflight, staging, workers and optional validation.
+        Values:
+          false - preserve the configured chromosome lists and existing X handling.
+          true - exclude X even when chromosome.allowed_after_split, chromosome.allowed or
+            resource_preflight.chromosomes includes it; preserve the order of all other chromosomes.
+        Example: --exclude-chr-x sets this value to true. Under the packaged normalization and
+          rename map, X, chrX, 23, 25, XY, PAR1 and PAR2 all resolve to X and are excluded.
+        Note: Removed rows retain their original provenance and are counted once with reason
+          chromosome_excluded_by_user, separately from invalid or unsupported chromosomes.
+          Excluded rows do not affect scientific QC denominators or study-wide decisions.
+          An X-only dataset fails without a successful empty result. Changing this policy
+          changes scientific checkpoint identity under the global resume policy.
+      origin: summary_statistics_io.py; shared/variant_columns.py; service.py
+      recommendation: null
+      type: bool
+      validator:
+        kind: flag
     drop_mt:
       default: true
       help: |-
@@ -1679,7 +1709,8 @@ policies:
             present in chromosome.allowed_after_split.
         Example: PLINK chromosome 26 and the label M are normalized to MT. With the packaged
           autosomes-plus-X chromosome lists and this default, those rows are removed and counted
-          as mitochondrial exclusions. PLINK chromosome 25 is normalized to X and is retained.
+          as mitochondrial exclusions. PLINK chromosome 25 is normalized to X and is retained
+          unless chromosome.exclude_x is true.
         Note: Both dataset-level and chromosome-level coordinate checks read this value from the
           resolved policy registry. There is no separate caller default. The packaged pipeline
           intentionally keeps only autosomes and X.
@@ -1718,7 +1749,8 @@ policies:
           label is removed with the separate unsupported_chromosome rejection reason.
         When it applies: chromosome step 02, and the same coordinate step run inside dataset step
           03. It is consulted after chromosome.rename_map has renamed labels, and
-          chromosome.drop_mt can remove MT from this list but never adds an unlisted chromosome.
+          chromosome.drop_mt can remove MT and chromosome.exclude_x can remove X from this list;
+          neither switch adds an unlisted chromosome.
         Values:
           Every member is a label that is kept, labels are compared in upper case, and this list's
           order is used when the validated per-chromosome VCFs are concatenated. Keep that order

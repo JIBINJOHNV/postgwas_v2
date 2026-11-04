@@ -37,6 +37,7 @@ from .shared.variant_columns import (
     canonicalize_variant_frame,
     has_canonical_variant_columns,
     read_reference_variant_table,
+    reference_schema_inference_rows,
 )
 
 __all__ = [
@@ -325,9 +326,7 @@ def _external_info_batches(
                 columns=selected_columns,
                 separator=separator,
                 null_values=list(policies.get("input.null_values")),
-                infer_schema_length=int(
-                    policies.get("input.schema_inference_rows")
-                ),
+                infer_schema_length=reference_schema_inference_rows(policies),
                 batch_rows=int(external_reference_staging["batch_rows"]),
                 compressed_suffixes=tuple(
                     external_reference_staging["compressed_suffixes"]

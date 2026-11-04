@@ -26,7 +26,10 @@ from postgwas.core.values import optional_text
 
 from .resource_paths import external_resource_template_fields
 from .resource_preflight import resource_preflight_file_paths
-from .shared.variant_columns import canonical_chromosome_expression
+from .shared.variant_columns import (
+    canonical_chromosome_expression,
+    reference_schema_inference_rows,
+)
 
 
 class ExternalReferenceStagingError(RuntimeError):
@@ -335,7 +338,7 @@ def _partition_group(
             columns=group.columns,
             separator=detected.value,
             null_values=list(policies.get("input.null_values")),
-            infer_schema_length=int(policies.get("input.schema_inference_rows")),
+            infer_schema_length=reference_schema_inference_rows(policies),
             batch_rows=batch_rows,
             compressed_suffixes=compressed_suffixes,
         ):

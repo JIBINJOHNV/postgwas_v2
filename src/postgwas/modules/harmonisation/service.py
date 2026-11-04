@@ -190,6 +190,9 @@ from postgwas.modules.harmonisation.qc_reporting import (
     harmonisation_qc_summary_lines,
     harmonisation_qc_takeaway_lines,
 )
+from postgwas.modules.harmonisation.shared.variant_columns import (
+    retained_chromosome_scope,
+)
 
 
 # ===============================================================
@@ -411,6 +414,7 @@ class _DatasetPreparation:
     ready_snps: int
     ready_indels_or_other: int
     partition_rows: Dict[str, int]
+    removed_excluded_chromosomes: int = 0
 
 
 @dataclass(frozen=True)
@@ -735,10 +739,10 @@ def _field_completeness_block(report):
 
     lines = [
         screen_line("analysis", "Input completeness and numeric conversion", indent=4),
-        screen_field("count", "Variants read", _count(report.get("input_rows")), indent=8, label_width=22),
+        screen_field("count", "Variants assessed", _count(report.get("input_rows")), indent=8, label_width=22),
         screen_field(
             "info", "Count timing",
-            "Missing: all input rows after missing-token parsing. Numeric conversion: "
+            "Missing: analysis-scope rows after explicit chromosome exclusion and missing-token parsing. Numeric conversion: "
             "rows remaining after initial missing-field and coordinate filtering.",
             indent=8, label_width=22,
         ),
@@ -937,6 +941,7 @@ def _input_validation_summary_block(
     ready_variants,
     ready_snps,
     ready_indels_or_other,
+    excluded_chromosomes=0,
 ):
     """Render input-QC accounting and its ready-row variant-type breakdown."""
     return "\n".join([
@@ -947,6 +952,10 @@ def _input_validation_summary_block(
         ),
         screen_field(
             "count", "Variants read", _count(variants_read),
+            indent=8, label_width=30,
+        ),
+        screen_field(
+            "loss", "User-excluded chromosomes", _count(excluded_chromosomes),
             indent=8, label_width=30,
         ),
         screen_field(
@@ -1879,7 +1888,7 @@ def preflight_harmonisation_resources(
     """Resolve and validate every resource before chromosome workers start."""
     resource_maps = {}
     issues = []
-    for chromosome in chromosomes:
+    for chromosome in retained_chromosome_scope(chromosomes, policies):
         try:
             resource_maps[str(chromosome)] = build_resource_map(
                 chromosome=str(chromosome),
@@ -1943,11 +1952,14 @@ def preflight_configured_reference_scope(defaults, resource_folder, scope, *, sa
     """
     external = sample_columns or {}
     policies = load_policies(defaults["policies"])
+    chromosomes = retained_chromosome_scope(scope.chromosomes, policies)
+    if not chromosomes:
+        return
     issues = []
     for build in scope.builds:
         try:
             preflight_harmonisation_resources(
-                scope.chromosomes, grch_version=build,
+                chromosomes, grch_version=build,
                 target_build=defaults["vcf_processing"]["target_builds"][build],
                 resource_folder=resource_folder,
                 user_eaf_file=external.get("eaffile"),
@@ -2918,7 +2930,7 @@ def _prepare_dataset_for_chromosome_processing(
         policy_keys=[
             "input.delimiter", "input.null_values", "input.strip_double_hash_lines",
             "columns.mandatory",
-            "chromosome.allowed", "allele.pattern",
+            "chromosome.allowed", "chromosome.exclude_x", "allele.pattern",
             "info.multi_value_delimiter",
             "info.multi_value_aggregation",
             "info.multi_value_output_column",
@@ -2954,6 +2966,9 @@ def _prepare_dataset_for_chromosome_processing(
         ctx.set_rows(df.height)
         ctx.rows_in = polars_rows
 
+    removed_excluded_chromosomes = int(
+        (field_completeness.get("chromosome_exclusion") or {}).get("excluded_rows", 0)
+    )
     field_completeness_path = configured_output_path(
         output_dir_path,
         output_layout["field_completeness"],
@@ -2977,6 +2992,7 @@ def _prepare_dataset_for_chromosome_processing(
         "\n" + _input_validation_summary_block(
             input_variants=file_cvariant_count,
             variants_read=polars_rows,
+            excluded_chromosomes=removed_excluded_chromosomes,
             missing_required=removed_missing_count,
             invalid_coordinates=removed_coords,
             unsupported_chromosomes=removed_unsupported_chromosomes,
@@ -3630,6 +3646,7 @@ def _prepare_dataset_for_chromosome_processing(
             ready_variant_types["indels_or_other_variants"]
         ),
         partition_rows=dict(partition_rows),
+        removed_excluded_chromosomes=removed_excluded_chromosomes,
     )
 
 
@@ -4268,6 +4285,9 @@ def harmonise_chromosomes(
 
     per_chr_qc["total_variant_infile"] = prepared.input_variants
     per_chr_qc["total_variant_read"] = prepared.rows_read
+    per_chr_qc["total_variant_removed_excluded_chromosomes"] = (
+        prepared.removed_excluded_chromosomes
+    )
     per_chr_qc["total_variant_removed_null_coords"] = (
         prepared.removed_invalid_coordinates
     )
@@ -4472,6 +4492,7 @@ def _fallback_qc_frame(qc_results):
     metrics = [
         "total_variant_infile",
         "total_variant_read",
+        "total_variant_removed_excluded_chromosomes",
         "total_variant_removed_null_coords",
         "total_variant_removed_unsupported_chromosomes",
         "total_variant_removed_non_standard_alleles",
@@ -4846,6 +4867,9 @@ def _run_post_merge_stages(
     pre_vcf_summary = {
         "total_variant_infile": qc_results.get("total_variant_infile"),
         "total_variant_read": qc_results.get("total_variant_read"),
+        "total_variant_removed_excluded_chromosomes": qc_results.get(
+            "total_variant_removed_excluded_chromosomes"
+        ),
         "total_variant_in_vcf_input": total_variants_in_gwas2vcf_input,
         "total_variant_removed_missing_values": qc_results.get(
             "total_variant_removed_missing_values"

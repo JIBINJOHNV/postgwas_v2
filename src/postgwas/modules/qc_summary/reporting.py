@@ -204,6 +204,7 @@ def _render_qc_summary_lines(
     for label, key, kind in (
         ("Input rows", "total_variant_infile", "count"),
         ("Rows read", "total_variant_read", "count"),
+        ("User-excluded chromosomes", "total_variant_removed_excluded_chromosomes", "loss"),
         (
             "Missing read-stage mandatory values",
             "total_variant_removed_missing_values",

@@ -10,7 +10,8 @@ older versions.
 
 The terminal and saved screen report show each field separately, with its actual
 study column or selected external/fixed source. **Missing in input** counts
-original missing tokens across all input rows. **Invalid numeric** counts
+original missing tokens across rows remaining after explicit chromosome
+exclusion. **Invalid numeric** counts
 non-missing cells changed to null by scalar conversion, using only the
 non-missing values assessed after initial missing-field and coordinate filtering.
 These denominators can differ; conversion failures are not automatically row
@@ -138,7 +139,8 @@ output provenance. Each row includes:
   status, comparison panel/population, and the exact chromosome reference files
   represented in the totals;
 - total input and input-QC-ready counts, including SNP and indel/other totals
-  among rows ready for harmonisation; chromosome-harmonised counts; and final
+  among rows ready for harmonisation; `excluded_chromosome_variants` for the
+  user-requested chromosome exclusion; chromosome-harmonised counts; and final
   merged-VCF counts with their separate SNP and indel/other totals;
 - QC-passed and QC-failed SNP counts and percentages, together with the number
   of active rules;
@@ -317,6 +319,20 @@ dataset finalization.
 source and total, including explicit zeros.
 `qc_summary/<dataset>_duplicates.tsv` records all duplicate-group members,
 their classification, conflicting fields, selection status, and action.
+
+With `--exclude-chr-x` or YAML `chromosome.exclude_x: true`, canonical X rows
+are recorded as `chromosome_excluded_by_user` before missingness or scientific
+QC. Packaged normalization includes `X`, `chrX`, `23`, `25`, `XY`, `PAR1`, and
+`PAR2`; custom normalization and rename policies remain authoritative.
+Original values and source-row IDs are preserved. The dataset metric
+`total_variant_removed_excluded_chromosomes` and run-summary column
+`excluded_chromosome_variants` report the count. The manifest's
+`dataset.field_completeness.chromosome_exclusion` records enabled state,
+excluded chromosome labels, raw input rows, excluded rows, and retained rows.
+These rows count once in raw-input accounting and the rejection ledger,
+separately from invalid/unsupported chromosomes, and do not enter scientific
+QC denominators or final variants. An X-only input fails without a successful
+empty VCF. The default `exclude_x: false` preserves existing X handling.
 
 Consistent duplicates are selected using configured completeness/quality/N
 ordering and a deterministic input-order tie-break. Conflicting association

@@ -20,7 +20,7 @@ from typing import Any
 _DATASET = (
     ("Configuration validation", "Check the resolved sample-sheet mappings, required inputs and configuration before analysis.", ("columns.", "input.")),
     ("Header validation", "Check that the configured columns exist in the study header.", ("columns.", "input.")),
-    ("Read and prepare the study", "Parse missing and numeric values, normalize coordinates and alleles, apply supported-chromosome rules and handle duplicates.", ("input.", "columns.", "chromosome.", "allele.", "duplicates.")),
+    ("Read and prepare the study", "Apply explicit chromosome exclusions before scientific QC, then parse missing and numeric values, normalize coordinates and alleles, apply supported-chromosome rules and handle duplicates.", ("input.", "columns.", "chromosome.", "allele.", "duplicates.")),
     ("Content validation and recovery plan", "Check usable inputs, plan missing sample-size handling and enforce chromosome-X Z-only reconstruction safety before workers start.", ("sample_size.", "effect_from_z.x_")),
     ("Genome-build determination", "Compare testable study variants with configured build references, or validate the declared build.", ("build.",)),
     ("Study-wide strand consensus", "Use informative non-palindromic reference matches to determine the study-wide strand evidence.", ("strand.",)),
@@ -436,6 +436,7 @@ def dataset_steps(manifest: Mapping[str, Any]) -> list[dict]:
     pre_vcf = _mapping(manifest.get("pre_vcf_summary"))
     input_counts = {key: pre_vcf[key] for key in (
         "total_variant_infile", "total_variant_read", "total_variant_removed_missing_values",
+        "total_variant_removed_excluded_chromosomes",
         "total_variant_removed_null_coords", "total_variant_removed_unsupported_chromosomes",
         "total_variant_removed_non_standard_alleles", "total_variant_removed_duplicates",
         "total_variant_remaining_for_harmonisation", "total_variant_ready_snps",
@@ -467,6 +468,7 @@ def dataset_steps(manifest: Mapping[str, Any]) -> list[dict]:
         cards[2]["summary"].insert(0, f"Study input: {manifest['sumstat_file']}.")
     cards[2]["metrics"].update({label: input_counts[key] for key, label in (
         ("total_variant_infile", "Input variants"), ("total_variant_read", "Variants read"),
+        ("total_variant_removed_excluded_chromosomes", "User-excluded chromosomes"),
         ("total_variant_remaining_for_harmonisation", "Ready for chromosome analysis"),
     ) if key in input_counts})
     return cards

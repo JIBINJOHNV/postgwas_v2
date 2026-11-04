@@ -13,7 +13,7 @@ from postgwas.core.io.delimiters import open_binary, open_text, resolve_delimite
 
 from postgwas.core.values import missing_tokens, optional_text
 
-from .coordinates import harmonise_coordinates_and_alleles
+from .coordinates import filter_excluded_chromosomes, harmonise_coordinates_and_alleles
 from .errors import SUMMARY_STATISTICS_READ_ERRORS, SummaryStatisticsReadError
 from .policies import FIELD_LIFECYCLE
 from .p_values import preserve_pvalue_source_text
@@ -29,6 +29,7 @@ from .sample_size import (
 from .shared.runtime import emit_message, reject_rows, resolve_policies
 from .shared.column_mapping import COLUMN_CONFIG_KEYS, column_mapping_groups
 from .shared.variant_columns import (
+    excluded_chromosome_labels,
     mark_canonical_variant_columns,
     minimal_allele_representation_series,
     study_string_schema,
@@ -138,6 +139,14 @@ def load_summary_statistics_table(file_path: str, sample_column_dict: dict, poli
     )
     sep = delimiter.value
     string_schema = study_string_schema(sample_column_dict)
+    if excluded_chromosome_labels(policies):
+        # Resolve scope before numeric validation: inferred types must not let
+        # a malformed value confined to an excluded chromosome stop the read.
+        # Retained values still use the existing explicit normalization/QC.
+        for key in ("pos_col", *NUMERIC_COLUMN_CONFIG_KEYS):
+            column = optional_text(sample_column_dict.get(key))
+            if column:
+                string_schema[column] = pl.String
     for key in ("pval_col", "ncase_col", "ncontrol_col"):
         column = optional_text(sample_column_dict.get(key))
         if column:
@@ -1645,9 +1654,6 @@ def read_summary_statistics(
         )
     df = df.with_row_index(SOURCE_INPUT_ROW_COLUMN, offset=1)
     source_snapshot = df.clone()
-    df, sample_column_dict = preserve_pvalue_source_text(
-        df, sample_column_dict
-    )
     own_collector = False
     if rejects is None and bool(policies.get("rejects.enabled")):
         reject_dir = configured_output_path(
@@ -1669,6 +1675,32 @@ def read_summary_statistics(
     reject_counts_before = rejects.counts() if rejects is not None else {}
 
     try:
+        df, excluded_rows = filter_excluded_chromosomes(
+            df, sample_column_dict, policies=policies, logger=logger,
+            rejects=rejects,
+        )
+        chromosome_exclusion = {
+            "enabled": bool(policies.get("chromosome.exclude_x")),
+            "excluded_chromosomes": list(excluded_chromosome_labels(policies)),
+            "excluded_rows": excluded_rows,
+            "input_rows": python_read_count,
+            "retained_rows": df.height,
+        }
+        if chromosome_exclusion["enabled"]:
+            _emit(
+                logger,
+                "Explicit chromosome-X exclusion: %d rows excluded; %d rows remain."
+                % (excluded_rows, df.height),
+            )
+            if df.is_empty():
+                raise ValueError(
+                    "No variants remain after --exclude-chr-x "
+                    "(chromosome.exclude_x: true). Provide a dataset containing "
+                    "retained chromosomes or disable the explicit exclusion."
+                )
+        df, sample_column_dict = preserve_pvalue_source_text(
+            df, sample_column_dict
+        )
         _emit(
             logger,
             "Sumstat reading successful: rows loaded %d, columns %s"
@@ -1684,6 +1716,7 @@ def read_summary_statistics(
         field_completeness = _input_field_completeness(
             df, sample_column_dict, policies,
         )
+        field_completeness["chromosome_exclusion"] = chromosome_exclusion
 
         if mapped_cols:
             total_rows = df.height
@@ -1929,6 +1962,7 @@ def read_summary_statistics(
 
         _emit(logger, "Removed %d duplicate variants" % removed_duplicates_count)
         measured_ledger = {
+            "excluded_chromosomes": int(excluded_rows),
             "missing_read_mandatory_value": int(removed_missing_count),
             "invalid_coordinates": int(removed_coords),
             "unsupported_chromosomes": int(removed_unsupported_chromosomes),
@@ -1943,6 +1977,9 @@ def read_summary_statistics(
                 if int(count) - int(reject_counts_before.get(reason, 0))
             }
             collector_ledger = {
+                "excluded_chromosomes": int(
+                    stage_reject_counts.get("chromosome_excluded_by_user", 0)
+                ),
                 "missing_read_mandatory_value": int(
                     stage_reject_counts.get("missing_read_mandatory_value", 0)
                 ),

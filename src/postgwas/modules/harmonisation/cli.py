@@ -63,6 +63,7 @@ from postgwas.core.ui import (
     screen_line,
 )
 from postgwas.modules.harmonisation.vcf_processing import require_binaries
+from postgwas.modules.harmonisation.shared.variant_columns import excluded_chromosome_labels
 
 
 _RESOLVED_RESOURCE_PATHS = (
@@ -90,6 +91,7 @@ _RUN_SUMMARY_FIELDS = (
     "input_ready_variants",
     "input_ready_snps",
     "input_ready_indels_or_other_variants",
+    "excluded_chromosome_variants",
     "parsed_variants",
     # Dataset step 5: genome-build inference.
     "genome_build",
@@ -192,6 +194,7 @@ CLI_OVERRIDE_PATHS = {
     "seed": "execution.random_seed",
     "validate": "modules.harmonisation.concordance_validation.enabled",
     "fixed_info": "modules.harmonisation.fixed_info.value",
+    "exclude_chr_x": "modules.harmonisation.policies.chromosome.exclude_x",
     "zero_p_se_action": (
         "modules.harmonisation.policies.pvalue.zero_missing_se"
     ),
@@ -506,6 +509,18 @@ def get_harmonisation_parser(add_help: bool = False) -> argparse.ArgumentParser:
             defaults.run.output_directory,
         ),
     )
+    scope = parser.add_argument_group("Chromosome scope")
+    scope.add_argument(
+        "--exclude-chr-x",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=help_with_default(
+            "Exclude chromosome X after configured label normalization, before "
+            "quality checks and study-wide decisions. Excluded rows are counted "
+            "with their original provenance; X-specific references are not required",
+            policy_defaults.get("chromosome.exclude_x"),
+        ),
+    )
     frequency = parser.add_argument_group("Reference frequency check")
     frequency.add_argument(
         "--eaf-replacement-file",
@@ -622,7 +637,12 @@ def _eaf_replacement_input_files(config) -> dict[str, Path]:
     if specification is None:
         return {}
     try:
-        files = validate_external_resource_spec(Path(specification).expanduser())
+        files = validate_external_resource_spec(
+            Path(specification).expanduser(),
+            excluded_chromosomes=excluded_chromosome_labels(
+                load_policies(config.modules.harmonisation.policies)
+            ),
+        )
     except (OSError, ValueError) as exc:
         raise ConfigurationError(
             "Invalid argument --eaf-replacement-file "
@@ -1068,6 +1088,9 @@ def _run_summary_record(
         "input_ready_snps": pre_vcf.get("total_variant_ready_snps"),
         "input_ready_indels_or_other_variants": pre_vcf.get(
             "total_variant_ready_indels_or_other"
+        ),
+        "excluded_chromosome_variants": pre_vcf.get(
+            "total_variant_removed_excluded_chromosomes"
         ),
         "parsed_variants": reconciliation.get("rows_read"),
         "rejected_variants": reconciliation.get("rejected"),
@@ -2181,6 +2204,16 @@ def main() -> int:
                     "--run-config harmonisation.yaml",
                     "--resource-directory resources",
                     "--output-directory results",
+                ),
+            ),
+            (
+                "Exclude chromosome X before quality checks:",
+                "postgwas harmonisation",
+                (
+                    "--sample-sheet studies.csv",
+                    "--resource-directory resources",
+                    "--output-directory results",
+                    "--exclude-chr-x",
                 ),
             ),
             (

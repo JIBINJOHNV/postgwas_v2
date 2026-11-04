@@ -18,7 +18,10 @@ from postgwas.core.input_validation import (
     require_unchanged_preflight_files, PreflightFileIdentity,
 )
 from postgwas.modules.harmonisation.shared.allele_join import prepare_reference_values
-from postgwas.modules.harmonisation.shared.variant_columns import read_reference_variant_table
+from postgwas.modules.harmonisation.shared.variant_columns import (
+    read_reference_variant_table,
+    retained_chromosome_scope,
+)
 from postgwas.modules.harmonisation.shared.statistics import frequency_maf_screen
 from .shared.csq_contigs import (
     CSQ_PREFIX_CONFIG_KEY, resolve_csq_prefixes, csq_contig_lookup, csq_target_contig,
@@ -443,6 +446,10 @@ def validate_harmonisation_resource_maps(
     validate_frequency_semantics: bool = True,
 ) -> dict[str, Any]:
     """Validate every resolved resource and return serialisable provenance."""
+    resource_maps = {
+        chromosome: resource_maps[chromosome]
+        for chromosome in retained_chromosome_scope(resource_maps, policies)
+    }
     csq_prefixes = resolve_csq_prefixes(vcf_config, grch_version)
     csq_names = {}
     issues: dict[tuple[str, str, str], set[str]] = {}

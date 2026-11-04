@@ -37,6 +37,7 @@ from postgwas.modules.harmonisation.study_properties import (
     selected_eaf_replacement,
 )
 from postgwas.modules.harmonisation.strand import STRAND_ACTION_COLUMN
+from postgwas.modules.harmonisation.shared.variant_columns import retained_chromosome_scope
 
 from .analysis import (
     INPUT_SOURCE_ROW_COLUMN,
@@ -938,7 +939,9 @@ def _compare_staged_partitions(
     external_eaf_build: str,
     log: PipelineLogger,
 ) -> ConcordanceAnalysis:
-    partitions = _partition_values(input_path, vcf_path)
+    partitions = retained_chromosome_scope(
+        _partition_values(input_path, vcf_path), policies,
+    ) or [None]
     log.info(
         "Concordance comparison will process %s canonical chromosome partition(s) "
         "sequentially: %s."

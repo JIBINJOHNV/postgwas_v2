@@ -19,6 +19,7 @@ chromosome.strip_leading_zero    treat '01' and '1' as the same
 chromosome.rename_map            how non-standard labels are renamed
 chromosome.allowed_after_split   which chromosomes survive this step
 chromosome.drop_mt               drop mitochondrial variants
+chromosome.exclude_x             explicitly exclude X before scientific checks
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -30,17 +31,20 @@ from postgwas.core.values import optional_text
 from .policies import default_policies
 from .shared.allele_join import unused_column_name
 from .shared.column_mapping import validate_scientific_column_mappings
-from .shared.runtime import reject_rows, step_context
+from .shared.runtime import active_context, reject_rows, step_context
 from .shared.variant_columns import (
+    COMBINED_COORDINATE_SEPARATORS,
     allowed_coordinate_chromosomes,
     canonical_chromosome_expression,
     canonicalize_variant_frame,
+    combined_coordinate_expressions,
+    excluded_chromosome_labels,
     position_text_expression,
     validate_coordinate_agreement,
 )
 
 
-__all__ = ["harmonise_coordinates_and_alleles"]
+__all__ = ["filter_excluded_chromosomes", "harmonise_coordinates_and_alleles"]
 
 
 #: The label written into the reject file's ``reject_step`` column.
@@ -55,6 +59,7 @@ POLICY_KEYS = [
     "chromosome.rename_map",
     "chromosome.allowed_after_split",
     "chromosome.drop_mt",
+    "chromosome.exclude_x",
 ]
 
 
@@ -63,6 +68,43 @@ POLICY_KEYS = [
 # =============================================================================
 
 _clean_name = optional_text
+
+
+def filter_excluded_chromosomes(
+    df, sample_column_dict, *, policies, logger=None, rejects=None, ctx=None,
+    counters=None,
+):
+    """Remove explicitly excluded rows before inspecting scientific values.
+
+    A configured chromosome column is authoritative. A combined coordinate
+    supplies only an absent chromosome role, using the same extraction as
+    concordance; the original source values and mapping stay unchanged.
+    """
+    excluded = excluded_chromosome_labels(policies)
+    if not excluded:
+        return df, 0
+    chromosome = _clean_name(sample_column_dict.get("chr_col"))
+    combined = _clean_name(sample_column_dict.get("chr_pos_col"))
+    source = chromosome or combined
+    if not source or source not in df.columns:
+        raise ValueError(
+            "Chromosome exclusion requires an existing chromosome_column or "
+            "chromosome_position_column in the sample sheet."
+        )
+    expression = pl.col(source)
+    if chromosome is None:
+        expression, _ = combined_coordinate_expressions(
+            expression, policies, require_position=False,
+        )
+    mask = canonical_chromosome_expression(expression, policies).is_in(
+        list(excluded)
+    ).fill_null(False)
+    return reject_rows(
+        df, mask, step_label=STEP_LABEL, reason="chromosome_excluded_by_user",
+        context=active_context(logger, ctx, df.height), collector=rejects,
+        counters=counters,
+        detail="explicit chromosome.exclude_x policy (--exclude-chr-x)",
+    )
 
 
 def _resolve_drop_mt(drop_mt, policies, ctx):
@@ -178,6 +220,11 @@ def harmonise_coordinates_and_alleles(
 def _harmonise(df, sample_column_dict, policies, ctx, rejects,
                drop_mt, counters, qc_info):
     # type: (pl.DataFrame, dict, Any, Any, Any, Optional[bool], Dict[str, int], Dict[str, Any]) -> Tuple[pl.DataFrame, dict]
+    df, excluded_rows = filter_excluded_chromosomes(
+        df, sample_column_dict, policies=policies, ctx=ctx,
+        rejects=rejects, counters=counters,
+    )
+    qc_info["excluded_chromosome_rows"] = excluded_rows
     chr_col = _clean_name(sample_column_dict.get("chr_col"))
     pos_col = _clean_name(sample_column_dict.get("pos_col"))
     chr_pos_col = _clean_name(sample_column_dict.get("chr_pos_col"))
@@ -340,7 +387,7 @@ def _split_chromosome_position(
     dup_before = df.select(pl.col(chr_pos_col).is_duplicated().sum()).item()
 
     used_sep = None
-    for sep in [":", "-", "_"]:
+    for sep in COMBINED_COORDINATE_SEPARATORS:
         try:
             temp = df.with_columns([
                 pl.col(chr_pos_col).cast(pl.Utf8, strict=False)

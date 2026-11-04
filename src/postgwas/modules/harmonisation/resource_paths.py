@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import glob
 from pathlib import Path
+import re
 from string import Formatter
+from typing import Sequence
 
 from postgwas.core.values import optional_text
 
@@ -12,16 +14,18 @@ from postgwas.core.values import optional_text
 _ALLOWED_TEMPLATE_FIELDS = frozenset(("build", "chromosome"))
 
 
-def _template_glob(value: str) -> tuple[set[str], str]:
+def _template_glob(value: str) -> tuple[set[str], str, re.Pattern | None]:
     """Return template fields and a safely escaped glob for their files."""
     fields: set[str] = set()
     parts: list[str] = []
+    match_parts: list[str] = []
     try:
         parsed = list(Formatter().parse(value))
     except ValueError as exc:
         raise ValueError("invalid path template %r: %s" % (value, exc)) from exc
     for literal, field, format_spec, conversion in parsed:
         parts.append(glob.escape(literal))
+        match_parts.append(re.escape(literal))
         if field is None:
             continue
         if field not in _ALLOWED_TEMPLATE_FIELDS:
@@ -34,15 +38,29 @@ def _template_glob(value: str) -> tuple[set[str], str]:
                 "placeholder {%s} must not use a format specifier or conversion"
                 % field
             )
+        match_parts.append(
+            (r"(?P=chromosome)" if field in fields else r"(?P<chromosome>[^/]*)")
+            if field == "chromosome" else r"[^/]*"
+        )
         fields.add(field)
         parts.append("*")
-    return fields, "".join(parts)
+    chromosome_match = (
+        re.compile("".join(match_parts)) if "chromosome" in fields else None
+    )
+    return fields, "".join(parts), chromosome_match
 
 
-def matching_external_resource_files(value: str | Path) -> tuple[Path, ...]:
-    """Return exact or template-matched files without opening their contents."""
-    text = str(value)
-    fields, pattern = _template_glob(text)
+def matching_external_resource_files(
+    value: str | Path, *, excluded_chromosomes: Sequence[str] = (),
+) -> tuple[Path, ...]:
+    """Return scoped template matches; literal shared files remain dependencies.
+
+    A declared ``{chromosome}`` token uses the canonical labels supplied to
+    ``resolve_resource_file``. Exclusion never guesses a label from a filename.
+    """
+    text = str(Path(value))
+    fields, pattern, chromosome_match = _template_glob(text)
+    excluded = {str(chromosome).strip().upper() for chromosome in excluded_chromosomes}
     candidates = (
         (Path(match) for match in glob.glob(pattern))
         if fields
@@ -50,6 +68,10 @@ def matching_external_resource_files(value: str | Path) -> tuple[Path, ...]:
     )
     files = []
     for candidate in candidates:
+        if chromosome_match is not None and excluded:
+            match = chromosome_match.fullmatch(str(candidate))
+            if match is not None and match.group("chromosome").strip().upper() in excluded:
+                continue
         try:
             if candidate.is_file() and candidate.stat().st_size > 0:
                 files.append(candidate.resolve())
@@ -60,17 +82,25 @@ def matching_external_resource_files(value: str | Path) -> tuple[Path, ...]:
 
 def external_resource_template_fields(value: str | Path) -> frozenset[str]:
     """Return the validated placeholders used by one external-resource path."""
-    fields, _pattern = _template_glob(str(value))
+    fields, _pattern, _chromosome_match = _template_glob(str(value))
     return frozenset(fields)
 
 
-def validate_external_resource_spec(value: str | Path) -> tuple[Path, ...]:
+def validate_external_resource_spec(
+    value: str | Path, *, excluded_chromosomes: Sequence[str] = (),
+) -> tuple[Path, ...]:
     """Require an existing file or an explicit template matching non-empty files."""
     text = str(value)
-    fields, _pattern = _template_glob(text)
-    files = matching_external_resource_files(text)
+    fields, _pattern, _chromosome_match = _template_glob(text)
+    files = matching_external_resource_files(
+        text, excluded_chromosomes=excluded_chromosomes,
+    )
     if files:
         return files
+    if excluded_chromosomes and matching_external_resource_files(text):
+        # An existing template inventory can contain only excluded files.
+        # Required retained resources are checked by chromosome preflight.
+        return ()
 
     if fields:
         raise ValueError(

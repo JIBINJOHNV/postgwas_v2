@@ -22,6 +22,11 @@ logging:
 modules:
   harmonisation:
     enabled: true
+    policies:
+      chromosome:
+        # Set true, or supply --exclude-chr-x, to exclude X before scientific QC.
+        # An omitted CLI flag preserves this YAML value.
+        exclude_x: false
     comparison_af:
       source: ALFA
       column: EUR

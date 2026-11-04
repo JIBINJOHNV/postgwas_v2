@@ -205,6 +205,59 @@ Coordinate QC separately records missing chromosomes and positions, Y and MT
 exclusions, other excluded chromosome labels, and the number of PAR-labelled
 rows normalized to X. Every removed row remains in the rejected-variant audit.
 
+Use `--exclude-chr-x` to explicitly remove chromosome X:
+
+```console
+postgwas harmonisation \
+  --sample-sheet /path/to/studies.csv \
+  --resource-directory /path/to/resources \
+  --output-directory /path/to/results \
+  --exclude-chr-x
+```
+
+The equivalent run-configuration policy is:
+
+```yaml
+modules:
+  harmonisation:
+    policies:
+      chromosome:
+        exclude_x: true
+```
+
+The packaged value is `false`. Omitting the flag preserves a YAML value of
+`true`; the flag takes no value and explicitly enables exclusion. The resolved
+normalization and rename map determine which labels mean X. With packaged
+settings, this includes `X`, `chrX`, `23`, `25`, `XY`, `PAR1`, and `PAR2`.
+Exclusion takes precedence over configured chromosome lists without changing
+the order or scope of the remaining chromosomes.
+
+The reader preserves source-row IDs and original values, resolves chromosome
+identity from separate or combined coordinates, then excludes X before
+missingness, scientific numeric conversion, allele validation, duplicates,
+build inference, strand consensus, frequency decisions, and chromosome work.
+Malformed scientific cells confined to excluded X rows do not affect retained
+rows. File readability, table structure, headers, and mappings must still be
+valid. Even with positive `input.schema_inference_rows`, mapped positions and
+scientific numeric columns are read as text before exclusion, then retained
+rows undergo normal explicit conversion and QC. Structural delimiter,
+row-width, and header errors still fail. Projected reference-table and streaming
+reference reads likewise use text before exclusion, so X values cannot affect
+reference validation, duplicate handling, or frequency screening. Excluded rows receive
+`chromosome_excluded_by_user`, distinct from an
+invalid or unsupported chromosome; raw-input counts include them once, while
+scientific QC denominators use the retained scope. An X-only dataset fails
+with an actionable message rather than producing a successful empty result.
+
+X-specific references are omitted from startup and observed-chromosome
+preflight, staging, workers, and optional `--validate` comparisons, including
+when the configured reference inventory lists X. Shared resources needed for
+retained chromosomes remain required. Changing `exclude_x` invalidates the
+scientific checkpoint under the global resume policy; an identical completed
+exclusion run can be reused after normal checkpoint validation. This option
+belongs to the direct `postgwas harmonisation` command; harmonisation currently
+has no pipeline adapter.
+
 ### Strand consensus and per-variant orientation
 
 Dataset step 05 tests each candidate genome build with forward, swapped,
@@ -712,7 +765,8 @@ post-recovery missing count. BETA and Z also receive an explicit alternative-
 group row showing how many variants lacked both. The same structure is retained
 in the run manifest and summarized in the canonical log and screen report.
 
-Input missingness is measured after configured missing-token parsing but before
+Input missingness is measured after explicit chromosome exclusion and
+configured missing-token parsing but before
 numeric normalization; later unparseable numeric values are reported by the
 normalization and field-specific validation steps. Final missing counts are
 measured after recovery at chromosome step 13. With the packaged `reject`
@@ -759,7 +813,8 @@ output root. It also writes the configured `runtime.run_summary_file` (packaged
 default `harmonisation_run_summary.csv`) with one row per selected dataset.
 Its columns follow pipeline order. This run-level CSV records final status,
 failure reason, recorded failure stage and dataset log path;
-input-QC-ready SNP and indel/other counts; resolved and detected build/effect/P
+input-QC-ready SNP and indel/other counts and `excluded_chromosome_variants`;
+resolved and detected build/effect/P
 types, with explicit automatic-detection flags; the harmonised effect scale;
 combined completed-chromosome strand counts and reference files; final-VCF SNP
 and indel/other totals; SNP QC pass/fail counts and percentages;

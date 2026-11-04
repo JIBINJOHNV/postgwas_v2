@@ -24,9 +24,10 @@ from ..shared.variant_columns import (
     canonical_allele_expression,
     canonical_chromosome_expression,
     canonical_position_expression,
+    combined_coordinate_expressions,
+    excluded_chromosome_labels,
     minimal_allele_representation_series,
     palindromic_snp_expression,
-    position_text_expression,
     reverse_complement_expression,
     validate_coordinate_agreement,
 )
@@ -139,7 +140,7 @@ def _source_text(frame: pl.DataFrame, name: str | None) -> pl.Expr:
 
 
 def _input_coordinates(
-    row, policies,
+    row, policies, *, require_position: bool = True,
 ) -> tuple[pl.Expr, pl.Expr, tuple[pl.Expr, pl.Expr] | None]:
     if row.chromosome_column and row.position_column:
         return pl.col(row.chromosome_column), pl.col(row.position_column), None
@@ -148,14 +149,9 @@ def _input_coordinates(
             "Coordinate mappings are incomplete. Supply chromosome_column and "
             "position_column, or chromosome_position_column in the sample sheet."
         )
-    combined = pl.col(row.chromosome_position_column).cast(pl.String, strict=False)
-    pattern = r"(?i)^(?:chr)?([^:_\-]+)[:_\-]+(.+)$"
-    parsed = (
-        combined.str.extract(pattern, 1),
-        position_text_expression(
-            combined.str.extract(pattern, 2),
-            str(policies.get("position.extraction")),
-        ),
+    parsed = combined_coordinate_expressions(
+        pl.col(row.chromosome_position_column), policies,
+        require_position=require_position,
     )
     return (
         pl.col(row.chromosome_column) if row.chromosome_column else parsed[0],
@@ -166,7 +162,9 @@ def _input_coordinates(
 
 def input_chromosome_expression(row, policies) -> pl.Expr:
     """Return the canonical chromosome expression shared by staging and analysis."""
-    chromosome, _, _ = _input_coordinates(row, policies)
+    chromosome, _, _ = _input_coordinates(
+        row, policies, require_position=not bool(excluded_chromosome_labels(policies)),
+    )
     return canonical_chromosome_expression(chromosome, policies)
 
 
@@ -226,6 +224,13 @@ def prepare_input_table(
                 "Configured coordinate column '%s' is absent from the study header. "
                 "Correct the sample-sheet coordinate mapping." % column
             )
+    if INPUT_SOURCE_ROW_COLUMN not in frame.columns:
+        frame = frame.with_row_index(INPUT_SOURCE_ROW_COLUMN, offset=1)
+    excluded = excluded_chromosome_labels(policies)
+    if excluded:
+        frame = frame.filter(
+            ~input_chromosome_expression(row, policies).is_in(excluded).fill_null(False)
+        )
     chrom, pos, combined = _input_coordinates(row, policies)
     if combined is not None:
         for role, retained, expression in (
@@ -273,13 +278,8 @@ def prepare_input_table(
         if "duplicate_input_row" in frame.columns else []
     )
 
-    indexed = (
-        frame
-        if INPUT_SOURCE_ROW_COLUMN in frame.columns
-        else frame.with_row_index(INPUT_SOURCE_ROW_COLUMN, offset=1)
-    )
     result = (
-        indexed
+        frame
         .select(
             pl.col(INPUT_SOURCE_ROW_COLUMN).cast(pl.UInt32).alias("input_row"),
             canonical_chromosome_expression(chrom, policies).alias("input_chrom"),
@@ -454,6 +454,12 @@ def _attach_external_eaf_to_matches(
     if external_eaf_mapping is None or not row.external_eaf_column:
         raise ValueError(
             "External EAF data require a column mapping and frequency column."
+        )
+    excluded = excluded_chromosome_labels(policies)
+    if excluded:
+        external_eaf_frame = external_eaf_frame.filter(
+            ~reference_chromosome_expression(external_eaf_mapping.chromosome, policies)
+            .is_in(excluded).fill_null(False)
         )
     reference_alt = unused_column_name(
         "__concordance_reference_alt", matched, external_eaf_frame
@@ -666,6 +672,11 @@ def prepare_vcf_table(frame: pl.DataFrame, policies) -> pl.DataFrame:
         if VCF_SOURCE_ROW_COLUMN in frame.columns
         else frame.with_row_index(VCF_SOURCE_ROW_COLUMN, offset=1)
     )
+    excluded = excluded_chromosome_labels(policies)
+    if excluded:
+        indexed = indexed.filter(
+            ~vcf_chromosome_expression(policies).is_in(excluded).fill_null(False)
+        )
     result = indexed.select(
         pl.col(VCF_SOURCE_ROW_COLUMN).cast(pl.UInt32).alias("vcf_row"),
         canonical_chromosome_expression(
@@ -741,6 +752,11 @@ def prepare_strand_action_table(
         raise ValueError(
             "Archived strand-orientation data is missing columns: %s"
             % ", ".join(missing)
+        )
+    excluded = excluded_chromosome_labels(policies)
+    if excluded:
+        frame = frame.filter(
+            ~vcf_chromosome_expression(policies).is_in(excluded).fill_null(False)
         )
     prepared = frame.select(
         canonical_chromosome_expression(

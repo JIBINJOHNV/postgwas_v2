@@ -79,6 +79,9 @@ _REASONS = {
     "unsupported_chromosome":
         "The chromosome is outside the configured analysis scope. PostGWAS "
         "retains autosomes and chromosome X in the packaged configuration.",
+    "chromosome_excluded_by_user":
+        "The chromosome was explicitly excluded from analysis by the resolved "
+        "chromosome.exclude_x policy (--exclude-chr-x).",
     "non_standard_allele":
         "An allele is not written as plain A, C, G or T letters - insertions and "
         "deletions coded as I, D or - land here.",
@@ -227,6 +230,7 @@ _REASON_STEPS = {
     "invalid_chromosome": "02",
     "invalid_position": "02",
     "unsupported_chromosome": "02",
+    "chromosome_excluded_by_user": "02",
     "non_standard_allele": "02",
     "null_allele": "02",
     "duplicate_variant": "02",
