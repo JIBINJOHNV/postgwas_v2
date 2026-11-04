@@ -1,5 +1,10 @@
 # Genome-build low-coverage fallback implementation
 
+Follow-up decision (2026-11-04): the user requested
+`low_coverage_fallback_enabled: true` as the canonical default. This supersedes
+the original opt-in/default-disabled requirement below. Explicit `false` still
+disables fallback; the scientific thresholds and decision order are unchanged.
+
 The user authorised implementation of the proposed package-wide fallback and
 asked whether 10,000 means matches to either build. The required interpretation
 is **10,000 distinct SNP loci supporting only the winning build**, not the sum

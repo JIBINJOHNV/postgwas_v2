@@ -2339,8 +2339,10 @@ policies:
             reverse-complement and reverse-complement-swapped orientations, then decide.
           GRCh37 - declare GRCh37 and read only its reference to collect strand evidence.
           GRCh38 - declare GRCh38 and read only its reference to collect strand evidence.
-        Example: By default under 'auto', an input whose evidence does not clear all four checks is reported
-          as "Ambiguous" and the whole dataset aborts with "Genome build inference failed".
+        Example: Under 'auto', normal acceptance is checked first. The enabled-by-default
+          low-coverage fallback may waive reference coverage alone when its stronger checks
+          pass. Otherwise the input is "Ambiguous" and the dataset aborts with
+          "Genome build inference failed".
           Setting build.mode: GRCh38 fixes the build decision while still comparing alleles with
           the GRCh38 reference for the study-level strand-consensus check.
         Note: The error message in the older code advertises a --genome-build command-line flag
@@ -2430,6 +2432,8 @@ policies:
           input rows. It passes this reference-coverage check because the build-check file is a
           representative marker panel, not an inventory of every possible study variant.
         Note: The input-wide fraction is still logged for audit but is not a pass/fail threshold.
+          The enabled low-coverage fallback may waive only this normal coverage gate when
+          all of its stronger evidence checks pass.
           This chromosome-scoped panel-coverage denominator and its default 0.1 are PostGWAS
           safety policies, not universal biological constants. Tools such as MungeSumstats
           also compare representative markers, with different denominators and decision rules.
@@ -2462,7 +2466,8 @@ policies:
           study file is not used in this fraction.
         Note: This denominator measures allele agreement among rows the reference can test.
           build.min_reference_match_fraction separately requires adequate coverage of the
-          representative reference markers on the chromosomes present in the study.
+          representative reference markers for normal acceptance; the low-coverage fallback
+          requires stronger evidence before waiving that coverage gate.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: float
@@ -2475,10 +2480,11 @@ policies:
         minimum: 0.0
         number_kind: float
     low_coverage_fallback_enabled:
-      default: false
+      default: true
       help: |-
         Enable experimental dominant-build inference only when reference coverage is the sole failed normal automatic gate. Requires exactly two candidate references; declared builds and normal acceptance are unchanged.
-        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+        Enabled by default. Set false to require normal reference coverage without fallback.
+        Applies only to build.mode: auto with the enabled low-coverage fallback.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: bool
@@ -2488,7 +2494,7 @@ policies:
       default: 0.95
       help: |-
         Minimum winning allele-compatible study-row fraction among coordinate-testable rows for the experimental fallback. Includes allele-incompatible coordinate hits in the denominator; this fraction is not a posterior probability.
-        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+        Applies only to build.mode: auto with the enabled low-coverage fallback.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: float
@@ -2504,7 +2510,7 @@ policies:
       default: 0.05
       help: |-
         Maximum competing allele-compatible study-row fraction using the same coordinate-testable denominator as the winner. Both-compatible rows contribute to both builds.
-        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+        Applies only to build.mode: auto with the enabled low-coverage fallback.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: float
@@ -2520,7 +2526,7 @@ policies:
       default: 10000
       help: |-
         Minimum distinct canonical chromosome/position SNP loci supporting only the winner. Count compatible different A/C/G/T single-base alleles once per locus; exclude a locus if any study evidence there matches the competitor. Duplicates cannot increase this floor.
-        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+        Applies only to build.mode: auto with the enabled low-coverage fallback.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: int
@@ -2536,7 +2542,7 @@ policies:
       default: 100
       help: |-
         Minimum distinct competitor-only SNP loci on one chromosome for the mixed-build veto, combined with low_coverage_chromosome_min_competitor_fraction. This veto applies only to fallback acceptance.
-        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+        Applies only to build.mode: auto with the enabled low-coverage fallback.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: int
@@ -2552,7 +2558,7 @@ policies:
       default: 0.95
       help: |-
         Minimum competitor match fraction among coordinate-testable study rows on one chromosome for the mixed-build veto, combined with the competitor-only locus floor. Sparse and unassessed chromosomes are not certified consistent.
-        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+        Applies only to build.mode: auto with the enabled low-coverage fallback.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: float

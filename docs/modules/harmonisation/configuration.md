@@ -268,7 +268,7 @@ consensus requires `strand.min_informative_variants` and the dominant fraction
 configured by `strand.consensus_threshold`. Palindromic SNPs never contribute
 because their allele letters cannot distinguish the competing strands.
 
-Automatic build inference requires all four independent evidence checks: at
+Normal automatic build acceptance requires all four evidence checks: at
 least `build.min_match_count` allele-compatible rows (default 100), at least
 `build.min_reference_match_fraction` of the winning build's unique reference
 markers on chromosomes present in the study (default 0.10), at least
@@ -300,10 +300,12 @@ a universal biological threshold.
 
 #### Experimental fallback for low reference coverage
 
-The canonical default `build.low_coverage_fallback_enabled: false` preserves
-the ordinary decision above. An opt-in fallback can waive **only reference
-coverage**, when it is the sole failed automatic gate. The absolute match
-count, testable-row fraction, unique winner and winning-share checks must still
+The canonical default `build.low_coverage_fallback_enabled: true` enables the
+fallback after checking normal acceptance first. Set this policy to `false`
+to require the normal coverage gate without fallback; an explicit value in an
+existing run YAML takes precedence over the packaged default. The fallback can
+waive **only reference coverage**, when it is the sole failed automatic gate.
+The absolute match count, testable-row fraction, unique winner and winning-share checks must still
 pass. Declared builds bypass automatic inference; normal automatic acceptance
 is unchanged even if fallback-specific checks would fail.
 

@@ -1,4 +1,4 @@
-"""Real reference joins exercise the opt-in dominant-build coverage exception."""
+"""Real reference joins exercise the configurable dominant-build coverage exception."""
 
 import json
 from copy import deepcopy
@@ -50,12 +50,12 @@ def padded(rows, count=300):
 
 
 @pytest.mark.parametrize("winner", ["GRCh37", "GRCh38"])
-def test_low_coverage_accepts_either_build_only_when_opted_in(tmp_path, winner):
+def test_low_coverage_accepts_either_build_and_can_be_explicitly_disabled(tmp_path, winner):
     study = [row(i) for i in range(20)]
     refs = [padded(study), [row(99999)]]
     if winner == "GRCh38":
         refs.reverse()
-    disabled = infer(tmp_path, study, *refs, enabled=None)
+    disabled = infer(tmp_path, study, *refs, enabled=False)
     assert disabled["inferred_build"] == "Ambiguous"
     assert disabled["low_coverage_fallback"]["status"] == "disabled"
     accepted = infer(tmp_path, study, *refs)
@@ -88,7 +88,8 @@ def test_same_testable_denominator_and_exact_fraction_boundaries(tmp_path, winni
 def test_actual_default_unique_winner_only_snp_floor(tmp_path, count, accepted):
     study = [row(i) for i in range(count)]
     result = infer(tmp_path, study, padded(study, 100001), [row(999999)],
-                   overrides={"build.low_coverage_min_unique_loci": 10000})
+                   enabled=None)
+    assert result["low_coverage_fallback"]["status"] == ("accepted" if accepted else "rejected")
     assert result["low_coverage_fallback"]["accepted"] is accepted
     assert result["distinct_loci"]["exclusive_snp_loci"]["GRCh37"] == count
 
@@ -182,8 +183,9 @@ def test_declared_build_bypasses_fallback_and_two_reference_constraint(tmp_path)
 
 def test_enabled_automatic_fallback_rejects_more_than_two_references(tmp_path):
     with pytest.raises(GenomeBuildError, match="exactly two.*low_coverage_fallback_enabled"):
-        infer(tmp_path, [row(1)], [row(1)], [row(2)], extra={"Third": [row(3)]})
-    assert infer(tmp_path, [row(1)], [row(1)], [row(2)], enabled=None,
+        infer(tmp_path, [row(1)], [row(1)], [row(2)], enabled=None,
+              extra={"Third": [row(3)]})
+    assert infer(tmp_path, [row(1)], [row(1)], [row(2)], enabled=False,
                  extra={"Third": [row(3)]})["inferred_build"] == "GRCh37"
 
 
@@ -202,11 +204,11 @@ def test_invalid_fallback_policies_fail_configuration_validation(key, invalid):
 
 def test_configuration_export_run_config_and_checkpoint_identity(tmp_path):
     exported = yaml.safe_load(render_module_configuration("harmonisation", style="values"))
-    assert exported["policies"]["build"]["low_coverage_fallback_enabled"] is False
+    assert exported["policies"]["build"]["low_coverage_fallback_enabled"] is True
     assert exported["policies"]["build"]["low_coverage_min_unique_loci"] == 10000
     default = load_configuration()
     changed = load_configuration(cli_overrides={
-        "modules.harmonisation.policies.build.low_coverage_fallback_enabled": True})
+        "modules.harmonisation.policies.build.low_coverage_fallback_enabled": False})
     assert configuration_digest(_checkpoint_configuration(default, "harmonisation", "harmonisation", ())) != configuration_digest(
         _checkpoint_configuration(changed, "harmonisation", "harmonisation", ()))
 
@@ -248,7 +250,7 @@ def test_compatible_non_snp_competitor_evidence_excludes_winner_snp_locus(tmp_pa
 
 
 @pytest.mark.parametrize("key,value", [
-    ("low_coverage_fallback_enabled", True),
+    ("low_coverage_fallback_enabled", False),
     ("low_coverage_min_match_fraction", 0.96),
     ("low_coverage_max_competitor_fraction", 0.04),
     ("low_coverage_min_unique_loci", 10001),
