@@ -513,7 +513,7 @@ documentation rather than generated policy descriptions.
 </details>
 
 <details>
-<summary><code>build</code> — dataset 05 genome build inference (6 settings)</summary>
+<summary><code>build</code> — dataset 05 genome build inference (12 settings)</summary>
 
 | Setting | Default | Allowed values | Decision or action |
 |---|---|---|---|
@@ -523,6 +523,12 @@ documentation rather than generated policy descriptions.
 | `build.min_reference_match_fraction` | `0.1` | Number ≥ `0.0` and ≤ `1.0` | Sets the smallest share of the winning build's representative reference markers that must be found with compatible alleles before automatic inference is trusted. Applies: dataset step 05 (genome build), only when build.mode is 'auto'. Only normalized chromosome labels present in the cleaned study contribute reference markers to the denominator. |
 | `build.min_match_fraction` | `0.8` | Number ≥ `0.0` and ≤ `1.0` | Sets the smallest share of coordinate-testable study variants whose alleles must match the winning reference before automatic inference is trusted. Applies: dataset step 05 (genome build), only when build.mode is 'auto'. It is combined with build.min_match_count, build.min_reference_match_fraction and build.confidence_ratio. |
 | `build.deduplicate_reference` | `true` | `true` or `false` | Removes repeated chromosome/position/ref/alt rows from each build reference file before the input is matched against it. Applies: dataset step 05 (genome build). Both references are treated the same way in auto mode; only the declared build's reference is treated in forced mode. |
+| `build.low_coverage_fallback_enabled` | `false` | `true` or `false` | Enable experimental dominant-build inference only when reference coverage is the sole failed normal automatic gate. |
+| `build.low_coverage_min_match_fraction` | `0.95` | Number ≥ `0.0` and ≤ `1.0` | Minimum winning allele-compatible study-row fraction among coordinate-testable rows for the experimental fallback. |
+| `build.low_coverage_max_competitor_fraction` | `0.05` | Number ≥ `0.0` and ≤ `1.0` | Maximum competing allele-compatible study-row fraction using the same coordinate-testable denominator as the winner. |
+| `build.low_coverage_min_unique_loci` | `10000` | Integer ≥ `1` | Minimum distinct canonical chromosome/position SNP loci supporting only the winner. |
+| `build.low_coverage_chromosome_min_competitor_loci` | `100` | Integer ≥ `1` | Minimum distinct competitor-only SNP loci on one chromosome for the mixed-build veto, combined with low_coverage_chromosome_min_competitor_fraction. |
+| `build.low_coverage_chromosome_min_competitor_fraction` | `0.95` | Number ≥ `0.0` and ≤ `1.0` | Minimum competitor match fraction among coordinate-testable study rows on one chromosome for the mixed-build veto, combined with the competitor-only locus floor. |
 
 </details>
 

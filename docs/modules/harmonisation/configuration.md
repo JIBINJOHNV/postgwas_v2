@@ -295,8 +295,93 @@ evidence thresholds while still collecting strand evidence from the declared
 build reference. Sampling informative SNPs for build inference is also used by
 [MungeSumstats](https://al-murphy.github.io/MungeSumstats/reference/get_genome_build.html)
 ([Murphy et al., 2021](https://doi.org/10.1093/bioinformatics/btab665)); the
-0.50 reference-coverage default is a configurable PostGWAS safety policy, not
+0.10 reference-coverage default is a configurable PostGWAS safety policy, not
 a universal biological threshold.
+
+#### Experimental fallback for low reference coverage
+
+The canonical default `build.low_coverage_fallback_enabled: false` preserves
+the ordinary decision above. An opt-in fallback can waive **only reference
+coverage**, when it is the sole failed automatic gate. The absolute match
+count, testable-row fraction, unique winner and winning-share checks must still
+pass. Declared builds bypass automatic inference; normal automatic acceptance
+is unchanged even if fallback-specific checks would fail.
+
+The fallback compares exactly two references. Both panels must contain markers
+on every coordinate-testable study chromosome; otherwise a zero competing count
+could reflect missing reference scope. Missing scope is recorded and rejects
+the fallback with a request for comparable panels. Entirely untestable
+chromosomes do not enter this check and remain explicitly unassessed.
+
+The default additional acceptance requirements are:
+
+| Policy under `policies.build` | Default | Meaning |
+|---|---:|---|
+| `low_coverage_min_match_fraction` | 0.95 | Winner matches / coordinate-testable study rows, inclusive minimum. |
+| `low_coverage_max_competitor_fraction` | 0.05 | Competitor matches / the same rows, inclusive maximum. |
+| `low_coverage_min_unique_loci` | 10000 | Distinct winner-only compatible SNP loci, inclusive minimum. |
+| `low_coverage_chromosome_min_competitor_loci` | 100 | Chromosome veto locus floor, combined with the fraction below. |
+| `low_coverage_chromosome_min_competitor_fraction` | 0.95 | Chromosome veto competitor match fraction, inclusive minimum. |
+
+Coordinate-testable rows include allele-incompatible hits and missing alleles.
+The row fractions preserve duplicate study rows, with each row contributing at
+most one match per build; a row matching both builds counts toward both
+numerators. The distinct-locus floor counts canonical `(chromosome, position)`
+once, requires different A/C/G/T single-base alleles compatible with the winner,
+and excludes a locus if **any** study evidence there matches the competitor,
+including an opposing allele pair on another row. Non-SNPs can supply ordinary
+row matches but cannot increase either SNP-locus floor. SNP loci can be in LD;
+distinct does not mean statistically independent. No study rows are removed.
+
+Fallback is vetoed if any chromosome has at least 100 distinct competitor-only
+SNP loci **and** competitor matches at least 95% of that chromosome's
+coordinate-testable study rows. A sparse chromosome or an absent veto does not
+certify consistency. Small mixed components can pass these gates.
+
+This is **experimental dominant-build inference**, not proof that every row
+uses one build. A 95% match fraction is not a posterior probability. Comparative
+mapping is supported by [GWASLab's InferBuild documentation](https://cloufield.github.io/gwaslab/InferBuild/)
+(which warns below 10,000 matches), [tidyGWAS](https://doi.org/10.1093/bioadv/vbaf262)
+(which compares 10,000 sampled study rows), and the
+[MungeSumstats upstream implementation](https://github.com/neurogenomics/MungeSumstats/blob/master/R/get_genome_build.R).
+These sources do **not** validate the exact PostGWAS 95/5%, 10,000 winner-only
+loci or chromosome 100/95% thresholds. They are configurable engineering
+safety policies. The existing downstream strand checks remain in force.
+
+For example, save the following as `build-fallback.yaml`, replacing the
+filesystem placeholders with your paths. It uses the existing run-configuration
+interface and exposes all fallback thresholds without changing ordinary gates:
+
+```yaml
+run:
+  output_directory: /absolute/path/to/harmonisation-output
+resources:
+  root: /absolute/path/to/harmonisation-resources
+modules:
+  harmonisation:
+    policies:
+      build:
+        mode: auto
+        low_coverage_fallback_enabled: true
+        low_coverage_min_match_fraction: 0.95
+        low_coverage_max_competitor_fraction: 0.05
+        low_coverage_min_unique_loci: 10000
+        low_coverage_chromosome_min_competitor_loci: 100
+        low_coverage_chromosome_min_competitor_fraction: 0.95
+```
+
+```bash
+postgwas harmonisation --sample-sheet /absolute/path/to/studies.csv --run-config build-fallback.yaml
+```
+
+The returned `genome_build` evidence in the dataset manifest records
+`acceptance_path` (`normal`, `declared`, `low_coverage_fallback` or `ambiguous`),
+all failed normal gates, distinct SNP-locus counts, per-chromosome row counts and
+fractions, scope omissions, vetoes and fallback gate outcomes. The canonical
+log, study-wide report and HTML report retain this evidence, including on
+failure. QC summaries label fallback acceptance as experimental. All resolved
+policies participate in the existing scientific checkpoint identity; changing
+any of them follows the global restart/resume policy.
 
 At chromosome step 04, the supplied raw frequency reference remains an
 ordinary `CHROM`, `POS`, `REF`, `ALT`, population-AF table. PostGWAS joins it

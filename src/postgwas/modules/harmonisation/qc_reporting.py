@@ -401,6 +401,8 @@ def harmonisation_qc_takeaway_lines(
         if genome_build_info.get("forced") is True
         else "automatically detected"
     )
+    if genome_build_info.get("acceptance_path") == "low_coverage_fallback":
+        build_source = "experimental low-coverage fallback"
     orientation = summarise_strand_orientation(dataset_summary)
     orientation_status = str(orientation["status"])
     reference_population_value = (

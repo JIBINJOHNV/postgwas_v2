@@ -90,6 +90,23 @@ def _build_fields(info, references):
     # resource build name. An accompanying ambiguity reason also bars selection.
     ambiguous = selected == "Ambiguous" or bool(info.get("ambiguous_reason"))
     fields = [("genetic", "Selected build", "No build selected" if ambiguous else _text(selected))]
+    if info.get("acceptance_path"):
+        fields.append(("info", "Acceptance path", _words(info["acceptance_path"])))
+    fallback = info.get("low_coverage_fallback") or {}
+    if fallback:
+        fields.append(("info", "Low-coverage fallback", _words(fallback.get("status"))))
+        if fallback.get("accepted"):
+            fields.append(("warning", "Experimental inference", "Dominant-build inference; match fraction is not a posterior probability and small mixed components can pass."))
+        if fallback.get("failed_gates") and fallback.get("attempted"):
+            fields.append(("warning", "Fallback failed gates", ", ".join(fallback["failed_gates"])))
+    for build, count in ((info.get("distinct_loci") or {}).get("exclusive_snp_loci") or {}).items():
+        fields.append(("count", "%s exclusive SNP loci" % build, format_count(count)))
+    for chromosome, item in (info.get("per_chromosome") or {}).items():
+        fields.append(("genetic", "Chromosome %s build evidence" % chromosome,
+                       "%s; %s testable; matches %s; exclusive SNP loci %s" % (
+                           _words(item.get("assessment")), format_count(item.get("testable_variants")),
+                           _text(item.get("matches")), _text(item.get("exclusive_snp_loci")),
+                       )))
     fields.extend(("count", label, format_count(info.get(key), missing="not available"))
                   for label, key in (
                       ("Input variants", "input_variants"),

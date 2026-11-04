@@ -212,6 +212,8 @@ class Num(Validator):
                 "a whole number" if self.integer else "a number",
                 value,
             )
+        if isinstance(value, float) and not math.isfinite(value):
+            return "must be a finite number (got %r)" % (value,)
         if self.integer and not float(value).is_integer():
             return "must be a whole number (got %r)" % (value,)
         if self.minimum is not None:
@@ -1250,10 +1252,6 @@ def _cross_check(values):
     """Relationships between settings that a single validator cannot see."""
     problems = []
 
-    for key, value in values.items():
-        if key.startswith("execution.") and isinstance(value, (int, float)):
-            if not math.isfinite(value):
-                problems.append(PolicyProblem(key, value, "must be finite"))
     if values.get("execution.scheduling_mode") == "adaptive":
         low = values.get("execution.min_threads_per_chromosome")
         high = values.get("execution.threads_per_chromosome")

@@ -272,10 +272,16 @@ def _decision_section(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     dataset = manifest.get("dataset") or {}
     decisions = dataset.get("study_decisions") or {}
     build = dataset.get("genome_build") or {}
+    fallback_accepted = (
+        build.get("acceptance_path") == "low_coverage_fallback"
+        or (build.get("low_coverage_fallback") or {}).get("accepted") is True
+    )
     strand_consensus = decisions.get("strand_consensus") or {}
     rows = (
         ("Genome build", record.get("genome_build")),
         ("Genome-build decision source", record.get("genome_build_source")),
+        ("Genome-build acceptance path", build.get("acceptance_path")),
+        ("Genome-build decision reason", build.get("ambiguous_reason")),
         ("Build matches / testable", "%s / %s" % (_text((build.get("matches") or {}).get(record.get("genome_build"))), _text(build.get("testable_variants")))),
         ("Effect type", record.get("effect_type")),
         ("Effect-type decision source", record.get("effect_type_source")),
@@ -295,8 +301,12 @@ def _decision_section(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
     )
     return _section(
         "Study-wide scientific decisions",
-        _key_value_table(rows) + _mapping_details("Full recorded study-decision evidence", decisions),
-        subtitle="Effect, SE, p-value and strand decisions are resolved study-wide and reused by chromosome workers. Initial MAF suspicion is provisional; the final frequency interpretation also incorporates subsequent chromosome-level reference validation.",
+        _key_value_table(rows)
+        + _mapping_details("Full recorded genome-build evidence", build)
+        + _mapping_details("Full recorded study-decision evidence", decisions),
+        subtitle="Effect, SE, p-value and strand decisions are resolved study-wide and reused by chromosome workers. Initial MAF suspicion is provisional; the final frequency interpretation also incorporates subsequent chromosome-level reference validation."
+        + (" Experimental dominant-build inference: the match fraction is not a posterior probability and small mixed components can pass."
+           if fallback_accepted else ""),
     )
 
 
@@ -793,6 +803,7 @@ def _decision_source(value: Any) -> str:
     """Translate recorded decision origins, never infer a missing origin."""
     return {
         "detector": "automatically inferred", "sample_sheet": "declared in sample sheet",
+        "low_coverage_fallback": "experimental low-coverage fallback",
         "policy": "configured in YAML", "dataset_z_pvalue_cross_check": "study-wide Z/P cross-check",
         "study_level_statistic": "study-wide frequency distribution",
     }.get(value, _text(value).replace("_", " "))

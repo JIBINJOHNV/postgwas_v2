@@ -1012,7 +1012,9 @@ def _run_summary_record(
         "genome_build": inferred_build,
         "genome_build_detected": None if forced_build else inferred_build,
         "genome_build_source": (
-            "policy" if forced_build else "detector" if inferred_build else None
+            "policy" if forced_build else "low_coverage_fallback"
+            if build.get("acceptance_path") == "low_coverage_fallback"
+            else "detector" if inferred_build else None
         ),
         "effect_type": decisions.get("effect_type"),
         "effect_type_detected": decisions.get("effect_type_detected"),

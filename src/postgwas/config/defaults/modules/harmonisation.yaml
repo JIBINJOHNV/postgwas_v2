@@ -881,6 +881,7 @@ common:
   - build.min_match_count
   - build.min_reference_match_fraction
   - build.min_match_fraction
+  - build.low_coverage_fallback_enabled
   - strand.mode
   - strand.consensus_threshold
   - strand.min_informative_variants
@@ -1174,6 +1175,12 @@ group_order:
       - min_reference_match_fraction
       - min_match_fraction
       - deduplicate_reference
+      - low_coverage_fallback_enabled
+      - low_coverage_min_match_fraction
+      - low_coverage_max_competitor_fraction
+      - low_coverage_min_unique_loci
+      - low_coverage_chromosome_min_competitor_loci
+      - low_coverage_chromosome_min_competitor_fraction
   - group: strand
     order: 10
     stage: dataset 06 / chromosome 04   strand consensus and allele orientation
@@ -2332,7 +2339,7 @@ policies:
             reverse-complement and reverse-complement-swapped orientations, then decide.
           GRCh37 - declare GRCh37 and read only its reference to collect strand evidence.
           GRCh38 - declare GRCh38 and read only its reference to collect strand evidence.
-        Example: Under 'auto', an input whose evidence does not clear all four checks is reported
+        Example: By default under 'auto', an input whose evidence does not clear all four checks is reported
           as "Ambiguous" and the whole dataset aborts with "Genome build inference failed".
           Setting build.mode: GRCh38 fixes the build decision while still comparing alleles with
           the GRCh38 reference for the study-level strand-consensus check.
@@ -2384,7 +2391,7 @@ policies:
         What it does: Sets the minimum absolute number of allele-compatible study variants that
           the winning build must have before automatic inference is trusted.
         When it applies: dataset step 05 (genome build), only when build.mode is 'auto'.
-        Values: A positive whole number. Raising it requires more independent study rows to
+        Values: A positive whole number. Raising it requires more allele-compatible study rows to
           support the build; lowering it permits small datasets but makes accidental evidence
           more influential.
         Example: A 98-to-2 winning share is not accepted when only 98 variants matched, because
@@ -2423,9 +2430,9 @@ policies:
           input rows. It passes this reference-coverage check because the build-check file is a
           representative marker panel, not an inventory of every possible study variant.
         Note: The input-wide fraction is still logged for audit but is not a pass/fail threshold.
-          This denominator follows the marker-sampling approach used by genome-build inference
-          tools such as MungeSumstats. The default 0.1 remains a configurable PostGWAS safety
-          policy, not a universal biological constant.
+          This chromosome-scoped panel-coverage denominator and its default 0.1 are PostGWAS
+          safety policies, not universal biological constants. Tools such as MungeSumstats
+          also compare representative markers, with different denominators and decision rules.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: float
@@ -2456,6 +2463,96 @@ policies:
         Note: This denominator measures allele agreement among rows the reference can test.
           build.min_reference_match_fraction separately requires adequate coverage of the
           representative reference markers on the chromosomes present in the study.
+      origin: genome_build.py:infer_genome_build
+      recommendation: null
+      type: float
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: false
+        kind: num
+        maximum: 1.0
+        minimum: 0.0
+        number_kind: float
+    low_coverage_fallback_enabled:
+      default: false
+      help: |-
+        Enable experimental dominant-build inference only when reference coverage is the sole failed normal automatic gate. Requires exactly two candidate references; declared builds and normal acceptance are unchanged.
+        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+      origin: genome_build.py:infer_genome_build
+      recommendation: null
+      type: bool
+      validator:
+        kind: flag
+    low_coverage_min_match_fraction:
+      default: 0.95
+      help: |-
+        Minimum winning allele-compatible study-row fraction among coordinate-testable rows for the experimental fallback. Includes allele-incompatible coordinate hits in the denominator; this fraction is not a posterior probability.
+        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+      origin: genome_build.py:infer_genome_build
+      recommendation: null
+      type: float
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: false
+        kind: num
+        maximum: 1.0
+        minimum: 0.0
+        number_kind: float
+    low_coverage_max_competitor_fraction:
+      default: 0.05
+      help: |-
+        Maximum competing allele-compatible study-row fraction using the same coordinate-testable denominator as the winner. Both-compatible rows contribute to both builds.
+        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+      origin: genome_build.py:infer_genome_build
+      recommendation: null
+      type: float
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: false
+        kind: num
+        maximum: 1.0
+        minimum: 0.0
+        number_kind: float
+    low_coverage_min_unique_loci:
+      default: 10000
+      help: |-
+        Minimum distinct canonical chromosome/position SNP loci supporting only the winner. Count compatible different A/C/G/T single-base alleles once per locus; exclude a locus if any study evidence there matches the competitor. Duplicates cannot increase this floor.
+        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+      origin: genome_build.py:infer_genome_build
+      recommendation: null
+      type: int
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: true
+        kind: num
+        maximum: null
+        minimum: 1
+        number_kind: int
+    low_coverage_chromosome_min_competitor_loci:
+      default: 100
+      help: |-
+        Minimum distinct competitor-only SNP loci on one chromosome for the mixed-build veto, combined with low_coverage_chromosome_min_competitor_fraction. This veto applies only to fallback acceptance.
+        Applies only to build.mode: auto with the opt-in low-coverage fallback.
+      origin: genome_build.py:infer_genome_build
+      recommendation: null
+      type: int
+      validator:
+        allow_none: false
+        exclusive_minimum: false
+        integer: true
+        kind: num
+        maximum: null
+        minimum: 1
+        number_kind: int
+    low_coverage_chromosome_min_competitor_fraction:
+      default: 0.95
+      help: |-
+        Minimum competitor match fraction among coordinate-testable study rows on one chromosome for the mixed-build veto, combined with the competitor-only locus floor. Sparse and unassessed chromosomes are not certified consistent.
+        Applies only to build.mode: auto with the opt-in low-coverage fallback.
       origin: genome_build.py:infer_genome_build
       recommendation: null
       type: float

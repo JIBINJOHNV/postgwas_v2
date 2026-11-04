@@ -1237,7 +1237,7 @@ def _finalise_failed_run_manifest(
         manifest.setdefault("dataset", {})["study_decisions"] = decisions
     build_evidence = getattr(error, "genome_build_info", None)
     if build_evidence is not None:
-        manifest.setdefault("dataset", {})["genome_build_info"] = build_evidence
+        manifest.setdefault("dataset", {})["genome_build"] = build_evidence
 
     try:
         _write_run_manifest(manifest_path, manifest)

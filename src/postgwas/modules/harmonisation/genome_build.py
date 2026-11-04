@@ -38,6 +38,12 @@ POLICY_KEYS = [
     "build.min_reference_match_fraction",
     "build.min_match_fraction",
     "build.deduplicate_reference",
+    "build.low_coverage_fallback_enabled",
+    "build.low_coverage_min_match_fraction",
+    "build.low_coverage_max_competitor_fraction",
+    "build.low_coverage_min_unique_loci",
+    "build.low_coverage_chromosome_min_competitor_loci",
+    "build.low_coverage_chromosome_min_competitor_fraction",
     "chromosome.strip_chr_prefix",
     "chromosome.strip_leading_zero",
     "chromosome.rename_map",
@@ -176,6 +182,13 @@ def infer_genome_build(
     min_match_fraction = float(policies.get("build.min_match_fraction"))
     deduplicate = bool(policies.get("build.deduplicate_reference"))
     build_names = list(reference_files)
+    fallback_enabled = policies.get("build.low_coverage_fallback_enabled")
+    if mode == "auto" and fallback_enabled and len(build_names) != 2:
+        raise GenomeBuildError(
+            "Automatic fallback requires exactly two configured references when "
+            "'build.low_coverage_fallback_enabled' is true; supply two references "
+            "or disable that policy."
+        )
     if len(build_names) < 2:
         raise GenomeBuildError(
             "Genome-build inference requires at least two configured references."
@@ -281,7 +294,7 @@ def infer_genome_build(
                 reverse.alias("__build_reverse"),
                 non_palindromic.alias("__build_informative"),
             ])
-            coordinate_rows = classified.select(study_row).unique()
+            coordinate_rows = classified.select(study_row, chr_col).unique()
             matched_rows = classified.filter(
                 pl.col("__build_forward") | pl.col("__build_reverse")
             )
@@ -299,8 +312,21 @@ def infer_genome_build(
             ambiguous_rows = informative.filter(
                 pl.col("__build_forward") & pl.col("__build_reverse")
             ).select(study_row).unique().height
-            return (
-                {
+            # DNA SNP substitutions are an algorithmic evidence invariant:
+            # indels, missing/ambiguous bases and identical alleles cannot
+            # supply the fallback's distinct SNP-locus floor.
+            snp_loci = matched_rows.filter(
+                # Genomic positions are one-based; direct library calls may
+                # bypass upstream coordinate QC, so invalid loci cannot count.
+                (pl.col(pos_col) > 0)
+                & ea.str.contains(r"^[ACGT]$")
+                & oa.str.contains(r"^[ACGT]$")
+                & ref.str.contains(r"^[ACGT]$")
+                & alt.str.contains(r"^[ACGT]$")
+                & (ea != oa) & (ref != alt)
+            ).select(chr_col, pos_col).unique()
+            return {
+                "summary": {
                     "matches": matched,
                     "coordinate_hits": coordinate_rows.height,
                     "reference_markers": reference_markers.height,
@@ -309,8 +335,14 @@ def infer_genome_build(
                     "reverse": reverse_rows,
                     "ambiguous": ambiguous_rows,
                 },
-                coordinate_rows,
-            )
+                "coordinate_rows": coordinate_rows,
+                "matched_rows": matched_rows.select(study_row, chr_col).unique(),
+                "matched_loci": matched_rows.select(chr_col, pos_col).unique(),
+                "snp_loci": snp_loci,
+                "reference_chromosomes": reference_markers.get_column(
+                    "__build_marker_chr"
+                ).unique().to_list(),
+            }
 
         # --- Compute match statistics -------------------------------------
         evidence_by_build = {
@@ -318,15 +350,16 @@ def infer_genome_build(
             for name, reference in references.items()
         }
         orientation_evidence = {
-            name: evidence[0] for name, evidence in evidence_by_build.items()
+            name: evidence["summary"] for name, evidence in evidence_by_build.items()
         }
         coordinate_rows = [
-            evidence[1] for evidence in evidence_by_build.values()
+            evidence["coordinate_rows"] for evidence in evidence_by_build.values()
         ]
-        testable = (
-            pl.concat(coordinate_rows, how="vertical").unique().height
-            if coordinate_rows else 0
+        testable_rows = (
+            pl.concat(coordinate_rows, how="vertical").unique()
+            if coordinate_rows else study.select(study_row, chr_col).head(0)
         )
+        testable = testable_rows.height
         untestable = t_df.height - testable
         step.info(
             "{:,} of {:,} variants have an exact coordinate in at least one "
@@ -368,12 +401,66 @@ def infer_genome_build(
             for name, count in reference_marker_counts.items()
         }
 
+        # A locus is exclusive only if NO allele-compatible study evidence at
+        # that canonical coordinate supports another reference, even when it
+        # comes from a different study row/allele pair at the same position.
+        exclusive_loci = {}
+        for name, item in evidence_by_build.items():
+            other_loci = [other["matched_loci"] for other_name, other in evidence_by_build.items()
+                          if other_name != name]
+            exclusive_loci[name] = (
+                item["snp_loci"].join(pl.concat(other_loci).unique(),
+                             on=[chr_col, pos_col], how="anti")
+                if other_loci else item["snp_loci"].head(0)
+            )
+        distinct_loci = {
+            "assessed_builds": list(evidence_by_build),
+            "compatible_snp_loci": {
+                name: item["snp_loci"].height for name, item in evidence_by_build.items()
+            },
+            "exclusive_snp_loci": {
+                name: item.height for name, item in exclusive_loci.items()
+            } if mode == "auto" else {},
+        }
+        # Aggregate compact evidence frames rather than scanning the study or
+        # reference joins separately for every chromosome.
+        def chromosome_counts(frame):
+            return dict(frame.group_by(chr_col).len().iter_rows())
+
+        testable_by_chromosome = chromosome_counts(testable_rows)
+        matches_by_chromosome = {
+            name: chromosome_counts(item["matched_rows"]) for name, item in evidence_by_build.items()
+        }
+        loci_by_chromosome = {
+            name: chromosome_counts(item) for name, item in exclusive_loci.items()
+        }
+        per_chromosome = {}
+        for chromosome in study_chromosomes.get_column("__build_chr").to_list():
+            denominator = testable_by_chromosome.get(chromosome, 0)
+            counts = {name: item.get(chromosome, 0)
+                      for name, item in matches_by_chromosome.items()}
+            per_chromosome[chromosome] = {
+                "testable_variants": denominator,
+                "matches": counts,
+                "match_fractions": {
+                    name: count / denominator if denominator else 0.0
+                    for name, count in counts.items()
+                },
+                "exclusive_snp_loci": {
+                    name: item.get(chromosome, 0) for name, item in loci_by_chromosome.items()
+                } if mode == "auto" else {},
+                "competitor_veto": False,
+                "assessment": "not_assessed" if mode != "auto" else "unassessed",
+            }
+
         total_matches = sum(matches.values())
         match_fraction = max(fractions.values())
         input_match_fraction = max(input_fractions.values())
         reference_match_fraction = max(reference_fractions.values())
         ambiguous_reason = None
         confidence = None
+        winner = None
+        normal_failed_gates = []
         if mode != "auto":
             inferred_build = mode
             confidence = None
@@ -397,6 +484,13 @@ def infer_genome_build(
             tied = len(ordered) > 1 and winning_matches == ordered[1][1]
             confidence = winning_matches / total_matches
             reference_match_fraction = reference_fractions[winner]
+            normal_failed_gates = [key for key, passed in (
+                ("unique_winner", not tied),
+                ("build.min_match_count", winning_matches >= min_match_count),
+                ("build.min_reference_match_fraction", reference_match_fraction >= min_reference_match_fraction),
+                ("build.min_match_fraction", match_fraction >= min_match_fraction),
+                ("build.confidence_ratio", confidence >= confidence_ratio),
+            ) if not passed]
             if tied:
                 inferred_build = "Ambiguous"
                 ambiguous_reason = "the leading genome-build references tied"
@@ -448,6 +542,87 @@ def infer_genome_build(
                     % (confidence_ratio, winner, confidence)
                 )
 
+        fallback = {
+            "enabled": fallback_enabled, "attempted": False, "accepted": False,
+            "status": "disabled" if not fallback_enabled else "not_applicable",
+            "winner": winner, "competitor": None, "gates": {}, "failed_gates": [],
+            "veto_chromosomes": [],
+            "missing_reference_chromosomes": {},
+            "thresholds": {
+                key: policies.get("build." + key) for key in (
+                    "low_coverage_min_match_fraction", "low_coverage_max_competitor_fraction",
+                    "low_coverage_min_unique_loci", "low_coverage_chromosome_min_competitor_loci",
+                    "low_coverage_chromosome_min_competitor_fraction",
+                )
+            },
+        }
+        acceptance_path = "declared" if mode != "auto" else (
+            "normal" if inferred_build != "Ambiguous" else "ambiguous"
+        )
+        if mode == "auto" and winner is not None and len(build_names) == 2:
+            competitor = next(name for name in build_names if name != winner)
+            fallback["competitor"] = competitor
+            # A zero competing count is interpretable only where both panels
+            # represent the chromosome. This comparability invariant applies
+            # to fallback alone; it does not alter normal/declared decisions.
+            fallback["missing_reference_chromosomes"] = {
+                name: sorted(set(testable_by_chromosome) - set(item["reference_chromosomes"]))
+                for name, item in evidence_by_build.items()
+                if set(testable_by_chromosome) - set(item["reference_chromosomes"])
+            }
+            for chromosome, item in per_chromosome.items():
+                competitor_loci = item["exclusive_snp_loci"][competitor]
+                veto = (
+                    competitor_loci >= policies.get("build.low_coverage_chromosome_min_competitor_loci")
+                    and item["match_fractions"][competitor] >= policies.get("build.low_coverage_chromosome_min_competitor_fraction")
+                )
+                item["competitor_veto"] = veto
+                item["assessment"] = (
+                    "competitor_dominated" if veto else "sparse" if
+                    max(item["exclusive_snp_loci"].values()) < policies.get("build.low_coverage_chromosome_min_competitor_loci")
+                    else "no_veto_detected"
+                ) if item["testable_variants"] else "unassessed"
+                if veto:
+                    fallback["veto_chromosomes"].append(chromosome)
+            fallback["gates"] = {
+                "build.low_coverage_min_match_fraction": fractions[winner] >= policies.get("build.low_coverage_min_match_fraction"),
+                "build.low_coverage_max_competitor_fraction": fractions[competitor] <= policies.get("build.low_coverage_max_competitor_fraction"),
+                "build.low_coverage_min_unique_loci": distinct_loci["exclusive_snp_loci"][winner] >= policies.get("build.low_coverage_min_unique_loci"),
+                "chromosome_veto": not fallback["veto_chromosomes"],
+                "comparable_reference_scope": not fallback["missing_reference_chromosomes"],
+            }
+            fallback["failed_gates"] = [key for key, passed in fallback["gates"].items() if not passed]
+        if fallback_enabled and mode == "auto":
+            if acceptance_path == "normal":
+                fallback["status"] = "not_needed"
+            elif normal_failed_gates == ["build.min_reference_match_fraction"]:
+                fallback["attempted"] = True
+                fallback["accepted"] = not fallback["failed_gates"]
+                fallback["status"] = "accepted" if fallback["accepted"] else "rejected"
+                if fallback["accepted"]:
+                    inferred_build = winner
+                    ambiguous_reason = None
+                    acceptance_path = "low_coverage_fallback"
+                    step.warn(
+                        "Experimental dominant-build inference accepted via low_coverage_fallback; "
+                        "reference coverage alone was waived. Match fractions are not a posterior "
+                        "probability and small mixed components can pass."
+                    )
+                else:
+                    ambiguous_reason += "; low-coverage fallback failed: " + ", ".join(fallback["failed_gates"])
+                    if fallback["veto_chromosomes"]:
+                        ambiguous_reason += " (competitor-dominated chromosomes: %s)" % ", ".join(fallback["veto_chromosomes"])
+                    if fallback["missing_reference_chromosomes"]:
+                        ambiguous_reason += (
+                            " (references missing testable chromosomes: %s; supply comparable "
+                            "panels covering these chromosomes)" % fallback["missing_reference_chromosomes"]
+                        )
+            else:
+                ambiguous_reason += (
+                    "; low-coverage fallback is inapplicable: reference coverage must be the sole failed "
+                    "normal gate; failed gates: %s" % ", ".join(normal_failed_gates or ["no_compatible_evidence"])
+                )
+
         evidence = {
             "input variants": "{:,}".format(t_df.height),
             "coordinate-testable variants": "{:,}".format(testable),
@@ -482,6 +657,14 @@ def infer_genome_build(
         evidence["winning share of matches"] = (
             "n/a" if confidence is None else "{:.3f}".format(confidence)
         )
+        evidence["acceptance path"] = acceptance_path
+        evidence["low_coverage_fallback"] = fallback["status"]
+        for name, count in distinct_loci["exclusive_snp_loci"].items():
+            evidence["%s exclusive SNP loci" % name] = "{:,}".format(count)
+        for chromosome, item in per_chromosome.items():
+            step.observed("Genome-build chromosome %s" % chromosome, **item)
+        step.observed("Genome-build distinct loci", **distinct_loci)
+        step.observed("Genome-build low-coverage fallback", **fallback)
         decision = inferred_build
         if ambiguous_reason:
             decision = "%s - %s" % (inferred_build, ambiguous_reason)
@@ -523,6 +706,12 @@ def infer_genome_build(
             "forced": mode != "auto",
             "ambiguous_reason": ambiguous_reason,
             "strand_evidence": orientation_evidence,
+            "acceptance_path": acceptance_path,
+            "normal_failed_gates": normal_failed_gates,
+            "distinct_loci": distinct_loci,
+            "per_chromosome": per_chromosome,
+            "low_coverage_fallback": fallback,
         }
+        step.extra["genome_build"] = genome_build_info
         step.set_rows(t_df.height, removed=0)
     return genome_build_info
