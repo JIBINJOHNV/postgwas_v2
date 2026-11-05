@@ -325,7 +325,7 @@ def _frequency_fields(decisions, policies, resources):
         fields.extend([
             ("count", "Comparable variants", "%s; required >= %s" % (format_count(comparison["comparable_variants"]), format_count(comparison.get("minimum_overlap"), missing="not available"))),
             ("info", "Correlation method", _text(comparison.get("correlation_method", comparison.get("maf_correlation_method")))),
-            ("info", "Direct EAF correlation", "%s; required >= %s" % (format_number(comparison.get("direct_eaf_correlation", comparison.get("correlation"))), format_number(comparison.get("minimum_correlation", comparison.get("minimum_maf_correlation"))))),
+            ("info", "Direct EAF correlation", "%s; required >= %s" % (format_number(comparison.get("direct_eaf_correlation", comparison.get("correlation"))), format_number(comparison.get("minimum_study_correlation", comparison.get("minimum_correlation", comparison.get("minimum_maf_correlation")))))),
             ("info", "Mean absolute EAF difference", "%s; required <= %s" % (format_number(comparison.get("mean_eaf_error", comparison.get("mean_absolute_difference"))), format_number(comparison.get("maximum_mean_absolute_difference", comparison.get("maximum_mean_absolute_maf_difference"))))),
             ("info", "Reference EA at or below 0.5", minor_fraction_text),
         ])
@@ -336,15 +336,29 @@ def _frequency_fields(decisions, policies, resources):
                     format_fraction_percentage(comparison.get("minimum_overlap_fraction")),
                 )),
             ])
-        if comparison.get("direct_eaf_accepted") is False:
+        if "rule_1_passed" in comparison:
             fields.extend([
-                ("info", "Folded-MAF correlation", "%s; required >= %s" % (format_number(comparison.get("maf_correlation")), format_number(comparison.get("minimum_maf_correlation", comparison.get("minimum_correlation"))))),
-                ("info", "Mean absolute folded-MAF difference", "%s; required <= %s" % (format_number(comparison.get("mean_absolute_maf_difference")), format_number(comparison.get("maximum_mean_absolute_maf_difference", comparison.get("maximum_mean_absolute_difference"))))),
-                ("info", "Input-versus-MAF error", format_number(comparison.get("mean_maf_error"))),
-                ("info", "Required error separation", format_number(comparison.get("minimum_error_margin"))),
-                ("info", "Directional MAF limit", "A reference EA-at-or-below-0.5 fraction strictly above %s makes MAF support inconclusive." % format_fraction_percentage(comparison.get("reference_minor_fraction_cutoff", policies.get("eaf.reference_minor_fraction_cutoff")))),
-                ("info", "MAF evidence", _words(comparison.get("decision_reason"))),
+                ("info", "Shared evidence gate", "Passed" if comparison["shared_evidence_gate_passed"] else "Failed"),
+                ("info", "Both rules evaluated", "Yes" if comparison["whole_study_rules_evaluated"] else "No — insufficient shared evidence"),
+                ("info", "Supplied AF versus reference MAF correlation", "%s; required >= %s" % (
+                    format_number(comparison.get("supplied_to_reference_maf_correlation")),
+                    format_number(comparison.get("minimum_study_correlation")),
+                )),
+                ("info", "Mean absolute supplied-AF / reference-MAF difference", "%s; required <= %s" % (
+                    format_number(comparison.get("mean_maf_error")),
+                    format_number(comparison.get("maximum_mean_absolute_maf_difference")),
+                )),
+                ("info", "Reference EA above 0.5", "%s; required > %s" % (
+                    format_fraction_percentage(comparison.get("reference_effect_allele_major_fraction")),
+                    format_fraction_percentage(comparison.get("minimum_reference_effect_allele_major_fraction")),
+                )),
             ])
+            for rule, label in ((1, "Rule 1 (retain original AF)"), (2, "Rule 2 (select replacement)")):
+                fields.append(("info", label, "Passed" if comparison["rule_%s_passed" % rule] else "Failed"))
+                failures = comparison.get("rule_%s_failed_requirements" % rule) or []
+                fields.append(("info", "Rule %s failed requirements" % rule,
+                               "; ".join(_words(item) for item in failures) if failures else "None"))
+            fields.append(("info", "Combined AF decision", _words(comparison.get("decision_reason"))))
     if comparison.get("maf_reference_decision") == "maf":
         fields.append(("info", "Input interpretation", "Input MAF supported by reference comparison; the supplied column is not accepted as EAF."))
     if status == "failed":

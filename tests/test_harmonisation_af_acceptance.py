@@ -64,13 +64,13 @@ def _variable_minor_values(count):
     return [.1 + .3 * i / max(count - 1, 1) for i in range(count)]
 
 
-def test_direct_correlation_uses_shared_threshold():
+def test_direct_correlation_uses_whole_study_threshold():
     import math
     reference = _variable_minor_values(1000)
     supplied = [value + .08 * math.sin(i) for i, value in enumerate(reference)]
     decision, evidence = _paired_comparison(supplied, reference)
     assert .80 < evidence['direct_eaf_correlation'] < .90
-    assert evidence['minimum_maf_correlation'] == .90
+    assert evidence['minimum_study_correlation'] == .95
     assert evidence['direct_eaf_acceptance_reason'] == 'correlation_below_minimum'
     assert decision == 'inconclusive'
 
@@ -81,7 +81,7 @@ def test_direct_correlation_threshold_is_inclusive():
     supplied = [value + .08 * math.sin(i) for i, value in enumerate(reference)]
     measured = pl.DataFrame({'a': supplied, 'b': reference}).select(pl.corr('a', 'b')).item()
     decision, evidence = _paired_comparison(supplied, reference,
-        overrides={'eaf.maf_reference_min_correlation': measured})
+        overrides={'eaf.study_reference_min_correlation': measured})
     assert evidence['direct_eaf_correlation'] == measured
     assert decision == 'eaf'
     assert evidence['direct_eaf_accepted'] is True
@@ -185,7 +185,8 @@ def test_whole_study_pair_count_cannot_exceed_denominator():
 def test_whole_study_af_policies_export_and_reload(tmp_path, scope, style):
     expected = {'maf_reference_min_overlap': 1000, 'maf_reference_min_overlap_fraction': .50,
         'maf_reference_min_correlation': .90, 'maf_reference_max_mean_absolute_difference': .10,
-        'maf_reference_error_margin': .02, 'study_reference_min_minor_fraction': .90}
+        'maf_reference_error_margin': .02, 'study_reference_min_minor_fraction': .90,
+        'study_reference_min_correlation': .95, 'study_reference_min_major_fraction': .20}
     text = render_module_configuration('harmonisation', scope=scope, style=style)
     target = tmp_path / 'defaults.yaml'
     target.write_text(text)
@@ -209,7 +210,8 @@ def test_whole_study_af_policies_export_and_reload(tmp_path, scope, style):
 
 
 @pytest.mark.parametrize('key', ['eaf.maf_reference_min_overlap_fraction', 'eaf.study_reference_min_minor_fraction',
-    'eaf.maf_reference_min_correlation'])
+    'eaf.maf_reference_min_correlation', 'eaf.study_reference_min_correlation',
+    'eaf.study_reference_min_major_fraction'])
 @pytest.mark.parametrize('value', [-.01, 1.01, float('nan'), float('inf'), -float('inf'), True, False, 90])
 def test_af_proportion_policies_reject_invalid_values(key, value):
     with pytest.raises(PolicyError, match=key):
@@ -291,6 +293,8 @@ def test_frequency_report_shows_whole_study_gates_and_exact_operators(decisions,
     ('maf_reference_min_overlap_fraction', .60),
     ('study_reference_min_minor_fraction', .92),
     ('maf_reference_min_correlation', .93),
+    ('study_reference_min_correlation', .96),
+    ('study_reference_min_major_fraction', .25),
 ])
 def test_af_policy_changes_scientific_checkpoint_identity_and_restarts(tmp_path, key, value):
     from postgwas.core.completion import configuration_digest
@@ -389,6 +393,7 @@ def test_true_maf_control_can_pass_whole_study_acceptance_heuristic():
     assert decision == 'eaf'
     assert evidence['direct_eaf_accepted'] is True
     assert evidence['reference_suitability_status'] == 'not_required'
+    assert evidence['rule_2_passed'] is False
 
 
 def test_accepted_whole_study_matches_reused_and_worker_swaps_eaf_once(tmp_path, monkeypatch):
@@ -472,7 +477,8 @@ def test_public_config_validate_preserves_valid_af_override_shape_and_exports(tm
     from copy import deepcopy
     from postgwas.config import load_configuration
     overrides = {'maf_reference_min_overlap_fraction': '0.14', 'study_reference_min_minor_fraction': '0.85',
-        'maf_reference_min_correlation': '0.93'}
+        'maf_reference_min_correlation': '0.93', 'study_reference_min_correlation': '0.96',
+        'study_reference_min_major_fraction': '0.25'}
     policies = {'eaf.' + key: value for key, value in overrides.items()} if dotted else {'eaf': overrides}
     source = tmp_path / 'valid.yaml'
     module = {'policies': deepcopy(policies)}
@@ -513,3 +519,314 @@ runpy.run_module('postgwas', run_name='__main__')
         capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     assert 'Configuration is valid.' in result.stdout
+
+
+@pytest.mark.parametrize('mode,want,rules', [
+    ('retain', 'eaf', (True, False)),
+    ('replace', 'maf', (False, True)),
+    ('neither', 'inconclusive', (False, False)),
+    ('both', 'inconclusive', (True, True)),
+])
+def test_both_complete_rules_determine_final_whole_study_action(mode, want, rules):
+    reference = _variable_minor_values(1000)
+    supplied = reference
+    overrides = {}
+    if mode == 'replace':
+        reference = [1 - value for value in supplied]
+    elif mode == 'neither':
+        supplied = [.2] * 1000
+    elif mode == 'both':
+        reference = _variable_minor_values(700) + [.51] * 300
+        supplied = [min(value, 1 - value) for value in reference]
+        overrides = {'eaf.study_reference_min_minor_fraction': .6}
+    decision, evidence = _paired_comparison(supplied, reference, overrides=overrides)
+    assert decision == want
+    assert (evidence['rule_1_passed'], evidence['rule_2_passed']) == rules
+    assert evidence['direct_eaf_accepted'] is (want == 'eaf')
+    assert evidence['supplied_to_reference_maf_correlation'] is not None or mode == 'neither'
+    if mode == 'both':
+        assert evidence['decision_reason'] == 'both_rules_passed'
+        assert evidence['direct_eaf_acceptance_reason'] == 'allele_aligned_frequency_agreement'
+    if mode == 'neither':
+        assert evidence['decision_reason'] == 'both_rules_failed'
+        assert evidence['rule_1_failed_requirements'] == ['correlation_unavailable']
+        assert evidence['rule_2_failed_requirements'] == [
+            'correlation_unavailable', 'reference_major_fraction_not_above_minimum']
+
+
+def test_rule_two_uses_raw_source_instead_of_folded_source():
+    decision, evidence = _paired_comparison([.1, .8, .3, .6] * 250,
+        [.9, .8, .7, .6] * 250)
+    assert evidence['maf_correlation'] == pytest.approx(1.)
+    assert evidence['supplied_to_reference_maf_correlation'] < .95
+    assert evidence['rule_2_passed'] is False
+    assert 'correlation_below_minimum' in evidence['rule_2_failed_requirements']
+    assert decision == 'inconclusive'
+
+
+@pytest.mark.parametrize('major_count,want', [(100, 'inconclusive'), (150, 'inconclusive'),
+    (200, 'inconclusive'), (201, 'maf')])
+def test_strict_major_profile_boundary_and_default_ten_to_twenty_percent_gap(major_count, want):
+    reference = _variable_minor_values(1000 - major_count) + [.51] * major_count
+    supplied = [min(value, 1 - value) for value in reference]
+    decision, evidence = _paired_comparison(supplied, reference)
+    assert evidence['reference_effect_allele_major_fraction'] == major_count / 1000
+    assert evidence['minimum_reference_effect_allele_major_fraction'] == .20
+    assert evidence['rule_1_passed'] is False
+    assert decision == want
+
+
+def test_full_maf_rule_selects_replacement_despite_partial_eaf_agreement(tmp_path):
+    # Both EAF agreement metrics pass; only the complete MAF rule passes.
+    values = _variable_minor_values(7) + [.51] * 3
+    reference = tmp_path / 'near_half.tsv'
+    reference.write_text('CHROM\tPOS\tREF\tALT\tEUR\n' + ''.join(
+        f'1\t{i}\tG\tA\t{value}\n' for i, value in enumerate(values, 1)))
+    frame = pl.DataFrame({'CHR': ['1'] * 10, 'POS': list(range(1, 11)),
+        'EA': ['A'] * 10, 'OA': ['G'] * 10,
+        'AF': [min(value, 1 - value) for value in values]}).with_row_index(SOURCE_INPUT_ROW_COLUMN)
+    decisions, prepared = prepare(frame, default_policies().with_overrides({
+        'eaf.maf_reference_min_overlap': 2}), reference,
+        eaf_replacement_file=str(reference), eaf_replacement_column='EUR')
+    evidence = decisions['eaf_reference_validation']
+    assert evidence['direct_eaf_correlation'] >= .95
+    assert evidence['mean_eaf_error'] < .02  # No directional advantage required.
+    assert evidence['rule_1_passed'] is False and evidence['rule_2_passed'] is True
+    assert decisions['eaf_selected_source'] == 'replacement_reference'
+    assert prepared.select(frame.columns).equals(frame)
+
+
+@pytest.mark.parametrize('pairs,total', [(999, 999), (1000, 2001)])
+def test_shared_gate_failure_cannot_authorize_either_rule(pairs, total):
+    supplied = _variable_minor_values(pairs)
+    decision, evidence = _paired_comparison(supplied, [1 - value for value in supplied], total=total)
+    assert decision == 'inconclusive'
+    assert evidence['rule_1_passed'] is False and evidence['rule_2_passed'] is False
+    assert evidence['shared_evidence_gate_passed'] is False
+    assert evidence['direct_eaf_accepted'] is False
+
+
+@pytest.mark.parametrize('method', ['pearson', 'spearman'])
+def test_constant_reference_maf_does_not_pass_rule_two(method):
+    decision, evidence = _paired_comparison([.1, .2] * 500, [.25, .75] * 500,
+        overrides={'eaf.maf_reference_correlation_method': method})
+    assert evidence['supplied_to_reference_maf_correlation'] is None
+    assert 'correlation_unavailable' in evidence['rule_2_failed_requirements']
+    assert decision == 'inconclusive'
+
+
+def test_whole_study_empty_pairs_fail_shared_gate_without_nonfinite_evidence():
+    decision, evidence = _paired_comparison([], [], total=1)
+    assert decision == 'inconclusive'
+    assert evidence['comparable_variants'] == 0
+    assert evidence['reference_effect_allele_major_fraction'] is None
+    assert evidence['rule_1_passed'] is False and evidence['rule_2_passed'] is False
+
+
+@pytest.mark.parametrize('missing', ['both', 'file', 'column'])
+def test_maf_replacement_uses_shared_missing_options(tmp_path, missing):
+    reference, frame, policies = fixture(tmp_path)
+    options = {} if missing == 'both' else {
+        ('eaf_replacement_column' if missing == 'file' else 'eaf_replacement_file'):
+        ('EUR' if missing == 'file' else str(reference))}
+    with pytest.raises(StudyAlleleFrequencyError) as caught:
+        prepare(frame, policies, reference, **options)
+    for option in ('file', 'column'):
+        if missing in ('both', option):
+            assert f'Required argument not provided: --eaf-replacement-{option}.' in str(caught.value)
+            assert f'modules.harmonisation.eaf_replacement_{option}' in str(caught.value)
+    if missing == 'both':
+        assert caught.value.study_decisions['eaf_reference_validation']['rule_2_passed'] is True
+        assert caught.value.study_decisions['eaf_input_interpretation'] == 'maf'
+        assert caught.value.study_decisions['eaf_reference_validation']['status'] == 'failed'
+        assert caught.value.study_decisions['eaf_reference_validation']['failure_reason'] == 'replacement_arguments_missing'
+        assert 'eaf_replacement' not in caught.value.study_decisions
+
+
+def test_whole_study_report_includes_both_rules_even_when_retained():
+    _, comparison = _paired_comparison(_variable_minor_values(1000))
+    comparison.update(status='passed', maf_reference_decision='eaf')
+    text = normal(render({'eaf_column': 'AF', 'eaf_is_maf_initial': True,
+        'eaf_selected_source': 'study_supplied', 'eaf_reference_validation': comparison}))
+    assert 'Rule 1 (retain original AF)' in text and 'Rule 2 (select replacement)' in text
+    assert 'Supplied AF versus reference MAF correlation' in text
+    assert 'Reference EA above 0.5' in text and 'required > 20.00%' in text
+    assert 'Required error separation' not in text
+    assert 'Directional MAF limit' not in text
+
+
+@pytest.mark.parametrize('key', ['study_reference_min_correlation', 'study_reference_min_major_fraction'])
+def test_changed_whole_study_policy_invalidates_prepared_contract(tmp_path, key):
+    from postgwas.modules.harmonisation import strand
+    reference, frame, policies = fixture(tmp_path)
+    decisions, _ = prepare(frame, policies, reference,
+        eaf_replacement_file=str(reference), eaf_replacement_column='EUR')
+    contract = decisions['eaf_prepared_references']['1']['contract']
+    changed = strand._reference_match_contract(str(reference), 'EUR', MAPPING, COLUMNS,
+        policies.with_overrides({'eaf.' + key: .5}))
+    assert contract != changed
+
+
+@pytest.mark.parametrize('rule', [1, 2])
+@pytest.mark.parametrize('delta,want', [(0., True), (-1e-9, False)])
+def test_each_rule_mean_absolute_difference_maximum_is_inclusive(rule, delta, want):
+    reference = [.125, .375] * 500 if rule == 1 else [.875, .625] * 500
+    supplied = [.25, .5] * 500
+    _, evidence = _paired_comparison(supplied, reference,
+        overrides={'eaf.maf_reference_max_mean_absolute_difference': .125 + delta})
+    assert evidence[f'rule_{rule}_passed'] is want
+    assert evidence['mean_eaf_error' if rule == 1 else 'mean_maf_error'] == .125
+
+
+@pytest.mark.parametrize('delta,want', [(0., True), (1e-9, False)])
+def test_rule_two_correlation_threshold_is_inclusive(delta, want):
+    import math
+    reference_maf = _variable_minor_values(1000)
+    reference = [1 - value for value in reference_maf]
+    supplied = [value + .02 * math.sin(i) for i, value in enumerate(reference_maf)]
+    measured = pl.DataFrame({'x': supplied, 'm': [1 - value for value in reference]}).select(pl.corr('x', 'm')).item()
+    _, evidence = _paired_comparison(supplied, reference,
+        overrides={'eaf.study_reference_min_correlation': measured + delta})
+    assert evidence['supplied_to_reference_maf_correlation'] == measured
+    assert evidence['rule_2_passed'] is want
+
+
+def test_all_failed_rule_requirements_are_recorded():
+    _, evidence = _paired_comparison([.99] * 1000, _variable_minor_values(1000))
+    assert evidence['rule_1_failed_requirements'] == [
+        'correlation_unavailable', 'mean_absolute_difference_above_maximum']
+    assert evidence['rule_2_failed_requirements'] == [
+        'correlation_unavailable', 'mean_absolute_difference_above_maximum',
+        'reference_major_fraction_not_above_minimum']
+
+
+def test_html_overview_preserves_both_rules_and_raw_maf_evidence():
+    from postgwas.modules.harmonisation.html_report import _overview_alignment
+    _, comparison = _paired_comparison(_variable_minor_values(1000))
+    comparison.update(status='passed', maf_reference_decision='eaf')
+    sections = _overview_alignment({}, {'dataset': {'study_decisions': {
+        'eaf_reference_validation': comparison}}}, {})
+    text = ' '.join(section[1] for section in sections)
+    for label in ('Rule 1 (retain original AF)', 'Rule 2 (select replacement)',
+                  'Supplied AF versus reference MAF correlation',
+                  'Reference frequency of listed effect allele &gt; 0.5',
+                  'Rule 2 failed requirements', 'reference_major_fraction_not_above_minimum'):
+        assert label in text
+
+
+def test_both_passing_rules_stop_real_preflight_without_retention_or_replacement(tmp_path):
+    values = _variable_minor_values(7) + [.51] * 3
+    reference = tmp_path / 'overlapping.tsv'
+    reference.write_text('CHROM\tPOS\tREF\tALT\tEUR\n' + ''.join(
+        f'1\t{i}\tG\tA\t{value}\n' for i, value in enumerate(values, 1)))
+    original = pl.DataFrame({'CHR': ['1'] * 10, 'POS': list(range(1, 11)),
+        'EA': ['A'] * 10, 'OA': ['G'] * 10,
+        'AF': [min(value, 1 - value) for value in values]}).with_row_index(SOURCE_INPUT_ROW_COLUMN)
+    policies = default_policies().with_overrides({'eaf.maf_reference_min_overlap': 2,
+        'eaf.study_reference_min_minor_fraction': .6})
+    with pytest.raises(StudyAlleleFrequencyError, match='both_rules_passed') as caught:
+        prepare(original, policies, reference,
+            eaf_replacement_file=str(reference), eaf_replacement_column='EUR')
+    decisions = caught.value.study_decisions
+    evidence = decisions['eaf_reference_validation']
+    assert evidence['rule_1_passed'] is True and evidence['rule_2_passed'] is True
+    assert evidence['direct_eaf_accepted'] is False
+    assert evidence['status'] == 'failed' and evidence['maf_reference_decision'] == 'inconclusive'
+    assert 'eaf_replacement' not in decisions and 'eaf_prepared_references' not in decisions
+    assert original['AF'].to_list() == [min(value, 1 - value) for value in values]
+
+
+@pytest.mark.parametrize('key', ['study_reference_min_correlation', 'study_reference_min_major_fraction'])
+def test_invalid_whole_study_policy_fails_canonical_configuration_loading(tmp_path, key):
+    from postgwas.core.errors import ConfigurationError
+    config = tmp_path / 'invalid.yaml'
+    config.write_text(yaml.safe_dump({'policies': {'eaf': {key: True}}}))
+    with pytest.raises(ConfigurationError, match='eaf.' + key):
+        load_run_configuration_for_module('harmonisation', config)
+
+
+def test_inconclusive_preflight_records_one_explicit_canonical_error(tmp_path):
+    from postgwas.core.pipeline_logging import PipelineLogger
+    reference, frame, policies = fixture(tmp_path)
+    frame = frame.with_columns(pl.lit(.2).alias('AF'))
+    with PipelineLogger('study', 'dataset', str(tmp_path / 'logs')) as logger:
+        with pytest.raises(StudyAlleleFrequencyError) as caught:
+            prepare(frame, policies, reference, logger=logger)
+    log = next((tmp_path / 'logs').glob('*dataset.log')).read_text()
+    assert log.count("Study frequency column 'AF'") == 1
+    assert caught.value.study_decisions['eaf_reference_validation']['status'] == 'failed'
+    assert 'both_rules_failed' in log and 'rule_2_failed_requirements' in log
+
+
+@pytest.mark.parametrize('key,value', [
+    ('maf_decision_cutoff', .9), ('maf_reference_min_overlap', 3),
+    ('maf_reference_min_overlap_fraction', .6),
+    ('maf_reference_correlation_method', 'spearman'),
+    ('study_reference_min_correlation', .96),
+    ('maf_reference_max_mean_absolute_difference', .09),
+    ('study_reference_min_minor_fraction', .85),
+    ('study_reference_min_major_fraction', .25),
+])
+def test_worker_refuses_prepared_acceptance_after_any_whole_study_policy_change(tmp_path, key, value):
+    from postgwas.modules.harmonisation import strand
+    reference, frame, policies = fixture(tmp_path)
+    decisions, prepared = prepare(frame, policies, reference,
+        eaf_replacement_file=str(reference), eaf_replacement_column='EUR')
+    decisions.update(strand='forward', effect_type='beta')
+    with pytest.raises(strand.StrandOrientationError, match='matching settings changed'):
+        strand.harmonise_strand_orientation('1', prepared, dict(COLUMNS),
+            str(reference), 'EUR', MAPPING, study_decision=decisions,
+            policies=policies.with_overrides({'eaf.' + key: value}))
+
+
+def test_real_worker_registers_each_resolved_policy_once(tmp_path, monkeypatch):
+    from postgwas.config import load_configuration
+    reference, frame, policies = fixture(tmp_path)
+    decisions, prepared = prepare(frame, policies, reference,
+        eaf_replacement_file=str(reference), eaf_replacement_column='EUR')
+    decisions.update(strand='forward', effect_type='beta')
+    decisions['eaf_replacement']['resolved_files'] = {'1': str(reference)}
+    observed = []
+    original_context = af.shared_step_context
+
+    def observe_context(*args, **kwargs):
+        observed.extend(kwargs['policy_keys'])
+        return original_context(*args, **kwargs)
+
+    monkeypatch.setattr(af, 'shared_step_context', observe_context)
+    layout = load_configuration().modules.harmonisation.output_layout.model_dump()
+    result, qc, selected = af.harmonise_allele_frequency('1', prepared,
+        dict(COLUMNS, output_folder=str(tmp_path / 'out'), gwas_outputname='study'), layout, '\t',
+        external_eaf_colmap=MAPPING, default_eaf_file=str(reference),
+        default_eaf_column='EUR', default_eaf_colmap=MAPPING,
+        policies=policies, study_decision=decisions)
+    assert qc['final_status'] == 'success'
+    assert result['AF'].to_list() == frame['AF'].to_list()
+    assert result[selected['eaf_col']].to_list() == pytest.approx([.8, .7, .6, .65, .75])
+    assert observed.count('eaf.study_reference_min_correlation') == 1
+    assert observed.count('eaf.study_reference_min_major_fraction') == 1
+    assert len(observed) == len(set(observed))
+
+
+@pytest.mark.parametrize('pairs,total,pair_text,total_text,reason', [
+    (999, 999, '999', '999', 'insufficient_overlap'),
+    (1000, 2001, '1,000', '2,001', 'insufficient_overlap_fraction'),
+    (0, 101, '0', '101', 'insufficient_overlap'),
+])
+def test_failed_gate_html_reports_observed_pairs_and_fixed_denominator(
+    pairs, total, pair_text, total_text, reason,
+):
+    from copy import deepcopy
+    from postgwas.modules.harmonisation.html_report import render_dataset_report
+    decision, comparison = _paired_comparison(_variable_minor_values(pairs), total=total)
+    assert decision == 'inconclusive' and comparison['decision_reason'] == reason
+    assert comparison['direct_eaf_correlation'] is None
+    assert comparison['supplied_to_reference_maf_correlation'] is None
+    assert comparison['reference_effect_allele_minor_fraction'] is None
+    assert comparison['reference_effect_allele_major_fraction'] is None
+    original = deepcopy(comparison)
+    html = render_dataset_report({'dataset_id': 'AF_GATE_FAILURE', 'status': 'FAILED'},
+        {'dataset': {'study_decisions': {'eaf_reference_validation': comparison}}})
+    assert f'Observed AF diagnostic pairs</th><td>{pair_text}</td>' in html
+    assert f'Study rows entering AF preflight</th><td>{total_text}</td>' in html
+    assert comparison == original

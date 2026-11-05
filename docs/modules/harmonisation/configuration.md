@@ -1355,32 +1355,44 @@ finite, uniquely allele-matched, non-palindromic variants across all chromosomes
 at reference sites eligible for biallelic frequency inference. Known extra
 alleles exclude a site from these diagnostics; complete site membership in the
 supplied reference remains an input assumption. Reference AF is aligned to the
-**original study effect allele** before comparing. PostGWAS tests direct EAF
-agreement first, without folding either vector to MAF. All configurable
-gates below must pass to retain the declared internal EAF source:
+**original study effect allele** before comparing. Let `x` be the unchanged
+supplied AF, `r` the aligned reference frequency, and `m = min(r, 1-r)`.
 
-| Policy under `modules.harmonisation.policies.eaf` | Default | Acceptance |
-|---|---:|---|
-| `maf_reference_min_overlap` | 1000 | Matched diagnostic variants ≥ minimum |
-| `maf_reference_min_overlap_fraction` | 0.50 | Usable diagnostic pairs / all study rows entering preflight ≥ minimum |
-| `maf_reference_min_correlation` | 0.90 | Finite correlation ≥ minimum |
-| `study_reference_min_minor_fraction` | 0.90 | Reference aligned effect-allele AF ≤ 0.5 fraction > minimum |
-| `maf_reference_max_mean_absolute_difference` | 0.10 | Mean absolute AF difference ≤ maximum |
+First require at least 1,000 usable diagnostic pairs and coverage >= 0.50.
+Coverage divides pooled pairs by **all study rows entering AF preflight after
+upstream preparation**, before diagnostic exclusions. Missing/invalid AF,
+palindromes, ambiguous matches and non-biallelic sites stay in that fixed
+denominator. Equality passes both gates; insufficient count or coverage stops
+that dataset as inconclusive before correlation calculation, investigation,
+replacement selection or chromosome analysis. No retry is attempted.
 
-`maf_reference_correlation_method` remains `pearson` by default; the existing
-`spearman` override is also supported. These are dataset QC heuristics, not
-validated universal cutoffs or proof that every frequency is correctly labelled.
-The usable-overlap denominator is fixed once from all study rows entering AF
-preflight after upstream preparation. Diagnostic exclusions (including missing
-or invalid frequencies, palindromes, ambiguous matches and non-biallelic sites)
-remain in that denominator. Pool usable pairs across all chromosomes; do not
-average chromosome correlations or fractions. Exactly 50% passes the default
-coverage gate, and the independent 1,000-pair floor still applies. Compare the
-fraction directly: 14 usable pairs out of 100 pass a configured minimum of 0.14.
-Insufficient count or coverage is inconclusive and cannot select replacement.
-The reference-minor numerator includes AF exactly 0.5. Exactly 90% fails its
-strict lower bound; 901/1,000 passes. Failure of this gate alone on otherwise
-passing direct agreement is also inconclusive and cannot select replacement.
+After this shared gate passes, evaluate **both complete rules** from the same
+pooled pairs, even when rule 1 passes. Do not average chromosome statistics.
+
+| Requirement | Rule 1: retain original AF | Rule 2: select replacement |
+|---|---|---|
+| Correlation | `corr(x,r) >= 0.95` | `corr(x,m) >= 0.95` |
+| Mean absolute difference | `mean(abs(x-r)) <= 0.10` | `mean(abs(x-m)) <= 0.10` |
+| Reference profile | `proportion(r <= 0.5) > 0.90` | `proportion(r > 0.5) > 0.20` |
+
+Rule 2 uses **raw supplied AF**, not folded supplied AF. Correlation and mean-error
+equality pass; profile equality fails. Reference AF exactly 0.5 counts as minor.
+Undefined, non-finite and constant-vector correlations fail the relevant rule.
+The configured method is Pearson by default; Spearman remains supported.
+A complete rule passes only when every requirement passes.
+
+| Rule 1 | Rule 2 | Final action |
+|---|---|---|
+| Pass | Fail | Retain original AF |
+| Fail | Pass | Select explicitly supplied replacement |
+| Pass | Pass | Inconclusive; stop dataset |
+| Fail | Fail | Inconclusive; stop dataset |
+
+The both-pass guard applies when configured profile bounds overlap. With the
+defaults, reference-major fractions 0.10 through 0.20 inclusive satisfy neither
+profile. Partial direct EAF agreement plus complete rule 2 **selects replacement**;
+no additional EAF-agreement exception or directional error-advantage margin applies.
+Only the complete-rule truth table authorizes retention or replacement.
 
 The full run-YAML keys are:
 
@@ -1391,20 +1403,17 @@ modules:
       eaf:
         maf_reference_min_overlap: 1000
         maf_reference_min_overlap_fraction: 0.50
-        maf_reference_min_correlation: 0.90
+        study_reference_min_correlation: 0.95
         maf_reference_max_mean_absolute_difference: 0.10
         study_reference_min_minor_fraction: 0.90
-        maf_reference_error_margin: 0.02
+        study_reference_min_major_fraction: 0.20
 ```
 
-Proportions use finite values from 0 to 1, not percentages such as `90`.
-When every direct acceptance gate passes, that source stays in use even if a
-replacement was supplied. Only when coverage is sufficient and direct agreement
-itself fails are the same eligible pairs tested for independent MAF support:
-folded MAF must pass the overlap, correlation and mean-difference gates, the
-reference must pass `reference_minor_fraction_cutoff`, and the MAF error must
-beat the EAF error by more than `maf_reference_error_margin`. Only supported
-MAF can select the paired [explicit EAF replacement source](eaf_replacement.md).
+Proportions must be finite values from 0 to 1, not percentages such as `90`.
+The new correlation setting is independent of the unchanged ordinary external
+classifier's `maf_reference_min_correlation: 0.90`. Mean absolute difference
+is an aggregate mean, not squared error or a per-variant filter.
+Only supported MAF can select the paired [explicit EAF replacement source](eaf_replacement.md).
 Its frequencies are a population-reference proxy; the replacement file never
 supplies evidence for its own selection or palindrome orientation.
 
@@ -1437,17 +1446,21 @@ remain in their existing order. Internal matching columns are removed before
 scientific outputs. A study that does not trigger the comparison continues to
 read its reference normally for chromosome orientation.
 
-The new `study_reference_min_minor_fraction` is a strict **lower bound** for
-direct whole-study acceptance. The existing `reference_minor_fraction_cutoff`
-remains a separate **upper directional bound** for fallback MAF support; a share
-strictly above its default 0.95 makes that classification inconclusive.
-If effect alleles are minor, their EAF legitimately equals MAF. The unchanged
-`maf_reference_error_margin: 0.02` applies only to fallback MAF classification
-after direct EAF agreement fails, and to the separate external-file classifier.
-The shared correlation threshold is now 0.90 for direct whole-study agreement,
-conditional MAF support and ordinary external-source classification. The existing
-0.02 margin remains an aggregate mean-error separation, not a per-variant
-tolerance or maximum error; it does not participate in direct acceptance.
+Canonical evidence, screen reports and HTML summaries record both complete
+rule results, every failed requirement, count/coverage, both raw-source
+correlations and errors, both reference-profile proportions, thresholds and the
+combined decision. `direct_eaf_accepted` records actual final retention;
+`rule_1_passed` and `rule_2_passed` record independent full rules. On shared-gate
+failure both flags are false, `whole_study_rules_evaluated` is false, the shared
+failures are recorded for both rules, and uncomputed metrics remain unavailable.
+The existing `maf_correlation` and `mean_absolute_maf_difference` evidence still
+mean **folded supplied AF versus folded reference AF**; these compatibility
+metrics do not decide whole-study rule 2. The new
+`supplied_to_reference_maf_correlation` and existing `mean_maf_error` use raw `x`.
+
+The ordinary classifier retains its `reference_minor_fraction_cutoff: 0.95`
+upper directional bound and `maf_reference_error_margin: 0.02`. Neither control
+participates in the whole-study truth table.
 
 A passing direct result means reference-consistent declared EAF, not proof of
 the original column's provenance. In particular, a deterministic synthetic
@@ -1455,16 +1468,20 @@ the original column's provenance. In particular, a deterministic synthetic
 direct correlation 0.9523683946, reference-minor fraction 0.94 and direct mean
 absolute difference 0.012, and passes all these default gates despite supplying
 MAF. These user-selected QC heuristics are not scientifically calibrated to
-resolve every EAF/MAF ambiguity. Existing whole-study preparation still requires
+resolve every EAF/MAF ambiguity. Near 0.5, population differences can make EAF
+and MAF fits similar; this limitation does not introduce another decision gate.
+Existing whole-study preparation still requires
 full-study data; this change makes no bounded-memory or 100–200-million-row
 scalability claim. Allele semantics follow the
 [GWAS-SSF contract](https://www.ebi.ac.uk/gwas/docs/summary-statistics-format/);
-subsequent swaps follow the
+[Winkler et al., Figure 4](https://pmc.ncbi.nlm.nih.gov/articles/PMC4083217/)
+discusses reference-frequency QC; [Polars correlation](https://docs.pola.rs/py-polars/html/reference/expressions/api/polars.corr.html)
+provides the configured correlation implementation. Subsequent swaps follow the
 [GWAS Catalog harmonisation rules](https://ebispot.github.io/gwas-sumstats-harmoniser-documentation/Introduction/Harmonising-the-variants/).
 
-The **ordinary sample-sheet external-file classifier** inherits the shared
+The **ordinary sample-sheet external-file classifier** retains its separate
 correlation default of 0.90 and unchanged error margin of 0.02. Its absolute
-overlap behavior remains unchanged; the two new whole-study fraction gates do
+overlap behavior remains unchanged; whole-study coverage/profile rules do
 not apply to it. Its
 frequency is screened on its deduplicated raw values before this swap operation. A non-MAF-like result
 retains the sample sheet's declared ALT/EAF meaning. A MAF-like result requires

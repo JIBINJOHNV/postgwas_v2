@@ -123,22 +123,36 @@ modules:
       eaf:
         maf_reference_min_overlap: 1000
         maf_reference_min_overlap_fraction: 0.50
-        maf_reference_min_correlation: 0.90
+        study_reference_min_correlation: 0.95
         maf_reference_max_mean_absolute_difference: 0.10
         study_reference_min_minor_fraction: 0.90
-        maf_reference_error_margin: 0.02
+        study_reference_min_major_fraction: 0.20
 ```
 
-Overlap and correlation use inclusive lower bounds; the reference-minor fraction
-uses a strict lower bound and counts aligned AF <= 0.5. Proportions are from
-0 to 1, not percentages such as `90`. Only adequate coverage plus independently
-supported MAF after direct agreement fails can select explicit replacement.
-The shared correlation default 0.90 also applies to conditional MAF support and
-ordinary external-source classification, whose absolute overlap and existing
-0.02 margin remain unchanged. These gates are user-selected QC heuristics:
-a deterministic 10,000-variant MAF control with 94% minor reference effect
-alleles passes (correlation 0.9523683946; direct mean absolute difference 0.012).
-This does not establish EAF semantics or calibrate the thresholds; see the
+After count >= 1,000 and usable coverage >= 0.50 pass, evaluate both full rules
+on the same pooled diagnostic pairs. With unchanged supplied AF `x`, aligned
+reference effect-allele AF `r` and `m = min(r,1-r)`, rule 1 requires
+`corr(x,r) >= 0.95`, `mean(abs(x-r)) <= 0.10` and `proportion(r <= 0.5) > 0.90`.
+Rule 2 requires `corr(x,m) >= 0.95`, `mean(abs(x-m)) <= 0.10` and
+`proportion(r > 0.5) > 0.20`. Rule 2 uses raw supplied AF. A constant or
+unavailable correlation fails its rule. Both full rules are evaluated even if
+rule 1 passes. Only rule 1 passing retains original AF; only rule 2 passing
+selects explicitly supplied replacement; both passing or both failing stops
+as inconclusive. Count/coverage failure stops before either rule or replacement.
+
+Correlation, error and overlap use inclusive bounds; both profile bounds are
+strict. AF exactly 0.5 counts as minor. Default major fractions 0.10 through
+0.20 inclusive meet neither profile. Proportions are from 0 to 1, not `90`.
+Partial direct EAF agreement plus a full rule-2 pass selects replacement.
+The ordinary external-source classifier retains correlation 0.90 and its
+existing strict 0.02 directional error margin; neither that margin nor its
+upper minor-profile veto applies to the whole-study truth table.
+
+These gates are user-selected QC heuristics. A deterministic 10,000-variant
+MAF control with 94% minor reference effect alleles passes rule 1 (correlation
+0.9523683946; direct mean absolute difference 0.012). Population differences
+near 0.5 can also make EAF and MAF fits similar. This does not establish
+column semantics or calibrate thresholds; see the
 [method discussion](../../modules/harmonisation/configuration.md).
 
 ## Stage 1 — preflight before the large input is read
@@ -633,7 +647,7 @@ documentation rather than generated policy descriptions.
 </details>
 
 <details>
-<summary><code>eaf</code> — chromosome 04 effect allele frequency (18 settings)</summary>
+<summary><code>eaf</code> — chromosome 04 effect allele frequency (22 settings)</summary>
 
 | Setting | Default | Allowed values | Decision or action |
 |---|---|---|---|
@@ -645,15 +659,17 @@ documentation rather than generated policy descriptions.
 | `eaf.non_effect_frequency_min_correlation` | `0.8` | Number ≥ `0.0` and ≤ `1.0` | Requires one-minus the supplied study frequency to have at least this Pearson correlation with the expected frequency of the study's listed effect allele before the column can be diagnosed as non-effect-allele frequency. Applies: only without a whole-study AF acceptance decision, together with the overlap, maximum-error and error-margin requirements; every requirement must pass, so correlation alone never changes or rejects data. |
 | `eaf.non_effect_frequency_max_error` | `0.1` | Number ≥ `0.0` and ≤ `1.0` | Sets the largest mean absolute difference allowed between one-minus the study frequency and the expected effect-allele frequency for a non-effect-frequency diagnosis. Applies: direct chromosome helpers without a whole-study AF acceptance decision, on the same uniquely oriented, non-palindromic evidence used by the correlation check. |
 | `eaf.non_effect_frequency_error_margin` | `0.1` | Number ≥ `0.0` and ≤ `1.0` | Requires the mean absolute error after one-minus inversion to be at least this much smaller than the error under the declared effect-allele-frequency interpretation. Applies: direct chromosome helpers without a whole-study AF acceptance decision, after the correlation and maximum inverted-error requirements. The pipeline fails on a conclusive diagnosis; it never auto-inverts data. |
-| `eaf.maf_decision_cutoff` | `0.95` | Number ≥ `0.0` and ≤ `1.0` | Screens the share of usable study AF at or below 0.5 across the whole dataset. Only a share strictly above this cutoff triggers additional reference-frequency comparison. Applies: Before chromosome processing for a study-supplied AF column. At or below the cutoff, accept its declared EAF contract without an additional AF-concordance check. Above it, first test whole-study agreement with reference AF aligned to the original effect allele; only if that fails, test MAF support for explicit replacement. Values must be finite and inside 0 to 1 to contribute to the screen; other values remain subject to the separate missing/range policies. No study rows change in this check. |
-| `eaf.maf_reference_min_overlap` | `1000` | Integer ≥ `2` | Sets the fewest usable matched non-palindromic variants for AF comparison. Applies: Whole-study preflight pools uniquely oriented matches across all chromosomes when the study AF screen is MAF-like, for direct EAF agreement and then conditional MAF support. The external-file classifier uses this count per chromosome. Direct, swapped and valid reverse-complement study matches at eligible biallelic reference sites can contribute. |
-| `eaf.maf_reference_min_overlap_fraction` | `0.5` | Number ≥ `0.0` and ≤ `1.0` | Whole-study usable diagnostic-pair count divided by all rows entering AF preflight after upstream preparation must be ≥ this fraction. Pool all chromosomes with one fixed denominator before diagnostic exclusions; missing/invalid AF, palindromic, ambiguous and non-biallelic rows stay in that denominator. The absolute 1,000-pair floor also applies. Insufficient coverage is inconclusive and cannot select MAF replacement. Ordinary external-source classification keeps count-based overlap. |
-| `eaf.study_reference_min_minor_fraction` | `0.9` | Number ≥ `0.0` and ≤ `1.0` | Direct acceptance of a MAF-like whole-study AF column requires the pooled reference effect-allele AF ≤ 0.5 fraction to be strictly > this lower bound. Exactly 0.5 counts; exactly 90% fails and 901/1,000 passes by default. Failure alone on otherwise passing direct agreement cannot select replacement. This differs from the existing upper directional `reference_minor_fraction_cutoff`. |
-| `eaf.maf_reference_correlation_method` | `pearson` | `pearson`, `spearman` | Selects the correlation statistic for reference-frequency agreement. Applies: MAF-like study AF is compared directly with reference AF aligned to the original effect allele across the whole dataset, without folding, for direct EAF acceptance. Only if that fails, the MAF-support classifier compares folded MAF for panel suitability. The ordinary external-file classifier uses the same folded-MAF suitability comparison. |
-| `eaf.maf_reference_min_correlation` | `0.9` | Number ≥ `0.0` and ≤ `1.0` | Sets the minimum correlation for the paired frequency comparison. Applies: Whole-study preflight compares supplied AF with allele-aligned reference AF without folding for direct EAF acceptance. Conditional study MAF support and the ordinary external-file classifier use folded MAF for panel suitability. |
-| `eaf.maf_reference_max_mean_absolute_difference` | `0.1` | Number ≥ `0.0` and ≤ `0.5` | Sets the maximum mean absolute difference across the paired frequencies. Applies: Whole-study preflight uses supplied AF and reference AF aligned to the original effect allele for direct EAF acceptance. Conditional study MAF support and the ordinary external-file classifier use folded MAF for panel suitability. |
-| `eaf.reference_minor_fraction_cutoff` | `0.95` | Number ≥ `0.0` and ≤ `1.0` | Detects a directional frequency comparison that cannot distinguish EAF from MAF because the reference effect alleles are predominantly minor. Applies: Conditional study MAF support after direct EAF agreement fails, the ordinary external-file classifier, and direct chromosome helpers without a whole-study decision. Its upper directional bound is distinct from the strict lower bound required by `eaf.study_reference_min_minor_fraction` for direct whole-study acceptance. |
-| `eaf.maf_reference_error_margin` | `0.02` | Number ≥ `0.0` and ≤ `1.0` | Sets the minimum error separation for directional EAF-versus-MAF classification. The existing default 0.02 is unchanged; it is aggregate mean-error separation, not a per-variant tolerance or maximum error. It is not required for direct whole-study EAF acceptance. Applies: Conditional study MAF support after direct EAF agreement fails, ordinary external-file classification, and direct chromosome helpers without a whole-study decision, after overlap and reference suitability pass. |
+| `eaf.maf_decision_cutoff` | `0.95` | Number ≥ `0.0` and ≤ `1.0` | Screens the share of usable study AF at or below 0.5 across the whole dataset. Only a share strictly above this cutoff triggers additional reference-frequency comparison. Applies: Before chromosome processing for a study-supplied AF column. At or below the cutoff, accept its declared EAF contract without an additional AF-concordance check. Above it, require the shared pooled count and coverage gates, then evaluate both complete whole-study rules against reference AF aligned to the original effect allele and reference MAF. Only the complete-rule truth table authorizes retention or explicit replacement. Values must be finite and inside 0 to 1 to contribute to the screen; other values remain subject to the separate missing/range policies. No study rows change in this check. |
+| `eaf.maf_reference_min_overlap` | `1000` | Integer ≥ `2` | Sets the fewest usable matched non-palindromic variants for AF comparison. Applies: Whole-study preflight pools uniquely oriented matches across all chromosomes when the study AF screen is MAF-like, for both complete raw-source AF rules. The external-file classifier uses this count per chromosome. Direct, swapped and valid reverse-complement study matches at eligible biallelic reference sites can contribute. |
+| `eaf.maf_reference_min_overlap_fraction` | `0.5` | Number ≥ `0.0` and ≤ `1.0` | Sets the minimum usable AF-comparison coverage for whole-study preflight. Applies: A MAF-like study AF column is compared with the pooled reference matches across all chromosomes. Divide the valid diagnostic-pair count by all study rows entering preflight after upstream preparation, before diagnostic exclusions. Missing, invalid, palindromic, ambiguous and non-biallelic rows remain in that fixed denominator. |
+| `eaf.study_reference_min_minor_fraction` | `0.9` | Number ≥ `0.0` and ≤ `1.0` | Sets the strict minimum reference effect-allele minor fraction for whole-study rule 1, retaining original study AF. The numerator counts aligned reference AF <= 0.5, including ties; the denominator is the pooled usable diagnostic-pair count. Applies: Both complete whole-study rules are evaluated after count and coverage pass. Rule 1 also requires direct raw-source correlation and mean absolute difference to pass. |
+| `eaf.study_reference_min_correlation` | `0.95` | Number ≥ `0.0` and ≤ `1.0` | Sets the shared minimum correlation for both complete whole-study AF rules. Applies: After pooled count and coverage pass, rule 1 compares unchanged supplied AF with reference AF aligned to the original listed effect allele; rule 2 compares that same unchanged supplied AF with min(reference AF, 1-reference AF). Never fold supplied AF for rule 2. Both rules are evaluated even when rule 1 passes. |
+| `eaf.study_reference_min_major_fraction` | `0.2` | Number ≥ `0.0` and ≤ `1.0` | Sets the strict minimum reference effect-allele major fraction for whole-study rule 2, selecting explicitly supplied replacement EAF. Count reference AF > 0.5, excluding ties, among the same pooled usable diagnostic pairs used by rule 1. Applies: After count and coverage pass, rule 2 also requires correlation of raw supplied AF with reference MAF and their mean absolute difference to pass. |
+| `eaf.maf_reference_correlation_method` | `pearson` | `pearson`, `spearman` | Selects the correlation statistic for reference-frequency agreement. Applies: Whole-study rules compare unchanged supplied AF with aligned reference AF and reference MAF respectively, using eaf.study_reference_min_correlation. Ordinary external-source classifiers compare folded vectors with eaf.maf_reference_min_correlation. |
+| `eaf.maf_reference_min_correlation` | `0.9` | Number ≥ `0.0` and ≤ `1.0` | Sets the minimum folded-MAF correlation for ordinary external-source and chromosome classifiers without a whole-study decision. Whole-study rules instead use eaf.study_reference_min_correlation. Applies: The existing independent-reference suitability comparison folds both supplied and reference AF. Mean absolute folded difference and absolute count also pass. |
+| `eaf.maf_reference_max_mean_absolute_difference` | `0.1` | Number ≥ `0.0` and ≤ `0.5` | Sets the maximum mean absolute difference across paired frequencies. Applies: Whole-study rule 1 uses unchanged supplied AF and aligned reference AF; rule 2 uses unchanged supplied AF and reference MAF. Ordinary external-source classifiers use folded supplied and reference AF for panel suitability. |
+| `eaf.reference_minor_fraction_cutoff` | `0.95` | Number ≥ `0.0` and ≤ `1.0` | Detects ordinary directional comparisons unable to distinguish EAF from MAF because the reference effect alleles are predominantly minor. Applies: Ordinary external-source classifiers and direct chromosome helpers without a whole-study decision. The whole-study truth table uses neither this upper profile veto nor the directional error margin. |
+| `eaf.maf_reference_error_margin` | `0.02` | Number ≥ `0.0` and ≤ `1.0` | Sets the minimum aggregate mean-error separation for ordinary directional EAF-versus-MAF classification. Neither whole-study rule uses an error-advantage margin. Applies: Ordinary external-source classifiers and direct chromosome helpers without a whole-study decision, after absolute count, folded suitability and profile checks pass. |
 | `eaf.invalid_fraction_cutoff` | `0.05` | Number ≥ `0.0` and ≤ `1.0` | Sets how large a share of out-of-range frequencies is tolerated before warning. Applies: chromosome step 04, on the study's own frequency column and on one merged from an external panel. Out of range means non-finite, below 0 or above 1; eaf.clip_tolerance is diagnostic only. |
 | `eaf.missing_fraction_cutoff` | `0.05` | Number ≥ `0.0` and ≤ `1.0` | Sets how large a share of empty frequency values is tolerated before a warning is printed. Applies: chromosome step 04, each time a frequency column is checked - the study's own column, and a column merged from an external panel, where every unmatched variant is left empty. |
 | `eaf.degenerate` | `reject` | `reject`, `null`, `keep`, `fail` | Decides what happens to a variant whose effect allele frequency is exactly 0 or exactly 1. Such an endpoint makes the Z-only BETA/SE reconstruction denominator zero. Applies: chromosome step 04 after frequency-range handling, and again at step 06 for rows that feed the BETA-and-SE-from-Z calculation. |

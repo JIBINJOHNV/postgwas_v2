@@ -48,18 +48,28 @@ orientation. An ordinary sample-sheet external EAF source keeps its existing
 source-selection and comparison rules; frequency attachment uses the same
 validated allele-frequency join described below.
 
-For a MAF-like study column, direct whole-study acceptance requires pooled
-usable pairs to satisfy both the existing 1,000-pair floor and at least 50% of
-all rows entering AF preflight after upstream preparation, correlation >= 0.90,
-mean absolute allele-aligned difference <= 0.10, and a reference effect-allele
-minor fraction strictly > 0.90. The minor fraction counts aligned reference
-AF <= 0.5, including exactly 0.5. Diagnostic exclusions stay in the fixed study
-coverage denominator. Failure of coverage, or failure of the new minor-fraction
-gate alone on otherwise passing direct agreement, is inconclusive and cannot
-select replacement. Replacement still requires independent MAF support when
-direct agreement itself fails and coverage is sufficient.
+For a MAF-like study column, require at least 1,000 pooled usable pairs and
+coverage >= 50% of all rows entering AF preflight after upstream preparation.
+Diagnostic exclusions remain in that fixed denominator. Count and coverage
+equality pass; failure is inconclusive and stops before either rule or replacement.
 
-All gates are configured under `modules.harmonisation.policies.eaf`:
+With `x` unchanged supplied AF, `r` reference AF aligned to the original listed
+study effect allele, and `m = min(r,1-r)`, evaluate both complete rules:
+
+| Requirement | Rule 1: retain original AF | Rule 2: select replacement |
+|---|---|---|
+| Correlation | `corr(x,r) >= 0.95` | `corr(x,m) >= 0.95` |
+| Mean absolute difference | `mean(abs(x-r)) <= 0.10` | `mean(abs(x-m)) <= 0.10` |
+| Reference profile | `proportion(r <= 0.5) > 0.90` | `proportion(r > 0.5) > 0.20` |
+
+Rule 2 never folds the supplied AF. Both rules are measured even if rule 1
+passes. Only rule 1 passing retains original AF; only rule 2 passing selects
+the explicit replacement. Both passing or both failing is inconclusive and
+stops the dataset. A partial EAF fit with a full rule-2 pass selects replacement.
+No 0.02 directional error-advantage margin applies to either whole-study rule.
+Reference-major fractions 0.10 through 0.20 inclusive meet neither default profile.
+
+All whole-study gates are configured under `modules.harmonisation.policies.eaf`:
 
 ```yaml
 modules:
@@ -68,24 +78,27 @@ modules:
       eaf:
         maf_reference_min_overlap: 1000
         maf_reference_min_overlap_fraction: 0.50
-        maf_reference_min_correlation: 0.90
+        study_reference_min_correlation: 0.95
         maf_reference_max_mean_absolute_difference: 0.10
         study_reference_min_minor_fraction: 0.90
-        maf_reference_error_margin: 0.02
+        study_reference_min_major_fraction: 0.20
 ```
 
-Use proportions from 0 to 1, not `90`. Correlation and overlap equality pass;
-reference-minor-fraction equality fails. The shared correlation default also
-applies to folded MAF support and ordinary external-source classification.
-The existing directional error margin remains 0.02; it compares aggregate
-mean errors, is not a per-variant tolerance or maximum error, and is not used
-for direct EAF acceptance. The separate upper directional
-`eaf.reference_minor_fraction_cutoff: 0.95` remains unchanged.
+Use finite proportions from 0 to 1, not `90`. Correlation and error equality
+pass; profile equality fails. AF exactly 0.5 counts toward the minor fraction.
+Undefined, non-finite or constant-vector correlations fail the relevant rule.
+The shared method remains Pearson by default, with Spearman supported.
+The separate ordinary external classifier retains
+`eaf.maf_reference_min_correlation: 0.90`,
+`eaf.maf_reference_error_margin: 0.02` and its upper directional
+`eaf.reference_minor_fraction_cutoff: 0.95`.
 
 These are user-selected QC heuristics. A deterministic 10,000-variant MAF
 control with 94% minor reference effect alleles passes the gates (correlation
 0.9523683946; minor fraction 0.94; direct mean absolute difference 0.012).
-Passing does not prove the semantic provenance of the supplied column. See the
+Passing does not prove the semantic provenance of the supplied column. Population
+differences near 0.5 can make EAF and MAF fits similar; this known limitation
+does not add a decision condition. See the
 [method and configuration discussion](configuration.md) for the fixed-denominator
 contract and this limitation.
 
