@@ -277,7 +277,7 @@ def test_real_late_af_failure_does_not_replay_pending_study_report(tmp_path, mon
     assert "accepted for assignment" not in report
     if failure == "replacement":
         assert "replacement frequency maf like" in report
-        assert "Replacement GWAS-row screen" in report or "Replacement B" in report
+        assert "Replacement distribution" in report
     else:
         assert "both rules failed" in report
 

@@ -45,14 +45,14 @@ def test_external_reports_screen_the_saved_gwas_overlap_and_skip_default_diagnos
     decisions = _decisions()
     before = deepcopy(decisions)
     for report in _reports(decisions):
-        assert "Initial selected AF A screen scope" in report
+        assert "Screen scope" in report
         assert "merged GWAS rows" in report
         assert "original listed GWAS effect allele" in report
         assert "190 / 200 (95.00%)" in report
         assert "strictly above 95.00%" in report
-        assert "Source-panel frequencies (descriptive only)" in report
-        assert "Default semantic comparison" in report
-        assert "Skipped; selected A was not MAF-like" in report
+        assert "999 / 1,000" not in report
+        assert "Reference comparison" in report
+        assert "Not required; input was not MAF-like" in report
         assert "Supplied external frequency; no native GWAS frequency column mapped" in report
     assert decisions == before
 
@@ -71,7 +71,7 @@ def test_replacement_screen_failure_is_terminal_without_fabricated_consistency_m
         "effective_frequency_screen": _screen(usable=usable, low=low, maf_like=bool(usable)),
     }
     for report in _reports(decisions):
-        assert "Replacement B screen scope" in report
+        assert "Replacement distribution" in report
         assert result in report
         assert reason.replace("_", " ") in report
         assert "No further default comparison, replacement or fallback" in report
@@ -91,10 +91,10 @@ def test_external_to_replacement_reports_preserve_absent_native_and_final_adopti
         "effective_frequency_screen": _screen(usable=200, low=100),
     }
     for report in _reports(decisions):
-        assert "Passed; replacement EAF accepted for assignment" in report
+        assert "Replacement approved" in report
         assert "external EAF accepted for assignment" not in report
         assert "Original study MAF remains unchanged" not in report
-        assert "Selected input AF A preserved" in report
+        assert "Original column" in report and "Preserved unchanged" in report
         assert "no native GWAS frequency column mapped" in report
 
 
@@ -104,7 +104,7 @@ def test_native_screen_records_original_effect_allele_scope():
         "eaf_evidence": _screen(), "eaf_reference_validation": {"status": "not_required"},
     }
     for report in _reports(decisions):
-        assert "Initial selected AF A screen scope" in report
+        assert "Screen scope" in report
         assert "original listed GWAS effect allele" in report
         assert "190 / 200 (95.00%)" in report
 
@@ -117,12 +117,12 @@ def test_terminal_native_screen_has_one_owner_for_counts_fraction_and_cutoff():
     report = _reports(decisions)[0]
     assert report.count("190 / 200 (95.00%)") == 1
     assert report.count("strictly above 95.00%") == 1
-    assert report.count("usable frequencies : 200") == 1
-    assert report.count("missing or invalid frequencies : 10") == 1
+    assert report.count("Input usable frequencies : 200") == 1
+    assert report.count("Input missing or invalid frequencies : 10") == 1
     assert "Usable frequencies : 200" not in report
     assert "Missing or invalid : 10" not in report
-    assert "Missing input : 7" in report
-    assert "0.1 to 0.8; median 0.3" in report
+    assert "Missing input: 7" in report
+    assert "Detailed evidence" in report
 
 
 def test_native_screen_retains_its_saved_cutoff_without_a_second_legacy_field():
@@ -144,8 +144,8 @@ def test_native_initial_and_replacement_screens_keep_independent_labels_and_deno
     report = _reports(decisions)[0]
     assert report.count("199 / 200 (99.50%)") == 1
     assert report.count("120 / 180 (66.67%)") == 1
-    assert "Initial selected AF A usable frequencies : 200" in report
-    assert "Replacement B usable frequencies : 180" in report
+    assert "Input usable frequencies : 200" in report
+    assert "Unresolved at preparation : 30" in report
 
 
 @pytest.mark.parametrize("replacement", [False, True])
@@ -165,8 +165,8 @@ def test_external_source_report_summarises_files_without_dumping_identity_maps(r
     report = _reports(decisions)[0]
     assert "column EUR" in report
     assert "22 declared files" in report
-    assert "22 resolved files" in report
-    assert '"a1": "REF"' in report and '"a2": "ALT"' in report
+    assert "source identities" in report
+    assert "allele mappings" in report
     assert "/cache/resolved_chr" not in report
     assert "/panel/declared_chr" not in report
     assert decisions == before
@@ -190,7 +190,7 @@ def test_zero_usable_initial_screen_is_unavailable_rather_than_acceptable_non_ma
         decisions = {"eaf_column": "AF", "eaf_evidence": _screen(usable=0, low=0),
             "eaf_reference_validation": {"status": "failed", "decision_reason": "no_usable_study_frequencies"}}
     report = _reports(decisions)[0]
-    assert "Initial selected AF A screen result : No usable frequencies" in report
+    assert "Input distribution : No usable frequencies" in report
     assert "accepted for assignment" not in report
     assert "EAF retained" not in report
 

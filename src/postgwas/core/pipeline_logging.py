@@ -1052,26 +1052,29 @@ def _chromosome_analysis_lines(summary, width):
         ], "genetic")
 
     if eaf:
-        external = str(eaf.get("decision_source") or "").startswith("external")
-        interpretation = "EAF" if external or eaf.get("maf_reference_decision") == "eaf" or eaf.get("study_decision_eaf_is_maf") is False else "MAF suspected / unresolved"
-        fields = [
-            ("Source", eaf.get("external_eaf_file") if external else "Study column %s" % value(eaf, "final_eaf_col")),
-            ("Frequency interpretation", interpretation),
-        ]
-        if external:
-            fields += [
-                ("Reference column", value(eaf, "external_eaf_column")),
-                ("Direct matches", count(eaf, "external_merge_direct_match_rows")),
-                ("Swapped matches", count(eaf, "external_merge_flip_match_rows")),
-                ("Unmatched", count(eaf, "external_merge_unmatched_rows")),
+        from postgwas.modules.harmonisation.study_reporting import chromosome_frequency_source_fields
+        fields = chromosome_frequency_source_fields(eaf)
+        if fields is None:
+            external = str(eaf.get("decision_source") or "").startswith("external")
+            interpretation = "EAF" if external or eaf.get("maf_reference_decision") == "eaf" or eaf.get("study_decision_eaf_is_maf") is False else "MAF suspected / unresolved"
+            fields = [
+                ("Source", eaf.get("external_eaf_file") if external else "Study column %s" % value(eaf, "final_eaf_col")),
+                ("Frequency interpretation", interpretation),
             ]
-        else:
-            actions = strand.get("actions") or {}
-            swapped = _integer(actions.get("forward_swapped")) + _integer(actions.get("reverse_complement_swapped"))
-            fields.append(("Transformation", "%s allele-swapped frequencies inverted using 1 − EAF" % _count(swapped)
-                           if interpretation == "EAF" else "No EAF inversion asserted while frequency type is unresolved"))
-            outside = eaf.get("internal_af_outside_unit_interval_count", eaf.get("internal_af_out_of_range_count"))
-            fields.append(("Out-of-range detected", _count(outside) if outside is not None else "not recorded"))
+            if external:
+                fields += [
+                    ("Reference column", value(eaf, "external_eaf_column")),
+                    ("Direct matches", count(eaf, "external_merge_direct_match_rows")),
+                    ("Swapped matches", count(eaf, "external_merge_flip_match_rows")),
+                    ("Unmatched", count(eaf, "external_merge_unmatched_rows")),
+                ]
+            else:
+                actions = strand.get("actions") or {}
+                swapped = _integer(actions.get("forward_swapped")) + _integer(actions.get("reverse_complement_swapped"))
+                fields.append(("Transformation", "%s allele-swapped frequencies inverted using 1 − EAF" % _count(swapped)
+                               if interpretation == "EAF" else "No EAF inversion asserted while frequency type is unresolved"))
+                outside = eaf.get("internal_af_outside_unit_interval_count", eaf.get("internal_af_out_of_range_count"))
+                fields.append(("Out-of-range detected", _count(outside) if outside is not None else "not recorded"))
         if eaf.get("strand_af_tolerance") is not None:
             fields.append(("Reference AF tolerance", "|aligned study EAF − reference AF| ≤ %s" % eaf["strand_af_tolerance"]))
         for label, prefix, action_key in [

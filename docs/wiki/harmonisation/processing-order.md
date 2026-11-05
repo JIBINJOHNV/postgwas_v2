@@ -453,6 +453,21 @@ These eight steps run once on the complete study.
    gate before approval. Initial external A and its descriptor remain frozen;
    B acquires its own source/cache bindings. These decisions finish before workers.
 
+   The terminal and HTML frequency summary lead with the saved source decision,
+   followed by **supplied frequency**, **reference comparison**, and
+   **replacement validation**. They use these names instead of A/B labels and
+   list multiple reference files once. Detailed thresholds, mappings, identities
+   and diagnostic exclusions remain in the run manifest. Failure summaries keep
+   the actionable reason and recorded limits visible. Unresolved preparation
+   counts are not final variant-removal counts. Chromosome reports reuse the
+   approved source and show local assignment/QC rather than repeat study-wide
+   classification; approved replacement EAF must not be labelled unresolved MAF.
+
+   Correlations retain their sign. Agreement with EAF compares unchanged supplied
+   frequency with reference frequency of the same listed effect allele;
+   agreement with MAF compares it with `min(f,1-f)`. Negative EAF correlation
+   alone does not establish MAF or authorise inversion of the supplied column.
+
    For the P-value column, finite numeric values provide the denominator for a
    study-wide negative-value check. At the packaged 0.1% maximum, any non-zero
    fraction up to and including 0.1% produces a prominent warning; more than 0.1%

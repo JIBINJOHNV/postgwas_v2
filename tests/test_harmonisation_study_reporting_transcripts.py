@@ -131,9 +131,9 @@ def test_detailed_report_reaches_canonical_and_dataset_logs_in_both_display_mode
         ):
             assert section in report
         assert "YAML policy declaration" in report
-        assert "Not required — distribution screen did not trigger comparison" in report
+        assert "Not required; input was not MAF-like" in report
         assert "Declared study EAF retained" in report
-        assert "Keep the supplied EAF; normal chromosome QC still applies." in report
+        assert "Detailed evidence" in report
         assert "Direct EAF correlation" not in report
         assert "Comparable variants" not in report
         assert "Folded-MAF correlation" not in report

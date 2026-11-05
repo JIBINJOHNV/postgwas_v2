@@ -76,8 +76,8 @@ def test_report_uses_existing_evidence_and_actual_policy_limits_without_mutation
     assert "Automatically inferred" in text
     assert "Sample-sheet declaration" in text
     assert "1,089 / 1,100 (99.00%)" in text
-    assert "Direct EAF correlation" in text and "0.98; required >= 0.9" in text
-    assert "0.02; required <= 0.03" in text
+    assert "Agreement with EAF" in text and "correlation 0.98" in text
+    assert "mean absolute difference 0.02" in text
     assert "Study EAF retained" in text
     assert "99.09%" in text and "99.00%" in text
     assert decisions == original
@@ -101,7 +101,7 @@ def test_maf_distribution_without_completed_reference_check_stays_provisional(de
     decisions.pop("eaf_selected_source")
     text = normal(render(decisions))
     assert "MAF-like; reference confirmation required" in text
-    assert "Pending" in text
+    assert "pending" in text
     assert "Study EAF retained" not in text
 
 
@@ -118,7 +118,7 @@ def test_selected_replacement_is_a_planned_source_not_a_completed_output(decisio
     )
     text = normal(render(decisions))
     assert "Input MAF supported" in text
-    assert "Replacement EAF selected" in text
+    assert "Replacement validation pending" in text
     assert "/references/replacement [EUR].tsv.gz" in text
     assert "EUR" in text
     assert "assignment pending" in text
@@ -133,9 +133,9 @@ def test_failed_or_inconclusive_reference_evidence_never_reports_accepted_eaf(de
         comparable_variants=20,
     )
     text = normal(render(decisions))
-    assert "FAILED" in text
+    assert "Failed" in text
     assert "insufficient overlap" in text.lower()
-    assert "20; required >= 1,000" in text
+    assert "Comparable variants : 20" in text and "minimum comparable variants : 1,000" in text
     assert "No chromosome analysis" in text
     assert "Study EAF retained" not in text
 
@@ -146,7 +146,7 @@ def test_absent_frequency_has_no_fabricated_distribution_or_comparison():
                           "eaf_selected_source": "external_eaf",
                           "eaf_reference_validation": {"status": "not_applicable"}}))
     assert "Supplied external frequency; no native GWAS frequency column mapped" in text
-    assert "External EAF selected" in text
+    assert "External EAF validation pending" in text
     assert "Usable frequencies" not in text
     assert "Direct EAF correlation" not in text
 
@@ -214,9 +214,9 @@ def test_evidence_explains_type_choices_and_frequency_exclusions(decisions):
     assert "The recorded OR detection rule was satisfied" in text
     assert "The negative-log10 count and fraction gates were not both met" in text
     assert "Median detection rule" in text
-    assert "Missing input : 3" in text
-    assert "Non-numeric input : 1" in text
-    assert "Non-finite input : 1" in text
+    assert "Missing input: 3" in text
+    assert "Non-numeric input: 1" in text
+    assert "Non-finite input: 1" in text
 
 
 def test_type_evidence_uses_one_finite_subset_with_distinct_exclusions():

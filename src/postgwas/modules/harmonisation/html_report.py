@@ -22,7 +22,7 @@ from postgwas.modules.harmonisation.report_steps import (
     chromosome_steps, dataset_steps, post_merge_steps, summarise_chromosome_evidence,
 )
 from postgwas.modules.harmonisation.study_reporting import (
-    external_frequency_fields, native_frequency_screen_fields, replacement_frequency_fields,
+    frequency_summary_fields,
 )
 
 
@@ -906,43 +906,10 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
         ("Frequency reference-check outcomes", reference_checks),
         ("P-value VCF representation", provenance.get("pvalue_vcf_formula")),
     ]
-    frequency_validation = decisions.get("eaf_reference_validation") or {}
-    if frequency_validation.get("reference_effect_allele_minor_fraction") is not None:
-        rows.append((
-            "Reference frequency of listed effect allele ≤ 0.5",
-            _fraction(frequency_validation["reference_effect_allele_minor_fraction"])
-            + " of " + _text(frequency_validation.get("comparable_variants"))
-            + " comparable non-palindromic pairs (ties included)",
-        ))
-    if "rule_1_passed" in frequency_validation:
-        rows.extend([
-            ("Observed AF diagnostic pairs", frequency_validation.get("comparable_variants")),
-            ("Study rows entering AF preflight", frequency_validation.get("study_variant_count")),
-            ("Shared AF evidence gate passed", frequency_validation.get("shared_evidence_gate_passed")),
-            ("Both whole-study AF rules evaluated", frequency_validation.get("whole_study_rules_evaluated")),
-            ("Usable AF diagnostic coverage", _fraction(frequency_validation.get("observed_overlap_fraction"))),
-            ("Reference frequency of listed effect allele > 0.5", _fraction(frequency_validation.get("reference_effect_allele_major_fraction"))),
-            ("Direct EAF correlation", frequency_validation.get("direct_eaf_correlation")),
-            ("Supplied AF versus reference MAF correlation", frequency_validation.get("supplied_to_reference_maf_correlation")),
-            ("Mean absolute EAF difference", frequency_validation.get("mean_eaf_error")),
-            ("Mean absolute supplied-AF / reference-MAF difference", frequency_validation.get("mean_maf_error")),
-            ("Whole-study minimum correlation (>=)", frequency_validation.get("minimum_study_correlation")),
-            ("Whole-study maximum mean absolute difference (<=)", frequency_validation.get("maximum_mean_absolute_maf_difference")),
-            ("Minimum reference minor fraction (>)", _fraction(frequency_validation.get("minimum_reference_effect_allele_minor_fraction"))),
-            ("Minimum reference major fraction (>)", _fraction(frequency_validation.get("minimum_reference_effect_allele_major_fraction"))),
-            ("Minimum AF diagnostic count (>=)", frequency_validation.get("minimum_overlap")),
-            ("Minimum AF diagnostic coverage (>=)", _fraction(frequency_validation.get("minimum_overlap_fraction"))),
-            ("Rule 1 (retain original AF)", frequency_validation["rule_1_passed"]),
-            ("Rule 1 failed requirements", frequency_validation.get("rule_1_failed_requirements") or "None"),
-            ("Rule 2 (select replacement)", frequency_validation["rule_2_passed"]),
-            ("Rule 2 failed requirements", frequency_validation.get("rule_2_failed_requirements") or "None"),
-            ("Combined whole-study AF decision", frequency_validation.get("decision_reason")),
-        ])
     reporting_decisions = {**decisions, "report_failure": decisions.get("report_failure")
         or (manifest.get("failure") or {}).get("message") or record.get("failure_reason")}
-    rows.extend((label, value) for _kind, label, value in native_frequency_screen_fields(reporting_decisions))
-    rows.extend((label, value) for _kind, label, value in replacement_frequency_fields(reporting_decisions))
-    rows.extend((label, value) for _kind, label, value in external_frequency_fields(reporting_decisions))
+    rows.extend((label, value) for _kind, label, value in frequency_summary_fields(
+        reporting_decisions, resources=(dataset.get("resource_preflight") or {}).get("resources_by_chromosome")))
     strand = [
         ("Strand reference", _text(record.get("strand_reference_panel")) + " / " + _text(record.get("strand_reference_population"))),
         ("Study strand consensus", record.get("strand_consensus")),

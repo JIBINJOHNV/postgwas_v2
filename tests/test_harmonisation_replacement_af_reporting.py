@@ -31,18 +31,17 @@ def test_passed_reports_show_final_approval_and_source_reuse_without_mutation(tm
     decisions = validate(fixture(tmp_path, same=same))
     before = deepcopy(decisions)
     for report in reports(decisions):
-        assert "Replacement validation" in report
-        assert "Passed; replacement EAF accepted for assignment" in report
+        assert "Frequency decision" in report
+        assert "Replacement approved" in report
         assert "assignment pending" not in report
-        assert "Replacement correlation" in report
-        assert "1; required &gt;= 0.95" in report or "1; required >= 0.95" in report
-        assert "Replacement major frequency" in report
-        assert "6 / 12 (50.00%); required &gt; 20.00%" in report or "6 / 12 (50.00%); required > 20.00%" in report
-        assert "Original study AF preserved" in report
+        assert "Replacement consistency" in report
+        assert "correlation 1; mean absolute difference" in report
+        assert "Detailed evidence" in report
+        assert decisions["eaf_replacement_validation"]["major_fraction"] == .5
+        assert "Original column" in report
         assert "population-reference proxy" in report
-        assert "Reused default-reference evidence" in report
-        assert ("Yes" if same else "No") in report
-        assert "full identities retained in structured evidence" in report.lower()
+        assert ("Prepared reference reused; this is not independent confirmation" in report) is same
+        assert "source identities" in report.lower()
         assert str(tmp_path) in report
     identities = decisions["eaf_replacement_validation"]["source"]["identities"]
     assert set(identities) == {"1"}
@@ -53,7 +52,7 @@ def test_passed_reports_show_final_approval_and_source_reuse_without_mutation(tm
 def test_provisional_selection_never_claims_acceptance_or_assignment_permission(tmp_path):
     decisions = fixture(tmp_path)[2]
     for report in reports(decisions):
-        assert "Provisionally selected; replacement validation pending" in report
+        assert "Replacement validation pending" in report
         assert "accepted for assignment" not in report
         assert "Assign selected reference EAF during chromosome processing" not in report
 
@@ -77,13 +76,13 @@ def test_numeric_failures_report_fixed_denominator_thresholds_and_all_reasons(tm
         assert "Inconclusive; dataset stopped before chromosome analysis" in report
         assert reason in report
         assert "12 / 24 (50.00%)" in report
-        assert "Replacement correlation" in report
-        assert "Replacement mean absolute difference" in report
-        assert "Replacement major frequency" in report
-        assert "unmatched original rows" in report
+        assert "Replacement consistency" in report
+        assert "mean absolute difference" in report
+        assert "Detailed evidence" in report
+        assert decisions["eaf_replacement_validation"]["excluded_counts"]["unmatched_original_rows"] == 12
         assert "accepted for assignment" not in report
         if not decisions["eaf_replacement_validation"]["shared_evidence_gate_passed"]:
-            assert "not available; required" in report
+            assert "correlation not available" in report
         for failed in decisions["eaf_replacement_validation"]["failed_requirements"]:
             assert failed.replace("_", " ") in report
 
@@ -97,7 +96,7 @@ def test_late_identity_failure_overrides_earlier_numeric_pass(tmp_path):
         assert "Invalid; dataset stopped before chromosome analysis" in report
         assert "replacement inputs changed" in report
         assert "accepted for assignment" not in report
-        assert "Replacement correlation" in report
+        assert "Replacement consistency" in report
 
 
 def test_early_io_failure_keeps_replacement_unvalidated(tmp_path):
@@ -145,13 +144,13 @@ def test_final_replacement_report_survives_visible_and_hidden_canonical_recordin
         capture_output=True, text=True, timeout=60, check=False)
     assert completed.returncode == 0, completed.stderr
     assert completed.stderr == ""
-    assert ("accepted for assignment" in completed.stdout) is visible
+    assert ("Replacement approved" in completed.stdout) is visible
     for path in (tmp_path / "screen.log", tmp_path / "logs" / "study_dataset.log"):
         raw = path.read_text()
         if path.name == "study_dataset.log":
             raw = "\n".join(line[_PREFIX_WIDTH:] for line in raw.splitlines())
         report = normal(raw)
-        assert "Passed; replacement EAF accepted for assignment" in report
+        assert "Replacement approved" in report
         assert "\x1b" not in report
 
 
@@ -160,11 +159,11 @@ def test_real_preparation_report_contains_only_terminal_replacement_outcome(tmp_
     from test_harmonisation_eaf_replacement_resources import test_real_dataset_preparation_selects_then_stages_replacement
     test_real_dataset_preparation_selects_then_stages_replacement(tmp_path, monkeypatch, mode)
     report = normal(capsys.readouterr().out)
-    assert "Provisionally selected; replacement validation pending" not in report
+    assert "Replacement validation pending" not in report
     assert report.count("Study-wide decisions and evidence") == 1
     assert report.count("Selected build") == 1
     if mode == "distinct":
-        assert "accepted for assignment" in report
+        assert "Replacement approved" in report
         assert "INFO" in report.split("Study-wide decisions and evidence", 1)[1]
         log = (tmp_path / "logs" / "study_dataset.log").read_text()
         assert log.index("Split by chromosome") < log.index("Dataset-wide INFO score type")
