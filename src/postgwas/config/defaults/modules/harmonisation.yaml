@@ -1398,20 +1398,20 @@ policies:
     strip_double_hash_lines:
       default: true
       help: |-
-        What it does: Removes the '##' metadata lines from the top of the study file before parsing.
-        When it applies: dataset step 03, as the very first thing done to the file, before the
-          delimiter is guessed and before anything is read.
+        What it does: Excludes leading '##' metadata and blank lines before CSV parsing.
+        When it applies: dataset step 03, after delimiter resolution and before the table is parsed.
         Values:
-          true - if any line begins with '##' the file is copied without those lines and the copy
-            is read; if there are none the original file is used untouched.
-          false - the '##' lines are left in place and the file is handed to the parser as it is.
-        Example: a file whose first line is '##fileformat=VCFv4.2' and whose second is
-          'CHR POS EA OA P' is copied to <file>.tsv starting at 'CHR POS EA OA P'. A .gz or .bgz
-          input is written out UNCOMPRESSED next to the original, so the input folder must be
-          writable and must have room for the plain-text copy.
-        Note: leave this on. The parser is not told that '##' means a comment, so with false the
-          line '##fileformat=VCFv4.2' becomes the column header, every real column name is lost
-          and the run fails on missing columns.
+          true - inspect physical lines in the decompressed stream until the first nonblank line
+            that does not start with '##'; parse from that table header. Counts are determined
+            separately for every file and logged. Later comment handling remains CSV-aware.
+          false - do not exclude metadata or tell the CSV parser to treat '##' as comments;
+            the input must already begin with a valid table header.
+        Example: a single-hash '#CHROM' table header is retained after any number of '##' lines.
+          Quotes in those leading metadata lines never enter the CSV parser. Normal data-field
+          quoting, including quoted multiline values, remains enabled.
+        Note: the original file is read-only. Shared decompression opens supported compressed
+          inputs without creating an uncompressed sidecar or requiring a writable input folder.
+          No metadata field name, file-specific line number or preamble length is assumed.
       origin: summary_statistics_io.py:load_summary_statistics_table
       recommendation: null
       type: bool

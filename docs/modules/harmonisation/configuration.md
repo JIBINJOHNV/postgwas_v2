@@ -85,6 +85,23 @@ also propagates through the existing canonical failure logger. Lower-memory
 parsing reduces memory pressure rather than repairing malformed data
 ([Polars reader documentation](https://docs.pola.rs/api/python/version/0.20/reference/api/polars.read_csv.html)).
 
+With `input.strip_double_hash_lines: true` (the default), the reader excludes
+leading `##` metadata and blank physical lines before handing the table to
+Polars. It determines the header position and excluded-line counts separately
+for every file; there is no fixed preamble length or metadata-field repair.
+This prevents malformed quotes in descriptive metadata from confusing older
+CSV readers. The single-hash `#CHROM` header, data values, row order and normal
+quoted-field handling are retained. Scanning stops at the table header, so a
+line beginning with `##` inside a quoted multiline data value is preserved.
+
+Shared decompression supplies the positioned input stream without rewriting
+the source or creating a full uncompressed sidecar. The log records the skipped
+metadata and blank-line counts. An allocation-related retry returns to the same
+observed header position. Setting the policy to `false` disables metadata
+exclusion and comment handling; the input must then already have a valid table
+header. Independent input-to-VCF staging uses the same preamble helper and keeps
+its existing source-row identities and strict data validation.
+
 ### P-value representation
 
 `pvalue.type` and the sample-sheet `p_value_type` accept exactly `auto`, `raw`,

@@ -99,6 +99,37 @@ def open_text(path: str | Path) -> Iterator[TextIO]:
             yield text
 
 
+def skip_table_preamble(
+    stream: BinaryIO, *, comment_prefix: str | None,
+) -> tuple[int, int]:
+    """Position a decompressed stream at its table header; return line counts.
+
+    Metadata is a physical-line preamble, so its quotes must never enter the
+    CSV parser. Stop at the first nonblank, non-comment line and leave every
+    subsequent byte to that parser, including quoted multiline fields.
+    A missing prefix disables preamble handling entirely.
+    """
+    metadata_lines = blank_lines = 0
+    if comment_prefix is None:
+        return metadata_lines, blank_lines
+    if not comment_prefix:
+        raise ValueError("comment_prefix must not be empty")
+    prefix = comment_prefix.encode("utf-8")
+    while True:
+        position = stream.tell()
+        line = stream.readline()
+        if not line:
+            break
+        if line.startswith(prefix):
+            metadata_lines += 1
+        elif not line.strip():
+            blank_lines += 1
+        else:
+            stream.seek(position)
+            break
+    return metadata_lines, blank_lines
+
+
 def _sample_lines(
     path: str | Path,
     *,
@@ -211,4 +242,5 @@ __all__ = [
     "open_text",
     "pandas_csv_engine",
     "resolve_delimiter",
+    "skip_table_preamble",
 ]

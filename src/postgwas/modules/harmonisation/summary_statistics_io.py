@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import os
 import re
@@ -9,7 +10,9 @@ from pathlib import Path
 import polars as pl
 
 from postgwas.core.paths import configured_output_path
-from postgwas.core.io.delimiters import open_binary, open_text, resolve_delimiter
+from postgwas.core.io.delimiters import (
+    open_binary, open_text, resolve_delimiter, skip_table_preamble,
+)
 
 from postgwas.core.values import missing_tokens, optional_text
 
@@ -181,14 +184,35 @@ def load_summary_statistics_table(file_path: str, sample_column_dict: dict, poli
         "comment_prefix": comment_prefix,
         "schema_overrides": string_schema,
     }
-    try:
-        df = pl.read_csv(file_path, **read_options)
-    except MemoryError as e:
-        # Lower memory pressure can help an allocation failure; repeating a
-        # deterministic parser/schema error cannot repair the input table.
-        _emit(logger, "Primary read failed: %s" % e, warn=True)
-        _emit(logger, "Retrying with low_memory=True.", warn=True)
-        df = pl.read_csv(file_path, low_memory=True, **read_options)
+    with open_binary(file_path) as source:
+        metadata_lines, blank_lines = skip_table_preamble(
+            source, comment_prefix=comment_prefix,
+        )
+        header_position = source.tell()
+        if metadata_lines or blank_lines:
+            _emit(
+                logger,
+                "Skipped %d leading metadata line(s) and %d blank line(s) "
+                "before table parsing; source file unchanged."
+                % (metadata_lines, blank_lines),
+            )
+        # A plain file with no preamble retains Polars' native path fast path.
+        # Otherwise the shared decompressor and observed header position define
+        # the input; CSV-aware skip_rows cannot safely skip broken metadata.
+        parse_source = (
+            file_path
+            if header_position == 0 and isinstance(source, io.BufferedReader)
+            else source
+        )
+        try:
+            df = pl.read_csv(parse_source, **read_options)
+        except MemoryError as e:
+            # Lower memory pressure can help an allocation failure; repeating a
+            # deterministic parser/schema error cannot repair the input table.
+            _emit(logger, "Primary read failed: %s" % e, warn=True)
+            _emit(logger, "Retrying with low_memory=True.", warn=True)
+            source.seek(header_position)
+            df = pl.read_csv(parse_source, low_memory=True, **read_options)
     # ----------------------------
     # 4. Required columns  (de-duplicated: two config keys may name one column)
     # ----------------------------

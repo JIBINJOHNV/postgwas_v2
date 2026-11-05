@@ -445,7 +445,7 @@ documentation rather than generated policy descriptions.
 
 | Setting | Default | Allowed values | Decision or action |
 |---|---|---|---|
-| `input.strip_double_hash_lines` | `true` | `true` or `false` | Removes the '##' metadata lines from the top of the study file before parsing. Applies: dataset step 03, as the very first thing done to the file, before the delimiter is guessed and before anything is read. |
+| `input.strip_double_hash_lines` | `true` | `true` or `false` | Excludes leading '##' metadata and blank lines before CSV parsing. Applies: dataset step 03, after delimiter resolution and before the table is parsed. |
 | `input.delimiter` | `auto` | `auto`, `tab`, `comma`, `semicolon`, `space`, `whitespace` | Sets the character that separates columns in the summary-statistics file. Applies: dataset step 02 (the header check) and dataset step 03 (the read); any value other than 'auto' skips the guessing in both. |
 | `input.delimiter_candidates` | `[tab, comma, semicolon, space, pipe]` | non-empty unique list selected from `tab`, `comma`, `semicolon`, `space`, `whitespace`, `pipe` | Ordered delimiter names evaluated when input.delimiter is auto. |
 | `input.delimiter_sample_rows` | `500` | Integer ≥ `1` and ≤ `10000` | Number of non-empty, non-metadata rows used for delimiter detection. |

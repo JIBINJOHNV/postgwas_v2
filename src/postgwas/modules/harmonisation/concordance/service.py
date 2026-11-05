@@ -18,7 +18,9 @@ import pyarrow as pa
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
-from postgwas.core.io.delimiters import open_binary, open_text, resolve_delimiter
+from postgwas.core.io.delimiters import (
+    open_binary, open_text, resolve_delimiter, skip_table_preamble,
+)
 from postgwas.core.paths import configured_output_matches, configured_output_path
 from postgwas.core.pipeline_logging import PipelineLogger
 from postgwas.core.processes import run_checked_command
@@ -312,15 +314,6 @@ def _stage_csv_batches(
     """
     del schema_inference_rows  # Projected source tokens intentionally remain text.
 
-    leading_rows = 0
-    if comment_prefix:
-        with open_text(source) as handle:
-            for line in handle:
-                if not line.strip() or line.startswith(comment_prefix):
-                    leading_rows += 1
-                    continue
-                break
-
     def invalid_row_handler(invalid_row) -> str:
         if comment_prefix and invalid_row.text.startswith(comment_prefix):
             return "skip"
@@ -330,10 +323,10 @@ def _stage_csv_batches(
     rows = 0
     try:
         with open_binary(source) as source_handle:
+            skip_table_preamble(source_handle, comment_prefix=comment_prefix)
             with pa.PythonFile(source_handle, mode="r") as stream:
                 reader = pacsv.open_csv(
                     stream,
-                    read_options=pacsv.ReadOptions(skip_rows=leading_rows),
                     parse_options=pacsv.ParseOptions(
                         delimiter=separator,
                         invalid_row_handler=invalid_row_handler,
