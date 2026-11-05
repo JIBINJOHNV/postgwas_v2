@@ -29,7 +29,7 @@ import os
 import shutil
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from postgwas.core.paths import (
     configured_output_matches,

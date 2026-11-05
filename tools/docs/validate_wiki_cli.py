@@ -86,7 +86,9 @@ def documented_commands(
                         f"Cannot parse command in {source.relative_to(REPOSITORY_ROOT)}: "
                         f"{command}: {exc}"
                     ) from exc
-                indexes = [index for index, token in enumerate(tokens) if token == "postgwas"]
+                # Environment/container names are option values, not commands.
+                indexes = [index for index, token in enumerate(tokens)
+                           if token == "postgwas" and (index == 0 or tokens[index - 1] != "--name")]
                 for index in indexes:
                     candidate = tokens[index:]
                     if len(candidate) > 1 and candidate[1] != "activate":

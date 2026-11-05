@@ -122,7 +122,7 @@ def get_magma_parser(add_help=False, *, direct_controls=False):
         metavar="TEXT",
         default=argparse.SUPPRESS,
         help=help_with_default(
-            "Scientific context represented by the positional gene-location file",
+            "Gene or tissue context represented by the positional gene-location file",
             positional_definition.context,
         ),
     )

@@ -13,7 +13,7 @@ Policies read here
 input.null_values   configured reader tokens added to shared identifier sentinels
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import polars as pl
 

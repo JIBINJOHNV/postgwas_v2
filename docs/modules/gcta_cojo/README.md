@@ -143,7 +143,7 @@ labels retain the single-command path. The safe fallback is deliberate: it
 prevents an unrecognised chromosome label from being silently omitted.
 
 Every chromosome worker receives the complete `.ma` file and the same PLINK
-reference, exclusions, thresholds and scientific settings; only GCTA's `--chr`
+reference, exclusions, thresholds and analysis settings; only GCTA's `--chr`
 candidate restriction differs. This follows GCTA's recommendation to retain
 all available summary variants for phenotypic-variance estimation while doing
 COJO selection chromosome by chromosome. Results are merged in numeric

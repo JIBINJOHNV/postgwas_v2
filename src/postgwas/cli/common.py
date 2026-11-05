@@ -1363,9 +1363,6 @@ def get_common_pops_parser(add_help=False):
     return parser
 
 
-from rich_argparse import RawTextRichHelpFormatter
-
-
 def get_common_sumstat_filter_parser(add_help=False):
     from postgwas.config import load_configuration
     from postgwas.core.ui import help_with_default

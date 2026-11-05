@@ -503,15 +503,22 @@ def _staged_frequency_bindings(resource_maps, source_files, staging_summary, lab
     return bindings
 
 
-def _effect_frequency_view(frame, matches, keys, policies, assignments=None, assignment=None):
+def _effect_frequency_view(
+    frame, matches, keys, policies, assignments=None, assignment=None,
+    *, study_columns_canonical=False,
+):
     """Select one safely aligned AF per source row from an already prepared join.
 
     Default-unmatched rows with an unambiguous external assignment still enter
     the screen. Ambiguous orientations stay missing; AF never selects a strand.
     Only narrow cached-value joins are used here, without reference I/O.
+    Preparation can supply its full, already-normalized original key frame;
+    direct callers retain normalization by default.
     """
-    original, _ = canonicalize_variant_frame(frame.select(SOURCE_INPUT_ROW_COLUMN, *keys.values()),
-        keys, policies, error_type=StudyAlleleFrequencyError, label="effect-frequency screen keys")
+    original = frame.select(SOURCE_INPUT_ROW_COLUMN, *keys.values())
+    if not study_columns_canonical:
+        original, _ = canonicalize_variant_frame(original,
+            keys, policies, error_type=StudyAlleleFrequencyError, label="effect-frequency screen keys")
     local_keys = {role: "__postgwas_effect_key_" + role for role in keys}
     original = original.rename({keys[role]: name for role, name in local_keys.items()})
     resolved = matches.filter(pl.col("__strand_candidates") == 1)
@@ -521,12 +528,12 @@ def _effect_frequency_view(frame, matches, keys, policies, assignments=None, ass
     ).otherwise(pl.col("__strand_af"))
     orientation = resolved.select(SOURCE_INPUT_ROW_COLUMN, STRAND_ACTION_COLUMN,
         default_value.alias("default_frequency"))
-    known = matches.select(SOURCE_INPUT_ROW_COLUMN).unique().with_columns(pl.lit(True).alias("__known_reference"))
-    selected = original.join(orientation, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True).join(
-        known, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True)
+    selected = original.join(orientation, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True)
     if assignments is None:
         return selected.select(SOURCE_INPUT_ROW_COLUMN,
             pl.col("default_frequency").alias("effect_frequency"), "default_frequency")
+    known = matches.select(SOURCE_INPUT_ROW_COLUMN).unique().with_columns(pl.lit(True).alias("__known_reference"))
+    selected = selected.join(known, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True)
     reverse = pl.col(STRAND_ACTION_COLUMN).is_in(["reverse_complement", "reverse_complement_swapped"])
     selected = selected.with_columns([
         pl.when(reverse).then(reverse_complement_expression(pl.col(local_keys[role]))).otherwise(pl.col(local_keys[role])).alias(local_keys[role])
@@ -621,13 +628,21 @@ def _require_unchanged_replacement_binding(binding):
         raise StudyAlleleFrequencyError(label + " partition changed; rerun dataset preparation.")
 
 
-def _replacement_candidate_keys(frame, matches, keys, policies, *, label="replacement assignment keys"):
-    """Enumerate possible output keys without using replacement AF to orient rows."""
+def _replacement_candidate_keys(
+    frame, matches, keys, policies, *, label="replacement assignment keys",
+    study_columns_canonical=False,
+):
+    """Enumerate output keys without using replacement AF to orient rows.
+
+    A canonical input must still contain every original source row, including
+    those without an eligible default-reference diagnostic match.
+    """
     columns = [SOURCE_INPUT_ROW_COLUMN, *keys.values()]
-    original, _ = canonicalize_variant_frame(
-        frame.select(columns), keys, policies, error_type=StudyAlleleFrequencyError,
-        label=label,
-    )
+    original = frame.select(columns)
+    if not study_columns_canonical:
+        original, _ = canonicalize_variant_frame(
+            original, keys, policies, error_type=StudyAlleleFrequencyError, label=label,
+        )
     candidates = original.join(matches.select(
         SOURCE_INPUT_ROW_COLUMN, "__strand_alt", "__strand_ref",
     ), on=SOURCE_INPUT_ROW_COLUMN, how="inner").with_columns(
@@ -914,10 +929,14 @@ def _prepare_selected_allele_frequency(
                 working, _ = canonicalize_variant_frame(frame.drop([PREPARED_INPUT_COLUMN, PREPARED_MATCHES_COLUMN]),
                     keys, pol, error_type=StudyAlleleFrequencyError, warn=emit.warn,
                     label="replacement frequency diagnostic keys")
+                # Retain every original source row and its once-normalized
+                # alleles before diagnostic eligibility or ALT/REF projection.
+                canonical_keys = working.select(SOURCE_INPUT_ROW_COLUMN, *keys.values())
                 working = working.join(eligible, on=SOURCE_INPUT_ROW_COLUMN, how="inner").with_columns(
                     pl.col("__strand_alt").alias(keys["ea"]), pl.col("__strand_ref").alias(keys["oa"]))
                 if same_source:
-                    effect_view = _effect_frequency_view(frame, matches, keys, pol)
+                    effect_view = _effect_frequency_view(canonical_keys, matches, keys, pol,
+                        study_columns_canonical=True)
                     reused.append(chromosome)
                     if initial_external:
                         raw_screens[chromosome] = prepared["duplicate_statistics"]["raw_frequency_screen"]
@@ -929,8 +948,9 @@ def _prepare_selected_allele_frequency(
                             compression=str(pol.get("input.chromosome_partition_compression")))
                         cache_paths[chromosome] = cache_path
                 else:
-                    candidates = _replacement_candidate_keys(frame, matches, keys, pol,
-                        label="external AF assignment keys" if initial_external else "replacement assignment keys")
+                    candidates = _replacement_candidate_keys(canonical_keys, matches, keys, pol,
+                        label="external AF assignment keys" if initial_external else "replacement assignment keys",
+                        study_columns_canonical=True)
                     assignments, assignment, statistics = merge_external_allele_frequencies(
                         candidates, staged, replacement["column"], external_eaf_colmap, keys,
                         chromosome=chromosome, policies=pol, logger=logger, min_match_fraction=0.0,
@@ -943,7 +963,8 @@ def _prepare_selected_allele_frequency(
                     raw_names = [assignment["value"], assignment["orientation"],
                         *assignment["frequency_columns"], *assignment["site_columns"]]
                     assignments = assignments.select(SOURCE_INPUT_ROW_COLUMN, *keys.values(), *raw_names)
-                    effect_view = _effect_frequency_view(frame, matches, keys, pol, assignments, assignment)
+                    effect_view = _effect_frequency_view(canonical_keys, matches, keys, pol, assignments, assignment,
+                        study_columns_canonical=True)
                     cache_column = unused_column_name("__postgwas_replacement_assignments", pl.scan_parquet(binding["partition"]["path"]))
                     cache = assignments.group_by(SOURCE_INPUT_ROW_COLUMN).agg(
                         pl.struct([*keys.values(), *raw_names]).alias(cache_column))
@@ -993,7 +1014,7 @@ def _prepare_selected_allele_frequency(
                 paired.write_parquet(paired_path, compression=str(pol.get("input.chromosome_partition_compression")))
                 paired_paths.append(paired_path)
                 bindings[chromosome] = binding
-                del frame, matches, eligible, working, paired, effect_view
+                del frame, matches, eligible, working, canonical_keys, paired, effect_view
             if initial_external:
                 evidence = _validate_initial_external_pairs(paired_paths, raw_screens, bindings,
                     replacement, external_eaf_colmap, exclusions, total, pol, emit, decisions[evidence_key],

@@ -76,7 +76,7 @@ from postgwas.core.pipeline_logging import (
 )
 from postgwas.core.ui import MeasuredProgress, StageProgress
 from postgwas.core.ui.screen import screen_field, screen_line
-from postgwas.core.paths import configured_output_matches, configured_output_path
+from postgwas.core.paths import configured_output_path
 from postgwas.core.io.artifacts import publish_artifact_set
 from postgwas.core.io.reports import write_json_report
 from postgwas.modules.harmonisation.rejects import (

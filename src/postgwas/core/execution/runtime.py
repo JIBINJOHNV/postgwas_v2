@@ -8,7 +8,6 @@ import glob
 import sys
 import subprocess
 import shutil
-from typing import Dict
 
 
 ## auto_detect_workers

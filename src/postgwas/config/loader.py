@@ -20,6 +20,9 @@ from postgwas.core.errors import ConfigurationError
 from postgwas.core.io.reports import write_yaml_report
 
 
+# Both loaders construct only standard YAML tags. The C implementation is
+# optional; keep the safe Python parser available without caching documents.
+_SAFE_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 MODULE_NAMES = tuple(ModulesConfig.model_fields)
 CONFIG_ALIASES = {
     "sumstat_filter": "filtering",
@@ -64,7 +67,7 @@ def _module_cli_overrides(
 def _read_yaml(path: Path) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as handle:
-            value = yaml.safe_load(handle) or {}
+            value = yaml.load(handle, Loader=_SAFE_YAML_LOADER) or {}
     except OSError as exc:
         raise ConfigurationError("Cannot read configuration %s: %s" % (path, exc)) from exc
     except yaml.YAMLError as exc:
@@ -77,7 +80,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 def _packaged_yaml(relative_path: str) -> dict[str, Any]:
     resource = files("postgwas.config").joinpath(relative_path)
     try:
-        value = yaml.safe_load(resource.read_text(encoding="utf-8")) or {}
+        value = yaml.load(resource.read_text(encoding="utf-8"), Loader=_SAFE_YAML_LOADER) or {}
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigurationError(
             "Cannot load packaged configuration %s: %s" % (relative_path, exc)

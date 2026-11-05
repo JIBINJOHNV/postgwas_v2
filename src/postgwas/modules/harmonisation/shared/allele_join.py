@@ -169,10 +169,6 @@ def deduplicate_reference_values(
     duplicate = pl.col(count_name) > 1
     exact = duplicate & (pl.col(distinct_name) == 1)
     non_identical = duplicate & (pl.col(distinct_name) > 1)
-    exact_groups = int(grouped.select(exact.sum()).item() or 0)
-    non_identical_groups = int(
-        grouped.select(non_identical.sum()).item() or 0
-    )
 
     def fail_for(mask: pl.Expr, kind: str, policy_key: str) -> None:
         conflicts = grouped.filter(mask)
@@ -218,36 +214,31 @@ def deduplicate_reference_values(
             non_identical_policy_key,
         )
 
-    exact_rows = int(
-        grouped.select(
-            pl.when(exact).then(pl.col(count_name)).otherwise(0).sum()
-        ).item()
-        or 0
-    )
-    non_identical_rows = int(
-        grouped.select(
-            pl.when(non_identical).then(pl.col(count_name)).otherwise(0).sum()
-        ).item()
-        or 0
-    )
     discard = pl.lit(False)
     if exact_action == "discard_all":
         discard = discard | exact
     if non_identical_action == "discard_all":
         discard = discard | non_identical
-    discarded_groups = int(grouped.select(discard.sum()).item() or 0)
+    counts = grouped.select([
+        exact.sum().alias("exact_groups"),
+        non_identical.sum().alias("non_identical_groups"),
+        pl.when(exact).then(pl.col(count_name)).otherwise(0).sum().alias("exact_rows"),
+        pl.when(non_identical).then(pl.col(count_name)).otherwise(0).sum().alias("non_identical_rows"),
+        discard.sum().alias("discarded_groups"),
+    ]).row(0, named=True)
+    counts = {key: int(value or 0) for key, value in counts.items()}
 
     resolved = grouped.filter(~discard).select([
         *[pl.col(key) for key in keys],
         pl.col(first_name).alias(value_column),
     ])
     statistics = {
-        "reference_duplicate_groups": exact_groups + non_identical_groups,
-        "reference_exact_duplicate_groups": exact_groups,
-        "reference_non_identical_duplicate_groups": non_identical_groups,
-        "reference_duplicate_groups_discarded": discarded_groups,
-        "reference_exact_duplicate_rows": exact_rows,
-        "reference_non_identical_duplicate_rows": non_identical_rows,
+        "reference_duplicate_groups": counts["exact_groups"] + counts["non_identical_groups"],
+        "reference_exact_duplicate_groups": counts["exact_groups"],
+        "reference_non_identical_duplicate_groups": counts["non_identical_groups"],
+        "reference_duplicate_groups_discarded": counts["discarded_groups"],
+        "reference_exact_duplicate_rows": counts["exact_rows"],
+        "reference_non_identical_duplicate_rows": counts["non_identical_rows"],
     }
     if frequency_output_columns is not None:
         sites = _reference_frequency_sites(

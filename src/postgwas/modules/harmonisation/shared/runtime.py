@@ -6,7 +6,7 @@ This module deliberately contains no scientific thresholds or formulas.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Iterable
+from typing import Iterable
 
 import polars as pl
 
