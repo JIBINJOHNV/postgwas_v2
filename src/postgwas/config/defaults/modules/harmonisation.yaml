@@ -3977,8 +3977,10 @@ policies:
           remain subject to the separate missing/range policies. No study rows change in this check.
         Values: A MAF column is at or below 0.5, but genuine EAF can have the same distribution when
           effect alleles are minor. Neither the study nor reference distribution alone proves meaning.
-          For external_eaf_file, chromosome step 04 retains its separate raw-frequency screen and
-          independent-panel EAF-versus-MAF classification, before applying allele-swap transformations.
+          With no mapped study AF, screen the selected external_eaf_file once after staging: pool
+          deduplicated raw counts over observed study chromosomes before any swap. A MAF-like source
+          uses the same whole-study rules against an independent default panel for the SAME external
+          counted allele. Zero usable frequencies fail; no default or replacement is auto-selected.
         Scientific basis: GWAS-SSF defines EAF relative to the listed effect allele. The 0.95 screen
           is a configurable PostGWAS heuristic, not a universal biological frequency distribution.
         Example: Study AF with 99.97% at or below 0.5 requires reference comparison; exactly 95%
@@ -4001,7 +4003,8 @@ policies:
         When it applies: Whole-study preflight pools uniquely oriented matches across all chromosomes
           when the study AF screen is MAF-like, for both complete raw-source AF rules. The
           replacement gate reuses this floor for unchanged original AF versus folded replacement
-          AF, pooled across the study. The external-file classifier uses this count per chromosome.
+          AF, pooled across the study. Initial external AF also pools this count before workers;
+          direct library classifiers without dataset approval retain their per-chromosome gate.
           Direct, swapped and valid reverse-complement study matches at eligible biallelic reference
           sites can contribute.
         Values: Integer at least 2. Too few matches stops that dataset before chromosome processing
@@ -4009,7 +4012,7 @@ policies:
           provide no evidence; their exclusion from diagnostics does not remove study rows.
         Scientific basis: A configurable evidence floor for GWAS-scale data, not a universal cutoff.
           It cannot prove the semantic meaning of every supplied AF value.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference; allele_frequency.py:validate_replacement_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference; allele_frequency.py:validate_replacement_frequency_pairs; allele_frequency.py:validate_external_allele_frequency
       recommendation: null
       type: int
       validator:
@@ -4032,10 +4035,11 @@ policies:
           The absolute eaf.maf_reference_min_overlap floor must also pass. Insufficient coverage is
           inconclusive and cannot authorize MAF replacement. A provisionally selected replacement
           must independently pass the same fixed-N coverage gate; its diagnostic exclusions also
-          remain in N. Ordinary external-source comparisons
-          keep their existing absolute count gate, without this whole-study fraction gate.
+          remain in N. Initial external AF uses the same fixed N and pooled coverage, including
+          unmatched and diagnostic-ineligible study rows. Direct library comparisons without a
+          dataset approval retain their existing absolute count gate.
         Scientific basis: A user-selected QC heuristic, not a validated proof of EAF semantics.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs; allele_frequency.py:validate_external_allele_frequency
       recommendation: null
       type: float
       validator:
@@ -4056,7 +4060,9 @@ policies:
           Rule 1 also requires direct raw-source correlation and mean absolute difference to pass.
         Values: Finite proportion from 0 to 1; equality fails. Rule 1 alone passing retains the
           original AF, rule 2 alone passing selects an explicit replacement, and both or neither
-          passing stops the dataset. This policy does not govern ordinary external-source callers.
+          passing stops the dataset. Initial external AF uses the same rule for the external counted
+          allele: rule 1 alone accepts; rule 2 alone stops without replacement because native study
+          AF is absent. Direct library classifiers without dataset approval remain unchanged.
         Scientific basis: A user-selected QC heuristic, not proof of column semantics or provenance.
       origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs
       recommendation: null
@@ -4079,12 +4085,15 @@ policies:
           for rule 2. Both rules are evaluated even when rule 1 passes. A selected replacement must
           separately meet this correlation minimum for unchanged original AF versus min(B, 1-B),
           where B is replacement frequency aligned to the original listed study effect allele.
+          For initially selected external AF, compare raw external counted-allele AF against default
+          AF for that SAME allele. External assignment swaps complement both values; study swaps
+          do not define this comparison. Both panels require unique non-palindromic biallelic evidence.
         Values: Finite proportion from 0 to 1; equality passes. Undefined, non-finite or constant
           vector correlations fail the relevant rule. Each rule also requires its own mean absolute
           difference and strict reference-profile gate. The configured correlation method is shared.
         Scientific basis: User-selected QC support, not semantic proof or empirical calibration.
           The independent eaf.maf_reference_min_correlation governs ordinary external classifiers.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs; allele_frequency.py:validate_external_allele_frequency
       recommendation: null
       type: float
       validator:
@@ -4109,9 +4118,11 @@ policies:
           A provisionally selected replacement also requires B > 0.5 strictly above this fraction,
           using the same eligible paired rows and B in original study-effect-allele direction;
           B exactly 0.5 is not major. This separate all-five gate adds no error-advantage margin.
+          Initial external rule 2 uses default AF for the external counted allele; only rule 2
+          passing supports external MAF and stops without selecting another source.
         Scientific basis: User-selected QC support, not proof of column semantics. Near-half
           population differences can make EAF and MAF fits similar; no extra error-gap rule applies.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs; allele_frequency.py:validate_external_allele_frequency
       recommendation: null
       type: float
       validator:
@@ -4127,11 +4138,12 @@ policies:
       help: |-
         What it does: Selects the correlation statistic for reference-frequency agreement.
         When it applies: Whole-study rules compare unchanged supplied AF with aligned reference AF
-          and reference MAF respectively, using eaf.study_reference_min_correlation. Ordinary
-          external-source classifiers compare folded vectors with eaf.maf_reference_min_correlation.
+          and reference MAF respectively, using eaf.study_reference_min_correlation. Initial external
+          AF uses these same pooled rules. Direct library classifiers without dataset approval
+          compare folded vectors with eaf.maf_reference_min_correlation.
         Values: pearson measures linear agreement; spearman measures rank agreement. Correlation
           must be finite, and the applicable count, mean-error and reference-profile gates also pass.
-          The replacement gate uses the same selected method over all pooled pairs. Pearson uses
+          Initial external and replacement gates use the same selected method over pooled pairs. Pearson uses
           stable centered sufficient statistics. Spearman uses exact global ranks with ties, never
           chromosome-local ranks or an average of correlations. Before global ranking, the existing
           execution memory budget, headroom, per-variant estimate and safety factor are checked;
@@ -4139,7 +4151,7 @@ policies:
           intentionally leaves direct-library ranking unbounded; estimates are not OS memory limits.
         Scientific basis: Correlation alone cannot establish effect-allele alignment. GWAS-SSF
           requires AF to refer to the listed effect allele, even when that allele is usually minor.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference; allele_frequency.py:validate_replacement_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference; allele_frequency.py:validate_replacement_frequency_pairs; allele_frequency.py:validate_external_allele_frequency
       recommendation: null
       type: enum
       validator:
@@ -4180,7 +4192,7 @@ policies:
         Values: Frequency units; equality passes. This is an aggregate mean, not squared error,
           a per-variant tolerance or a filtering rule. All diagnostic pairs contribute. Correlation,
           count and the mode-specific coverage and reference-profile gates must also pass.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs; allele_frequency.py:validate_external_allele_frequency
       recommendation: null
       type: float
       validator:
@@ -4196,9 +4208,8 @@ policies:
       help: |-
         What it does: Detects ordinary directional comparisons unable to distinguish EAF from MAF
           because the reference effect alleles are predominantly minor.
-        When it applies: Ordinary external-source classifiers and direct chromosome helpers without
-          a whole-study decision. The whole-study truth table uses neither this upper profile veto
-          nor the directional error margin.
+        When it applies: Direct external-source and chromosome helpers without a dataset approval.
+          The whole-study truth table uses neither this upper profile veto nor the directional error margin.
         Values: A share strictly above the cutoff makes ordinary directional inference inconclusive.
           Whole-study rules use their separate strict lower minor and major profile controls.
       origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs

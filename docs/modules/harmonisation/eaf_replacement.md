@@ -44,9 +44,9 @@ comparison panel supports the MAF interpretation. A confirmed MAF input without
 an explicit replacement stops that dataset. Insufficient or conflicting evidence
 continues to stop the dataset. The replacement table is then checked by the
 separate whole-study gate below before its EAF can be adopted. It does not
-supply the initial MAF decision or palindrome orientation. An ordinary sample-sheet external EAF source keeps its existing
-source-selection and comparison rules; frequency attachment uses the same
-validated allele-frequency join described below.
+supply the initial MAF decision or palindrome orientation. A sample-sheet external EAF source
+selected because no study AF is mapped uses the separate initial-external whole-study
+validation described below; attachment reuses the same validated allele-frequency join.
 
 For a MAF-like study column, require at least 1,000 pooled usable pairs and
 coverage >= 50% of all rows entering AF preflight after upstream preparation.
@@ -88,7 +88,7 @@ Use finite proportions from 0 to 1, not `90`. Correlation and error equality
 pass; profile equality fails. AF exactly 0.5 counts toward the minor fraction.
 Undefined, non-finite or constant-vector correlations fail the relevant rule.
 The shared method remains Pearson by default, with Spearman supported.
-The separate ordinary external classifier retains
+Direct library classifiers without dataset approval retain
 `eaf.maf_reference_min_correlation: 0.90`,
 `eaf.maf_reference_error_margin: 0.02` and its upper directional
 `eaf.reference_minor_fraction_cutoff: 0.95`.
@@ -250,8 +250,9 @@ finalization recalculates row counts, unresolved-site reasons, coordinate-level
 site counts and coverage on the actual surviving worker rows. Private cache
 fields are removed before strand rejection/output handling. The original AF,
 all five gates, original-EA diagnostic B, complete-site REF arithmetic and effect
-transformations remain unchanged. The worker records
-`reused_prepared_replacement_assignments` and zero `external_rows_loaded`.
+transformations remain unchanged. The replacement worker records
+`reused_prepared_replacement_assignments` and zero `external_rows_loaded`. Initial
+external assignments use `reused_prepared_external_assignments`.
 
 Numeric passes replay temporary paired Parquet files. Cache publication adds a
 compressed partition rewrite and retains a narrow chromosome cache/join build
@@ -272,3 +273,87 @@ fingerprints. This applies to files outside `resources.root`, YAML settings,
 `--option VALUE` and `--option=VALUE`. A changed tracked source invalidates the
 completed checkpoint under the canonical restart policy. Original study MAF,
 replacement source and final EAF interpretation remain distinct in provenance.
+
+
+## Initially selected external AF when study AF is absent
+
+No mapped study AF remains an explicit absence. After existing chromosome partitioning
+and shared external-table staging, `validate_external_allele_frequency` validates the
+sample sheet's selected external source once before any chromosome worker. It records
+`eaf_external_validation`, distinct from original-study and explicit-replacement
+validation. Its selected values remain a population-reference proxy.
+
+The raw screen pools deduplicated usable counts and counts at or below 0.5 over
+observed study chromosomes. It never averages chromosome fractions, counts one
+whole-source chromosome twice, or includes unobserved source chromosomes. Zero usable
+frequencies stop the dataset. A non-MAF-like source retains its declared ALT/EAF
+contract without an independent semantic comparison.
+
+For a MAF-like source, the comparison uses raw external counted-allele frequency `x`
+and independent default-reference frequency `r` for that **same external allele**.
+With external assignment swap `s` in default ALT direction,
+`x = 1-assigned_AF if s else assigned_AF` and
+`r = 1-default_ALT_AF if s else default_ALT_AF`. The original study/default swap
+is independent of `s`. Both panels must supply unique non-palindromic biallelic
+evidence before any complement or folding; complete-site membership is established
+before allele filtering. Other rows remain available for final attachment and QC.
+
+The same configured defaults apply: at least 1,000 pooled pairs and coverage at least
+0.50 of **all study rows originally entering AF preparation**, then the two rules
+above using correlation 0.95, MAE 0.10, minor fraction strictly above 0.90 and major
+fraction strictly above 0.20. Rule 1 alone accepts declared external EAF. Rule 2 alone
+supports external MAF and stops; both or neither passing is inconclusive and stops.
+There is no original study AF for the explicit-replacement consistency contract,
+so no replacement/default source is selected automatically. The same physical file,
+including aliases or another population column, cannot supply independent confirmation.
+
+Preparation reuses nullable reference matching, complete assignments, narrow replayable
+Parquet spools, stable pooled Pearson statistics and the existing exact-Spearman memory
+estimate. It appends prepared default matches and assignment caches atomically to the
+original work shards only after global acceptance. The old shard fingerprint is checked
+after streaming and immediately before replacement. All publication and final identity
+checks must pass before approval; partial publication never authorizes workers.
+
+Workers verify source, declared aliases, staged paths, default reference, mappings,
+policies, software, descriptor and exact cached-row bindings before strand work. They
+reuse prepared orientation and only the assignment for the final allele key, without
+another source parse, heavy match, semantic classification, or MAF warning. Missing or
+changed global approval fails without falling back. Direct helpers outside dataset
+preparation retain their legacy classification contract. Actual per-chromosome usable
+coverage, missing/invalid/degenerate AF, palindrome, complete-site REF, duplicates,
+strand/effect transformations and final output concordance remain enforced.
+
+Canonical logs, terminal/hidden-screen summaries, manifests and HTML consume saved
+`eaf_external_validation` evidence. Per-chromosome semantic metrics are superseded by
+that global evidence; actual row-level QC remains per chromosome. Cache adoption records
+zero loaded source rows and the existing cache-reuse marker. No configuration keys,
+thresholds, CLI flags or protected adapters change.
+
+The available five-chromosome EGG extract has 972,784 eligible pairs among 2,077,782
+study rows (0.46818386144455965), so it must fail the canonical 0.50 coverage gate
+before metrics. It is not a positive whole-GWAS test. Full 22-chromosome/server success
+and 100–200M-row capacity are unverified. Existing premerge memory and exact-Spearman
+limitations described above still apply. The linked GWAS-SSF/IGSR/VCF sources define
+allele semantics; they do not calibrate these configured QC heuristics.
+
+
+Initial-external resource preflight retains all header/index/build checks while
+deferring its legacy content-semantic screen through the existing
+`validate_frequency_semantics` interface. The observed-chromosome pooled raw
+screen is the sole initial-source classifier; unobserved source chromosomes
+cannot trigger an early same-file semantic veto.
+
+Before staging, preparation binds original external and default declared aliases
+to the identities from resource preflight. It rechecks those aliases and the
+preflight identities after staging. The existing staging producer now records
+its before-read source identity and checks it before publication, then records
+identities for its published partitions. Global external preparation requires
+those producer identities when attachment uses a staged image; it never accepts
+a fresh post-staging snapshot as proof of an earlier source. Source/default alias
+retargeting, original content mutation, changed staged values, and absent producer
+proof stop with external-AF evidence before workers. Direct unstaged library calls
+capture their bindings before their own reads. These are provenance fields, not
+new configuration settings. Ordinary-mode failures use external-AF wording and
+`external_inputs_changed`, `external_staging_failed`, or
+`external_cache_publication_failed` as appropriate; replacement-mode diagnostics
+retain their established strings.

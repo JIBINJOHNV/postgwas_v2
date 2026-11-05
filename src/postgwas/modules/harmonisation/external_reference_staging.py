@@ -13,7 +13,7 @@ while each worker reads only its chromosome-sized partition.
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -21,6 +21,7 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from postgwas.core.io.delimiters import open_text, resolve_delimiter
+from postgwas.core.input_validation import capture_preflight_file_identities, require_unchanged_preflight_files
 from postgwas.core.paths import configured_output_path
 from postgwas.core.values import optional_text
 
@@ -294,6 +295,8 @@ def _partition_group(
     policies,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     group = plan.group
+    source_identities = capture_preflight_file_identities([group.source],
+        error_type=ExternalReferenceStagingError, label="Shared external reference staging input")
     detected = resolve_delimiter(
         group.source,
         group.configured_delimiter,
@@ -394,9 +397,11 @@ def _partition_group(
         ) from failure
 
     try:
+        require_unchanged_preflight_files(source_identities,
+            error_type=ExternalReferenceStagingError, label="Shared external reference staging input")
         for chromosome in chromosomes:
             temporary[chromosome].replace(destinations[chromosome])
-    except OSError as exc:
+    except Exception as exc:
         for path in temporary.values():
             path.unlink(missing_ok=True)
         raise ExternalReferenceStagingError(
@@ -408,6 +413,13 @@ def _partition_group(
         {chromosome: str(path) for chromosome, path in destinations.items()},
         {
             "source": str(group.source),
+            "source_identity": {**asdict(source_identities[0]), "path": str(source_identities[0].path)},
+            "partition_identities": {
+                chromosome: {**asdict(identity), "path": str(identity.path)}
+                for chromosome, identity in zip(chromosomes,
+                    capture_preflight_file_identities((destinations[c] for c in chromosomes),
+                        error_type=ExternalReferenceStagingError, label="Staged external reference partition"))
+            },
             "roles": [role.resource_key for role in group.roles],
             "selected_columns": list(group.columns),
             "rows_read": rows_read,

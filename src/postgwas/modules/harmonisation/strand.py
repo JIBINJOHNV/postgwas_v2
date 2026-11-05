@@ -189,7 +189,7 @@ def resolve_strand_consensus(genome_build_info, build, policies=None):
 
 
 def _load_reference(
-    path, population_col, colmap, policies, chromosome, *, warn=None,
+    path, population_col, colmap, policies, chromosome, *, warn=None, screen_chromosomes=None,
 ):
     raw, _detected = read_reference_variant_table(
         path,
@@ -257,7 +257,8 @@ def _load_reference(
     )
     reference = reference.join(site_eligibility, on=["__strand_chr", "__strand_pos"], how="left", coalesce=True)
     duplicate_stats["raw_frequency_screen"] = frequency_maf_screen(
-        reference,
+        (reference.filter(pl.col("__strand_chr").is_in(screen_chromosomes))
+         if screen_chromosomes is not None else reference),
         "__strand_af",
         float(policies.get("eaf.maf_decision_cutoff")),
     )
@@ -408,7 +409,7 @@ def _reference_match_contract(path, population, mapping, columns, policies):
     identity["path"] = str(identity["path"])
     return {
         "reference": identity, "population": population, "mapping": dict(mapping),
-        "study_columns": {key: columns[key] for key in
+        "study_columns": {key: columns.get(key) for key in
                           ("chr_col", "pos_col", "ea_col", "oa_col", "eaf_col")},
         "policies": {key: policies.get(key) for key in POLICY_KEYS},
     }
@@ -417,6 +418,7 @@ def _reference_match_contract(path, population, mapping, columns, policies):
 def _reference_input(columns):
     return pl.struct([SOURCE_INPUT_ROW_COLUMN] + [
         columns[key] for key in ("chr_col", "pos_col", "ea_col", "oa_col", "eaf_col")
+        if columns.get(key) is not None
     ])
 
 
@@ -457,7 +459,7 @@ def prepare_study_reference_matches(
     _validate_source_row_ids(df, "Study reference preparation")
     study = df.select([SOURCE_INPUT_ROW_COLUMN] + [
         columns[key] for key in ("chr_col", "pos_col", "ea_col", "oa_col")
-    ] + [frequency_column])
+    ] + ([frequency_column] if frequency_column is not None else []))
     row_col = SOURCE_INPUT_ROW_COLUMN
     inputs = study.select(row_col, _reference_input(columns).alias(PREPARED_INPUT_COLUMN))
     study, _ = canonicalize_variant_frame(
@@ -473,6 +475,7 @@ def prepare_study_reference_matches(
         reference_file, population_column, reference_mapping, policies,
         ",".join(study[columns["chr_col"]].unique().sort().to_list()),
         warn=warn,
+        screen_chromosomes=study[columns["chr_col"]].unique().to_list() if frequency_column is None else None,
     )
     candidates = _reference_orientation_candidates(
         study, reference, columns, row_col, str(policies.get("strand.mode")),
@@ -489,7 +492,8 @@ def prepare_study_reference_matches(
         pl.col(PREPARED_MATCHES_COLUMN).fill_null([])
     )
     return (
-        _study_reference_frequency_pairs(candidates, row_col, frequency_column),
+        (_study_reference_frequency_pairs(candidates, row_col, frequency_column)
+         if frequency_column is not None else pl.DataFrame()),
         packed, {"contract": contract, "duplicate_statistics": duplicates,
                  "diagnostic_statistics": {"excluded_non_biallelic_rows":
                      candidates.filter(~pl.col("__strand_biallelic")).select(row_col).n_unique()}},
@@ -850,7 +854,10 @@ def harmonise_strand_orientation(
     prepared_columns = (PREPARED_MATCHES_COLUMN, PREPARED_INPUT_COLUMN)
     if prepared is not None:
         status = _study_value(study_decision, "eaf_reference_validation", {}).get("status")
-        accepted = status == "passed" or (
+        accepted = (
+            _study_value(study_decision, "eaf_external_validation", {}).get("status") == "passed"
+            and bool(_study_value(study_decision, "eaf_external_validation", {}).get("contract"))
+        ) or status == "passed" or (
             status == "replacement_selected"
             and _study_value(study_decision, "eaf_selected_source") == "replacement_reference"
             and _study_value(study_decision, "eaf_input_interpretation") == "maf"

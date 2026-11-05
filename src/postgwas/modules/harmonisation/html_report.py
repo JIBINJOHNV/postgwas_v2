@@ -21,7 +21,7 @@ from postgwas.core.pipeline_logging import _elapsed
 from postgwas.modules.harmonisation.report_steps import (
     chromosome_steps, dataset_steps, post_merge_steps, summarise_chromosome_evidence,
 )
-from postgwas.modules.harmonisation.study_reporting import replacement_frequency_fields
+from postgwas.modules.harmonisation.study_reporting import replacement_frequency_fields, external_frequency_fields
 
 
 _STATUS_STYLES = {
@@ -939,6 +939,7 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
     reporting_decisions = {**decisions, "report_failure": decisions.get("report_failure")
         or (manifest.get("failure") or {}).get("message") or record.get("failure_reason")}
     rows.extend((label, value) for _kind, label, value in replacement_frequency_fields(reporting_decisions))
+    rows.extend((label, value) for _kind, label, value in external_frequency_fields(reporting_decisions))
     strand = [
         ("Strand reference", _text(record.get("strand_reference_panel")) + " / " + _text(record.get("strand_reference_population"))),
         ("Study strand consensus", record.get("strand_consensus")),

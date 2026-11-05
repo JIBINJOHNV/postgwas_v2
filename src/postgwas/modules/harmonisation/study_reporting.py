@@ -343,6 +343,77 @@ def render_replacement_frequency_validation(study_decisions):
     return "\n".join(screen_summary_card("genetic", "Whole-study replacement AF validation", fields)) if fields else ""
 
 
+def external_frequency_fields(decisions):
+    """Present initial external-source evidence without calling it study AF."""
+    if not decisions.get("eaf_external_validation_required"):
+        return []
+    evidence = decisions.get("eaf_external_validation") or {}
+    status = evidence.get("status")
+    accepted = status == "passed" and bool(evidence.get("contract"))
+    outcome = ("Passed; external EAF accepted for assignment" if accepted else
+        "Numeric gates passed; external approval not recorded" if status == "passed" else
+        "Inconclusive; dataset stopped before chromosome analysis" if status == "inconclusive" else
+        "Invalid; dataset stopped before chromosome analysis" if status == "invalid" else
+        "Not validated; dataset stopped before external approval" if decisions.get("report_failure") else
+        "External EAF selected; whole-study validation and assignment pending.")
+    fields = [
+        ("analysis" if accepted else "error" if status in ("inconclusive", "invalid") else "info", "External validation", outcome),
+        ("info", "Frequency provenance", "Population-reference proxy; no study frequency column supplied."),
+    ]
+    if not evidence:
+        return fields
+    screen = evidence.get("raw_frequency_screen") or {}
+    fields.extend([
+        ("count", "Study rows entering AF preflight (fixed N)", format_count(evidence.get("study_variant_count"), missing="not available")),
+        ("info", "Raw external AF at or below 0.5", _pair(screen.get("at_or_below_0_5"), screen.get("usable"))),
+        ("info", "Raw external MAF-like screen", _text(screen.get("maf_like"))),
+        ("info", "External decision reason", _words(evidence.get("failure_reason", evidence.get("decision_reason")))),
+    ])
+    partial_screens = evidence.get("raw_frequency_screens_by_chromosome") or {}
+    if partial_screens and "raw_frequency_screen" not in evidence:
+        fields.append(("info", "Raw external screen scope",
+            "Partial preparation; %s chromosome(s) screened; whole-study screen not finalized." % len(partial_screens)))
+        fields.extend(("info", "Chromosome %s raw external AF <= 0.5" % chromosome,
+            _pair(item.get("at_or_below_0_5"), item.get("usable")))
+            for chromosome, item in partial_screens.items())
+    if "comparable_variants" in evidence:
+        fields.extend([
+            ("count", "External comparable variants", "%s; required >= %s" % (format_count(evidence.get("comparable_variants")), format_count(evidence.get("minimum_overlap")))),
+            ("info", "External diagnostic coverage", "%s; required >= %s" % (_pair(evidence.get("comparable_variants"), evidence.get("study_variant_count")), format_fraction_percentage(evidence.get("minimum_overlap_fraction")))),
+            ("info", "External correlation method", _text(evidence.get("maf_correlation_method"))),
+            ("info", "External shared evidence gate", "Passed" if evidence.get("shared_evidence_gate_passed") else "Failed"),
+            ("info", "External direct correlation", "%s; required >= %s" % (format_number(evidence.get("direct_eaf_correlation")), format_number(evidence.get("minimum_study_correlation")))),
+            ("info", "External direct mean absolute difference", "%s; required <= %s" % (format_number(evidence.get("mean_eaf_error")), format_number(evidence.get("maximum_mean_absolute_maf_difference")))),
+            ("info", "Reference frequency of external counted allele <= 0.5", "%s; required > %s" % (format_fraction_percentage(evidence.get("reference_effect_allele_minor_fraction")), format_fraction_percentage(evidence.get("minimum_reference_effect_allele_minor_fraction")))),
+            ("info", "External AF versus reference MAF correlation", format_number(evidence.get("supplied_to_reference_maf_correlation"))),
+            ("info", "External AF versus reference MAF mean absolute difference", format_number(evidence.get("mean_maf_error"))),
+            ("info", "Reference frequency of external counted allele > 0.5", "%s; required > %s" % (format_fraction_percentage(evidence.get("reference_effect_allele_major_fraction")), format_fraction_percentage(evidence.get("minimum_reference_effect_allele_major_fraction")))),
+        ])
+        for rule, label in ((1, "Retain declared external EAF"), (2, "External MAF support; stop without replacement")):
+            evaluated = "rule_%s_passed" % rule in evidence
+            fields.append(("info", "External rule %s: %s" % (rule, label),
+                _text(evidence["rule_%s_passed" % rule]) if evaluated else "Not evaluated"))
+            fields.append(("info", "External rule %s failed requirements" % rule,
+                ("; ".join(_words(item) for item in evidence.get("rule_%s_failed_requirements" % rule) or []) or "None")
+                if evaluated else "Not evaluated"))
+    for key, label in (("estimated_rank_memory_bytes", "Spearman estimated rank memory (bytes)"),
+                       ("available_rank_memory_bytes", "Spearman available rank memory (bytes)")):
+        if key in evidence:
+            fields.append(("info", label, format_number(evidence[key])))
+    if evidence.get("failure_message"):
+        fields.append(("error", "External failure details", evidence["failure_message"]))
+    fields.extend(("count", "External excluded: %s" % _words(key), format_count(value))
+        for key, value in (evidence.get("excluded_counts") or {}).items())
+    fields.append(("info", "External source and mapping", json.dumps(evidence.get("source") or {}, sort_keys=True, ensure_ascii=False)))
+    fields.append(("info", "External interpretation", "Configured QC heuristics support this source decision; they do not prove column semantics or measured study EAF. Normal chromosome QC and output concordance still apply."))
+    return fields
+
+
+def render_external_frequency_validation(study_decisions):
+    fields = external_frequency_fields(study_decisions or {})
+    return "\n".join(screen_summary_card("genetic", "Whole-study external AF validation", fields)) if fields else ""
+
+
 def _frequency_fields(decisions, policies, resources):
     evidence = decisions.get("eaf_evidence") or {}
     comparison = decisions.get("eaf_reference_validation") or {}
@@ -350,10 +421,8 @@ def _frequency_fields(decisions, policies, resources):
     source = decisions.get("eaf_selected_source")
     column = decisions.get("eaf_column")
     if column is None and decisions.get("eaf_is_maf_source") == "no_study_frequency_column":
-        return [
-            ("info", "Input frequency", "No study frequency column supplied"),
-            ("info", "Selected source", "External EAF selected; per-chromosome validation and assignment pending."),
-        ]
+        return [("info", "Input frequency", "No study frequency column supplied"),
+            *external_frequency_fields(decisions)]
     fields = [("info", "Input column", column or "Not recorded")]
     if evidence:
         fields.extend([
@@ -505,4 +574,5 @@ def render_study_decisions(
     return "\n".join(lines)
 
 
-__all__ = ["render_study_decisions", "render_replacement_frequency_validation", "replacement_frequency_fields"]
+__all__ = ["render_study_decisions", "render_replacement_frequency_validation", "replacement_frequency_fields",
+    "render_external_frequency_validation", "external_frequency_fields"]

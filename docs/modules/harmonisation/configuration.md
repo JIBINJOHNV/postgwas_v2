@@ -1644,41 +1644,17 @@ discusses reference-frequency QC; [Polars correlation](https://docs.pola.rs/py-p
 provides the configured correlation implementation. Subsequent swaps follow the
 [GWAS Catalog harmonisation rules](https://ebispot.github.io/gwas-sumstats-harmoniser-documentation/Introduction/Harmonising-the-variants/).
 
-The **ordinary sample-sheet external-file classifier** retains its separate
-correlation default of 0.90 and unchanged error margin of 0.02. Its absolute
-overlap behavior remains unchanged; whole-study coverage/profile rules do
-not apply to it. Its
-frequency is screened on its deduplicated raw values before this swap operation. A non-MAF-like result
-retains the sample sheet's declared ALT/EAF meaning. A MAF-like result requires
-an independent default panel; if `external_eaf_file` and the resource selected
-by `modules.harmonisation.default_eaf.source` resolve to the same physical file,
-processing stops and asks for a different default source. The frequency column is
-accepted as EAF only after at least `eaf.maf_reference_min_overlap`
-non-palindromic matches. PostGWAS first folds both frequency columns as
-`MAF = min(AF, 1-AF)` and requires the configured Pearson or Spearman
-correlation to reach `eaf.maf_reference_min_correlation` and their mean
-absolute difference not to exceed
-`eaf.maf_reference_max_mean_absolute_difference`. Both requirements must pass:
-a high correlation alone can hide a systematic frequency offset, and a missing
-correlation from a constant frequency vector is inconclusive. This gate checks
-whether the default population panel is compatible enough for the direction
-test; folding removes allele direction and therefore cannot prove that the
-study field is EAF.
-
-After that suitability gate, the aligned reference must also be informative:
-no more than `eaf.reference_minor_fraction_cutoff` of its EAF values may be at
-or below 0.5. The column is classified as EAF only when its mean absolute error
-as EAF is lower than its error as folded MAF by more than
-`eaf.maf_reference_error_margin`; the reverse error separation confirms MAF.
-Too few matches, an unsuitable default panel, a reference set dominated by
-minor effect alleles, or errors closer than the required margin are
-inconclusive. Confirmed MAF and inconclusive results both stop with the measured
-evidence; neither is silently used as effect-aligned EAF. Palindromic A/T and
-C/G variants do not contribute to this decision. Population-frequency
-differences motivating the compatibility gate are documented by the
-[1000 Genomes Project Consortium](https://doi.org/10.1038/nature15393); the
-resulting EAF must still satisfy the
-[GWAS-SSF effect-allele-frequency contract](https://www.ebi.ac.uk/gwas/docs/summary-statistics-format).
+When no native study AF is mapped, the sample-sheet external source now uses a
+whole-study validation after staging and before workers. Raw deduplicated counts are
+pooled over observed chromosomes. MAF-like sources require the same count, fixed-N
+coverage and dual-rule gates as study AF, with default AF aligned to the SAME external
+counted allele. Rule 1 alone accepts; rule 2 alone, both, or neither stop without
+replacement. The same physical source, including aliases/different population columns,
+cannot independently confirm itself. Approved workers reuse checked assignments and
+retain all per-variant QC. See [initial external AF](eaf_replacement.md#initially-selected-external-af-when-study-af-is-absent)
+for exact direction, publication, provenance and scale contracts. Direct library
+classifiers without dataset preparation retain the documented 0.90 correlation,
+0.02 directional-margin and 0.95 upper minor-profile controls.
 
 All non-VCF reference tables use the same shared, compressed-file-aware reader.
 Before a reference reader materializes any rows, PostGWAS checks the delimited

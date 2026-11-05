@@ -120,10 +120,12 @@ from postgwas.modules.harmonisation.allele_frequency import (
     same_frequency_reference_source,
     validate_study_allele_frequency,
     validate_replacement_allele_frequency,
+    validate_external_allele_frequency,
+    capture_external_frequency_sources,
     StudyAlleleFrequencyError,
 )
 from postgwas.modules.harmonisation.study_reporting import (
-    render_replacement_frequency_validation, render_study_decisions,
+    render_replacement_frequency_validation, render_external_frequency_validation, render_study_decisions,
 )
 from postgwas.modules.harmonisation.sample_size import (
     harmonise_sample_sizes,
@@ -3246,6 +3248,7 @@ def _prepare_dataset_for_chromosome_processing(
             vcf_config=vcf_config,
             policies=policies,
             require_default_eaf=True,
+            validate_frequency_semantics=study_decisions.get("eaf_column") is not None,
             logger=logger,
         )
     except ResourcePreflightError as exc:
@@ -3480,7 +3483,13 @@ def _prepare_dataset_for_chromosome_processing(
                 ", ".join(sorted(chr_file_by_chrom, key=_chromosome_sort_key)),
             )
         )
+        external_source_bindings = None
         try:
+            if study_decisions.get("eaf_selected_source") == "external_eaf":
+                require_unchanged_preflight_files(preflight_resource_identities(resource_preflight),
+                    error_type=StudyAlleleFrequencyError, label="Whole-study external AF validation inputs")
+                external_source_bindings = capture_external_frequency_sources(resource_maps,
+                    expected_identities=resource_preflight["file_identities"])
             resource_maps, staging_summary = (
                 stage_shared_external_reference_files(
                     resource_maps,
@@ -3499,25 +3508,60 @@ def _prepare_dataset_for_chromosome_processing(
                     logger=logger,
                 )
             )
-        except ExternalReferenceStagingError as exc:
-            raise PipelineError(
-                "%s No chromosome worker was started; fix the user EAF/INFO "
-                "file or external-reference staging configuration and rerun."
-                % exc
-            ) from exc
+            if external_source_bindings is not None:
+                require_unchanged_preflight_files(preflight_resource_identities(resource_preflight),
+                    error_type=StudyAlleleFrequencyError, label="Whole-study external AF validation inputs")
+        except (StudyAlleleFrequencyError, ExternalReferenceStagingError) as exc:
+            if study_decisions.get("eaf_selected_source") != "external_eaf":
+                raise PipelineError(
+                    "%s No chromosome worker was started; fix the user EAF/INFO "
+                    "file or external-reference staging configuration and rerun." % exc
+                ) from exc
+            reason = "external_inputs_changed" if isinstance(exc, StudyAlleleFrequencyError) else "external_staging_failed"
+            failed_decisions = dict(study_decisions)
+            failed_decisions["eaf_external_validation"] = {"status": "invalid", "failure_reason": reason,
+                "decision_reason": reason, "study_variant_count": study_decisions.get("eaf_external_study_variant_count")}
+            error = StudyAlleleFrequencyError("Whole-study external AF validation: %s" % exc,
+                study_decisions=failed_decisions)
+            _report_study_failure(logger, error, failed_decisions, genome_build_info=genome_build_info,
+                build_reference_files=build_reference_files, policies=policies, resource_maps=resource_maps)
+            raise error from exc
         resource_preflight["external_reference_staging"] = staging_summary
         try:
+            study_decisions = validate_external_allele_frequency(
+                chromosome_partitions, sample_column_dict, study_decisions,
+                resource_maps, external_eaf_colmap, default_eaf_colmap,
+                original_resource_maps=resource_preflight["resources_by_chromosome"],
+                source_bindings=external_source_bindings, staging_summary=staging_summary,
+                policies=policies, logger=logger,
+            )
+            if external_source_bindings is not None:
+                require_unchanged_preflight_files(preflight_resource_identities(resource_preflight),
+                    error_type=StudyAlleleFrequencyError, label="Whole-study external AF validation inputs")
             study_decisions = validate_replacement_allele_frequency(
                 chromosome_partitions, sample_column_dict, study_decisions,
                 resource_maps, external_eaf_colmap, policies=policies, logger=logger,
             )
         except Exception as exc:
+            if external_source_bindings is not None and getattr(exc, "study_decisions", None) is None:
+                failed_decisions = dict(study_decisions)
+                evidence = dict(failed_decisions.get("eaf_external_validation") or {})
+                evidence.update(status="invalid", failure_reason="external_inputs_changed")
+                evidence.pop("contract", None)
+                failed_decisions["eaf_external_validation"] = evidence
+                exc.study_decisions = failed_decisions
             _report_study_failure(
                 logger, exc, study_decisions, genome_build_info=genome_build_info,
                 build_reference_files=build_reference_files, policies=policies,
                 resource_maps=resource_maps,
             )
             raise
+        for key in ("eaf_external_validation", "eaf_external_source", "eaf_external_study_variant_count", "eaf_external_validation_required"):
+            if key in study_decisions:
+                dataset_study_decisions[key] = study_decisions[key]
+                ctx.extra[key] = study_decisions[key]
+        if "eaf_external_validation" in study_decisions:
+            _announce(logger, render_external_frequency_validation(study_decisions))
         if "eaf_replacement_validation" in study_decisions:
             dataset_study_decisions["eaf_replacement_validation"] = study_decisions["eaf_replacement_validation"]
             ctx.extra["eaf_replacement_validation"] = study_decisions["eaf_replacement_validation"]

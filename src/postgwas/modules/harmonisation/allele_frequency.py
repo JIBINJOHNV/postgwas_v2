@@ -20,7 +20,9 @@ What this module does, in order:
     A-versus-folded-B consistency and major-profile gate after dataset staging.
     A remains original study AF; B is aligned to the original listed effect
     allele. Only final passed, row/source-bound approval permits adoption.
-    Otherwise take the frequency from an external panel, matching each variant in
+    Otherwise validate the initially selected external source once after staging
+    and before chromosome workers, retaining separate external-source evidence.
+    Then take frequency from its approved cache, matching each variant in
     the two orientations named by ``eaf.match_orientations`` (direct and swap —
     never complement). For an ordinary sample-sheet external source, before swap
     alignment, screen the deduplicated raw
@@ -115,6 +117,8 @@ __all__ = [
     "validate_study_allele_frequency",
     "validate_replacement_frequency_pairs",
     "validate_replacement_allele_frequency",
+    "validate_external_allele_frequency",
+    "capture_external_frequency_sources",
     "STEP_LABEL",
     "STEP_TITLE",
     "POLICY_KEYS",
@@ -221,6 +225,9 @@ def validate_study_allele_frequency(
     evidence = {"status": "not_applicable", "decision_reason": "no_study_frequency"}
     decisions["eaf_selected_source"] = "study_supplied" if column is not None else "external_eaf"
     decisions["eaf_input_interpretation"] = "eaf" if column is not None else None
+    if column is None:
+        decisions["eaf_external_validation_required"] = True
+        decisions["eaf_external_study_variant_count"] = df.height
     if column is not None:
         if initial is not True and initial is not False:
             raise StudyAlleleFrequencyError(
@@ -425,12 +432,43 @@ def same_frequency_reference_source(path, column, mapping, reference_path, refer
     )
 
 
-def _replacement_file_identity(path):
+def _frequency_validation_label(initial_external):
+    return "Whole-study external AF validation" if initial_external else "EAF replacement validation"
+
+
+def _replacement_file_identity(path, *, label="EAF replacement validation input"):
     """Use the invocation-local identity contract for original and staged inputs."""
     identity, = capture_preflight_file_identities(
-        [path], error_type=StudyAlleleFrequencyError, label="EAF replacement validation input",
+        [path], error_type=StudyAlleleFrequencyError, label=label,
     )
     return {**asdict(identity), "path": str(identity.path)}
+
+
+def capture_external_frequency_sources(resource_maps, *, expected_identities=None):
+    """Bind each declared alias before staging, including its resolved identity.
+
+    When preflight identities are available, a retargeted alias must not bless a
+    different source merely because the old resolved target remains unchanged.
+    """
+    bindings = {}
+    label = _frequency_validation_label(True)
+    for chromosome, resources in resource_maps.items():
+        path = optional_text(resources.get("user_eaf_file"))
+        if path is None:
+            raise StudyAlleleFrequencyError(label + " lacks its selected original external source.")
+        identity = _replacement_file_identity(path, label=label + " input")
+        if expected_identities and identity not in expected_identities:
+            raise StudyAlleleFrequencyError(label + " original source changed after resource preflight; rerun dataset preparation.")
+        reference_path = optional_text(resources.get("default_eaf_file"))
+        if reference_path is None:
+            raise StudyAlleleFrequencyError(label + " lacks its selected default reference.")
+        reference_identity = _replacement_file_identity(reference_path, label=label + " default reference")
+        if expected_identities and reference_identity not in expected_identities:
+            raise StudyAlleleFrequencyError(label + " default reference changed after resource preflight; rerun dataset preparation.")
+        bindings[chromosome] = {"path": str(Path(path).expanduser().absolute()), "identity": identity,
+            "reference_path": str(Path(reference_path).expanduser().absolute()), "reference_identity": reference_identity}
+    return bindings
+
 
 
 def _replacement_configuration(columns, decisions, mapping, policies):
@@ -439,6 +477,10 @@ def _replacement_configuration(columns, decisions, mapping, policies):
         "study_columns": {key: columns.get(key) for key in
                           ("chr_col", "pos_col", "ea_col", "oa_col", "eaf_col")},
         "replacement": decisions.get("eaf_replacement"),
+        "external_source": decisions.get("eaf_external_source"),
+        "external_validation_required": decisions.get("eaf_external_validation_required"),
+        "external_column": columns.get("eafcolumn") if decisions.get("eaf_external_validation_required") else None,
+        "external_study_variant_count": decisions.get("eaf_external_study_variant_count"),
         "original_evidence": decisions.get("eaf_reference_validation"),
         "original_interpretation": decisions.get("eaf_input_interpretation"),
         "mapping": mapping, "policies": policies.resolved_dict(),
@@ -448,24 +490,25 @@ def _replacement_configuration(columns, decisions, mapping, policies):
 
 def _require_unchanged_replacement_binding(binding):
     """Check every source plus the checksummed generated row-evidence partition."""
+    label = _frequency_validation_label(binding.get("source_mode") == "external_eaf")
     original_reference = binding["prepared_reference"]["contract"]["reference"]
     for pathname, expected in (
         (binding["source_path"], binding["source"]),
         (binding.get("staged_path"), binding.get("staged")),
         (binding["reference_path"], original_reference),
     ):
-        if expected is not None and expected != _replacement_file_identity(pathname):
-            raise StudyAlleleFrequencyError("EAF replacement validation inputs changed; rerun dataset preparation.")
+        if expected is not None and expected != _replacement_file_identity(pathname, label=label + " input"):
+            raise StudyAlleleFrequencyError(label + " inputs changed; rerun dataset preparation.")
     if binding["partition"] != prepared_work_fingerprint(binding["partition_path"], error_type=StudyAlleleFrequencyError):
-        raise StudyAlleleFrequencyError("EAF replacement validation partition changed; rerun dataset preparation.")
+        raise StudyAlleleFrequencyError(label + " partition changed; rerun dataset preparation.")
 
 
-def _replacement_candidate_keys(frame, matches, keys, policies):
+def _replacement_candidate_keys(frame, matches, keys, policies, *, label="replacement assignment keys"):
     """Enumerate possible output keys without using replacement AF to orient rows."""
     columns = [SOURCE_INPUT_ROW_COLUMN, *keys.values()]
     original, _ = canonicalize_variant_frame(
         frame.select(columns), keys, policies, error_type=StudyAlleleFrequencyError,
-        label="replacement assignment keys",
+        label=label,
     )
     candidates = original.join(matches.select(
         SOURCE_INPUT_ROW_COLUMN, "__strand_alt", "__strand_ref",
@@ -510,6 +553,7 @@ def _reserve_assignment_columns(assignments, assignment, working, *, reserved=()
 
 def _consume_replacement_assignments(frame, cache, descriptor, keys, policies, *, chromosome, emit, logger, ctx, rejects):
     """Select only the key chosen by existing strand processing; never rematch a source."""
+    label = "External AF" if descriptor.get("source_mode") == "external_eaf" else "EAF replacement"
     assignment = descriptor["assignment"]
     # Public destinations depend only on scientific input, as in a fresh merge.
     destination = unused_column_name(descriptor["statistics"]["source_column"], frame)
@@ -517,7 +561,7 @@ def _consume_replacement_assignments(frame, cache, descriptor, keys, policies, *
     candidates = cache.explode(packed_column).unnest(packed_column)
     join_keys = [SOURCE_INPUT_ROW_COLUMN, *keys.values()]
     if candidates.select(pl.struct(join_keys).is_duplicated().any()).item():
-        raise AlleleFrequencyError("EAF replacement cache contains duplicate assignment keys.")
+        raise AlleleFrequencyError(label + " cache contains duplicate assignment keys.")
     candidates, assignment = _reserve_assignment_columns(candidates, assignment, frame, reserved=(destination,))
     marker = unused_column_name("__postgwas_cached_assignment", frame, candidates, reserved=(destination,))
     order = unused_column_name("__postgwas_cached_order", frame, candidates, reserved=(destination, marker))
@@ -526,11 +570,13 @@ def _consume_replacement_assignments(frame, cache, descriptor, keys, policies, *
         # source row; this does not permit null-key matches to reference alleles.
         on=join_keys, how="left", coalesce=True, join_nulls=True).sort(order)
     if selected.height != frame.height or selected[marker].null_count():
-        raise AlleleFrequencyError("EAF replacement cache lacks a known assignment for an oriented study row.")
+        raise AlleleFrequencyError(label + " cache lacks a known assignment for an oriented study row.")
     selected = selected.drop(marker)
     assignment["row"] = order
     stats = dict(descriptor["statistics"])
-    stats.update(external_rows_loaded=0, reused_prepared_replacement_assignments=True,
+    reuse_marker = ("reused_prepared_external_assignments" if descriptor.get("source_mode") == "external_eaf"
+                    else "reused_prepared_replacement_assignments")
+    stats.update(external_rows_loaded=0, **{reuse_marker: True},
         min_match_fraction=float(policies.get("eaf.external_min_match_fraction")))
     assignment["reason"] = unused_column_name(assignment["reason"], selected, reserved=(destination,))
     assignment["biallelic"] = None
@@ -554,56 +600,190 @@ def validate_replacement_allele_frequency(
     """
     if study_decisions.get("eaf_selected_source") != "replacement_reference":
         return dict(study_decisions)
+    return _prepare_selected_allele_frequency(chromosome_partitions, sample_columns,
+        study_decisions, resource_maps, external_eaf_colmap, policies=policies, logger=logger)
+
+
+def validate_external_allele_frequency(
+    chromosome_partitions, sample_columns, study_decisions, resource_maps,
+    external_eaf_colmap, default_eaf_colmap, *, original_resource_maps,
+    policies=None, logger=None, source_bindings=None, staging_summary=None,
+):
+    """Approve initially selected external AF after staging, before any worker.
+
+    Original preflight paths remain authoritative declarations after staging;
+    no native study frequency is inferred or synthesized. Staged inputs require
+    source/default alias bindings captured before staging and producer identities
+    from the existing staging summary. Unstaged direct calls capture before reads.
+    """
+    if study_decisions.get("eaf_selected_source") != "external_eaf":
+        return dict(study_decisions)
+    decisions = deepcopy(study_decisions)
+    decisions["eaf_external_validation_required"] = True
+    decisions["eaf_external_source"] = {
+        "column": sample_columns.get("eafcolumn"),
+        "resolved_files": {c: r.get("user_eaf_file") for c, r in original_resource_maps.items()},
+        "declared_files": {c: r.get("user_eaf_file") for c, r in original_resource_maps.items()},
+    }
+    try:
+        if source_bindings is None:
+            if any(Path(resources["user_eaf_file"]).expanduser().absolute() !=
+                Path(original_resource_maps[c]["user_eaf_file"]).expanduser().absolute()
+                for c, resources in resource_maps.items()):
+                raise StudyAlleleFrequencyError(
+                    _frequency_validation_label(True) + " requires original source proof captured before external staging.")
+            source_bindings = capture_external_frequency_sources(original_resource_maps)
+        if source_bindings != capture_external_frequency_sources(original_resource_maps):
+            raise StudyAlleleFrequencyError(
+                _frequency_validation_label(True) + " original inputs or aliases changed after staging; rerun dataset preparation.")
+        staged_bindings = {}
+        for chromosome, resources in resource_maps.items():
+            # A produced pathname remains staged even if it is retargeted to
+            # an unchanged original. Its producer identity must still match.
+            if str(Path(resources["user_eaf_file"]).expanduser().absolute()) == source_bindings[chromosome]["path"]:
+                continue
+            producer = next((item for item in (staging_summary or {}).get("resources", [])
+                if "user_eaf_file" in item.get("roles", [])
+                and item.get("source_identity") == source_bindings[chromosome]["identity"]
+                and item.get("partitions", {}).get(chromosome) == resources["user_eaf_file"]), None)
+            expected = (producer or {}).get("partition_identities", {}).get(chromosome)
+            if expected is None or expected != _replacement_file_identity(resources["user_eaf_file"],
+                label=_frequency_validation_label(True) + " staged input"):
+                raise StudyAlleleFrequencyError(
+                    _frequency_validation_label(True) + " staged inputs changed or lack producer proof; rerun dataset preparation.")
+            staged_bindings[chromosome] = expected
+    except Exception as exc:
+        decisions["eaf_external_validation"] = {"status": "invalid", "failure_reason": "external_inputs_changed",
+            "decision_reason": "external_inputs_changed", "study_variant_count": decisions.get("eaf_external_study_variant_count")}
+        raise StudyAlleleFrequencyError(str(exc), study_decisions=decisions) from exc
+    return _prepare_selected_allele_frequency(chromosome_partitions, sample_columns,
+        decisions, resource_maps, external_eaf_colmap, policies=policies, logger=logger,
+        initial_external=True, default_eaf_colmap=default_eaf_colmap, source_bindings=source_bindings, staged_bindings=staged_bindings)
+
+
+def _validate_initial_external_pairs(paired_paths, raw_screens, bindings, source, mapping,
+                                     exclusions, total, policies, emit, evidence):
+    """Screen raw counts, then compare independent same-counted-allele pairs."""
+    screen = {key: sum(item[key] for item in raw_screens.values())
+        for key in ("rows", "usable", "unusable", "at_or_below_0_5")}
+    screen.update(column_present=True, decision_cutoff=float(policies.get("eaf.maf_decision_cutoff")))
+    screen["low_fraction_of_usable"] = screen["at_or_below_0_5"] / screen["usable"] if screen["usable"] else 0.0
+    screen["maf_like"] = bool(screen["usable"] and screen["low_fraction_of_usable"] > screen["decision_cutoff"])
+    evidence.update(status="passed", decision_reason="external_frequency_not_predominantly_minor",
+        raw_frequency_screen=screen, study_variant_count=total, excluded_counts=exclusions,
+        source={**source, "mapping": dict(mapping),
+            "identities": {c: b["source"] for c, b in bindings.items()}})
+    if not screen["usable"]:
+        evidence.update(status="inconclusive", decision_reason="no_usable_external_frequencies")
+    elif screen["maf_like"]:
+        if any(os.path.samefile(b["source_path"], b["reference_path"]) for b in bindings.values()):
+            evidence.update(status="inconclusive", decision_reason="independent_reference_required")
+        else:
+            def usable_pairs():
+                for paired_path in paired_paths:
+                    batch = pl.read_parquet(paired_path)
+                    yield batch.filter(pl.col("eligible").fill_null(False)
+                        & valid_frequency_mask(pl.col("study_frequency"))
+                        & valid_frequency_mask(pl.col("replacement_frequency")))
+            count = sum(batch.height for batch in usable_pairs())
+            interpretation, comparison = _compare_frequency_pairs(usable_pairs,
+                "study_frequency", "replacement_frequency", policies, emit, accept_direct_eaf=True,
+                study_variant_count=total, pair_count=count, comparison_evidence=evidence)
+            evidence.update(comparison, status="passed" if interpretation == "eaf" else "inconclusive",
+                maf_reference_decision=interpretation)
+    evidence["failed_requirements"] = evidence.get("shared_evidence_failed_requirements") or (
+        [] if evidence["status"] == "passed" else [evidence["decision_reason"]])
+    emit.decide("Whole-study external AF validation", evidence, evidence["status"])
+    return evidence
+
+
+def _prepare_selected_allele_frequency(
+    chromosome_partitions, sample_columns, study_decisions, resource_maps,
+    external_eaf_colmap, *, policies=None, logger=None, initial_external=False,
+    default_eaf_colmap=None, source_bindings=None, staged_bindings=None,
+):
+    """Share row-bound assignment, replay, publication and approval by AF mode."""
     pol = resolve_policies(policies)
     decisions = deepcopy(study_decisions)
     emit = active_context(logger)
-    replacement = decisions.get("eaf_replacement") or {}
+    evidence_key = "eaf_external_validation" if initial_external else "eaf_replacement_validation"
+    label = _frequency_validation_label(initial_external)
+    replacement = decisions.get("eaf_external_source" if initial_external else "eaf_replacement") or {}
+    if initial_external:
+        decisions[evidence_key] = {"status": "pending",
+            "study_variant_count": decisions.get("eaf_external_study_variant_count"),
+            "source": {**replacement, "mapping": dict(external_eaf_colmap),
+                "identities": {c: b["identity"] for c, b in source_bindings.items()}}}
     original = decisions.get("eaf_reference_validation") or {}
     try:
-        if (original.get("status") != "replacement_selected"
+        if not initial_external and (original.get("status") != "replacement_selected"
                 or decisions.get("eaf_input_interpretation") != "maf"
                 or decisions.get("eaf_is_maf") is not True):
             raise StudyAlleleFrequencyError("EAF replacement validation requires the original whole-study MAF decision.")
         paths, rows = chromosome_partitions.paths, chromosome_partitions.rows
-        total = original.get("study_variant_count")
+        total = decisions.get("eaf_external_study_variant_count") if initial_external else original.get("study_variant_count")
         if (isinstance(total, bool) or not isinstance(total, int) or total <= 0
                 or set(paths) != set(rows) or set(paths) != set(resource_maps)
                 or sum(rows.values()) != total):
-            raise StudyAlleleFrequencyError("EAF replacement validation partitions do not reconcile to the fixed original study variant count.")
-        column = sample_columns["eaf_col"]
+            raise StudyAlleleFrequencyError(label + " partitions do not reconcile to the fixed original study variant count.")
+        column = sample_columns.get("eaf_col")
         keys = {key: sample_columns[key + "_col"] for key in ("chr", "pos", "ea", "oa")}
-        projection = list(dict.fromkeys([SOURCE_INPUT_ROW_COLUMN, *keys.values(), column,
-            PREPARED_INPUT_COLUMN, PREPARED_MATCHES_COLUMN]))
+        projection = list(dict.fromkeys([SOURCE_INPUT_ROW_COLUMN, *keys.values()] +
+            ([column, PREPARED_INPUT_COLUMN, PREPARED_MATCHES_COLUMN] if not initial_external else [])))
         configuration = _replacement_configuration(sample_columns, decisions, external_eaf_colmap, pol)
+        raw_screens = {}
+        external_exclusion = "external_non_biallelic_or_unresolved_rows" if initial_external else "replacement_non_biallelic_or_unresolved_rows"
         bindings, reused, exclusions = {}, [], {"original_orientation_ineligible_rows": 0,
-            "replacement_non_biallelic_or_unresolved_rows": 0}
+            external_exclusion: 0}
+        if initial_external:
+            # These small observed counters remain explicitly per chromosome
+            # until the complete whole-study preparation reaches its screen.
+            decisions[evidence_key].update(raw_frequency_screens_by_chromosome=raw_screens,
+                excluded_counts=exclusions)
         # The spool is an internal temporary protocol, not a scientific output.
         # Native temporary names avoid a second output-layout filename policy.
         with TemporaryDirectory(dir=Path(next(iter(paths.values()))).parent) as temporary:
             paired_paths, cache_paths = [], {}
             for chromosome, path in paths.items():
                 prepared = decisions.get("eaf_prepared_references", {}).get(chromosome)
+                original_partition = prepared_work_fingerprint(path, error_type=StudyAlleleFrequencyError)
+                if initial_external:
+                    frame = pl.read_parquet(original_partition["path"], columns=projection)
+                    if any(name in pl.scan_parquet(path).schema for name in (PREPARED_INPUT_COLUMN, PREPARED_MATCHES_COLUMN)):
+                        raise StudyAlleleFrequencyError("Initial external AF input contains reserved preparation columns.")
+                    _, packed, prepared = prepare_study_reference_matches(frame, sample_columns, None,
+                        resource_maps[chromosome]["default_eaf_file"],
+                        resource_maps[chromosome]["default_eaf_reference_column"],
+                        default_eaf_colmap, pol, warn=emit.warn)
+                    frame = frame.join(packed, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True)
+                    decisions.setdefault("eaf_prepared_references", {})[chromosome] = prepared
+                    if prepared["contract"]["reference"] != source_bindings[chromosome]["reference_identity"]:
+                        raise StudyAlleleFrequencyError(label + " default reference changed during preparation; rerun dataset preparation.")
                 if not prepared:
-                    raise StudyAlleleFrequencyError("EAF replacement validation lacks prepared original orientation for chromosome %s." % chromosome)
+                    raise StudyAlleleFrequencyError((label + " lacks prepared original orientation for chromosome %s.") % chromosome)
                 reference = prepared["contract"]
                 source = replacement.get("resolved_files", {}).get(chromosome)
                 if source is None or optional_text(replacement.get("column")) is None:
-                    raise StudyAlleleFrequencyError("EAF replacement validation lacks the resolved replacement file or column.")
+                    raise StudyAlleleFrequencyError(label + (" lacks the resolved external file or column." if initial_external else " lacks the resolved replacement file or column."))
                 resources = resource_maps[chromosome]
                 same_source = same_frequency_reference_source(source, replacement["column"], external_eaf_colmap,
                     reference["reference"]["path"], reference["population"], reference["mapping"])
                 staged = resources.get("user_eaf_file") or (None if same_source else source)
-                binding = {"partition": prepared_work_fingerprint(path, error_type=StudyAlleleFrequencyError),
-                    "partition_path": str(Path(path).expanduser().absolute()), "source": _replacement_file_identity(source),
+                binding = {"partition": original_partition,
+                    "partition_path": str(Path(path).expanduser().absolute()), "source": (source_bindings[chromosome]["identity"] if initial_external else _replacement_file_identity(source)),
                     "source_path": str(Path(replacement.get("declared_files", {}).get(chromosome, source)).expanduser().absolute()),
-                    "staged": _replacement_file_identity(staged) if staged else None,
+                    "staged": (staged_bindings.get(chromosome) or _replacement_file_identity(staged, label=label + " input")) if initial_external and staged else
+                        _replacement_file_identity(staged, label=label + " input") if staged else None,
                     "staged_path": str(Path(staged).expanduser().absolute()) if staged else None,
                     "reference_path": str(Path(resources["default_eaf_file"]).expanduser().absolute()),
                     "prepared_reference": deepcopy(prepared)}
+                if initial_external:
+                    binding["source_mode"] = "external_eaf"
                 _require_unchanged_replacement_binding(binding)
-                frame = pl.read_parquet(binding["partition"]["path"], columns=projection)
+                if not initial_external:
+                    frame = pl.read_parquet(binding["partition"]["path"], columns=projection)
                 if frame.height != rows[chromosome]:
-                    raise StudyAlleleFrequencyError("EAF replacement validation partition row count changed for chromosome %s." % chromosome)
+                    raise StudyAlleleFrequencyError((label + " partition row count changed for chromosome %s.") % chromosome)
                 validate_prepared_reference_matches(frame, sample_columns, prepared,
                     resources["default_eaf_file"], resources["default_eaf_reference_column"], reference["mapping"], pol)
                 matches = unpack_prepared_reference_matches(frame, SOURCE_INPUT_ROW_COLUMN)
@@ -618,13 +798,23 @@ def validate_replacement_allele_frequency(
                     value = "__strand_af"
                     eligibility = "__strand_biallelic"
                     reused.append(chromosome)
+                    if initial_external:
+                        raw_screens[chromosome] = prepared["duplicate_statistics"]["raw_frequency_screen"]
+                        with NamedTemporaryFile(dir=temporary, delete=False) as handle:
+                            cache_path = Path(handle.name)
+                        packed.write_parquet(cache_path, compression=str(pol.get("input.chromosome_partition_compression")))
+                        cache_paths[chromosome] = cache_path
                 else:
-                    candidates = _replacement_candidate_keys(frame, matches, keys, pol)
+                    candidates = _replacement_candidate_keys(frame, matches, keys, pol,
+                        label="external AF assignment keys" if initial_external else "replacement assignment keys")
                     assignments, assignment, statistics = merge_external_allele_frequencies(
                         candidates, staged, replacement["column"], external_eaf_colmap, keys,
                         chromosome=chromosome, policies=pol, logger=logger, min_match_fraction=0.0,
-                        study_columns_canonical=True, declared_alt_frequency=True,
-                        retain_biallelic_eligibility=True, _prepare_only=True)
+                        study_columns_canonical=True, declared_alt_frequency=not initial_external,
+                        retain_biallelic_eligibility=True, _prepare_only=True,
+                        _screen_chromosomes=[chromosome] if initial_external else None)
+                    if initial_external:
+                        raw_screens[chromosome] = statistics.pop("raw_frequency_screen")
                     assignments, assignment = _reserve_assignment_columns(assignments, assignment, working)
                     raw_names = [assignment["value"], assignment["orientation"],
                         *assignment["frequency_columns"], *assignment["site_columns"]]
@@ -634,21 +824,39 @@ def validate_replacement_allele_frequency(
                     frequency_columns = assignment["frequency_columns"]
                     working = working.with_columns((~pl.col(frequency_columns[2]) & pl.col(frequency_columns[1]).is_null())
                         .fill_null(False).alias(eligibility))
-                    exclusions["replacement_non_biallelic_or_unresolved_rows"] += working.filter(~pl.col(eligibility)).height
+                    exclusions[external_exclusion] += working.filter(~pl.col(eligibility)).height
                     cache_column = unused_column_name("__postgwas_replacement_assignments", pl.scan_parquet(binding["partition"]["path"]))
                     cache = assignments.group_by(SOURCE_INPUT_ROW_COLUMN).agg(
                         pl.struct([*keys.values(), *raw_names]).alias(cache_column))
+                    if initial_external:
+                        cache = packed.join(cache, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True)
                     if cache.height != frame.height or cache[cache_column].null_count():
-                        raise StudyAlleleFrequencyError("Replacement assignment cache did not cover every source row.")
+                        raise StudyAlleleFrequencyError(("External AF" if initial_external else "Replacement") + " assignment cache did not cover every source row.")
                     with NamedTemporaryFile(dir=temporary, delete=False) as handle:
                         cache_path = Path(handle.name)
                     cache.write_parquet(cache_path, compression=str(pol.get("input.chromosome_partition_compression")))
                     cache_paths[chromosome] = cache_path
                     binding["assignment_cache"] = {"column": cache_column, "assignment": assignment, "statistics": statistics}
+                    if initial_external:
+                        binding["assignment_cache"]["source_mode"] = "external_eaf"
                     binding["assignment_cache_digest"] = configuration_digest(binding["assignment_cache"])
                     del candidates, assignments, cache
-                # Complement only two-allele evidence, back to ORIGINAL study EA.
-                paired = working.select(
+                if initial_external:
+                    # The proof has reached its private spool/cache. Do not keep
+                    # the preceding shard alive while preparing the next one.
+                    del packed
+                # The external assignment swap is independent of original study
+                # orientation. Complement only eligible two-allele evidence.
+                if initial_external:
+                    swapped = pl.lit(False) if same_source else pl.col(assignment["orientation"]) == 1
+                    external_frequency = pl.when(pl.col(eligibility)).then(pl.col(value)).otherwise(None)
+                    default_frequency = pl.when(pl.col(eligibility)).then(pl.col("__strand_af")).otherwise(None)
+                    paired = working.select(
+                        pl.when(swapped).then(1.0 - external_frequency).otherwise(external_frequency).alias("study_frequency"),
+                        pl.when(swapped).then(1.0 - default_frequency).otherwise(default_frequency).alias("replacement_frequency"),
+                        pl.col(eligibility).alias("eligible"))
+                else:
+                    paired = working.select(
                     pl.col(column).cast(pl.Float64, strict=False).alias("study_frequency"),
                     pl.when(pl.col(eligibility)).then(
                         pl.when(pl.col("__strand_swapped")).then(1.0 - pl.col(value)).otherwise(pl.col(value))
@@ -662,18 +870,24 @@ def validate_replacement_allele_frequency(
                 paired_paths.append(paired_path)
                 bindings[chromosome] = binding
                 del frame, matches, eligible, working, paired
-            evidence = validate_replacement_frequency_pairs(
-                lambda: (pl.read_parquet(path) for path in paired_paths), "study_frequency", "replacement_frequency",
+            if initial_external:
+                evidence = _validate_initial_external_pairs(paired_paths, raw_screens, bindings,
+                    replacement, external_eaf_colmap, exclusions, total, pol, emit, decisions[evidence_key])
+            else:
+                evidence = validate_replacement_frequency_pairs(
+                    lambda: (pl.read_parquet(path) for path in paired_paths), "study_frequency", "replacement_frequency",
                 policies=pol, logger=logger, study_variant_count=total, eligibility_column="eligible",
                 excluded_counts=exclusions, source={**replacement, "mapping": dict(external_eaf_colmap),
                     "identities": {c: b["source"] for c, b in bindings.items()},
                     "reused_default_chromosomes": reused, "same_source_evidence_reused": bool(reused)})
-            decisions["eaf_replacement_validation"] = evidence
+            decisions[evidence_key] = evidence
             try:
+                if configuration != _replacement_configuration(sample_columns, decisions, external_eaf_colmap, pol):
+                    raise StudyAlleleFrequencyError("AF validation configuration changed during preparation; rerun dataset preparation.")
                 for binding in bindings.values():
                     _require_unchanged_replacement_binding(binding)
             except Exception:
-                evidence.update(status="invalid", failure_reason="replacement_inputs_changed")
+                evidence.update(status="invalid", failure_reason="external_inputs_changed" if initial_external else "replacement_inputs_changed")
                 raise
             if evidence["status"] == "passed":
                 try:
@@ -694,9 +908,16 @@ def validate_replacement_allele_frequency(
                         del cache, joined
                     for binding in bindings.values():
                         _require_unchanged_replacement_binding(binding)
+                    if configuration != _replacement_configuration(sample_columns, decisions, external_eaf_colmap, pol):
+                        raise StudyAlleleFrequencyError("AF validation configuration changed during publication; rerun dataset preparation.")
                 except Exception:
-                    evidence.update(status="invalid", failure_reason="replacement_cache_publication_failed")
+                    evidence.update(status="invalid", failure_reason="external_cache_publication_failed" if initial_external else "replacement_cache_publication_failed")
                     raise
+        if initial_external and evidence["status"] != "passed":
+            raise StudyAlleleFrequencyError(
+                "Whole-study external AF validation stopped: %s. No chromosome analysis was started; "
+                "no automatic replacement or dataset retry will be attempted." % evidence["decision_reason"],
+                study_decisions=decisions)
         if evidence["status"] != "passed":
             raise StudyAlleleFrequencyError(
                 "EAF replacement validation is inconclusive: %s. No chromosome analysis was started. "
@@ -709,6 +930,19 @@ def validate_replacement_allele_frequency(
     except Exception as exc:
         # Invalid source/I/O errors retain their type; all failures retain the
         # original decision for canonical dataset failure finalization.
+        if initial_external:
+            evidence = decisions[evidence_key]
+            if evidence.get("status") not in ("invalid", "inconclusive"):
+                reason = evidence.get("failure_reason") or ("external_preparation_failed"
+                    if isinstance(exc, StudyAlleleFrequencyError) else "external_inputs_invalid")
+                evidence.update(status="invalid", failure_reason=reason, decision_reason=reason)
+            evidence.pop("contract", None)
+            evidence["failure_message"] = str(exc)
+            if evidence.get("status") == "invalid":
+                emit.decide(label, evidence, "invalid")
+            if not isinstance(exc, StudyAlleleFrequencyError):
+                raise StudyAlleleFrequencyError(label + ": " + str(exc), study_decisions=decisions) from exc
+            exc.study_decisions = deepcopy(decisions)
         if getattr(exc, "study_decisions", None) is None:
             exc.study_decisions = decisions
         raise
@@ -751,34 +985,37 @@ def _prepared_frequency_rows_equal(left, right, list_columns):
 def _require_replacement_validation(chromosome, frame, columns, decisions,
                                     external_file, mapping, policies):
     """Allow only unchanged validated input rows, including legitimate subsets."""
-    evidence = decisions.get("eaf_replacement_validation") or {}
+    initial_external = decisions.get("eaf_selected_source") == "external_eaf"
+    evidence = decisions.get("eaf_external_validation" if initial_external else "eaf_replacement_validation") or {}
+    label = _frequency_validation_label(initial_external)
     contract = evidence.get("contract") or {}
     binding = contract.get("chromosomes", {}).get(str(chromosome))
     if evidence.get("status") != "passed" or not binding:
-        raise AlleleFrequencyError("EAF replacement adoption requires passed, row-bound replacement validation.")
+        raise AlleleFrequencyError(label + " requires passed, row-bound approval." if initial_external else
+            "EAF replacement adoption requires passed, row-bound replacement validation.")
     if contract.get("configuration") != _replacement_configuration(columns, decisions, mapping, policies):
-        raise AlleleFrequencyError("EAF replacement validation configuration changed; rerun dataset preparation.")
-    source = decisions["eaf_replacement"]["resolved_files"].get(str(chromosome))
+        raise AlleleFrequencyError(label + " configuration changed; rerun dataset preparation.")
+    source = decisions["eaf_external_source" if initial_external else "eaf_replacement"]["resolved_files"].get(str(chromosome))
     current_staged = optional_text(external_file) or source
     expected_attachment = binding.get("staged") or binding["source"]
     _require_unchanged_replacement_binding(binding)
-    if (expected_attachment != _replacement_file_identity(current_staged)
+    if (expected_attachment != _replacement_file_identity(current_staged, label=label + " input")
             or binding["prepared_reference"] != decisions.get("eaf_prepared_references", {}).get(str(chromosome))):
-        raise AlleleFrequencyError("EAF replacement validation inputs changed; rerun dataset preparation.")
-    _validate_source_row_ids(frame, "EAF replacement validation")
+        raise AlleleFrequencyError(label + " inputs changed; rerun dataset preparation.")
+    _validate_source_row_ids(frame, label)
     projection = [SOURCE_INPUT_ROW_COLUMN, *[columns[key + "_col"] for key in ("chr", "pos", "ea", "oa")],
-        columns["eaf_col"], PREPARED_INPUT_COLUMN, PREPARED_MATCHES_COLUMN]
+        *([columns["eaf_col"]] if columns.get("eaf_col") is not None else []), PREPARED_INPUT_COLUMN, PREPARED_MATCHES_COLUMN]
     list_columns = [PREPARED_MATCHES_COLUMN]
     descriptor = binding.get("assignment_cache")
     if descriptor is None and binding.get("assignment_cache_digest") is not None:
-        raise AlleleFrequencyError("EAF replacement validation cache descriptor is missing; rerun dataset preparation.")
+        raise AlleleFrequencyError(label + " cache descriptor is missing; rerun dataset preparation.")
     if descriptor is not None:
         if configuration_digest(descriptor) != binding.get("assignment_cache_digest"):
-            raise AlleleFrequencyError("EAF replacement validation cache descriptor changed; rerun dataset preparation.")
+            raise AlleleFrequencyError(label + " cache descriptor changed; rerun dataset preparation.")
         projection.append(descriptor["column"])
         list_columns.append(descriptor["column"])
     if any(name not in frame.columns for name in projection):
-        raise AlleleFrequencyError("EAF replacement validation input columns are incomplete; rerun dataset preparation.")
+        raise AlleleFrequencyError(label + " input columns are incomplete; rerun dataset preparation.")
     expected = pl.read_parquet(binding["partition"]["path"], columns=projection)
     observed = frame.select(projection)
     if observed[SOURCE_INPUT_ROW_COLUMN].equals(expected[SOURCE_INPUT_ROW_COLUMN], check_dtypes=True):
@@ -788,7 +1025,7 @@ def _require_replacement_validation(chromosome, frame, columns, decisions,
             on=SOURCE_INPUT_ROW_COLUMN, how="semi").sort(SOURCE_INPUT_ROW_COLUMN)
         observed = observed.sort(SOURCE_INPUT_ROW_COLUMN)
     if not _prepared_frequency_rows_equal(observed, selected, list_columns):
-        raise AlleleFrequencyError("EAF replacement validation rows changed or contain unknown source IDs; rerun dataset preparation.")
+        raise AlleleFrequencyError(label + " rows changed or contain unknown source IDs; rerun dataset preparation.")
     # Attach through the verified resolved pathname, not a mutable alias that
     # could be retargeted while strand work runs between this guard and the read.
     return expected_attachment["path"]
@@ -1270,7 +1507,7 @@ def _measure_frequency_pairs(
         sums = {key: math.fsum((sums[key], float(values[key] or 0.0))) for key in means}
         count += n
     if expected_pair_count is not None and count != expected_pair_count:
-        raise StudyAlleleFrequencyError("Replacement AF replay changed the pair count between counting and measurement.")
+        raise StudyAlleleFrequencyError("AF replay changed the pair count between counting and measurement.")
     result = {key: sums[key] / count if count else None for key in means}
     for key in correlations:
         moment = moments.get(key)
@@ -1281,6 +1518,38 @@ def _measure_frequency_pairs(
         # Pearson lies in [-1,1]; correct only final floating-point roundoff.
         result[key] = max(-1.0, min(1.0, value)) if value is not None and math.isfinite(value) else None
     return result
+
+
+def _check_spearman_memory(n, pol, spearman_memory_budget_bytes=None, *, evidence=None):
+    """Apply the shared conservative global-rank resource estimate before replay."""
+    # Reuse the canonical conservative per-variant working estimate,
+    # safety multiplier and parent/headroom reservation. This includes
+    # ranks/sort workspace rather than budgeting only the two columns.
+    estimate = n * float(pol.get("execution.memory_bytes_per_variant")) * float(pol.get("execution.memory_safety_factor"))
+    budget = pol.get("execution.memory_budget_gb")
+    available = None
+    if budget is not None:
+        import psutil
+        budget_bytes = float(budget) * 1024**3  # canonical GiB units
+        available = budget_bytes - max(psutil.Process().memory_info().rss,
+            budget_bytes * float(pol.get("execution.memory_headroom_fraction")))
+    if spearman_memory_budget_bytes is not None:
+        if (isinstance(spearman_memory_budget_bytes, bool)
+                or not math.isfinite(spearman_memory_budget_bytes) or spearman_memory_budget_bytes <= 0):
+            raise StudyAlleleFrequencyError("Spearman memory budget must be positive finite bytes.")
+        available = (float(spearman_memory_budget_bytes) if available is None
+            else min(available, float(spearman_memory_budget_bytes)))
+    resources = {"estimated_rank_memory_bytes": estimate, "available_rank_memory_bytes": available}
+    if evidence is not None:
+        evidence.update(resources)
+    if available is not None and estimate > available:
+        if evidence is not None:
+            evidence["failure_reason"] = "spearman_memory_budget_exceeded"
+        raise StudyAlleleFrequencyError(
+            "Exact global Spearman AF comparison exceeds its memory budget: estimated %s bytes; available %s. "
+            "Increase --memory-gb / execution.memory_budget_gb or adjust the canonical execution memory estimate; "
+            "the correlation method was not changed." % (estimate, available))
+    return resources
 
 
 def validate_replacement_frequency_pairs(
@@ -1371,29 +1640,7 @@ def validate_replacement_frequency_pairs(
                 yield batch.filter(usable).select(study.alias(study_column), replacement.alias(replacement_column))
         selected = paired.filter(usable) if isinstance(paired, pl.DataFrame) else usable_batches
         if method == "spearman":
-            # Reuse the canonical conservative per-variant working estimate,
-            # safety multiplier and parent/headroom reservation. This includes
-            # ranks/sort workspace rather than budgeting only the two columns.
-            estimate = n * float(pol.get("execution.memory_bytes_per_variant")) * float(pol.get("execution.memory_safety_factor"))
-            budget = pol.get("execution.memory_budget_gb")
-            available = None
-            if budget is not None:
-                import psutil
-                budget_bytes = float(budget) * 1024**3  # canonical GiB units
-                available = budget_bytes - max(psutil.Process().memory_info().rss,
-                    budget_bytes * float(pol.get("execution.memory_headroom_fraction")))
-            if spearman_memory_budget_bytes is not None:
-                if (isinstance(spearman_memory_budget_bytes, bool)
-                        or not math.isfinite(spearman_memory_budget_bytes) or spearman_memory_budget_bytes <= 0):
-                    raise StudyAlleleFrequencyError("Spearman memory budget must be positive finite bytes.")
-                available = (float(spearman_memory_budget_bytes) if available is None
-                    else min(available, float(spearman_memory_budget_bytes)))
-            evidence.update(estimated_rank_memory_bytes=estimate, available_rank_memory_bytes=available)
-            if available is not None and estimate > available:
-                raise StudyAlleleFrequencyError(
-                    "Exact global Spearman AF comparison exceeds its memory budget: estimated %s bytes; available %s. "
-                    "Increase --memory-gb / execution.memory_budget_gb or adjust the canonical execution memory estimate; "
-                    "the correlation method was not changed." % (estimate, available))
+            evidence.update(_check_spearman_memory(n, pol, spearman_memory_budget_bytes))
             if not isinstance(selected, pl.DataFrame):
                 frames = list(selected())
                 selected = pl.concat(frames, rechunk=False) if frames else pl.DataFrame(
@@ -1419,7 +1666,7 @@ def validate_replacement_frequency_pairs(
 
 def _compare_frequency_pairs(
     paired, study_column, reference_column, policies, emit, *, accept_direct_eaf=False,
-    study_variant_count=None,
+    study_variant_count=None, pair_count=None, comparison_evidence=None,
 ):
     """Compare one eligible paired set once, retaining original EA direction.
 
@@ -1429,6 +1676,9 @@ def _compare_frequency_pairs(
     table as the sole decision. Other callers retain the existing folded
     suitability and directional-margin rules.
     """
+    n = paired.height if isinstance(paired, pl.DataFrame) else pair_count
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise StudyAlleleFrequencyError("Batched AF comparison requires a known nonnegative pair count.")
     minimum = int(policies.get("eaf.maf_reference_min_overlap"))
     minimum_fraction = None
     minimum_minor_fraction = None
@@ -1439,13 +1689,13 @@ def _compare_frequency_pairs(
             raise StudyAlleleFrequencyError(
                 "Whole-study AF comparison requires a positive integer study variant count."
             )
-        if paired.height > study_variant_count:
+        if n > study_variant_count:
             raise StudyAlleleFrequencyError(
                 "Whole-study AF comparison pair count cannot exceed the study variant count."
             )
         minimum_fraction = float(policies.get("eaf.maf_reference_min_overlap_fraction"))
         minimum_minor_fraction = float(policies.get("eaf.study_reference_min_minor_fraction"))
-        overlap_fraction = paired.height / study_variant_count
+        overlap_fraction = n / study_variant_count
     method = str(policies.get("eaf.maf_reference_correlation_method"))
     minimum_correlation = float(policies.get("eaf.maf_reference_min_correlation"))
     maximum_difference = float(policies.get("eaf.maf_reference_max_mean_absolute_difference"))
@@ -1454,29 +1704,48 @@ def _compare_frequency_pairs(
     shared_failures = []
     if accept_direct_eaf:
         shared_failures = [reason for reason, failed in (
-            ("insufficient_overlap", paired.height < minimum),
+            ("insufficient_overlap", n < minimum),
             ("insufficient_overlap_fraction", overlap_fraction < minimum_fraction),
         ) if failed]
-    # Do not scan or rank when the count/coverage gate already failed.
-    measured = ({key: None for key in (
-        "direct_eaf_correlation", "maf_correlation", "mean_absolute_maf_difference",
-        "mean_eaf_error", "mean_maf_error", "reference_effect_allele_minor_fraction",
-        "supplied_to_reference_maf_correlation", "reference_effect_allele_major_fraction",
-    )} if shared_failures else _measure_frequency_pairs(
-        paired, study_column, reference_column, method, include_raw_maf=accept_direct_eaf))
+    # Save established metadata before ranking/measurement can fail. Optional
+    # caller-owned evidence does not change native/direct comparison semantics.
     stats = {
-        "comparable_variants": paired.height, "minimum_overlap": minimum,
+        "comparable_variants": n, "minimum_overlap": minimum,
         "maf_correlation_method": method, "minimum_maf_correlation": minimum_correlation,
         "maximum_mean_absolute_maf_difference": maximum_difference,
         "reference_minor_fraction_cutoff": minor_cutoff, "minimum_error_margin": margin,
-        **{key: float(value) if value is not None and math.isfinite(value) else None
-           for key, value in measured.items()},
     }
     if accept_direct_eaf:
+        study_correlation = float(policies.get("eaf.study_reference_min_correlation"))
+        major_minimum = float(policies.get("eaf.study_reference_min_major_fraction"))
         stats.update(study_variant_count=study_variant_count,
-                     observed_overlap_fraction=overlap_fraction,
-                     minimum_overlap_fraction=minimum_fraction,
-                     minimum_reference_effect_allele_minor_fraction=minimum_minor_fraction)
+            observed_overlap_fraction=overlap_fraction, minimum_overlap_fraction=minimum_fraction,
+            minimum_reference_effect_allele_minor_fraction=minimum_minor_fraction,
+            minimum_study_correlation=study_correlation,
+            minimum_reference_effect_allele_major_fraction=major_minimum,
+            shared_evidence_gate_passed=not shared_failures,
+            shared_evidence_failed_requirements=shared_failures,
+            whole_study_rules_evaluated=False)
+    measured = {key: None for key in (
+        "direct_eaf_correlation", "maf_correlation", "mean_absolute_maf_difference",
+        "mean_eaf_error", "mean_maf_error", "reference_effect_allele_minor_fraction",
+        "supplied_to_reference_maf_correlation", "reference_effect_allele_major_fraction",
+    )}
+    if comparison_evidence is not None:
+        comparison_evidence.update(stats, **measured)
+    # Do not scan or rank when the count/coverage gate already failed.
+    if not shared_failures:
+        if method == "spearman" and not isinstance(paired, pl.DataFrame):
+            stats.update(_check_spearman_memory(n, policies, evidence=comparison_evidence))
+            paired = pl.concat(list(paired()), rechunk=False)
+            if paired.height != n:
+                raise StudyAlleleFrequencyError("AF replay changed the pair count before global ranking.")
+        measured = _measure_frequency_pairs(paired, study_column, reference_column, method,
+            include_raw_maf=accept_direct_eaf, expected_pair_count=n)
+    stats.update({key: float(value) if value is not None and math.isfinite(value) else None
+        for key, value in measured.items()})
+    if comparison_evidence is not None:
+        comparison_evidence.update(stats)
     eaf_error, maf_error = stats["mean_eaf_error"], stats["mean_maf_error"]
     stats["absolute_error_difference"] = (
         abs(eaf_error - maf_error) if eaf_error is not None and maf_error is not None else None
@@ -1484,15 +1753,7 @@ def _compare_frequency_pairs(
     if accept_direct_eaf:
         # Whole-study thresholds are distinct from the ordinary external
         # classifier. Both raw-source rules share one measured paired set.
-        study_correlation = float(policies.get("eaf.study_reference_min_correlation"))
-        major_minimum = float(policies.get("eaf.study_reference_min_major_fraction"))
-        stats.update(
-            minimum_study_correlation=study_correlation,
-            minimum_reference_effect_allele_major_fraction=major_minimum,
-            shared_evidence_gate_passed=not shared_failures,
-            shared_evidence_failed_requirements=shared_failures,
-            whole_study_rules_evaluated=not shared_failures,
-        )
+        stats["whole_study_rules_evaluated"] = not shared_failures
         for rule, correlation, error, profile, threshold, profile_failure in (
             (1, stats["direct_eaf_correlation"], eaf_error,
              stats["reference_effect_allele_minor_fraction"], minimum_minor_fraction,
@@ -1536,7 +1797,7 @@ def _compare_frequency_pairs(
 
     # Ordinary external-source / chromosome classifier: preserve the existing
     # direct evidence, folded compatibility, profile veto and strict error gap.
-    if paired.height < minimum:
+    if n < minimum:
         direct_reason = "insufficient_overlap"
     elif stats["direct_eaf_correlation"] is None:
         direct_reason = "correlation_unavailable"
@@ -1548,7 +1809,7 @@ def _compare_frequency_pairs(
         direct_reason = "allele_aligned_frequency_agreement"
     stats["direct_eaf_acceptance_reason"] = direct_reason
     stats["direct_eaf_accepted"] = direct_reason == "allele_aligned_frequency_agreement"
-    if paired.height < minimum:
+    if n < minimum:
         suitability_reason = "insufficient_overlap"
     elif stats["maf_correlation"] is None:
         suitability_reason = "maf_correlation_unavailable"
@@ -1721,6 +1982,7 @@ def merge_external_allele_frequencies(
     declared_alt_frequency: bool = False,
     retain_biallelic_eligibility: bool = False,
     _prepare_only: bool = False,
+    _screen_chromosomes=None,
 ) -> Tuple[pl.DataFrame, str | Dict[str, Any], Dict[str, Any]]:
     """Take the frequency from an external panel.
 
@@ -1742,9 +2004,10 @@ def merge_external_allele_frequencies(
     filter attachment rows or change the ordinary coverage gate.
 
     Private ``_prepare_only`` returns raw assignments, their column descriptor
-    (instead of the final column name), and source statistics. Only the owning
-    replacement preparation uses it; finalization and coverage run later on the
-    independently oriented worker rows. Ordinary calls retain the public tuple.
+    (instead of the final column name), and source statistics. Initial-external
+    and explicit-replacement preparation both use it; finalization and coverage
+    run later on independently oriented worker rows. Ordinary calls retain the
+    public tuple.
     """
     resolved_policies = resolve_policies(policies)
     emit = active_context(logger, ctx, df.height)
@@ -1878,6 +2141,7 @@ def merge_external_allele_frequencies(
         warn=emit.warn,
         reference_label="external frequency file '%s'" % load_path,
         screen_frequency=not declared_alt_frequency,
+        screen_chromosomes=_screen_chromosomes,
         require_complete_frequency_site=True,
         frequency_reason_column=assignment_reason_col,
         frequency_biallelic_column=biallelic_col,
@@ -2436,11 +2700,14 @@ def harmonise_allele_frequency(
             }
 
             replacement_cache = replacement_cache_descriptor = None
+            external_approved = isinstance(study_decision, dict) and (
+                study_decision.get("eaf_external_validation_required") is True
+                or "eaf_external_validation" in study_decision)
             if (isinstance(study_decision, dict)
-                    and study_decision.get("eaf_selected_source") == "replacement_reference"):
+                    and (study_decision.get("eaf_selected_source") == "replacement_reference" or external_approved)):
                 eaffile = _require_replacement_validation(chromosome, df, sample_column_dict,
                     study_decision, eaffile, external_eaf_colmap, pol)
-                binding = study_decision["eaf_replacement_validation"]["contract"]["chromosomes"][str(chromosome)]
+                binding = study_decision["eaf_external_validation" if external_approved else "eaf_replacement_validation"]["contract"]["chromosomes"][str(chromosome)]
                 replacement_cache_descriptor = binding.get("assignment_cache")
                 if replacement_cache_descriptor is not None:
                     cache_column = replacement_cache_descriptor["column"]
@@ -2481,6 +2748,8 @@ def harmonise_allele_frequency(
                 eaf_input_interpretation=(study_decision.get("eaf_input_interpretation")
                     if isinstance(study_decision, dict) else None),
             )
+            if external_approved:
+                qc_info["eaf_external_validation"] = deepcopy(study_decision["eaf_external_validation"])
             if replacement_selected:
                 qc_info["eaf_replacement"] = dict(replacement)
                 qc_info["eaf_replacement_validation"] = deepcopy(study_decision["eaf_replacement_validation"])
@@ -2679,7 +2948,7 @@ def harmonise_allele_frequency(
                     if isinstance(study_decision, dict) else {}
                 )
                 default_original = prepared_reference.get("contract", {}).get("reference", {}).get("path") or default_eaf_file
-                source_identity_path = binding["source"]["path"] if replacement_selected else target_file
+                source_identity_path = binding["source"]["path"] if replacement_selected or external_approved else target_file
                 same_reference_file = same_frequency_reference_source(
                     source_identity_path, target_col, target_map,
                     default_original, target_col, target_map,
@@ -2695,7 +2964,7 @@ def harmonise_allele_frequency(
                             "external EAF source is identical to the strand reference, but its "
                             "validated aligned frequency column is unavailable."
                         )
-                    raw_frequency_screen = {} if replacement_selected else strand_qc.get("raw_frequency_screen")
+                    raw_frequency_screen = {} if replacement_selected or external_approved else strand_qc.get("raw_frequency_screen")
                     if not isinstance(raw_frequency_screen, dict):
                         raise AlleleFrequencyError(
                             "Internal PostGWAS execution-order error: the raw "
@@ -2795,6 +3064,14 @@ def harmonise_allele_frequency(
                     }
                     merged_df = df
                     new_col_name = REFERENCE_AF_COLUMN
+                    if external_approved and not same_frequency_reference_source(
+                        target_file, target_col, target_map, default_original, default_eaf_column, default_eaf_colmap,
+                    ):
+                        # Shared staging used to attach this exact source via a
+                        # separate file. Preserve that public destination schema
+                        # while reusing the already aligned value, without I/O.
+                        new_col_name = unused_column_name(target_col, merged_df)
+                        merged_df = merged_df.with_columns(pl.col(REFERENCE_AF_COLUMN).alias(new_col_name))
                     emit.info(
                         "Reused the allele-aligned population AF already retained from "
                         "strand orientation: external EAF file %s, source column %r, "
@@ -2806,9 +3083,9 @@ def harmonise_allele_frequency(
                             _fmt_int(usable_rows), _fmt_int(merged_df.height),
                         )
                     )
-                elif replacement_selected:
+                elif replacement_selected or external_approved:
                     if replacement_cache_descriptor is None:
-                        raise AlleleFrequencyError("EAF replacement validation lacks its approved assignment cache.")
+                        raise AlleleFrequencyError(_frequency_validation_label(external_approved) + " lacks its approved assignment cache.")
                     merged_df, new_col_name, merge_stats = _consume_replacement_assignments(
                         df, replacement_cache, replacement_cache_descriptor, std_cols, pol,
                         chromosome=chromosome, emit=emit, logger=logger, ctx=ctx, rejects=rejects)
@@ -2848,7 +3125,7 @@ def harmonise_allele_frequency(
                     "external_raw_af",
                     raw_frequency_screen,
                 )
-                if raw_frequency_screen:
+                if raw_frequency_screen and not external_approved:
                     emit.decide(
                         "Raw external frequency column '%s'" % target_col,
                         {
@@ -2877,7 +3154,7 @@ def harmonise_allele_frequency(
                             )
                         ),
                     )
-                if raw_frequency_screen.get("maf_like") is True:
+                if raw_frequency_screen.get("maf_like") is True and not external_approved:
                     if same_reference_file:
                         raise AlleleFrequencyError(
                             "The external AF column '%s' is MAF-like: %s of %s "
@@ -2967,7 +3244,7 @@ def harmonise_allele_frequency(
                     logger=logger,
                     ctx=ctx,
                     rejects=rejects,
-                    study_eaf_accepted=replacement_selected,
+                    study_eaf_accepted=replacement_selected or external_approved,
                 )
                 if replacement_selected:
                     # Selected output frequency has a separate column; original

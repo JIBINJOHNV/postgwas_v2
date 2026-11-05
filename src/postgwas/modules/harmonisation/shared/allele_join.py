@@ -347,6 +347,7 @@ def allele_oriented_left_join(
     warn: Callable[[str], None] | None = None,
     reference_label: str = "reference table",
     screen_frequency: bool = True,
+    screen_chromosomes: Sequence[str] | None = None,
     require_complete_frequency_site: bool = False,
     frequency_reason_column: str | None = None,
     frequency_biallelic_column: str | None = None,
@@ -458,7 +459,8 @@ def allele_oriented_left_join(
     rows_after_deduplication = reference.height
     if swapped_value == "one_minus" and screen_frequency:
         duplicate_stats["raw_frequency_screen"] = frequency_maf_screen(
-            reference,
+            (reference.filter(pl.col(study_columns["chr"]).is_in(screen_chromosomes))
+             if screen_chromosomes is not None else reference),
             value_column,
             float(policies.get("eaf.maf_decision_cutoff")),
         )
