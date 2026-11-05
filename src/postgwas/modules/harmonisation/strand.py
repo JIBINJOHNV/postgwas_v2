@@ -353,8 +353,8 @@ def _reference_orientation_candidates(study, reference, columns, row_col, mode):
     return candidates
 
 
-def _study_reference_frequency_pairs(candidates, row_column, frequency_column):
-    """Return valid, uniquely matched non-palindromic diagnostic pairs only."""
+def frequency_diagnostic_candidates(candidates, row_column):
+    """Share unique, non-palindromic, biallelic eligibility before AF arithmetic."""
     if "__strand_biallelic" not in candidates.columns:
         raise StrandOrientationError(
             "Frequency comparison requires biallelic reference-site eligibility "
@@ -367,11 +367,16 @@ def _study_reference_frequency_pairs(candidates, row_column, frequency_column):
             pl.len().over(row_column).alias("__strand_candidates")
         )
     )
-    unique_non_palindromic = counted_candidates.filter(
+    return counted_candidates.filter(
         ~pl.col("__strand_palindromic")
         & (pl.col("__strand_candidates") == 1)
         & pl.col("__strand_biallelic")
     )
+
+
+def _study_reference_frequency_pairs(candidates, row_column, frequency_column):
+    """Return valid, uniquely matched non-palindromic diagnostic pairs only."""
+    unique_non_palindromic = frequency_diagnostic_candidates(candidates, row_column)
     study_frequency = pl.col(frequency_column).cast(pl.Float64, strict=False)
     reference_alt_frequency = pl.col("__strand_af").cast(
         pl.Float64, strict=False
@@ -413,6 +418,30 @@ def _reference_input(columns):
     return pl.struct([SOURCE_INPUT_ROW_COLUMN] + [
         columns[key] for key in ("chr_col", "pos_col", "ea_col", "oa_col", "eaf_col")
     ])
+
+
+def validate_prepared_reference_matches(df, columns, prepared, reference_file,
+                                       population, mapping, policies):
+    """Validate the original row-bound candidate protocol without reorientation."""
+    if not all(name in df.columns for name in (PREPARED_INPUT_COLUMN, PREPARED_MATCHES_COLUMN)):
+        raise StrandOrientationError("Prepared reference matches are incomplete.")
+    if prepared["contract"] != _reference_match_contract(
+        reference_file, population, mapping, columns, policies,
+    ):
+        raise StrandOrientationError("Prepared reference or matching settings changed; restart the run.")
+    _validate_source_row_ids(df, "Prepared chromosome reference matches")
+    if df.select((
+        ~_reference_input(columns).eq_missing(pl.col(PREPARED_INPUT_COLUMN))
+        | pl.col(PREPARED_MATCHES_COLUMN).is_null()
+    ).any()).item():
+        raise StrandOrientationError("Study rows changed or prepared reference matches are incomplete; restart the run.")
+
+
+def unpack_prepared_reference_matches(df, row_column):
+    """Unpack the existing immutable candidate structs using the caller's row ID."""
+    return df.select(row_column, PREPARED_MATCHES_COLUMN).explode(
+        PREPARED_MATCHES_COLUMN
+    ).unnest(PREPARED_MATCHES_COLUMN).filter(pl.col(STRAND_ACTION_COLUMN).is_not_null())
 
 
 def prepare_study_reference_matches(
@@ -829,16 +858,10 @@ def harmonise_strand_orientation(
         )
         if not accepted or not all(column in df.columns for column in prepared_columns):
             raise StrandOrientationError("Prepared reference matches are incomplete or lack study AF acceptance.")
-        if prepared["contract"] != _reference_match_contract(
-            reference_file, population_col, reference_colmap, sample_column_dict, pol,
-        ):
-            raise StrandOrientationError("Prepared reference or matching settings changed; restart the run.")
-        _validate_source_row_ids(df, "Prepared chromosome reference matches")
-        if df.select((
-            ~_reference_input(sample_column_dict).eq_missing(pl.col(PREPARED_INPUT_COLUMN))
-            | pl.col(PREPARED_MATCHES_COLUMN).is_null()
-        ).any()).item():
-            raise StrandOrientationError("Study rows changed or prepared reference matches are incomplete; restart the run.")
+        validate_prepared_reference_matches(
+            df, sample_column_dict, prepared, reference_file, population_col,
+            reference_colmap, pol,
+        )
         reference_duplicate_stats = prepared["duplicate_statistics"]
         if ctx is not None:
             ctx.info("Reusing prepared reference matches and whole-study AF decision; no reference reread or rematching.")
@@ -875,9 +898,7 @@ def harmonise_strand_orientation(
             label="study before strand-reference matching",
         )
     if prepared is not None:
-        matched = df.with_row_index(row_col).select(row_col, PREPARED_MATCHES_COLUMN).explode(
-            PREPARED_MATCHES_COLUMN
-        ).unnest(PREPARED_MATCHES_COLUMN).filter(pl.col(STRAND_ACTION_COLUMN).is_not_null())
+        matched = unpack_prepared_reference_matches(df.with_row_index(row_col), row_col)
         candidates = study.join(matched, on=row_col, how="inner")
     else:
         candidates = _reference_orientation_candidates(

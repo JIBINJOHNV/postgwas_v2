@@ -9,6 +9,8 @@ configurable QC threshold.
 
 from __future__ import annotations
 
+import json
+
 from postgwas.core.ui import screen_line, screen_summary_card
 from postgwas.core.values import (
     format_count, format_fraction_percentage, format_number, format_percentage,
@@ -278,6 +280,69 @@ def _beta_z_fields(decisions):
     ]
 
 
+def replacement_frequency_fields(decisions):
+    """Present final orchestration evidence, never re-evaluate numeric gates.
+
+    A numeric ``passed`` alone is not an adoption decision: preparation issues
+    its row/source-bound contract only after the final identity checks succeed.
+    """
+    if decisions.get("eaf_selected_source") != "replacement_reference":
+        return []
+    evidence = decisions.get("eaf_replacement_validation") or {}
+    source = evidence.get("source") or decisions.get("eaf_replacement") or {}
+    status = evidence.get("status")
+    accepted = status == "passed" and bool(evidence.get("contract"))
+    outcome = {
+        "inconclusive": "Inconclusive; dataset stopped before chromosome analysis",
+        "invalid": "Invalid; dataset stopped before chromosome analysis",
+    }.get(status)
+    if outcome is None:
+        outcome = ("Passed; replacement EAF accepted for assignment" if accepted else
+                   "Numeric gates passed; replacement approval not recorded" if status == "passed" else
+                   "Not validated; dataset stopped before replacement approval" if decisions.get("report_failure") else
+                   "Provisionally selected; replacement validation pending; assignment pending.")
+    fields = [
+        ("analysis" if accepted else "error" if status in ("inconclusive", "invalid") else "info", "Replacement validation", outcome),
+        ("info", "Replacement source", "%s; column %s" % (_text(source.get("file")), _text(source.get("column")))),
+        ("info", "Original study AF preserved", "Original study MAF remains unchanged; working EAF is a population-reference proxy."),
+    ]
+    if not evidence:
+        return fields
+    fields.extend([
+        ("count", "Study rows entering AF preflight (fixed N)", format_count(evidence.get("study_variant_count"), missing="not available")),
+        ("count", "Replacement paired input rows", format_count(evidence.get("input_pair_rows"), missing="not available")),
+        ("count", "Replacement comparable variants", "%s; required >= %s" % (format_count(evidence.get("comparable_variants"), missing="not available"), format_count(evidence.get("minimum_overlap"), missing="not available"))),
+        ("info", "Replacement diagnostic coverage", "%s; required >= %s" % (_pair(evidence.get("comparable_variants"), evidence.get("study_variant_count")), format_fraction_percentage(evidence.get("minimum_overlap_fraction")))),
+        ("info", "Replacement correlation method", _text(evidence.get("correlation_method"))),
+        ("info", "Replacement correlation", "%s; required >= %s" % (format_number(evidence.get("correlation")), format_number(evidence.get("minimum_correlation")))),
+        ("info", "Replacement mean absolute difference", "%s; required <= %s" % (format_number(evidence.get("mean_absolute_difference")), format_number(evidence.get("maximum_mean_absolute_difference")))),
+        ("info", "Replacement major frequency (B > 0.5)", "%s; required > %s" % (_pair(evidence.get("major_count"), evidence.get("comparable_variants")), format_fraction_percentage(evidence.get("minimum_major_fraction")))),
+        ("info", "Replacement shared evidence gate", "Passed" if evidence.get("shared_evidence_gate_passed") is True else "Failed" if evidence.get("shared_evidence_gate_passed") is False else "Not recorded"),
+        ("info", "Replacement failed requirements", "; ".join(_words(item) for item in evidence.get("failed_requirements") or []) or "None recorded"),
+        ("info", "Replacement decision reason", _words(evidence.get("failure_reason", evidence.get("decision_reason")))),
+    ])
+    fields.extend(("count", "Replacement excluded: %s" % _words(key), format_count(value, missing="not available"))
+                  for key, value in (evidence.get("excluded_counts") or {}).items())
+    for key, label in (("mapping", "Replacement declared allele mapping"),
+                       ("resolved_files", "Replacement resolved source files"),
+                       ("identities", "Replacement source identities")):
+        if key in source:
+            fields.append(("info", label, json.dumps(source[key], sort_keys=True, ensure_ascii=False)))
+    reused = source.get("same_source_evidence_reused")
+    fields.extend([
+        ("info", "Reused default-reference evidence", "Yes" if reused is True else "No" if reused is False else "Not recorded"),
+        ("info", "Chromosomes reusing default evidence", ", ".join(map(str, source.get("reused_default_chromosomes") or [])) or "None recorded"),
+        ("info", "Replacement interpretation", "Folded-frequency and major-profile agreement supports consistency under the declared allele mapping; it does not prove allele direction or measured study EAF. Reused source evidence is not independent evidence."),
+    ])
+    return fields
+
+
+def render_replacement_frequency_validation(study_decisions):
+    """Render the later preparation outcome without repeating initial decisions."""
+    fields = replacement_frequency_fields(study_decisions or {})
+    return "\n".join(screen_summary_card("genetic", "Whole-study replacement AF validation", fields)) if fields else ""
+
+
 def _frequency_fields(decisions, policies, resources):
     evidence = decisions.get("eaf_evidence") or {}
     comparison = decisions.get("eaf_reference_validation") or {}
@@ -309,7 +374,7 @@ def _frequency_fields(decisions, policies, resources):
     fields.append(("info", "Reference comparison", {
         "not_required": "Not required — distribution screen did not trigger comparison",
         "passed": "Allele-aligned reference agreement passed",
-        "replacement_selected": "Input MAF supported; replacement source selected",
+        "replacement_selected": "Input MAF supported; replacement source selected provisionally",
         "failed": "FAILED",
         "not_applicable": "Not applicable",
     }.get(status, "Pending")))
@@ -370,12 +435,10 @@ def _frequency_fields(decisions, policies, resources):
             ("error", "Planned action", "No chromosome analysis; no frequency replacement or EAF acceptance was authorised."),
         ])
     elif status == "replacement_selected" and source == "replacement_reference":
-        replacement = decisions.get("eaf_replacement") or {}
         fields.extend([
-            ("analysis", "Frequency decision", "Replacement EAF selected; assignment pending."),
-            ("info", "Replacement source", "%s; column %s" % (_text(replacement.get("file")), _text(replacement.get("column")))),
-            ("info", "Planned action", "Assign selected reference EAF during chromosome processing; preserve the original study MAF."),
+            ("analysis", "Frequency decision", "Replacement EAF selected provisionally by original AF rules."),
         ])
+        fields.extend(replacement_frequency_fields(decisions))
     elif status in ("passed", "not_required"):
         fields.extend([
             ("analysis", "Frequency decision", "Study EAF retained" if status == "passed" else "Declared study EAF retained"),
@@ -442,4 +505,4 @@ def render_study_decisions(
     return "\n".join(lines)
 
 
-__all__ = ["render_study_decisions"]
+__all__ = ["render_study_decisions", "render_replacement_frequency_validation", "replacement_frequency_fields"]

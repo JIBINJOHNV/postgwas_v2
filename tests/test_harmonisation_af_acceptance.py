@@ -781,11 +781,18 @@ def test_worker_refuses_prepared_acceptance_after_any_whole_study_policy_change(
 
 def test_real_worker_registers_each_resolved_policy_once(tmp_path, monkeypatch):
     from postgwas.config import load_configuration
+    from postgwas.modules.harmonisation.chromosome_partition import ChromosomePartitions
     reference, frame, policies = fixture(tmp_path)
     decisions, prepared = prepare(frame, policies, reference,
         eaf_replacement_file=str(reference), eaf_replacement_column='EUR')
     decisions.update(strand='forward', effect_type='beta')
     decisions['eaf_replacement']['resolved_files'] = {'1': str(reference)}
+    path = tmp_path / 'work.parquet'
+    prepared.write_parquet(path)
+    decisions = af.validate_replacement_allele_frequency(
+        ChromosomePartitions({'1': str(path)}, {'1': prepared.height}), COLUMNS, decisions,
+        {'1': {'default_eaf_file': str(reference), 'default_eaf_reference_column': 'EUR'}},
+        MAPPING, policies=policies)
     observed = []
     original_context = af.shared_step_context
 

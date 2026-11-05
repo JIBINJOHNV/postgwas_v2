@@ -486,9 +486,12 @@ sample-sheet external EAF source, its deduplicated raw frequency column is scree
 auto-converts MAF: a non-MAF-like result retains the declared external ALT/EAF
 contract, while a MAF-like result must pass the independent comparison below.
 An explicitly selected MAF replacement instead uses its declared ALT-frequency
-semantics and bypasses this raw-frequency classifier; numerical, coverage and
-allele-matching safeguards still apply. `default_eaf` remains the sole source
-of comparison and orientation evidence.
+semantics and bypasses this ordinary raw-frequency classifier. After provisional
+selection it must pass the separate whole-study replacement gate before adoption;
+numerical, coverage and allele-matching safeguards still apply. `default_eaf`
+supplies the initial study-AF decision and orientation evidence. Replacement
+frequencies supply consistency evidence only for the later gate, never strand
+or palindrome orientation.
 The matcher normalizes the four join keys,
 gives direct matches precedence, performs one Polars left join and preserves
 the study row count and order. On an ordinary swapped match, EAF becomes
@@ -939,8 +942,10 @@ assessment. An ordinary sample-sheet external EAF source is selected only when
 no internal EAF column is selected; it does not silently fill individual nulls
 in an internal study column. The separate
 [explicit EAF replacement](eaf_replacement.md) can replace the working frequency
-source only after whole-study reference evidence supports MAF. SE has no
-external-file source. When no SE column is selected, it is
+source only after whole-study reference evidence supports MAF and its separate
+[whole-study consistency gate](eaf_replacement.md#whole-study-replacement-validation)
+passes after dataset step-08 staging. SE has no external-file source. When no SE
+column is selected, it is
 derived from usable Z or from BETA and P under the configured scientific
 policies. When a selected study SE column is only partly populated, the
 pipeline preserves every populated value, first recovers eligible null cells
@@ -1487,8 +1492,9 @@ The new correlation setting is independent of the unchanged ordinary external
 classifier's `maf_reference_min_correlation: 0.90`. Mean absolute difference
 is an aggregate mean, not squared error or a per-variant filter.
 Only supported MAF can select the paired [explicit EAF replacement source](eaf_replacement.md).
-Its frequencies are a population-reference proxy; the replacement file never
-supplies evidence for its own selection or palindrome orientation.
+Its frequencies are a population-reference proxy; the replacement file does not
+supply evidence for the initial MAF decision or palindrome orientation. Its
+provisional selection must pass the separate validation gate below.
 
 Supported MAF without a replacement, insufficient overlap, constant diagnostic
 vectors or otherwise inconclusive evidence stops that dataset before chromosome
@@ -1530,6 +1536,81 @@ The existing `maf_correlation` and `mean_absolute_maf_difference` evidence still
 mean **folded supplied AF versus folded reference AF**; these compatibility
 metrics do not decide whole-study rule 2. The new
 `supplied_to_reference_maf_correlation` and existing `mean_maf_error` use raw `x`.
+
+#### Post-selection whole-study replacement gate
+
+Original `eaf_reference_validation` remains unchanged. After step-08 replacement
+staging, `eaf_replacement_validation` separately records candidate consistency
+against unchanged original A. B is attached with the existing declared-allele
+join and expressed in the original listed study-EA direction. C=min(B,1-B).
+All five conditions must pass on the same eligible pairs: n >=
+`maf_reference_min_overlap`, n/N >= `maf_reference_min_overlap_fraction`,
+corr(A,C) >= `study_reference_min_correlation`, mean(abs(A-C)) <=
+`maf_reference_max_mean_absolute_difference`, and proportion(B>0.5) strictly
+greater than `study_reference_min_major_fraction`. Packaged values are 1,000,
+0.50, 0.95, 0.10 and 0.20, respectively; no new configuration key or flag is added.
+
+N is the original fixed preflight study-row count. Original-orientation
+ambiguity, palindromes, non-biallelic sites, missing/non-finite/out-of-range
+frequencies and unmatched replacements cannot shrink it. n and every metric
+use the same finite valid unique non-palindromic biallelic paired set. Count
+and coverage failure stops before correlation/ranking, whose values remain
+unavailable. Equality passes count, coverage, correlation and MAE; exactly
+the configured major fraction fails, and B=0.5 is not major. Multiallelic
+attachment remains supported through complete-site sums; these diagnostic
+exclusions do not remove source rows. Chromosome attachment coverage retains
+its separate `external_min_match_fraction` requirement.
+
+The existing `maf_reference_correlation_method` selects Pearson (default) or
+exact global Spearman. Centered Pearson moments are pooled across batches;
+global ranks retain ties, never local ranks or averaged chromosome correlations.
+The global Spearman planning estimate uses the existing execution memory budget,
+parent/headroom reservation, per-variant estimate and safety factor before
+materialization. A null direct-library budget is unbounded; the estimate is not
+an OS memory limit. Preparation otherwise holds one narrow chromosome plus its
+reference/merge working set, without a configured RAM-admission check before
+that merge. Later worker scheduling cannot guarantee this preparation fits.
+Large individual chromosomes/references therefore remain a memory limitation.
+
+One diagnostic shared merge per distinct chromosome source feeds temporary
+paired Parquet files; numeric passes replay those files without reparsing or
+remerging the source. Matching same-source aliases/columns/mappings reuse
+default prepared AF and record `same_source_evidence_reused` and
+`reused_default_chromosomes`. Reuse is not independent scientific evidence;
+different paths alone do not establish independence. Distinct sources are
+attached again during workers because the diagnostic subset does not contain
+all output rows or multiallelic assignments. Temporary pairs are removed on
+both success and failure.
+
+Numeric failure is `inconclusive` and stops before chromosome workers, with
+all failed requirements recorded and no fallback/retry. A source/work identity
+change after measurement is `invalid`, with `replacement_inputs_changed` and
+the measured metrics retained. Earlier I/O/schema errors retain their original
+classification and original AF evidence without invented replacement metrics.
+Final `passed` status receives the row/source/policy/software-bound approval
+contract, checked again at worker adoption. Changing scientific inputs or
+policies follows the existing checkpoint restart policy; resume/overwrite
+semantics are unchanged.
+
+Terminal and canonical logs distinguish the initial provisional selection from
+the later preparation outcome; HTML uses the same recorded replacement fields.
+They show source/column/mapping/identities, reuse, fixed N, paired input rows,
+usable count/coverage, exclusions, method, all thresholds, correlation, MAE,
+major count/fraction and failures. Numeric `passed` without the final contract
+is not reported as approval. A late invalid identity overrides an earlier
+numeric passing log. Original study MAF remains preserved; working EAF retains
+population-reference-imputed provenance.
+
+Folding/profile agreement supports consistency under the declared mapping,
+not per-row direction or recovered measured study EAF. With
+A=[.1,.2,.3,.4] repeated and B=[.1,.8,.3,.6], both B and 1-B give corr=1,
+MAE=0 and major fraction .5. Both pass; no unapproved extra gate is introduced.
+The counted-allele contract remains necessary, consistent with
+[GWAS-SSF](https://github.com/gwas-catalog/summary-statistics-standard/blob/main/gwas-ssf_v1.1.0.tex).
+These numerical QC policies are not calibrated error rates. The
+[full replacement guide](eaf_replacement.md) describes thresholds and attachment
+limits; [Spearman's definition](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.spearmanr.html)
+requires ranks over the combined evidence.
 
 The ordinary classifier retains its `reference_minor_fraction_cutoff: 0.95`
 upper directional bound and `maf_reference_error_margin: 0.02`. Neither control

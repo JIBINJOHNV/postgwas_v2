@@ -4000,14 +4000,16 @@ policies:
         What it does: Sets the fewest usable matched non-palindromic variants for AF comparison.
         When it applies: Whole-study preflight pools uniquely oriented matches across all chromosomes
           when the study AF screen is MAF-like, for both complete raw-source AF rules. The
-          external-file classifier uses this count per chromosome. Direct, swapped and
-          valid reverse-complement study matches at eligible biallelic reference sites can contribute.
+          replacement gate reuses this floor for unchanged original AF versus folded replacement
+          AF, pooled across the study. The external-file classifier uses this count per chromosome.
+          Direct, swapped and valid reverse-complement study matches at eligible biallelic reference
+          sites can contribute.
         Values: Integer at least 2. Too few matches stops that dataset before chromosome processing
           for study AF. Missing, invalid, palindromic, non-biallelic and ambiguously matched values
           provide no evidence; their exclusion from diagnostics does not remove study rows.
         Scientific basis: A configurable evidence floor for GWAS-scale data, not a universal cutoff.
           It cannot prove the semantic meaning of every supplied AF value.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference; allele_frequency.py:validate_replacement_frequency_pairs
       recommendation: null
       type: int
       validator:
@@ -4028,10 +4030,12 @@ policies:
           palindromic, ambiguous and non-biallelic rows remain in that fixed denominator.
         Values: Finite proportion from 0 to 1, not a percentage. Exactly the minimum passes.
           The absolute eaf.maf_reference_min_overlap floor must also pass. Insufficient coverage is
-          inconclusive and cannot authorize MAF replacement. Ordinary external-source comparisons
+          inconclusive and cannot authorize MAF replacement. A provisionally selected replacement
+          must independently pass the same fixed-N coverage gate; its diagnostic exclusions also
+          remain in N. Ordinary external-source comparisons
           keep their existing absolute count gate, without this whole-study fraction gate.
         Scientific basis: A user-selected QC heuristic, not a validated proof of EAF semantics.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs
       recommendation: null
       type: float
       validator:
@@ -4072,13 +4076,15 @@ policies:
         When it applies: After pooled count and coverage pass, rule 1 compares unchanged supplied
           AF with reference AF aligned to the original listed effect allele; rule 2 compares that
           same unchanged supplied AF with min(reference AF, 1-reference AF). Never fold supplied AF
-          for rule 2. Both rules are evaluated even when rule 1 passes.
+          for rule 2. Both rules are evaluated even when rule 1 passes. A selected replacement must
+          separately meet this correlation minimum for unchanged original AF versus min(B, 1-B),
+          where B is replacement frequency aligned to the original listed study effect allele.
         Values: Finite proportion from 0 to 1; equality passes. Undefined, non-finite or constant
           vector correlations fail the relevant rule. Each rule also requires its own mean absolute
           difference and strict reference-profile gate. The configured correlation method is shared.
         Scientific basis: User-selected QC support, not semantic proof or empirical calibration.
           The independent eaf.maf_reference_min_correlation governs ordinary external classifiers.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs
       recommendation: null
       type: float
       validator:
@@ -4100,9 +4106,12 @@ policies:
         Values: Finite proportion from 0 to 1; equality fails. Only rule 2 passing authorizes
           replacement selection; both rules passing or both failing is inconclusive. Default major
           fractions 0.10 through 0.20 inclusive satisfy neither rule's reference-profile gate.
+          A provisionally selected replacement also requires B > 0.5 strictly above this fraction,
+          using the same eligible paired rows and B in original study-effect-allele direction;
+          B exactly 0.5 is not major. This separate all-five gate adds no error-advantage margin.
         Scientific basis: User-selected QC support, not proof of column semantics. Near-half
           population differences can make EAF and MAF fits similar; no extra error-gap rule applies.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs
       recommendation: null
       type: float
       validator:
@@ -4122,9 +4131,15 @@ policies:
           external-source classifiers compare folded vectors with eaf.maf_reference_min_correlation.
         Values: pearson measures linear agreement; spearman measures rank agreement. Correlation
           must be finite, and the applicable count, mean-error and reference-profile gates also pass.
+          The replacement gate uses the same selected method over all pooled pairs. Pearson uses
+          stable centered sufficient statistics. Spearman uses exact global ranks with ties, never
+          chromosome-local ranks or an average of correlations. Before global ranking, the existing
+          execution memory budget, headroom, per-variant estimate and safety factor are checked;
+          insufficient estimated memory fails rather than changing the method. A null memory budget
+          intentionally leaves direct-library ranking unbounded; estimates are not OS memory limits.
         Scientific basis: Correlation alone cannot establish effect-allele alignment. GWAS-SSF
           requires AF to refer to the listed effect allele, even when that allele is usually minor.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:confirm_eaf_with_reference; allele_frequency.py:validate_replacement_frequency_pairs
       recommendation: null
       type: enum
       validator:
@@ -4159,11 +4174,13 @@ policies:
         What it does: Sets the maximum mean absolute difference across paired frequencies.
         When it applies: Whole-study rule 1 uses unchanged supplied AF and aligned reference AF;
           rule 2 uses unchanged supplied AF and reference MAF. Ordinary external-source classifiers
-          use folded supplied and reference AF for panel suitability.
+          use folded supplied and reference AF for panel suitability. The separate replacement
+          gate compares unchanged original AF against min(B, 1-B), with B aligned to the original
+          study effect allele. Original AF is never folded or overwritten by this gate.
         Values: Frequency units; equality passes. This is an aggregate mean, not squared error,
           a per-variant tolerance or a filtering rule. All diagnostic pairs contribute. Correlation,
           count and the mode-specific coverage and reference-profile gates must also pass.
-      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs
+      origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs
       recommendation: null
       type: float
       validator:

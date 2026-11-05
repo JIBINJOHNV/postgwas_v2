@@ -9,6 +9,7 @@ from postgwas.config import load_configuration
 from postgwas.modules.harmonisation import allele_frequency as af, strand
 from postgwas.modules.harmonisation.policies import default_policies
 from postgwas.modules.harmonisation.rejects import SOURCE_INPUT_ROW_COLUMN
+from postgwas.modules.harmonisation.chromosome_partition import ChromosomePartitions
 
 
 REFERENCE_MAPPING = {
@@ -21,10 +22,10 @@ ELIGIBILITY_KEY = "strand_reference_biallelic_col"
 
 def _study(tmp_path, *, same_source):
     frame = pl.DataFrame({
-        "CHR": ["1", "1"], "POS": [10, 20],
-        "EA": ["G" if same_source else "A", "T"], "OA": ["A" if same_source else "G", "C"],
-        "MAF": [.1, .2], "strand_reference_biallelic": [.2, .3],
-        "__postgwas_external_eaf_swap_guard": ["source one", "source two"],
+        "CHR": ["1"] * 4, "POS": [10, 20, 30, 40],
+        "EA": ["G" if same_source else "A", "T", "C", "C"], "OA": ["A" if same_source else "G", "C", "A", "A"],
+        "MAF": [.3, .3, .2, .4], "strand_reference_biallelic": [.2, .3, .4, .5],
+        "__postgwas_external_eaf_swap_guard": ["source one", "source two", "source three", "source four"],
     }).with_row_index(SOURCE_INPUT_ROW_COLUMN)
     columns = {
         "chr_col": "CHR", "pos_col": "POS", "ea_col": "EA", "oa_col": "OA",
@@ -35,8 +36,8 @@ def _study(tmp_path, *, same_source):
 
 
 def _reference(path, *, extra=.1, reverse=False):
-    first = "G\tA\t0.8" if reverse else "A\tG\t0.3"
-    text = "CHROM\tPOS\tREF\tALT\tEUR\n1\t10\t" + first + "\n1\t20\tC\tT\t0.7\n"
+    first = "G\tA\t0.7" if reverse else "A\tG\t0.3"
+    text = "CHROM\tPOS\tREF\tALT\tEUR\n1\t10\t" + first + "\n1\t20\tC\tT\t0.7\n1\t30\tA\tC\t0.8\n1\t40\tA\tC\t0.6\n"
     if extra is not None:
         text += "1\t10\tA\tC\t%s\n" % extra
     path.write_text(text)
@@ -54,21 +55,37 @@ def _decision(reference):
     }
 
 
+def _approved(source, columns, comparison, replacement):
+    policies = default_policies().with_overrides({"eaf.maf_reference_min_overlap": 2})
+    maps = {"1": {"default_eaf_file": str(comparison), "default_eaf_reference_column": "EUR",
+        "user_eaf_file": str(replacement)}}
+    decisions, work = af.validate_study_allele_frequency(source, columns,
+        dict(_decision(replacement), eaf_column="MAF"), maps, REFERENCE_MAPPING,
+        policies=policies, eaf_replacement_file=str(replacement), eaf_replacement_column="EUR")
+    decisions["eaf_replacement"]["resolved_files"] = {"1": str(replacement)}
+    path = comparison.parent / "work.parquet"
+    work.write_parquet(path)
+    decisions = af.validate_replacement_allele_frequency(
+        ChromosomePartitions({"1": str(path)}, {"1": work.height}), columns, decisions,
+        maps, REFERENCE_MAPPING, policies=policies)
+    return work, decisions, policies
+
+
 @pytest.mark.parametrize("prepared", [False, True])
 def test_same_reference_replacement_reuses_aligned_frequencies_without_reread(
     tmp_path, prepared,
 ):
     reference = _reference(tmp_path / "reference.tsv")
     source, columns = _study(tmp_path, same_source=True)
-    work = source
-    decisions = _decision(reference)
-    if prepared:
-        _, packed, descriptor = strand.prepare_study_reference_matches(
-            source, columns, "MAF", str(reference), "EUR", REFERENCE_MAPPING,
-            default_policies(),
-        )
-        work = source.join(packed, on=SOURCE_INPUT_ROW_COLUMN, how="left", coalesce=True)
-        decisions["eaf_prepared_references"] = {"1": descriptor}
+    work, decisions, policies = _approved(source, columns, reference, reference)
+    if not prepared:
+        with pytest.raises(af.AlleleFrequencyError, match="replacement validation input columns"):
+            af.harmonise_allele_frequency("1", source, columns,
+                load_configuration().modules.harmonisation.output_layout.model_dump(), "\t",
+                external_eaf_colmap=REFERENCE_MAPPING, default_eaf_file=str(reference),
+                default_eaf_column="EUR", default_eaf_colmap=REFERENCE_MAPPING,
+                study_decision=decisions, policies=policies)
+        return
     layout = load_configuration().modules.harmonisation.output_layout.model_dump()
     with patch.object(af, "read_reference_variant_table", side_effect=AssertionError("replacement reread")):
         with patch.object(strand, "_load_reference", wraps=strand._load_reference) as reads:
@@ -76,14 +93,14 @@ def test_same_reference_replacement_reuses_aligned_frequencies_without_reread(
                 "1", work, columns, layout, "\t", external_eaf_colmap=REFERENCE_MAPPING,
                 default_eaf_file=str(reference), default_eaf_column="EUR",
                 default_eaf_colmap=REFERENCE_MAPPING, study_decision=decisions,
-                policies=default_policies(),
+                policies=policies,
             )
-    assert reads.call_count == (0 if prepared else 1)
+    assert reads.call_count == 0
     assert result.select(source.columns).equals(source)
-    assert result[resolved["eaf_col"]].to_list() == pytest.approx([.3, .7])
+    assert result[resolved["eaf_col"]].to_list() == pytest.approx([.3, .7, .8, .6])
     assert ELIGIBILITY_KEY not in resolved
     assert GUARD_KEY not in resolved
-    assert result["__postgwas_external_eaf_swap_guard"].to_list() == ["source one", "source two"]
+    assert result["__postgwas_external_eaf_swap_guard"].equals(source["__postgwas_external_eaf_swap_guard"])
     assert qc["external_merge_reused_aligned_strand_reference"] is True
 
 
@@ -91,17 +108,18 @@ def test_fresh_replacement_preserves_source_columns_without_export_guard_metadat
     comparison = _reference(tmp_path / "comparison.tsv", extra=None, reverse=True)
     replacement = _reference(tmp_path / "replacement.tsv")
     source, columns = _study(tmp_path, same_source=False)
+    work, decisions, policies = _approved(source, columns, comparison, replacement)
     layout = load_configuration().modules.harmonisation.output_layout.model_dump()
     with patch.object(af, "read_reference_variant_table", wraps=af.read_reference_variant_table) as reads:
         result, qc, resolved = af.harmonise_allele_frequency(
-            "1", source, columns, layout, "\t", eaffile=str(replacement),
+            "1", work, columns, layout, "\t", eaffile=str(replacement),
             external_eaf_colmap=REFERENCE_MAPPING, default_eaf_file=str(comparison),
             default_eaf_column="EUR", default_eaf_colmap=REFERENCE_MAPPING,
-            study_decision=_decision(replacement), policies=default_policies(),
+            study_decision=decisions, policies=policies,
         )
     assert reads.call_count == 1
     assert result.select(source.columns).equals(source)
-    assert result[resolved["eaf_col"]].to_list() == pytest.approx([.6, .7])
+    assert result[resolved["eaf_col"]].to_list() == pytest.approx([.6, .7, .8, .6])
     assert GUARD_KEY not in resolved
     assert ELIGIBILITY_KEY not in resolved
     assert "external_merge_frequency_swap_guard_column" not in qc
@@ -114,21 +132,22 @@ def test_safe_biallelic_references_do_not_allocate_export_guard(tmp_path, same_s
         tmp_path / "comparison.tsv", extra=None, reverse=True,
     )
     source, columns = _study(tmp_path, same_source=same_source)
+    work, decisions, policies = _approved(source, columns, comparison, replacement)
     layout = load_configuration().modules.harmonisation.output_layout.model_dump()
     result, _, resolved = af.harmonise_allele_frequency(
-        "1", source, columns, layout, "\t", eaffile=str(replacement),
+        "1", work, columns, layout, "\t", eaffile=str(replacement),
         external_eaf_colmap=REFERENCE_MAPPING, default_eaf_file=str(comparison),
         default_eaf_column="EUR", default_eaf_colmap=REFERENCE_MAPPING,
-        study_decision=_decision(replacement), policies=default_policies(),
+        study_decision=decisions, policies=policies,
     )
     assert GUARD_KEY not in resolved
-    assert result["__postgwas_external_eaf_swap_guard"].to_list() == ["source one", "source two"]
+    assert result["__postgwas_external_eaf_swap_guard"].equals(source["__postgwas_external_eaf_swap_guard"])
 
 
 def test_internal_study_frequency_does_not_add_external_export_guard_context(tmp_path):
     reference = _reference(tmp_path / "reference.tsv", extra=None)
     source, columns = _study(tmp_path, same_source=True)
-    source = source.with_columns(pl.Series("MAF", [.3, .7]))
+    source = source.with_columns(pl.Series("MAF", [.3, .7, .8, .6]))
     layout = load_configuration().modules.harmonisation.output_layout.model_dump()
     result, _, resolved = af.harmonise_allele_frequency(
         "1", source, columns, layout, "\t", external_eaf_colmap=REFERENCE_MAPPING,

@@ -119,9 +119,12 @@ from postgwas.modules.harmonisation.allele_frequency import (
     harmonise_allele_frequency,
     same_frequency_reference_source,
     validate_study_allele_frequency,
+    validate_replacement_allele_frequency,
     StudyAlleleFrequencyError,
 )
-from postgwas.modules.harmonisation.study_reporting import render_study_decisions
+from postgwas.modules.harmonisation.study_reporting import (
+    render_replacement_frequency_validation, render_study_decisions,
+)
 from postgwas.modules.harmonisation.sample_size import (
     harmonise_sample_sizes,
     prepare_missing_sample_sizes,
@@ -177,9 +180,10 @@ from postgwas.modules.harmonisation.resource_preflight import (
     validate_harmonisation_resource_maps,
 )
 from postgwas.modules.harmonisation.qc_results import qc_results_to_dataframe
-from postgwas.core.completion import file_fingerprint, configuration_digest
+from postgwas.core.completion import configuration_digest
+from postgwas.modules.harmonisation.shared.runtime import prepared_work_fingerprint
 from postgwas.core.input_validation import (
-    capture_preflight_file_identities, require_unchanged_preflight_files, validate_once,
+    capture_preflight_file_identities, require_unchanged_preflight_files,
     current_validation_recorder,
 )
 from postgwas.core.values import optional_text
@@ -437,17 +441,8 @@ class PreparedHarmonisation:
                        for before, after in zip(self.identities, current) if before != after]
             raise PipelineError("%s\n%s" % (exc, "\n".join(changes))) from exc
         for expected in self.work_fingerprints:
-            if _prepared_work_fingerprint(expected["path"]) != expected:
+            if prepared_work_fingerprint(expected["path"], error_type=PipelineError) != expected:
                 raise PipelineError("Prepared harmonisation work file changed after preflight: %s" % expected["path"])
-
-
-def _prepared_work_fingerprint(path):
-    # Generated work is validated as content, as in the global checkpoint
-    # contract. Filesystem metadata updates alone do not change scientific data.
-    return validate_once(
-        [path], ("harmonisation.prepared_work_fingerprint",),
-        lambda: file_fingerprint(path, error_type=PipelineError), error_type=PipelineError,
-    )
 
 
 @dataclass(frozen=True)
@@ -2010,7 +2005,7 @@ def _activate_eaf_replacement_resources(
         raise PipelineError("Selected EAF replacement is missing its file or frequency column.")
 
     selected = {str(chromosome): dict(resources) for chromosome, resources in resource_maps.items()}
-    resolved_files, replacement_maps, reused = {}, {}, []
+    resolved_files, declared_files, replacement_maps, reused = {}, {}, {}, []
     for chromosome, resources in selected.items():
         try:
             path = resolve_resource_file(
@@ -2019,6 +2014,9 @@ def _activate_eaf_replacement_resources(
             )
         except ValueError as exc:
             raise PipelineError("Invalid EAF replacement path: %s" % exc) from exc
+        # Preserve the formatted pathname separately: resolving it alone loses
+        # the alias whose target must remain unchanged through AF adoption.
+        declared_files[chromosome] = str(Path(path).absolute())
         path = str(Path(path).resolve())
         resolved_files[chromosome] = path
         identical = same_frequency_reference_source(
@@ -2058,6 +2056,7 @@ def _activate_eaf_replacement_resources(
     )
     summary["reused_default_chromosomes"] = sorted(reused, key=_chromosome_sort_key)
     replacement["resolved_files"] = resolved_files
+    replacement["declared_files"] = declared_files
     study_decisions["eaf_replacement"] = replacement
     if logger is not None:
         logger.info(
@@ -3507,6 +3506,22 @@ def _prepare_dataset_for_chromosome_processing(
                 % exc
             ) from exc
         resource_preflight["external_reference_staging"] = staging_summary
+        try:
+            study_decisions = validate_replacement_allele_frequency(
+                chromosome_partitions, sample_column_dict, study_decisions,
+                resource_maps, external_eaf_colmap, policies=policies, logger=logger,
+            )
+        except Exception as exc:
+            _report_study_failure(
+                logger, exc, study_decisions, genome_build_info=genome_build_info,
+                build_reference_files=build_reference_files, policies=policies,
+                resource_maps=resource_maps,
+            )
+            raise
+        if "eaf_replacement_validation" in study_decisions:
+            dataset_study_decisions["eaf_replacement_validation"] = study_decisions["eaf_replacement_validation"]
+            ctx.extra["eaf_replacement_validation"] = study_decisions["eaf_replacement_validation"]
+            _announce(logger, render_replacement_frequency_validation(study_decisions))
         if staging_summary["status"] == "staged":
             ctx.info(
                 "Read %d shared whole-genome external reference file%s once "
@@ -5505,7 +5520,7 @@ def run_harmonisation_pipeline(
                         output_folder, output_layout["chromosome_source_snapshot"],
                         dataset_id=sample_id, chromosome=chromosome,
                     ) for chromosome in chromosome_result.chromosome_files)
-                work_fingerprints = tuple(_prepared_work_fingerprint(path) for path in sorted(work_paths))
+                work_fingerprints = tuple(prepared_work_fingerprint(path, error_type=PipelineError) for path in sorted(work_paths))
                 manifest["status"] = "PREFLIGHT_PASSED"
                 manifest["dataset"] = {"study_decisions": chromosome_result.dataset_study_decisions}
                 _write_run_manifest(manifest_path, manifest)

@@ -21,7 +21,7 @@ from postgwas.core.pipeline_logging import _elapsed
 from postgwas.modules.harmonisation.report_steps import (
     chromosome_steps, dataset_steps, post_merge_steps, summarise_chromosome_evidence,
 )
-from postgwas.modules.harmonisation.study_properties import selected_eaf_replacement
+from postgwas.modules.harmonisation.study_reporting import replacement_frequency_fields
 
 
 _STATUS_STYLES = {
@@ -884,7 +884,7 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
     consensus = decisions.get("strand_consensus") or {}
     source = manifest.get("config") or {}
     provenance = manifest.get("vcf_provenance") or {}
-    replacement = selected_eaf_replacement(decisions)
+    replacement = (decisions.get("eaf_replacement") or {}) if decisions.get("eaf_selected_source") == "replacement_reference" else None
     ptype = record.get("p_value_type")
     reference_checks = decisions.get("eaf_reference_decisions")
     if (decisions.get("eaf_is_maf_initial") is False and isinstance(reference_checks, Mapping)
@@ -936,6 +936,9 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
             ("Rule 2 failed requirements", frequency_validation.get("rule_2_failed_requirements") or "None"),
             ("Combined whole-study AF decision", frequency_validation.get("decision_reason")),
         ])
+    reporting_decisions = {**decisions, "report_failure": decisions.get("report_failure")
+        or (manifest.get("failure") or {}).get("message") or record.get("failure_reason")}
+    rows.extend((label, value) for _kind, label, value in replacement_frequency_fields(reporting_decisions))
     strand = [
         ("Strand reference", _text(record.get("strand_reference_panel")) + " / " + _text(record.get("strand_reference_population"))),
         ("Study strand consensus", record.get("strand_consensus")),
@@ -954,9 +957,9 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
     ))
     frequency = evidence.get("frequency") or {}
     if replacement is not None:
-        frequency_source = "reference proxy · " + replacement["column"]
-        reference_file = replacement["file"]
-        reference_column = replacement["column"]
+        frequency_source = "Declared replacement population-reference proxy · " + _text(replacement.get("column"))
+        reference_file = replacement.get("file")
+        reference_column = replacement.get("column")
         input_frequency = decisions.get("eaf_evidence") or {}
         strand.extend([
             ("Original input frequencies usable for evidence", input_frequency.get("usable")),

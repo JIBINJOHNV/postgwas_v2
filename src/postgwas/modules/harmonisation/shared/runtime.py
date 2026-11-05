@@ -10,12 +10,26 @@ from typing import Any, Iterable
 
 import polars as pl
 
+from postgwas.core.completion import file_fingerprint
+from postgwas.core.input_validation import validate_once
 from postgwas.core.ui.screen import screen_field, screen_line
 from postgwas.core.ui.progress import print_screen_block
 from postgwas.core.values import format_count, optional_text
 
 from ..policies import default_policies
 from ..rejects import REASONS
+
+
+def prepared_work_fingerprint(path, *, error_type):
+    """Cache the content identity of unchanged generated harmonisation work.
+
+    Metadata-only updates do not change scientific content. The invoking
+    preparation or AF-validation boundary retains its own exception type.
+    """
+    return validate_once(
+        [path], ("harmonisation.prepared_work_fingerprint",),
+        lambda: file_fingerprint(path, error_type=error_type), error_type=error_type,
+    )
 
 
 class NullStepContext:
@@ -303,6 +317,7 @@ __all__ = [
     "format_inference_warning",
     "log_info",
     "log_warning",
+    "prepared_work_fingerprint",
     "reject_rows",
     "resolve_policies",
     "step_context",
