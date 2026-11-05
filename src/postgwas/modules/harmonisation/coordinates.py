@@ -30,7 +30,10 @@ from postgwas.core.values import optional_text
 
 from .policies import default_policies
 from .shared.allele_join import unused_column_name
-from .shared.column_mapping import validate_scientific_column_mappings
+from .shared.column_mapping import (
+    column_mapping_groups,
+    validate_scientific_column_mappings,
+)
 from .shared.runtime import active_context, reject_rows, step_context
 from .shared.variant_columns import (
     COMBINED_COORDINATE_SEPARATORS,
@@ -192,7 +195,28 @@ def harmonise_coordinates_and_alleles(
     ) as step_ctx:
         validate_scientific_column_mappings(
             sample_column_dict, stage="coordinate harmonisation",
+            allow_coordinate_identifier=True,
         )
+        shared_source = _clean_name(sample_column_dict.get("chr_pos_col"))
+        if shared_source and shared_source == _clean_name(sample_column_dict.get("snp_id_col")):
+            if shared_source not in df.columns:
+                raise ValueError(
+                    "Configured shared coordinate/identifier column %r is absent "
+                    "from the study header. Correct chromosome_position_column "
+                    "and variant_id_column in the sample sheet." % shared_source
+                )
+            identifier_column = unused_column_name(
+                shared_source, df, reserved=tuple(column_mapping_groups(sample_column_dict)),
+            )
+            df = df.with_columns(pl.col(shared_source).alias(identifier_column))
+            sample_column_dict = dict(sample_column_dict, snp_id_col=identifier_column)
+            shared_identifier = {
+                "source_column": shared_source,
+                "identifier_column": identifier_column,
+                "copied_rows": df.height,
+            }
+            step_ctx.output("shared coordinate/identifier input", **shared_identifier)
+            qc_info["shared_coordinate_identifier"] = shared_identifier
         df, sample_column_dict = _harmonise(
             df=df,
             sample_column_dict=sample_column_dict,

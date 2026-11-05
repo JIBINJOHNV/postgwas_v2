@@ -5043,8 +5043,9 @@ policies:
     on_ambiguous_column_mapping:
       default: fail
       help: |-
-        What it does: Decides what happens when two configuration keys point at the same column of the
-          input file.
+        What it does: Decides what happens when unrelated configuration roles point at the same input
+          column. The combined-coordinate and variant-identifier pair (chr_pos_col and snp_id_col)
+          may share one source column and is not considered ambiguous.
         When it applies: Twice. At dataset step 02 the header check reports it, and 'fail' makes that
           report an error that stops the run there. At dataset step 03, when the file is actually read,
           'fail' raises again and names both configuration keys.
@@ -5056,6 +5057,10 @@ policies:
         Example: a config with beta_or_col: Z and imp_z_col: Z both naming the column 'Z'. Before this
           setting existed the run died with a polars "duplicate output name 'Z'" error that named the
           column and not the two configuration keys; now the message names beta_or_col and imp_z_col.
+        Note: Shared combined-coordinate and identifier values are read once. Coordinates use the
+          existing splitter; the supplied IDs are copied to an unused working column before ID
+          cleaning. The source snapshot is preserved and the resolved mapping and copied-row count
+          are logged. This exception does not permit other roles to share a working column.
       origin: summary_statistics_io.py:read_summary_statistics
       recommendation: null
       type: enum

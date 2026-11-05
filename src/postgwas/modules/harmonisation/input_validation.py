@@ -57,6 +57,7 @@ from postgwas.modules.harmonisation.shared.runtime import (
 )
 from postgwas.modules.harmonisation.shared.column_mapping import (
     COLUMN_CONFIG_KEYS,
+    column_mapping_conflicts,
     column_mapping_groups,
 )
 from postgwas.modules.harmonisation.shared.variant_columns import (
@@ -1045,9 +1046,9 @@ def validate_header(cfg, sumstat_path, policies=None, logger=None):
     ambiguous_severity = _severity_for(
         policies.get("validation.on_ambiguous_column_mapping")
     )
-    for value, keys in by_value.items():
-        if len(keys) < 2:
-            continue
+    for value, keys in column_mapping_conflicts(
+        cfg, allow_coordinate_identifier=True,
+    ).items():
         joined = " and ".join(keys)
         problems.append(
             Problem(
@@ -1055,8 +1056,9 @@ def validate_header(cfg, sumstat_path, policies=None, logger=None):
                 configured_value=None,
                 issue="%s are both set to '%s'" % (joined, value),
                 suggestion=(
-                    "Reading the same column twice ends in a polars duplicate-name "
-                    "error that names the column, not the config keys."
+                    "These roles need separate working columns. Check the source "
+                    "mappings; only the combined-coordinate/variant-identifier "
+                    "pair may share an input column."
                 ),
                 category="ambiguous_mapping",
                 stage="header",

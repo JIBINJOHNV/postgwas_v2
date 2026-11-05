@@ -27,7 +27,11 @@ from .sample_size import (
     normalise_sample_count_column,
 )
 from .shared.runtime import emit_message, reject_rows, resolve_policies
-from .shared.column_mapping import COLUMN_CONFIG_KEYS, column_mapping_groups
+from .shared.column_mapping import (
+    COLUMN_CONFIG_KEYS,
+    column_mapping_conflicts,
+    column_mapping_groups,
+)
 from .shared.variant_columns import (
     excluded_chromosome_labels,
     mark_canonical_variant_columns,
@@ -597,8 +601,10 @@ def _resolve_mapped_columns(sample_column_dict, df_columns, policies, logger):
     by_column = column_mapping_groups(sample_column_dict)
     order = list(by_column)
 
-    collisions = [(c, by_column[c]) for c in order if len(by_column[c]) > 1]
-    for column, keys in collisions:
+    collisions = column_mapping_conflicts(
+        sample_column_dict, allow_coordinate_identifier=True,
+    )
+    for column, keys in collisions.items():
         _emit(
             logger,
             "Config keys %s name the same column '%s'. It is read once."
@@ -609,7 +615,8 @@ def _resolve_mapped_columns(sample_column_dict, df_columns, policies, logger):
         raise AmbiguousColumnMappingError(
             "Two or more config keys name the same input column: "
             + "; ".join(
-                "%s -> '%s'" % (" and ".join(keys), column) for column, keys in collisions
+                "%s -> '%s'" % (" and ".join(keys), column)
+                for column, keys in collisions.items()
             )
             + ". Point each key at its own column, or set policy "
             "validation.on_ambiguous_column_mapping to 'warn'."

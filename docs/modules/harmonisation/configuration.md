@@ -20,6 +20,24 @@ The version-2 sample sheet contains dataset-specific paths, identifiers, and
 source-column mappings. `resource_directory` and `output_directory` are run
 settings and do not belong in dataset rows.
 
+`chromosome_position_column` and `variant_id_column` may select the same
+source column. For a file whose `SNP` values are `10:10000018`, use:
+
+| Sample-sheet field | Value |
+|---|---|
+| `chromosome_column` | `NA` |
+| `position_column` | `NA` |
+| `chromosome_position_column` | `SNP` |
+| `variant_id_column` | `SNP` |
+
+PostGWAS reads that column once, derives coordinates with the existing splitter,
+and copies the supplied identifiers into an unused working column before ID
+cleaning. The source values remain in the original-input snapshot; the log
+records the source column, working identifier column and copied-row count.
+This exception is limited to these two input roles. Other conflicting mappings
+still fail, and coordinate validation and allele-aware duplicate handling remain
+unchanged. A coordinate-based study identifier is not treated as an rsID.
+
 `external_eaf_file` and `external_info_file` accept either one existing table
 containing all chromosomes or an explicit path template containing
 `{chromosome}` and optionally `{build}`. A common filename prefix alone is not

@@ -26,8 +26,29 @@ def column_mapping_groups(
     return groups
 
 
+def column_mapping_conflicts(
+    mapping: Mapping, *, keys: Iterable[str] = COLUMN_CONFIG_KEYS,
+    allow_coordinate_identifier: bool = False,
+) -> dict[str, list[str]]:
+    """Find incompatible roles, allowing a coordinate/ID source only at input.
+
+    A combined coordinate string can also be a study identifier. That input
+    alias must be separated into working columns before either role changes.
+    The two effect keys are names for the same role throughout processing.
+    """
+    conflicts = {}
+    for column, selected in column_mapping_groups(mapping, keys=keys).items():
+        roles = {"beta_or_col" if key == "beta_col" else key for key in selected}
+        if len(roles) > 1 and not (
+            allow_coordinate_identifier and roles == {"chr_pos_col", "snp_id_col"}
+        ):
+            conflicts[column] = selected
+    return conflicts
+
+
 def validate_scientific_column_mappings(
     mapping: Mapping, *, stage: str, error_type=ValueError,
+    allow_coordinate_identifier: bool = False,
 ) -> None:
     """Reject unrelated scientific roles sharing one resolved working column.
 
@@ -36,17 +57,17 @@ def validate_scientific_column_mappings(
     identifiers, uncertainty, frequency, or annotation values is never valid.
     This representation invariant cannot be waived by a header-warning policy.
     """
-    conflicts = []
-    for column, keys in column_mapping_groups(
+    conflicts = column_mapping_conflicts(
         mapping, keys=(*COLUMN_CONFIG_KEYS, "beta_col"),
-    ).items():
-        roles = {"beta_or_col" if key == "beta_col" else key for key in keys}
-        if len(roles) > 1:
-            conflicts.append("%s -> %r" % (" and ".join(keys), column))
+        allow_coordinate_identifier=allow_coordinate_identifier,
+    )
     if conflicts:
         raise error_type(
             "%s has incompatible scientific column mappings: %s. "
             "Assign each scientific role its own column; selected values "
             "must not be overwritten by another role."
-            % (stage, "; ".join(conflicts))
+            % (stage, "; ".join(
+                "%s -> %r" % (" and ".join(keys), column)
+                for column, keys in conflicts.items()
+            ))
         )
