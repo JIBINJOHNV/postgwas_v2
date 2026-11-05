@@ -20,26 +20,48 @@ def valid_frequency_mask(value):
     ).fill_null(False)
 
 
+def pool_frequency_maf_screens(screens, cutoff):
+    """Combine screen counts before applying one caller-supplied cutoff.
+
+    ``screens`` is an iterable of records from ``frequency_maf_screen``.
+    Fractions and shard decisions are deliberately not averaged or reused.
+    An empty pool or a missing column remains explicit; the owning dataset
+    validation decides how to handle absent or zero-usable evidence.
+    """
+    counts = dict.fromkeys(("rows", "usable", "unusable", "at_or_below_0_5"), 0)
+    any_screen = False
+    columns_present = True
+    for screen in screens:
+        any_screen = True
+        columns_present = columns_present and bool(screen["column_present"])
+        for key in counts:
+            counts[key] += int(screen[key])
+    fraction = counts["at_or_below_0_5"] / counts["usable"] if counts["usable"] else 0.0
+    return {
+        "column_present": any_screen and columns_present,
+        **counts,
+        "low_fraction_of_usable": fraction,
+        "decision_cutoff": float(cutoff),
+        "maf_like": bool(counts["usable"] and fraction > float(cutoff)),
+    }
+
+
 def frequency_maf_screen(frame, column, cutoff):
-    """Describe whether one raw frequency column is MAF-like.
+    """Describe whether one frequency column is MAF-like.
 
     The screen is deliberately representation-only: it uses finite numeric
     probabilities and asks what fraction are at or below one half.  It does not
-    decide allele semantics.  Callers must confirm a MAF-like result against an
-    independent, allele-aligned reference before labelling the column EAF or
-    MAF.
+    decide allele semantics. Callers own semantic validation, acceptance and
+    zero-usable-value decisions.
     """
     if column not in frame.columns:
-        return {
+        return pool_frequency_maf_screens([{
             "column_present": False,
             "rows": frame.height,
             "usable": 0,
             "unusable": frame.height,
             "at_or_below_0_5": 0,
-            "low_fraction_of_usable": 0.0,
-            "decision_cutoff": float(cutoff),
-            "maf_like": False,
-        }
+        }], cutoff)
     value = pl.col(column).cast(pl.Float64, strict=False)
     usable = valid_frequency_mask(value)
     evidence = frame.select([
@@ -49,17 +71,13 @@ def frequency_maf_screen(frame, column, cutoff):
     ]).to_dicts()[0]
     usable_count = int(evidence["usable"] or 0)
     low_count = int(evidence["at_or_below_0_5"] or 0)
-    fraction = low_count / usable_count if usable_count else 0.0
-    return {
+    return pool_frequency_maf_screens([{
         "column_present": True,
         "rows": int(evidence["rows"] or 0),
         "usable": usable_count,
         "unusable": int(evidence["rows"] or 0) - usable_count,
         "at_or_below_0_5": low_count,
-        "low_fraction_of_usable": fraction,
-        "decision_cutoff": float(cutoff),
-        "maf_like": bool(usable_count and fraction > float(cutoff)),
-    }
+    }], cutoff)
 
 
 def two_sided_negative_log10_p_from_z(values):
@@ -76,6 +94,7 @@ def two_sided_negative_log10_p_from_z(values):
 
 __all__ = [
     "frequency_maf_screen",
+    "pool_frequency_maf_screens",
     "two_sided_negative_log10_p_from_z",
     "valid_frequency_mask",
 ]

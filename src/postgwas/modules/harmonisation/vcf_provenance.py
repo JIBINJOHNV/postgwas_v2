@@ -85,6 +85,40 @@ def _joined_paths(paths: Sequence[str], separator: str, missing: str) -> str:
     return separator.join(str(path) for path in paths) if paths else missing
 
 
+def _initial_frequency_provenance(
+    sample: Mapping[str, Any], decisions: Mapping[str, Any], chromosomes: Sequence[str],
+    external_files: str, separator: str, missing: str,
+) -> tuple[dict[str, str], list[str]]:
+    """Identify input A independently of a later replacement or private column."""
+    native_column = optional_text(decisions.get("eaf_column", sample.get("eaf_col")))
+    initial = decisions.get("eaf_initial_frequency") or {}
+    if not initial and native_column is None and decisions.get("eaf_selected_source") == "replacement_reference":
+        raise ValueError("VCF provenance requires the preserved initial external AF source descriptor.")
+    source = initial.get("source") or {}
+    initial_paths = []
+    if initial:
+        if initial.get("source_kind") != "external_eaf":
+            raise ValueError("VCF provenance received an unsupported initial external AF source kind.")
+        column = optional_text(source.get("column"))
+        files = source.get("resolved_files") or {}
+        absent = [chromosome for chromosome in chromosomes if optional_text(files.get(chromosome)) is None]
+        if column is None or absent:
+            raise ValueError("VCF provenance requires the initial external AF source column and resolved files for every completed chromosome.")
+        initial_paths = list(dict.fromkeys(
+            _resolved_path(files[chromosome], "the initial external AF source file") for chromosome in chromosomes))
+        reference_files = _joined_paths(initial_paths, separator, missing)
+    else:
+        column = native_column or optional_text(sample.get("eafcolumn"))
+        reference_files = missing if native_column is not None else external_files
+    return {
+        "af_native_input_column": native_column or missing,
+        "af_initial_source": "study column" if native_column is not None else
+            "external user-provided reference proxy; not study-measured AF",
+        "af_initial_reference_files": reference_files,
+        "af_input_column": column or missing,
+    }, initial_paths
+
+
 def _effect_provenance(
     sample: Mapping[str, Any],
     decisions: Mapping[str, Any],
@@ -342,11 +376,19 @@ def build_harmonisation_vcf_provenance(
         if af_external else optional_text(sample.get("eaf_col"))
     )
     af_source = "external user-provided reference" if af_external else "study column"
+    af_type_decision = _decision_source(study_decisions.get("eaf_is_maf_source"))
     af_reference_template = (
         _resolved_path(sample.get("eaffile"), "the external EAF template")
         if af_external else missing
     )
     af_reference_files = paths("user_eaf_file") if af_external else missing
+    initial_af, initial_paths = _initial_frequency_provenance(
+        sample, study_decisions, chromosomes, af_reference_files, separator, missing)
+    for path in initial_paths:
+        if path not in seen_paths:
+            all_paths.append(path)
+            seen_paths.add(path)
+    af_reference_column = af_column if af_external else missing
     af_harmonisation = (
         "Reference frequency aligned to the working effect allele"
         if af_external else "Frequency oriented to the final VCF ALT allele"
@@ -366,7 +408,8 @@ def build_harmonisation_vcf_provenance(
             raise ValueError("EAF replacement provenance is missing resolved files for chromosome(s): %s."
                              % ", ".join(absent))
         af_source = "replacement reference proxy; not study-measured EAF"
-        af_column = optional_text(sample.get("eaf_col"))
+        af_column = initial_af["af_input_column"]
+        af_reference_column = replacement["column"]
         af_reference_template = _resolved_path(replacement["file"], "the selected EAF replacement template")
         replacement_paths = list(dict.fromkeys(
             _resolved_path(replacement["resolved_files"][chromosome], "the selected EAF replacement file")
@@ -374,11 +417,16 @@ def build_harmonisation_vcf_provenance(
         ))
         af_reference_files = _joined_paths(replacement_paths, separator, missing)
         all_paths.extend(path for path in replacement_paths if path not in seen_paths)
-        af_harmonisation = (
-            "Original study MAF preserved; selected reference column %s supplies "
-            "EAF aligned to the working effect allele" % replacement["column"]
-        )
-        af_swapped_formula = reference_af_formula + "; original study MAF is preserved"
+        initially_external = (study_decisions.get("eaf_initial_frequency") or {}).get("source_kind") == "external_eaf"
+        if initially_external:
+            af_type_decision = "reference EAF selected after initial external AF MAF support"
+        preserved = ("Initially selected external AF A preserved; no native GWAS frequency column supplied"
+            if initially_external else "Original study MAF preserved")
+        af_harmonisation = "%s; selected reference column %s supplies EAF aligned to the working effect allele" % (
+            preserved, replacement["column"])
+        af_swapped_formula = reference_af_formula + (
+            "; initial external AF A preserved; native GWAS frequency absent" if initially_external else
+            "; original study MAF is preserved")
 
     info_source = optional_text(sample.get("info_source")) or missing
     if info_source == "internal":
@@ -548,11 +596,10 @@ def build_harmonisation_vcf_provenance(
             "minor_allele_frequency" if replacement is not None
             else study_decisions.get("frequency_type") or missing
         ),
-        "af_type_decision": _decision_source(
-            study_decisions.get("eaf_is_maf_source")
-        ),
+        "af_type_decision": af_type_decision,
         "af_reference_template": af_reference_template,
         "af_reference_files": af_reference_files,
+        "af_reference_column": af_reference_column or missing,
         "af_harmonisation": af_harmonisation,
         "af_swapped_formula": af_swapped_formula,
         "af_output_field": str(output_fields["af"]),
@@ -611,6 +658,7 @@ def build_harmonisation_vcf_provenance(
         ),
         "vcf_status": "created and structurally validated",
     }
+    values.update(initial_af)
     values.update(
         _effect_provenance(sample, study_decisions, reconstruction, missing)
     )

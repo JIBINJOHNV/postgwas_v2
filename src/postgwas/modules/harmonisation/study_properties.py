@@ -49,6 +49,7 @@ from .shared.runtime import (
     configured_column,
     emit_high_visibility_warning,
     format_inference_warning,
+    log_warning,
     resolve_policies,
 )
 from .shared.statistics import valid_frequency_mask
@@ -351,6 +352,7 @@ def _collect_study_statistics(df, sample_column_dict, pol):
 
 def _decide_effect_type(
     df, sample_column_dict, pol, ctx, decisions, statistics, logger=None,
+    *, report_inference_warnings=True,
 ):
     configured = pol.get("effect.type")
     declared = optional_text(sample_column_dict.get("declared_effect_type"))
@@ -448,10 +450,14 @@ def _decide_effect_type(
         decisions["effect_type_source"] = "detector"
         warning = _automatic_inference_warning(verdict, detector_evidence)
         decisions["effect_type_inference_warning"] = warning
-        emit_high_visibility_warning(
-            logger, warning,
-            screen_message=_automatic_inference_warning(verdict, detector_evidence, screen=True),
-        )
+        if report_inference_warnings:
+            emit_high_visibility_warning(
+                logger, warning,
+                screen_message=_automatic_inference_warning(verdict, detector_evidence, screen=True),
+            )
+        else:
+            log_warning(logger, "Automatic effect-type inference; evidence and recommendation "
+                        "are included in the consolidated study report.")
 
     ctx.decide(
         "Effect column '%s'" % column,
@@ -562,6 +568,7 @@ def _decide_beta_z_sign_consistency(
 
 def _decide_pvalue_type(
     df, sample_column_dict, pol, ctx, decisions, statistics, logger=None,
+    *, report_inference_warnings=True,
 ):
     configured = pol.get("pvalue.type")
     declared = optional_text(sample_column_dict.get("declared_pvalue_type"))
@@ -711,12 +718,16 @@ def _decide_pvalue_type(
         decisions["pvalue_type_source"] = "detector"
         warning = _automatic_pvalue_inference_warning(verdict, detector_evidence)
         decisions["pvalue_type_inference_warning"] = warning
-        emit_high_visibility_warning(
-            logger, warning,
-            screen_message=_automatic_pvalue_inference_warning(
-                verdict, detector_evidence, screen=True,
-            ),
-        )
+        if report_inference_warnings:
+            emit_high_visibility_warning(
+                logger, warning,
+                screen_message=_automatic_pvalue_inference_warning(
+                    verdict, detector_evidence, screen=True,
+                ),
+            )
+        else:
+            log_warning(logger, "Automatic P-value-type inference; evidence and recommendation "
+                        "are included in the consolidated study report.")
 
     ctx.decide(
         "P-value column '%s'" % column,
@@ -1033,6 +1044,8 @@ def resolve_study_properties(
     logger=None,
     step_number=7,
     step_total=8,
+    *,
+    report_inference_warnings=True,
 ):
     # type: (pl.DataFrame, Dict[str, Any], Any, Any, int, int) -> Dict[str, Any]
     """Dataset step 07 - decide the study-wide properties once, before the split.
@@ -1060,6 +1073,9 @@ def resolve_study_properties(
 
     The frame is never modified.  Raises :class:`StudyPropertyError` when a
     property cannot be decided with confidence, naming the policy to set.
+    Orchestration can defer routine inference cards to its final study report
+    with ``report_inference_warnings=False``; warning evidence is still saved,
+    and declaration conflicts and fatal diagnostics remain immediate.
     """
     pol = resolve_policies(policies)
     log = logger if logger is not None else NullLogger()
@@ -1106,12 +1122,14 @@ def resolve_study_properties(
         try:
             _decide_effect_type(
                 df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
+                report_inference_warnings=report_inference_warnings,
             )
             _decide_beta_z_sign_consistency(
                 df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
             )
             _decide_pvalue_type(
                 df, sample_column_dict, pol, ctx, decisions, statistics, logger=logger,
+                report_inference_warnings=report_inference_warnings,
             )
             _decide_or_se_scale(
                 df, sample_column_dict, pol, ctx, decisions, logger=logger,

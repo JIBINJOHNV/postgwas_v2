@@ -108,7 +108,17 @@ def test_fresh_replacement_preserves_source_columns_without_export_guard_metadat
     comparison = _reference(tmp_path / "comparison.tsv", extra=None, reverse=True)
     replacement = _reference(tmp_path / "replacement.tsv")
     source, columns = _study(tmp_path, same_source=False)
+    # The resolved multiallelic row now contributes to diagnostics. Its original
+    # GWAS EA is REF with B=1-(.3+.1)=.6, so align the unchanged input MAF and
+    # default comparison to that same allele rather than relying on exclusion.
+    source = source.with_columns(pl.when(pl.col("POS") == 10).then(.4)
+        .otherwise(pl.col("MAF")).alias("MAF"))
+    pl.read_csv(comparison, separator="\t").with_columns(
+        pl.when(pl.col("POS") == 10).then(.6).otherwise(pl.col("EUR")).alias("EUR")
+    ).write_csv(comparison, separator="\t")
     work, decisions, policies = _approved(source, columns, comparison, replacement)
+    assert decisions["eaf_replacement_validation"]["comparable_variants"] == 4
+    assert decisions["eaf_replacement_validation"]["correlation"] == pytest.approx(1.)
     layout = load_configuration().modules.harmonisation.output_layout.model_dump()
     with patch.object(af, "read_reference_variant_table", wraps=af.read_reference_variant_table) as reads:
         result, qc, resolved = af.harmonise_allele_frequency(

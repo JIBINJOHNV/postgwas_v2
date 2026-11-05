@@ -359,6 +359,15 @@ These eight steps run once on the complete study.
    normalization because the canonical chromosome and position columns are
    preserved through that conversion.
 
+   One **Input validation** section combines dataset identity, the effective
+   field mappings and selected external/fixed sources, missing/conversion
+   counts, and this removal ledger. It uses established file references, or
+   the exact declared path/template when no file reference exists. It does not
+   repeat a separate verbose sample-sheet listing. Full resolved configuration
+   and structured field evidence remain available in the audit outputs.
+   Missingness and conversion retain their own labelled denominators; field
+   missing counts are not added together as removed rows.
+
    Chromosome normalization is not study-only. The exact same resolved
    `chromosome.strip_chr_prefix`, `chromosome.strip_leading_zero`, and
    `chromosome.rename_map` policies are reused for every build, strand,
@@ -426,33 +435,36 @@ These eight steps run once on the complete study.
    - raw P versus negative-log10 P (other logarithmic representations are refused); and
    - EAF-like versus MAF-like frequency distribution.
 
+   Selected A is the native frequency or initially external AF merged onto GWAS
+   rows in original listed GWAS-EA direction. The common screen pools usable
+   counts across GWAS rows before diagnostic exclusions. Raw panel-only rows do
+   not contribute. Only a share strictly above `eaf.maf_decision_cutoff` (default
+   0.95) at or below 0.5 is MAF-like; zero usable values stop. Non-MAF-like A
+   skips the additional semantic default comparison. MAF-like A uses independent
+   default AF for the same original GWAS effect allele and the retained dual
+   rules. Diagnostic folding is `min(f,1-f)`, with raw f retained for the profile
+   gates. Independently resolved multiallelic status alone does not exclude a
+   diagnostic pair; orientation, palindrome and validity safeguards still apply.
+
+   Rule 2 alone selects explicit replacement B for native or external A. After
+   staging, merge B in the same original-EA direction and screen all GWAS rows.
+   MAF-like or zero-usable B stops without another default comparison, replacement,
+   retry or fallback. A non-MAF-like B must still pass the separate consistency
+   gate before approval. Initial external A and its descriptor remain frozen;
+   B acquires its own source/cache bindings. These decisions finish before workers.
+
    For the P-value column, finite numeric values provide the denominator for a
    study-wide negative-value check. At the packaged 0.1% maximum, any non-zero
    fraction up to and including 0.1% produces a prominent warning; more than 0.1%
    stops before chromosome processing.
 
    Explicit sample-sheet declarations remain visible and are compared with the
-   detected evidence. Automatic beta/OR inference produces a warning because
-   an all-positive beta column can resemble odds ratios.
-
-   After the conditional whole-study frequency decision, one detailed
-   **Study-wide decisions and evidence** report brings together the build,
-   effect/P representations, SE scale, BETA/Z direction for missing-SE recovery,
-   frequency acceptance/source and strand consensus. It shows observed counts,
-   the relevant denominators, resolved policy limits, the decision source and
-   the planned action. The renderer reuses already-computed scalar evidence;
-   it adds no study/reference scan or scientific comparison. Warnings remain
-   immediate, and scientific decisions are unchanged.
-
-   A frequency comparison not required by the distribution screen is labelled
-   accordingly, rather than reference-confirmed. A replacement source is
-   selected for later assignment, not reported as delivered output EAF. Explicit
-   reference-aligned strand declarations are distinguished from inferred
-   consensus. Missing inputs and empty eligible subsets receive a reason, not
-   fabricated passing counts. On study-property or frequency failure, the
-   completed evidence is displayed before the original error propagates and
-   is retained in the failed manifest. Successful runs retain the same evidence
-   in their existing study-decision metadata for later inspection.
+   detected evidence. Routine automatic effect/P-value inference notices are
+   recorded here and shown once inside the consolidated study report after
+   preparation finishes. They retain warning severity, supporting evidence,
+   interpretation limits, recommendations and the planned transformation.
+   Declaration conflicts and fatal warnings remain immediate. Direct library
+   calls retain their immediate inference notices by default.
 
 Immediately after dataset step 4, PostGWAS applies the **chromosome-X Z-only reconstruction
 guard**. If X is present and the study supplies Z but neither BETA nor SE, the
@@ -538,6 +550,30 @@ and the standard
    Before each spawn pool starts, the same
    per-chromosome thread limit is exported through `POLARS_MAX_THREADS`, so
    Polars and bcftools are bounded consistently inside every worker.
+
+After AF validation, INFO resolution, partition validation and chromosome-set
+checks have finished, PostGWAS shows one **Study-wide decisions and evidence**
+report immediately before returning the prepared worker inputs. It brings
+together build, effect and P-value interpretation, SE scale, BETA/Z direction,
+strand consensus, AF A/B and INFO decisions, with the saved counts, denominators,
+policy limits and planned actions. A and any selected B appear together in one
+frequency subsection; provisional selection does not produce a separate pending
+report before the terminal preparation outcome. A skipped semantic frequency
+comparison is labelled as skipped, not reference-confirmed.
+
+Genome build appears once as a dataset decision with pooled supporting evidence.
+The readable terminal, screen and dataset logs do not expand routine chromosome
+build rows. Full chromosome evidence, distinct loci and normal/fallback gate
+outcomes remain in the existing structured stage evidence and manifests.
+
+If preparation fails earlier, one partial-evidence report shows the known
+decisions, failed check and stop reason before the original exception propagates.
+This includes AF/staging, INFO, partition-write and chromosome-set failures.
+Unvisited checks remain unknown or pending, never passed. A later failure shows
+the failing stage and new findings without replaying unchanged study decisions.
+Mandatory step progress and final output/completeness summaries remain visible;
+they describe different stages. Rendering uses saved evidence and adds no input
+scan, join or scientific comparison.
 
 At this point PostGWAS has not yet created VCFs. It has a validated study,
 recorded study-wide decisions, and one work file per chromosome.
@@ -636,39 +672,14 @@ See [Authoritative input mappings](sample-sheet.md#authoritative-input-mappings)
    It then validates the selected internal EAF or, only when no internal EAF
    column was selected, allele-matches the configured external EAF. An external
    EAF file is a dataset-level alternative source; it does not row-wise fill
-   null values in a selected study EAF column. If the whole-study screen marked
-   an internal column as MAF-like, the reference performs the second check here
-   using non-palindromic matches.
-
-   An external source is screened separately on its deduplicated raw frequency
-   values before a swapped allele match can apply `1-AF`. A result that is not
-   MAF-like retains the sample sheet's declared ALT/EAF meaning. If it is
-   MAF-like, PostGWAS requires the same EAF-versus-folded-MAF comparison against
-   the independently configured `modules.harmonisation.default_eaf` panel. When
-   the external source and that default resolve to the same physical file,
-   independent confirmation is impossible, so processing stops and asks for a
-   different `modules.harmonisation.default_eaf.source`.
-
-   For either internal or external MAF-like evidence, the
-   reference must contain enough matched variants. PostGWAS folds both matched
-   columns as `MAF = min(AF, 1-AF)` and requires the YAML-selected Pearson or
-   Spearman correlation plus the configured maximum mean absolute difference to
-   pass. This checks whether the default population panel is suitable for the
-   comparison; because folding removes allele direction, it does not itself
-   identify EAF. A constant vector has no finite correlation and is
-   inconclusive. The aligned reference must then not be dominated by effect
-   alleles whose frequency is already at or below 0.5, and the mean error as EAF
-   versus folded MAF must differ by the configured minimum margin. Clear EAF
-   evidence for an internal column triggers the deferred
-   `1-EAF` correction on allele-swapped rows; clear EAF evidence for an external
-   column retains its declared mapping and normal direct/swap alignment. A true
-   MAF result, too little overlap, an uninformative reference comparison, or
-   errors that are too close stop with an actionable message. PostGWAS never
-   guesses that an unresolved MAF-like column is EAF and never auto-converts an
-   external MAF column. The population-frequency compatibility rationale follows
-   the [1000 Genomes Project](https://doi.org/10.1038/nature15393), while the
-   accepted output still follows the
-   [GWAS-SSF EAF definition](https://www.ebi.ac.uk/gwas/docs/summary-statistics-format).
+   null values in a selected study EAF column. Workers reuse the saved global
+   source approval and prepared row/key assignments without repeating MAF-like
+   screening or semantic default-reference comparisons. A global pass does not
+   override the chromosome's usable external-frequency coverage requirement
+   (default 0.80), identity checks, missing/invalid-value policies or final QC.
+   Allele swaps apply the accepted frequency transformation once; frozen A is
+   retained as provenance when B supplies working EAF. The output continues to
+   follow the [GWAS-SSF EAF definition](https://www.ebi.ac.uk/gwas/docs/summary-statistics-format).
 
    A palindromic frequency from an independent external EAF file cannot orient
    the study beta. After automatic consensus/internal study EAF or an explicit
@@ -951,8 +962,9 @@ After each chromosome round:
    mislabelled as scientific rejects.
 8. Write the reason-by-chromosome report from the same validated streaming
    counts used by the assertion.
-9. Finalize the EAF/MAF decision using chromosome reference evidence. This final
-   decision replaces the initial MAF suspicion in later QC and concordance.
+9. Finalize frequency provenance from completed chromosome outputs and the saved
+   whole-study source approval. Incomplete coverage or a chromosome failure
+   cannot establish final EAF adoption. No semantic classification is repeated.
 
 ## Stage 5 — Merge chromosome results and run final QC
 

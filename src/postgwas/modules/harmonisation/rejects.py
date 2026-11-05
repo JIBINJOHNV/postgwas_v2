@@ -132,6 +132,10 @@ _REASONS = {
     "reference_ambiguous":
         "More than one reference allele orientation remains possible, so the "
         "effect allele cannot be selected safely.",
+    "native_multiallelic_eaf_swap_unsupported":
+        "A reference-aligned allele swap at a multiallelic site cannot recover "
+        "the opposite allele frequency from one native study EAF. The original "
+        "study frequency is preserved in rejection provenance.",
 
     # -- step 04, sample size --------------------------------------------------
     "neff_invalid":
@@ -247,6 +251,7 @@ _REASON_STEPS = {
     "af_discordant": "03",
     "reference_unmatched": "03",
     "reference_ambiguous": "03",
+    "native_multiallelic_eaf_swap_unsupported": "03",
     "neff_invalid": "04",
     "sample_size_invalid": "04",
     "effect_non_positive_or": "05",

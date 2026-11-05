@@ -8,14 +8,24 @@ older versions.
 
 ## Input completeness and numeric conversion
 
-The terminal and saved screen report show each field separately, with its actual
-study column or selected external/fixed source. **Missing in input** counts
+One **Input validation** section in the terminal and saved screen report combines
+dataset/source identity, effective field mappings, each field's missing/conversion
+counts and the read-stage removal ledger. It identifies the actual study column
+or selected external/fixed source. Established file references are reused;
+unregistered paths/templates retain their exact declaration. A separate verbose
+sample-sheet dump is not repeated in the readable stream. **Missing in input** counts
 original missing tokens across rows remaining after explicit chromosome
 exclusion. **Invalid numeric** counts
 non-missing cells changed to null by scalar conversion, using only the
 non-missing values assessed after initial missing-field and coordinate filtering.
 These denominators can differ; conversion failures are not automatically row
 removals. Counts reuse the existing parsers rather than scanning the data again.
+
+For example, 11,749,765 input rows with 315,449 read-stage mandatory-field
+removals leave 11,434,316 retained rows. Missingness assessed on the original
+input and conversion assessed on the retained rows keep those different
+denominators. Missing counts for several fields are not summed into another
+removal total; the disjoint row ledger owns removal accounting.
 
 An absent Z column is reported as not supplied, with a planned calculation from
 harmonised BETA and SE; it never borrows the effect column's missing count.
@@ -29,7 +39,25 @@ Successful conversion does not establish valid scientific ranges or statistical
 consistency. The detailed field-completeness TSV retains technical lifecycle
 information and adds per-column numeric conversion evidence as JSON.
 
-When effect type is inferred automatically, a structured warning shows the study
+## Study-wide decisions and inference notices
+
+An orchestrated run emits one **Study-wide decisions and evidence** report after
+AF approval, INFO resolution, partition validation and chromosome-set checks,
+immediately before prepared worker inputs are returned. It contains the build,
+effect, SE, P-value, BETA/Z, strand, AF A/B and INFO decisions together. A and any
+selected replacement B share one frequency subsection with their separate roles,
+saved screens and terminal preparation outcome. No preliminary pending report
+is followed by a second full report. Preparation approval does not establish
+successful chromosome processing, final output validation or analysis readiness.
+
+The build section shows one selected dataset build and pooled evidence, without
+routine chromosome-by-chromosome rows in the readable terminal, screen or
+dataset log. Full chromosome build evidence, distinct loci and normal/fallback
+gate outcomes remain in structured stage evidence and successful/failed
+manifests. A blocking conflict may identify the affected chromosomes in the
+dataset failure reason.
+
+When effect type is inferred automatically, an inline warning shows the study
 column, inferred type, usable-value count, zero/negative count and percentage,
 and median. The odds-ratio acceptance threshold and median interval are taken
 from the resolved configuration, not fixed display defaults. The warning states
@@ -37,8 +65,8 @@ the planned transformation and asks the user to verify the study documentation
 before declaring `effect_type`. The detailed explanation remains in the canonical
 log. This presentation does not change the inference or scientific calculations.
 
-An automatically selected p-value scale has a matching structured warning at
-the same dataset-level step. It shows the exact input column, finite numeric
+An automatically selected p-value scale has a matching inline warning in the
+same consolidated report. It shows the exact input column, finite numeric
 count, excluded missing/non-numeric/non-finite count, observed range, and the
 count and percentage above the resolved detection threshold. The displayed
 minimum count, minimum percentage and median interval come from the detector's
@@ -49,15 +77,26 @@ from `-log10(P)` using `P = 10^(-input value)`, and asks the user to confirm
 `p_value_type` in the sample sheet or `pvalue.type` in YAML. It does not infer
 whether the statistical test is one-sided or two-sided.
 
-This warning is shown once when the study applies automatic inference, not
+These routine notices are shown once in the orchestrated report when the study
+applies automatic inference, not
 when an explicit sample-sheet/YAML scale is applied or when detection fails.
 Excluded values are omitted from inference, not removed at this step. The notice
 is returned with the study decisions and saved in the canonical log; the screen
-recorder captures the structured block even with terminal display hidden.
+recorder captures the consolidated report even with terminal display hidden.
+Direct library calls retain immediate inference notices by default; declaration
+conflicts and fatal warnings remain immediate in every mode.
 Chromosome workers reuse the decision without repeating this notice. Detection,
 conversion, missingness and range policies remain unchanged; no additional
 data scan is performed. Any tolerated negative values still follow the
 configured chromosome range policy, which can reject, null or fail.
+
+If preparation fails before its report, one partial report retains only measured
+or known evidence, the failed check and the stop reason. Unperformed checks are
+not described as passed. This covers failures in AF/staging, INFO inference,
+partition writing and final chromosome checks. Failures after the report show
+the failing stage and new findings without replaying unchanged build or
+statistic-type sections. Mandatory stage start/completion/failure messages,
+chromosome progress and final output/completeness summaries remain in place.
 
 ## Primary VCFs
 
@@ -422,7 +461,7 @@ the run manifest supplies the forward/reverse study consensus that harmonisation
 used to orient them. A missing consensus is reported and never replaced by an
 allele-frequency strand guess; SE remains directly comparable.
 
-When the whole-study comparison supports the original frequency column as MAF
+When the whole-study comparison supports selected native or initially external A as MAF
 and selects an explicitly supplied replacement reference, the sample-sheet
 mapping and original MAF values remain provenance. The run manifest records
 `eaf_input_interpretation: maf`, `eaf_selected_source: replacement_reference`,
@@ -440,8 +479,18 @@ Original MAF cells, including missing or invalid values excluded from the
 classification evidence, remain preserved. A row with missing original MAF can
 remain when its selected reference EAF and other required fields pass validation.
 An entirely unusable original frequency column cannot establish MAF and stops
-before replacement selection. Reports keep original evidence usability counts
-separate from retained replacement values and output-frequency missingness.
+before replacement selection. B is screened once across merged GWAS rows in
+original listed GWAS-EA direction before consistency checking. MAF-like B records
+`replacement_frequency_maf_like`; zero usable B records
+`no_usable_replacement_frequencies`. Both stop without another default comparison,
+replacement, retry or fallback. Reports show each saved screen's source role,
+GWAS-row scope, allele direction, rows, usable/unusable counts, numerator/fraction,
+cutoff and result, followed by computed diagnostic N/n, exclusions, exact reason
+and approval status. Source-panel statistics are descriptive only. An early
+screen failure does not invent later correlation or consistency measurements.
+Reports keep original usability separate from retained replacement values and
+output-frequency missingness; rendering does not rescan data. External A keeps
+its source descriptor and explicit absent-native-column provenance through B adoption.
 
 Automatic and standalone concordance read that manifest selection and reuse the
 existing full-allele reference lookup. Expected AF comes from the selected
@@ -462,8 +511,10 @@ It counts as unusable in the original reference-coverage denominator and follows
 the configured required-field missing action; the packaged
 `final_check.on_missing: reject` records and removes the row. Coverage and
 rejection limits remain active. Original MAF and reported reference values are
-preserved. Diagnostic MAF/EAF comparison remains restricted to its existing
-biallelic set, and the replacement is not used to reclassify the input.
+preserved. Diagnostic effect-versus-all-other folding may include independently
+resolved multiallelic evidence; orientation, palindrome and value safeguards
+remain. The replacement does not reclassify A. Workers reuse the global source
+decision without repeating chromosome-level semantic checks.
 Ordinary CSV external sources retain their existing direct concordance lookup
 contract.
 
@@ -490,6 +541,17 @@ harmonisation description identifies the selected column and final ALT EAF;
 the original input MAF is not described as inverted. This follows the
 [GWAS-VCF ALT-oriented association-field contract](https://github.com/MRCIEU/gwas-vcf-specification)
 and the [VCF allele-specific AF definition](https://samtools.github.io/hts-specs/VCFv4.5.pdf).
+
+For initially external A followed by replacement B, `postgwas_af_input_column`
+names A's original external column. `postgwas_af_native_input_column` explicitly
+records `not_provided` when the GWAS had no mapped frequency column.
+`postgwas_af_initial_source` and `postgwas_af_initial_reference_files` identify
+the preserved A source; `postgwas_af_reference_column` and the existing reference
+file/template headers identify final B. Private working-column names are not
+published as scientific input columns. The harmonisation and swap descriptions
+preserve the distinction between supplied external A and study-measured AF.
+These additive metadata names are configured under `vcf_processing.provenance.headers`;
+they do not change frequencies, numeric defaults or QC policies.
 
 ## Logs and provenance
 

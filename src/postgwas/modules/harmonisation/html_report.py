@@ -21,7 +21,9 @@ from postgwas.core.pipeline_logging import _elapsed
 from postgwas.modules.harmonisation.report_steps import (
     chromosome_steps, dataset_steps, post_merge_steps, summarise_chromosome_evidence,
 )
-from postgwas.modules.harmonisation.study_reporting import replacement_frequency_fields, external_frequency_fields
+from postgwas.modules.harmonisation.study_reporting import (
+    external_frequency_fields, native_frequency_screen_fields, replacement_frequency_fields,
+)
 
 
 _STATUS_STYLES = {
@@ -304,7 +306,7 @@ def _decision_section(record: Mapping[str, Any], manifest: Mapping[str, Any]) ->
         _key_value_table(rows)
         + _mapping_details("Full recorded genome-build evidence", build)
         + _mapping_details("Full recorded study-decision evidence", decisions),
-        subtitle="Effect, SE, p-value and strand decisions are resolved study-wide and reused by chromosome workers. Initial MAF suspicion is provisional; the final frequency interpretation also incorporates subsequent chromosome-level reference validation."
+        subtitle="Effect, SE, p-value, strand decisions and whole-study frequency source approval are resolved before workers and reused unchanged. Initial MAF suspicion is provisional; final frequency interpretation also requires successful chromosome and output QC."
         + (" Experimental dominant-build inference: the match fraction is not a posterior probability and small mixed components can pass."
            if fallback_accepted else ""),
     )
@@ -938,6 +940,7 @@ def _overview_alignment(record: Mapping, manifest: Mapping, evidence: Mapping) -
         ])
     reporting_decisions = {**decisions, "report_failure": decisions.get("report_failure")
         or (manifest.get("failure") or {}).get("message") or record.get("failure_reason")}
+    rows.extend((label, value) for _kind, label, value in native_frequency_screen_fields(reporting_decisions))
     rows.extend((label, value) for _kind, label, value in replacement_frequency_fields(reporting_decisions))
     rows.extend((label, value) for _kind, label, value in external_frequency_fields(reporting_decisions))
     strand = [

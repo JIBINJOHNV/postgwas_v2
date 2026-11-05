@@ -230,7 +230,10 @@ def test_saved_evidence_canonical_log_and_report_preserve_strand_and_acceptance(
     log = open(logger.log_path).read()
     assert "low_coverage_fallback" in log
     assert "exclusive SNP loci" in log
-    assert "chromosome 1" in log
+    assert "Genome-build chromosome" not in log
+    stage = next(item for item in logger.summary()["steps"] if "genome_build" in item.get("extra", {}))
+    assert stage["extra"]["genome_build"]["per_chromosome"] == result["per_chromosome"]
+    assert result["per_chromosome"]["1"]["testable_variants"] == 1
 
 
 def test_missing_alleles_remain_in_coordinate_testable_denominator(tmp_path):

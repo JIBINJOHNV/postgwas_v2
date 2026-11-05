@@ -145,39 +145,51 @@ def test_whole_study_comparison_requires_positive_total(total):
 
 
 def test_whole_study_overlap_uses_all_input_rows(tmp_path):
-    # Six usable pairs over two chromosomes, plus missing/invalid, palindrome,
-    # unmatched, split-site and ambiguously oriented diagnostic exclusions.
+    # Seven usable pairs (including the resolved split site) over two
+    # chromosomes. Invalid/unmatched/palindromic rows stay in the denominator.
     reference = tmp_path / 'coverage.tsv'
     reference.write_text('CHROM\tPOS\tREF\tALT\tEUR\n' + ''.join(
         f'{chrom}\t{pos}\tG\tA\t{af}\n' for chrom, pos, af in
         [('1', 1, .1), ('1', 2, .2), ('1', 3, .3), ('2', 1, .15), ('2', 2, .25), ('2', 3, .35),
          ('1', 4, .1), ('1', 5, .2), ('1', 7, .2), ('1', 7, .1)])
         + '1\t6\tT\tA\t0.2\n1\t8\tC\tG\t0.2\n')
-    frame = pl.DataFrame({'CHR': ['1'] * 3 + ['2'] * 3 + ['1'] * 6,
-        'POS': [1, 2, 3, 1, 2, 3, 4, 5, 6, 99, 7, 8],
-        'EA': ['A'] * 11 + ['G'], 'OA': ['G'] * 8 + ['T', 'G', 'G', 'C'],
-        'AF': [.1, .2, .3, .15, .25, .35, None, -1., .2, .2, .2, .2]})
-    # Different ALT at the same position makes site 7 ineligible.
+    frame = pl.DataFrame({'CHR': ['1'] * 3 + ['2'] * 3 + ['1'] * 8,
+        'POS': [1, 2, 3, 1, 2, 3, 4, 5, 6, 99, 7, 8, 199, 200],
+        'EA': ['A'] * 11 + ['G', 'A', 'A'], 'OA': ['G'] * 8 + ['T', 'G', 'G', 'C', 'G', 'G'],
+        'AF': [.1, .2, .3, .15, .25, .35, None, -1., .2, .2, .2, .2, .2, .2]})
+    # A different ALT does not itself exclude the matched effect-frequency pair.
     text = reference.read_text().replace('1\t7\tG\tA\t0.1', '1\t7\tG\tC\t0.1')
     reference.write_text(text)
     frame = frame.with_row_index(SOURCE_INPUT_ROW_COLUMN)
     pol = default_policies().with_overrides({'eaf.maf_reference_min_overlap': 2})
     result, prepared = prepare(frame, pol, reference)
     evidence = result['eaf_reference_validation']
-    assert evidence['study_variant_count'] == 12
-    assert evidence['comparable_variants'] == 6
+    assert evidence['study_variant_count'] == 14
+    assert evidence['comparable_variants'] == 7
     assert evidence['observed_overlap_fraction'] == .5
     assert prepared.select(frame.columns).equals(frame)
     bad = frame.with_columns(pl.when(pl.col(SOURCE_INPUT_ROW_COLUMN) == 0).then(None).otherwise(pl.col('AF')).alias('AF'))
     with pytest.raises(StudyAlleleFrequencyError, match='insufficient_overlap_fraction') as caught:
         prepare(bad, pol, reference)
-    assert caught.value.study_decisions['eaf_reference_validation']['study_variant_count'] == 12
-    assert caught.value.study_decisions['eaf_reference_validation']['comparable_variants'] == 5
+    assert caught.value.study_decisions['eaf_reference_validation']['study_variant_count'] == 14
+    assert caught.value.study_decisions['eaf_reference_validation']['comparable_variants'] == 6
 
 
 def test_whole_study_pair_count_cannot_exceed_denominator():
     with pytest.raises(StudyAlleleFrequencyError, match='exceed'):
         _paired_comparison([.1, .2, .3], total=2)
+
+
+@pytest.mark.parametrize('values', [[None, None], [float('nan'), float('inf')], [-1., 2.]])
+def test_selected_native_frequency_without_usable_values_cannot_be_retained(values):
+    frame = pl.DataFrame({'CHR': ['1', '1'], 'POS': [1, 2], 'EA': ['A', 'A'],
+        'OA': ['G', 'G'], 'AF': values}).with_row_index(SOURCE_INPUT_ROW_COLUMN)
+    before = frame.clone()
+    with pytest.raises(StudyAlleleFrequencyError, match='no usable') as caught:
+        af.validate_study_allele_frequency(frame, COLUMNS,
+            {'eaf_column': 'AF', 'eaf_is_maf': False}, {}, MAPPING, policies=default_policies())
+    assert caught.value.study_decisions['eaf_effective_frequency_screen']['usable'] == 0
+    assert frame.equals(before)
 
 
 @pytest.mark.parametrize('scope', ['all', 'common'])

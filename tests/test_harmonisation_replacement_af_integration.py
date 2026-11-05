@@ -201,7 +201,7 @@ def test_unchanged_invalid_original_values_remain_provenance(tmp_path, value):
 
 @pytest.mark.parametrize("extra", [.1, None, float("nan"), .9])
 @pytest.mark.parametrize("swapped", [False, True])
-def test_multiallelic_diagnostics_exclude_rows_without_changing_attachment(tmp_path, extra, swapped):
+def test_multiallelic_diagnostics_include_resolved_values_without_changing_attachment(tmp_path, extra, swapped):
     def modify(source, default, replacement):
         ref = pl.read_csv(replacement, separator="\t", infer_schema_length=0)
         if swapped:
@@ -215,10 +215,11 @@ def test_multiallelic_diagnostics_exclude_rows_without_changing_attachment(tmp_p
     parts = fixture(tmp_path, modify=modify)
     decisions = validate(parts)
     evidence = decisions["eaf_replacement_validation"]
-    assert evidence["study_variant_count"] == 12 and evidence["comparable_variants"] == 11
-    assert evidence["excluded_counts"]["replacement_non_biallelic_or_unresolved_rows"] == 1
-    result, _, columns = adopt(parts, decisions)
     expected = (None if extra is None or extra != extra or extra == .9 else .7) if swapped else .8
+    assert evidence["study_variant_count"] == 12
+    assert evidence["comparable_variants"] == (11 if expected is None else 12)
+    assert evidence["excluded_counts"]["replacement_unresolved_rows"] == (1 if expected is None else 0)
+    result, _, columns = adopt(parts, decisions)
     if expected is None:
         assert result[columns["eaf_col"]][0] is None
     else:
@@ -410,13 +411,22 @@ def test_changed_allele_mapping_same_file_runs_shared_merge(tmp_path, monkeypatc
 
 def test_unreadable_candidate_preserves_io_failure_and_original_evidence(tmp_path, monkeypatch):
     parts = fixture(tmp_path)
+    before = {p: Path(p).read_bytes() for p in parts[5].paths.values()}
     def unreadable(*args, **kwargs):
         raise PermissionError("selected replacement cannot be read")
     monkeypatch.setattr(af, "read_reference_variant_table", unreadable)
     with pytest.raises(PermissionError, match="selected replacement cannot be read") as caught:
         validate(parts)
     assert caught.value.study_decisions["eaf_reference_validation"] == parts[2]["eaf_reference_validation"]
-    assert "eaf_replacement_validation" not in caught.value.study_decisions
+    evidence = caught.value.study_decisions["eaf_replacement_validation"]
+    assert evidence["status"] == "invalid" and "contract" not in evidence
+    assert evidence["failure_reason"]
+    assert evidence["failure_reason"] == evidence["decision_reason"]
+    assert evidence["failure_message"] == str(caught.value)
+    assert evidence["source"]["file"] == parts[2]["eaf_replacement"]["file"]
+    assert evidence["source"]["column"] == "AF"
+    assert {p: Path(p).read_bytes() for p in before} == before
+    assert "eaf_replacement_validation" not in parts[2]
 
 
 def test_chromosome_without_diagnostic_candidates_does_not_shrink_fixed_n(tmp_path):
@@ -452,6 +462,7 @@ def test_chromosome_template_matches_one_global_whole_file_decision(tmp_path):
 @pytest.mark.parametrize("problem", ["missing", "malformed", "column", "mapping", "wrong_build"])
 def test_invalid_selected_sources_never_supply_approval(tmp_path, problem):
     parts = fixture(tmp_path)
+    before = {p: Path(p).read_bytes() for p in parts[5].paths.values()}
     path = tmp_path / "replacement.tsv"
     if problem == "missing":
         path.unlink()
@@ -467,10 +478,23 @@ def test_invalid_selected_sources_never_supply_approval(tmp_path, problem):
         pl.read_csv(path, separator="\t").with_columns((pl.col("POS") + 100000).alias("POS")).write_csv(path, separator="\t")
     with pytest.raises(af.AlleleFrequencyError) as caught:
         validate(parts)
+    assert caught.value.study_decisions["eaf_reference_validation"] == parts[2]["eaf_reference_validation"]
+    assert {p: Path(p).read_bytes() for p in before} == before
     if problem == "wrong_build":
-        assert caught.value.study_decisions["eaf_replacement_validation"]["comparable_variants"] == 0
+        evidence = caught.value.study_decisions["eaf_replacement_validation"]
+        assert evidence["failure_reason"] == "no_usable_replacement_frequencies"
+        assert evidence["effective_frequency_screen"]["usable"] == 0
+        assert "comparable_variants" not in evidence
+        assert "contract" not in evidence
     else:
-        assert "eaf_replacement_validation" not in caught.value.study_decisions
+        evidence = caught.value.study_decisions["eaf_replacement_validation"]
+        assert evidence["status"] == "invalid" and "contract" not in evidence
+        assert evidence["failure_reason"]
+        assert evidence["failure_reason"] == evidence["decision_reason"]
+        assert evidence["failure_message"] == str(caught.value)
+        assert evidence["source"]["file"] == parts[2]["eaf_replacement"]["file"]
+        assert evidence["source"]["column"] == parts[2]["eaf_replacement"]["column"]
+        assert "eaf_replacement_validation" not in parts[2]
 
 
 @pytest.mark.parametrize("same", [False, True])

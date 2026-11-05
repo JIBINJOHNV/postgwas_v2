@@ -144,7 +144,9 @@ def test_real_dataset_preparation_selects_then_stages_replacement(tmp_path, monk
         "ALT": ["C"] * count, "EUR": frequency,
     })
     reference.write_csv(default, separator="\t")
-    reference.with_columns((pl.lit(.25) if reference_mode == "inconclusive" else pl.col("EUR")).alias("PANEL_AF")).write_csv(replacement, separator="\t")
+    # A constant major frequency passes the new merged-B screen while its
+    # constant folded vector still isolates the retained correlation gate.
+    reference.with_columns((pl.lit(.75) if reference_mode == "inconclusive" else pl.col("EUR")).alias("PANEL_AF")).write_csv(replacement, separator="\t")
     selected_file = default if same_reference else replacement
     selected_column = "EUR" if same_reference else "PANEL_AF"
     resource_maps = {
@@ -205,6 +207,7 @@ def test_real_dataset_preparation_selects_then_stages_replacement(tmp_path, monk
             with pytest.raises(service.StudyAlleleFrequencyError, match="replacement.*inconclusive") as caught:
                 service.harmonise_chromosomes(**arguments)
             assert caught.value.study_decisions["eaf_replacement_validation"]["status"] == "inconclusive"
+            assert caught.value.study_decisions["eaf_replacement_validation"]["effective_frequency_screen"]["maf_like"] is False
             assert logger.summary()["steps"][-1]["status"] == "failed"
             log = Path(logger.log_path).read_text()
             assert "Whole-study replacement AF validation" in log and "correlation_unavailable" in log

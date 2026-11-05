@@ -70,17 +70,28 @@ def adopt(parts, decisions, chromosome="1", frame=None):
 
 
 @pytest.mark.parametrize("external_swap,study_swap", [(False, False), (False, True), (True, False), (True, True)])
-def test_pooled_external_source_uses_its_own_counted_allele_and_never_reclassifies(tmp_path, monkeypatch, external_swap, study_swap):
+def test_pooled_external_screen_uses_original_gwas_effect_allele_and_never_reclassifies(tmp_path, monkeypatch, external_swap, study_swap):
     raw = [.1 + i % 40 / 100 for i in range(1200)]
     parts = fixture(tmp_path, external_swap=external_swap, study_swap=study_swap, values=raw,
         default_values=[1-x for x in raw] if external_swap else raw)
     decisions = validate(parts)
     evidence = decisions["eaf_external_validation"]
     assert evidence["status"] == "passed"
-    assert evidence["comparable_variants"] == evidence["study_variant_count"] == 1200
-    assert evidence["rule_1_passed"] and not evidence["rule_2_passed"]
-    assert evidence["direct_eaf_correlation"] == pytest.approx(1.)
-    assert evidence["mean_eaf_error"] == pytest.approx(0.)
+    original_ea_minor = external_swap == study_swap
+    screen = evidence["effective_frequency_screen"]
+    assert screen["rows"] == screen["usable"] == evidence["study_variant_count"] == 1200
+    assert screen["at_or_below_0_5"] == (1200 if original_ea_minor else 0)
+    assert screen["maf_like"] is original_ea_minor
+    assert screen["scope"] == "merged_gwas_rows"
+    assert screen["allele_direction"] == "original_gwas_effect_allele"
+    if original_ea_minor:
+        assert evidence["comparable_variants"] == 1200
+        assert evidence["rule_1_passed"] and not evidence["rule_2_passed"]
+        assert evidence["direct_eaf_correlation"] == pytest.approx(1.)
+        assert evidence["mean_eaf_error"] == pytest.approx(0.)
+    else:
+        assert evidence["decision_reason"] == "external_frequency_not_predominantly_minor"
+        assert "comparable_variants" not in evidence and "rule_1_passed" not in evidence
     assert evidence["raw_frequency_screen"]["usable"] == 1200
     assert decisions["eaf_column"] is None and decisions["eaf_is_maf"] is None
     assert "eaf_replacement" not in decisions
@@ -139,10 +150,13 @@ def test_external_maf_inconclusive_and_unusable_sources_stop_without_replacement
         x = [None if kind == "missing" else -1.] * 1200
     parts = fixture(tmp_path, values=x, default_values=r, policies=policies)
     original = {p: Path(p).read_bytes() for p in parts[5].paths.values()}
-    with pytest.raises(af.StudyAlleleFrequencyError, match=reason) as caught:
+    message = "(?s)MAF.*eaf-replacement-file.*eaf-replacement-column" if kind == "maf" else reason
+    with pytest.raises(af.StudyAlleleFrequencyError, match=message) as caught:
         validate(parts)
     decisions = caught.value.study_decisions
     assert decisions["eaf_external_validation"]["decision_reason"] == reason
+    if kind == "maf":
+        assert decisions["eaf_external_validation"]["failure_reason"] == "replacement_arguments_missing"
     assert "contract" not in decisions["eaf_external_validation"] and "eaf_replacement" not in decisions
     assert {p: Path(p).read_bytes() for p in original} == original
 
@@ -163,7 +177,7 @@ def test_same_physical_file_never_supplies_independent_semantic_evidence(tmp_pat
         validate(parts)
 
 
-def test_raw_screen_counts_shared_source_only_over_observed_chromosomes(tmp_path):
+def test_descriptive_panel_counts_and_decisive_gwas_screen_ignore_unobserved_chromosomes(tmp_path):
     parts = fixture(tmp_path)
     path = Path(parts[3]["1"]["user_eaf_file"])
     reference = pl.read_csv(path, separator="\t")
@@ -173,6 +187,9 @@ def test_raw_screen_counts_shared_source_only_over_observed_chromosomes(tmp_path
     screen = result["eaf_external_validation"]["raw_frequency_screen"]
     assert screen["rows"] == screen["usable"] == screen["at_or_below_0_5"] == 1200
     assert screen["maf_like"] is True
+    effective = result["eaf_external_validation"]["effective_frequency_screen"]
+    assert effective["rows"] == effective["usable"] == effective["at_or_below_0_5"] == 1200
+    assert effective["scope"] == "merged_gwas_rows" and effective["maf_like"] is True
 
 
 @pytest.mark.parametrize("change", ["source", "partition", "mapping", "column", "descriptor", "cache", "approval"])
@@ -400,7 +417,7 @@ def test_approved_assignment_matches_fresh_declared_alt_output_schema_and_all_ro
     decisions = validate(parts)
     evidence = decisions["eaf_external_validation"]
     assert evidence["comparable_variants"] == (1199 if case in (
-        "missing", "invalid", "palindrome", "multiallelic", "unresolved", "unmatched", "default_multiallelic") else 1200)
+        "missing", "invalid", "palindrome", "unmatched") else 1200)
     frame = pl.read_parquet(parts[5].paths["1"])
     if case == "subset":
         frame = frame.slice(1, 30).reverse()
@@ -463,7 +480,7 @@ def test_external_terminal_and_html_report_recorded_global_evidence_without_rean
         assert "Replacement validation" not in report
 
 
-def test_both_panels_ineligible_rows_have_no_private_diagnostic_frequency(tmp_path, monkeypatch):
+def test_resolved_multiallelic_rows_keep_valid_private_diagnostic_frequencies(tmp_path, monkeypatch):
     def modify(source, default, external):
         with external.open("a") as handle:
             handle.write("1\t100\tA\tG\t.1\n")
@@ -473,15 +490,18 @@ def test_both_panels_ineligible_rows_have_no_private_diagnostic_frequency(tmp_pa
     observed = []
     def inspect(frame, *a, **k):
         if frame.columns == ["study_frequency", "replacement_frequency", "eligible"]:
-            invalid = frame.filter(~pl.col("eligible"))
-            if invalid.height:
-                observed.append(invalid.height)
-                assert invalid["study_frequency"].null_count() == invalid.height
-                assert invalid["replacement_frequency"].null_count() == invalid.height
+            observed.append(frame.clone())
+            assert frame["eligible"].all()
+            assert frame["study_frequency"].null_count() == 0
+            assert frame["replacement_frequency"].null_count() == 0
         return writer(frame, *a, **k)
     monkeypatch.setattr(pl.DataFrame, "write_parquet", inspect)
-    assert validate(parts)["eaf_external_validation"]["comparable_variants"] == 1199
-    assert observed == [1]
+    assert validate(parts)["eaf_external_validation"]["comparable_variants"] == 1200
+    paired = pl.concat(observed)
+    assert paired.height == 1200
+    expected = [.1 + i % 40 / 100 for i in range(1200)]
+    assert sorted(paired["study_frequency"].to_list()) == pytest.approx(sorted(expected))
+    assert paired.select((pl.col("study_frequency") - pl.col("replacement_frequency")).abs().max()).item() == pytest.approx(0.)
 
 
 def test_absolute_count_equality_pools_two_individually_insufficient_shards(tmp_path):
@@ -714,5 +734,10 @@ def test_typed_second_shard_failure_retains_partial_raw_counts_without_claiming_
     assert partial["1"]["usable"] == partial["1"]["at_or_below_0_5"] == 600
     assert evidence["excluded_counts"]["original_orientation_ineligible_rows"] == 0
     report = {label: value for _, label, value in external_frequency_fields(caught.value.study_decisions)}
-    assert "Partial" in report["Raw external screen scope"]
-    assert report["Chromosome 1 raw external AF <= 0.5"] == "600 / 600 (100.00%)"
+    assert "do not decide the GWAS-row screen" in report["Partial source-panel description"]
+    assert "1 chromosome(s) described" in report["Partial source-panel description"]
+    assert not any(label.startswith("Chromosome ") for label in report)
+    assert "effective_frequency_screen" not in evidence
+    effective = evidence["effective_frequency_screens_by_chromosome"]
+    assert set(effective) == {"1"}
+    assert effective["1"]["usable"] == effective["1"]["at_or_below_0_5"] == 600

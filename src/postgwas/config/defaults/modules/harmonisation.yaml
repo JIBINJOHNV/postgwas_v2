@@ -560,10 +560,14 @@ module:
         strand_reference_files: postgwas_strand_reference_files
         af_source: postgwas_af_source
         af_input_column: postgwas_af_input_column
+        af_native_input_column: postgwas_af_native_input_column
+        af_initial_source: postgwas_af_initial_source
+        af_initial_reference_files: postgwas_af_initial_reference_files
         af_input_type: postgwas_af_input_type
         af_type_decision: postgwas_af_type_decision
         af_reference_template: postgwas_af_reference_template
         af_reference_files: postgwas_af_reference_files
+        af_reference_column: postgwas_af_reference_column
         af_harmonisation: postgwas_af_harmonisation
         af_swapped_formula: postgwas_af_swapped_formula
         af_output_field: postgwas_af_output_field
@@ -784,7 +788,7 @@ export_layout:
   comments:
     enabled: ['Used when selecting modules in a pipeline; the direct harmonisation command runs the selected module.']
     default_eaf: ['Strand orientation and EAF/MAF validation table for chromosome step 04.', 'This panel does not fill missing study EAF; an external source is declared separately in the sample sheet.']
-    eaf_replacement_file: ['Optional ALT-frequency table used only when default_eaf confirms the selected internal frequency column is MAF.', 'Supply together with eaf_replacement_column; accepts a literal file or {build}/{chromosome} template. This source is never comparison evidence.']
+    eaf_replacement_file: ['Optional declared-allele frequency table used when default_eaf supports MAF for the selected native or initially external AF input.', 'Supply together with eaf_replacement_column; accepts a literal file or {build}/{chromosome} template. Merged GWAS-row replacement AF must pass its own original-effect-allele screen and consistency gate before adoption.']
     eaf_replacement_column: ['ALT-frequency column in eaf_replacement_file; both replacement values must be supplied together.']
     comparison_af: ['Reference VCF for population annotation and post-merge QC.', 'This panel does not determine the study strand or supply its EAF.']
     reference: ['dbSNP annotation used during chromosome VCF processing.']
@@ -3800,8 +3804,8 @@ policies:
           success. Matching only chromosome, position and alleles is not enough when the matched
           frequency is empty or invalid.
         When it applies: chromosome step 04, when the frequency comes from the sample-sheet
-          external_eaf_file source or an explicitly selected replacement after supported internal
-          MAF. An ordinary external source is used only without a selected internal column; it does
+          external_eaf_file source or an explicitly selected replacement after supported MAF in the
+          selected input A. An ordinary external source is used only without a selected internal column; it does
           not fill internal missing values. The comparison-AF panel never fills study frequencies.
         Values: Larger demands a more complete panel and stops the chromosome sooner; smaller
           accepts a deliberately limited panel. The numerator counts matched frequencies that are
@@ -3966,21 +3970,22 @@ policies:
     maf_decision_cutoff:
       default: 0.95
       help: |-
-        What it does: Screens the share of usable study AF at or below 0.5 across the whole dataset.
-          Only a share strictly above this cutoff triggers additional reference-frequency comparison.
-        When it applies: Before chromosome processing for a study-supplied AF column. At or below
-          the cutoff, accept its declared EAF contract without an additional AF-concordance check.
-          Above it, require the shared pooled count and coverage gates, then evaluate both complete
-          whole-study rules against reference AF aligned to the original effect allele and reference
-          MAF. Only the complete-rule truth table authorizes retention or explicit replacement.
-          Values must be finite and inside 0 to 1 to contribute to the screen; other values
-          remain subject to the separate missing/range policies. No study rows change in this check.
+        What it does: Screens native A, initially external merged A and selected replacement B on
+          all GWAS rows in original listed GWAS effect-allele direction. Pool counts of finite
+          values in [0,1]; the share at or below 0.5 must be strictly above this cutoff to be MAF-like.
+        When it applies: Once before workers, before diagnostic exclusions. Raw source-panel rows
+          outside the GWAS overlap do not contribute; never average chromosome percentages.
+          Non-MAF-like A skips only the semantic default-panel comparison. MAF-like A requires
+          the pooled count/coverage gates and both complete default-reference rules; rule 2 alone
+          selects the explicit replacement. B must independently pass this same screen before its
+          retained consistency gate: MAF-like or zero-usable B stops without another default
+          comparison, replacement, retry or fallback. Zero usable A also stops. Equality does not
+          trigger the diagnostic. Values and study rows remain unchanged by screening.
         Values: A MAF column is at or below 0.5, but genuine EAF can have the same distribution when
           effect alleles are minor. Neither the study nor reference distribution alone proves meaning.
-          With no mapped study AF, screen the selected external_eaf_file once after staging: pool
-          deduplicated raw counts over observed study chromosomes before any swap. A MAF-like source
-          uses the same whole-study rules against an independent default panel for the SAME external
-          counted allele. Zero usable frequencies fail; no default or replacement is auto-selected.
+          Initially external A uses independently resolved original-GWAS-EA assignments and an
+          independent default panel for that same allele. Missing/unresolved assignments remain null.
+          Source-panel statistics are descriptive; chromosome workers reuse saved decisions.
         Scientific basis: GWAS-SSF defines EAF relative to the listed effect allele. The 0.95 screen
           is a configurable PostGWAS heuristic, not a universal biological frequency distribution.
         Example: Study AF with 99.97% at or below 0.5 requires reference comparison; exactly 95%
@@ -4001,14 +4006,15 @@ policies:
       help: |-
         What it does: Sets the fewest usable matched non-palindromic variants for AF comparison.
         When it applies: Whole-study preflight pools uniquely oriented matches across all chromosomes
-          when the study AF screen is MAF-like, for both complete raw-source AF rules. The
+          when the selected A screen is MAF-like, for both complete unchanged-A rules. The
           replacement gate reuses this floor for unchanged original AF versus folded replacement
           AF, pooled across the study. Initial external AF also pools this count before workers;
           direct library classifiers without dataset approval retain their per-chromosome gate.
-          Direct, swapped and valid reverse-complement study matches at eligible biallelic reference
-          sites can contribute.
+          Direct, swapped and valid reverse-complement study matches can contribute. Independently
+          resolved multiallelic status alone does not exclude diagnostic pairs; folding uses the
+          effect allele versus all other alleles, separately from complete-site attachment arithmetic.
         Values: Integer at least 2. Too few matches stops that dataset before chromosome processing
-          for study AF. Missing, invalid, palindromic, non-biallelic and ambiguously matched values
+          for selected AF. Missing, invalid, palindromic and ambiguously matched values
           provide no evidence; their exclusion from diagnostics does not remove study rows.
         Scientific basis: A configurable evidence floor for GWAS-scale data, not a universal cutoff.
           It cannot prove the semantic meaning of every supplied AF value.
@@ -4030,7 +4036,7 @@ policies:
         When it applies: A MAF-like study AF column is compared with the pooled reference matches
           across all chromosomes. Divide the valid diagnostic-pair count by all study rows entering
           preflight after upstream preparation, before diagnostic exclusions. Missing, invalid,
-          palindromic, ambiguous and non-biallelic rows remain in that fixed denominator.
+          palindromic, ambiguous and otherwise diagnostic-ineligible rows remain in that fixed denominator.
         Values: Finite proportion from 0 to 1, not a percentage. Exactly the minimum passes.
           The absolute eaf.maf_reference_min_overlap floor must also pass. Insufficient coverage is
           inconclusive and cannot authorize MAF replacement. A provisionally selected replacement
@@ -4057,12 +4063,12 @@ policies:
           rule 1, retaining original study AF. The numerator counts aligned reference AF <= 0.5,
           including ties; the denominator is the pooled usable diagnostic-pair count.
         When it applies: Both complete whole-study rules are evaluated after count and coverage pass.
-          Rule 1 also requires direct raw-source correlation and mean absolute difference to pass.
+          Rule 1 also requires direct unchanged-A correlation and mean absolute difference to pass.
         Values: Finite proportion from 0 to 1; equality fails. Rule 1 alone passing retains the
           original AF, rule 2 alone passing selects an explicit replacement, and both or neither
-          passing stops the dataset. Initial external AF uses the same rule for the external counted
-          allele: rule 1 alone accepts; rule 2 alone stops without replacement because native study
-          AF is absent. Direct library classifiers without dataset approval remain unchanged.
+          passing stops the dataset. Initial external AF uses the same original GWAS effect allele:
+          rule 1 alone accepts; rule 2 alone selects the explicit replacement, preserving external A
+          and the absent native-column status. Direct library classifiers without dataset approval remain unchanged.
         Scientific basis: A user-selected QC heuristic, not proof of column semantics or provenance.
       origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs
       recommendation: null
@@ -4085,9 +4091,10 @@ policies:
           for rule 2. Both rules are evaluated even when rule 1 passes. A selected replacement must
           separately meet this correlation minimum for unchanged original AF versus min(B, 1-B),
           where B is replacement frequency aligned to the original listed study effect allele.
-          For initially selected external AF, compare raw external counted-allele AF against default
-          AF for that SAME allele. External assignment swaps complement both values; study swaps
-          do not define this comparison. Both panels require unique non-palindromic biallelic evidence.
+          Initially external A and default AF use the same original listed GWAS effect allele.
+          Both panels require unique non-palindromic independently resolved evidence. Multiallelic
+          status alone does not exclude a pair; min(f,1-f) is effect-versus-all-other folding, not
+          a universal multiallelic MAF definition. Raw f and B remain available for profile gates.
         Values: Finite proportion from 0 to 1; equality passes. Undefined, non-finite or constant
           vector correlations fail the relevant rule. Each rule also requires its own mean absolute
           difference and strict reference-profile gate. The configured correlation method is shared.
@@ -4118,8 +4125,9 @@ policies:
           A provisionally selected replacement also requires B > 0.5 strictly above this fraction,
           using the same eligible paired rows and B in original study-effect-allele direction;
           B exactly 0.5 is not major. This separate all-five gate adds no error-advantage margin.
-          Initial external rule 2 uses default AF for the external counted allele; only rule 2
-          passing supports external MAF and stops without selecting another source.
+          Initial external rule 2 uses default AF for the original listed GWAS effect allele;
+          only rule 2 passing supports MAF and selects the explicitly supplied replacement. B must
+          pass its own merged-GWAS/original-EA screen before this retained consistency gate.
         Scientific basis: User-selected QC support, not proof of column semantics. Near-half
           population differences can make EAF and MAF fits similar; no extra error-gap rule applies.
       origin: allele_frequency.py:validate_study_allele_frequency; allele_frequency.py:_compare_frequency_pairs; allele_frequency.py:validate_replacement_frequency_pairs; allele_frequency.py:validate_external_allele_frequency

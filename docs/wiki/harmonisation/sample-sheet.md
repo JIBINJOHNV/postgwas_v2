@@ -151,20 +151,29 @@ example `/references/GRCh37_panel_chr{chromosome}.tsv.gz`. Do not enter only the
 common filename prefix: PostGWAS does not guess which matching file belongs to
 each chromosome.
 
-`external_eaf_column` declares an ALT/effect-allele frequency, not MAF. Before
-allele-swapped matches apply `1-AF`, PostGWAS screens the deduplicated raw column.
-A non-MAF-like distribution retains that declaration. A MAF-like distribution
-must be confirmed against the independently configured
-`modules.harmonisation.default_eaf` panel. Confirmed MAF or inconclusive evidence
-stops; PostGWAS does not auto-convert it. If both sources resolve to the same
-physical file **and the external column is MAF-like**, preflight reports the
-conflict for every affected chromosome before workers start. Choose a different
-`modules.harmonisation.default_eaf.source` so
-the comparison is independent. Before deciding EAF versus MAF, PostGWAS also
-requires the supplied and default panels to have compatible folded-MAF spectra
-under the YAML-configured correlation and mean-absolute-difference limits. This
-checks whether the chosen default population panel is suitable; it does not use
-correlation alone to infer allele direction.
+`external_eaf_column` declares frequency for the counted allele selected by the
+external mapping (ALT in the packaged mapping), not MAF. After staging, the
+existing join expresses selected A for the original listed GWAS effect allele.
+The common screen counts finite [0,1] values across the merged GWAS rows, before
+diagnostic exclusions. Full-panel or unrelated source rows do not contribute.
+Only a fraction strictly above `eaf.maf_decision_cutoff` (default 0.95) at or
+below 0.5 is MAF-like; equality passes and zero usable values stop.
+
+A non-MAF-like A retains the declaration and skips the additional semantic
+default-panel comparison. MAF-like A needs independent evidence from
+`modules.harmonisation.default_eaf` for the same original GWAS effect allele.
+The same physical source, including aliases or another population column,
+cannot independently confirm itself; choose an independent default source.
+Both complete whole-study rules and their retained count/coverage thresholds
+apply. Rule 1 alone retains A; rule 2 alone requires the paired
+[explicit replacement options](../../modules/harmonisation/eaf_replacement.md).
+Both/neither passing stops. No native study AF column is fabricated.
+
+Replacement B must pass the same merged-GWAS/original-EA screen before its
+separate consistency gate. MAF-like or unusable B stops without a further default
+comparison, retry or fallback. Workers reuse the saved decision; per-chromosome
+attachment coverage (default 0.80), missing-value and allele QC still apply.
+These user-selected heuristics support a source decision, not proof of semantics.
 
 ## Sample-size mappings
 

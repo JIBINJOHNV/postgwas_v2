@@ -42,8 +42,11 @@ def test_passed_reports_show_final_approval_and_source_reuse_without_mutation(tm
         assert "population-reference proxy" in report
         assert "Reused default-reference evidence" in report
         assert ("Yes" if same else "No") in report
-        assert "source identities" in report.lower()
+        assert "full identities retained in structured evidence" in report.lower()
         assert str(tmp_path) in report
+    identities = decisions["eaf_replacement_validation"]["source"]["identities"]
+    assert set(identities) == {"1"}
+    assert identities["1"]["path"] == str(tmp_path / ("default.tsv" if same else "replacement.tsv"))
     assert decisions == before
 
 
@@ -153,14 +156,19 @@ def test_final_replacement_report_survives_visible_and_hidden_canonical_recordin
 
 
 @pytest.mark.parametrize("mode", ["distinct", "inconclusive"])
-def test_real_preparation_announces_final_gate_after_provisional_selection(tmp_path, monkeypatch, capsys, mode):
+def test_real_preparation_report_contains_only_terminal_replacement_outcome(tmp_path, monkeypatch, capsys, mode):
     from test_harmonisation_eaf_replacement_resources import test_real_dataset_preparation_selects_then_stages_replacement
     test_real_dataset_preparation_selects_then_stages_replacement(tmp_path, monkeypatch, mode)
     report = normal(capsys.readouterr().out)
-    assert "Provisionally selected; replacement validation pending" in report
+    assert "Provisionally selected; replacement validation pending" not in report
+    assert report.count("Study-wide decisions and evidence") == 1
+    assert report.count("Selected build") == 1
     if mode == "distinct":
-        assert report.index("replacement validation pending") < report.index("accepted for assignment")
-        assert report.count("Study-wide decisions and evidence") == 1
+        assert "accepted for assignment" in report
+        assert "INFO" in report.split("Study-wide decisions and evidence", 1)[1]
+        log = (tmp_path / "logs" / "study_dataset.log").read_text()
+        assert log.index("Split by chromosome") < log.index("Dataset-wide INFO score type")
+        assert log.index("Dataset-wide INFO score type") < log.index("Study-wide decisions and evidence")
     else:
         assert "Inconclusive; dataset stopped before chromosome analysis" in report
         assert "accepted for assignment" not in report

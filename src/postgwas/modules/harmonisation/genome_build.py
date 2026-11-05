@@ -661,8 +661,6 @@ def infer_genome_build(
         evidence["low_coverage_fallback"] = fallback["status"]
         for name, count in distinct_loci["exclusive_snp_loci"].items():
             evidence["%s exclusive SNP loci" % name] = "{:,}".format(count)
-        for chromosome, item in per_chromosome.items():
-            step.observed("Genome-build chromosome %s" % chromosome, **item)
         step.observed("Genome-build distinct loci", **distinct_loci)
         step.observed("Genome-build low-coverage fallback", **fallback)
         decision = inferred_build

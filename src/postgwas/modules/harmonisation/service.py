@@ -124,9 +124,7 @@ from postgwas.modules.harmonisation.allele_frequency import (
     capture_external_frequency_sources,
     StudyAlleleFrequencyError,
 )
-from postgwas.modules.harmonisation.study_reporting import (
-    render_replacement_frequency_validation, render_external_frequency_validation, render_study_decisions,
-)
+from postgwas.modules.harmonisation.study_reporting import render_study_decisions
 from postgwas.modules.harmonisation.sample_size import (
     harmonise_sample_sizes,
     prepare_missing_sample_sizes,
@@ -476,29 +474,33 @@ def _announce(logger, message, marker="", indent=0):
     sys.stdout.flush()
 
 
-def _study_decisions_block(study_decisions, **context):
-    """Present existing study evidence through the shared detailed renderer."""
+def _display_file_reference(path):
+    """Use an established file identity without registering or reading a source."""
     display = getattr(current_validation_recorder(), "display", None)
     if display is not None:
-        def reference(path):
-            try:
-                return display.file_reference(str(path))
-            except ValueError:
-                return path  # An unrecorded source must retain its exact identity.
+        try:
+            return display.file_reference(str(path))
+        except ValueError:
+            pass
+    return path
 
+
+def _study_decisions_block(study_decisions, **context):
+    """Present existing study evidence through the shared detailed renderer."""
+    if getattr(current_validation_recorder(), "display", None) is not None:
         context["build_reference_files"] = {
-            build: reference(path)
+            build: _display_file_reference(path)
             for build, path in (context.get("build_reference_files") or {}).items()
         }
         context["resource_maps"] = {
-            chromosome: {**resources, "default_eaf_file": reference(resources["default_eaf_file"])}
+            chromosome: {**resources, "default_eaf_file": _display_file_reference(resources["default_eaf_file"])}
             if resources.get("default_eaf_file") else resources
             for chromosome, resources in (context.get("resource_maps") or {}).items()
         }
         replacement = (study_decisions or {}).get("eaf_replacement")
         if replacement and replacement.get("file"):
             study_decisions = {**study_decisions, "eaf_replacement": {
-                **replacement, "file": reference(replacement["file"]),
+                **replacement, "file": _display_file_reference(replacement["file"]),
             }}
     return render_study_decisions(study_decisions, **context)
 
@@ -511,6 +513,24 @@ def _report_study_failure(logger, error, study_decisions, **context):
     _announce(logger, "\n" + _study_decisions_block(
         {**decisions, "report_failure": str(error)}, **context,
     ))
+
+
+@contextmanager
+def _report_preparation_errors(logger, evidence):
+    """Present one failure using the latest already-measured preparation state."""
+    try:
+        yield
+    except Exception as error:
+        _report_study_failure(logger, error, **evidence())
+        raise
+
+
+def _record_info_score_decision(decision, *destinations):
+    """Preserve a measured INFO decision even if a later preparation step fails."""
+    for destination in destinations:
+        destination.update(info_score_type=decision["resolved_type"],
+            info_score_type_source=decision["decision_source"],
+            info_score_type_evidence=dict(decision))
 
 
 def _population_frequency_block(result):
@@ -714,7 +734,7 @@ def _count(value):
         return str(value)
 
 
-def _field_completeness_block(report):
+def _field_completeness_block(report, *, validation_summary=None, sample_columns=None):
     """Keep original missingness separate from later numeric conversion counts."""
     labels = {
         "chr": "Chromosome", "pos": "Position", "ea": "Effect allele",
@@ -734,8 +754,17 @@ def _field_completeness_block(report):
     def detail(label, value):
         return screen_field("info", label, value, indent=12, label_width=22).splitlines()
 
-    lines = [
-        screen_line("analysis", "Input completeness and numeric conversion", indent=4),
+    consolidated = validation_summary is not None
+    lines = [screen_line("analysis", "Input validation" if consolidated else
+                         "Input completeness and numeric conversion", indent=4)]
+    for label, key in (("Dataset", "gwas_outputname"), ("Input file", "sumstat_file"),
+                       ("Trait type", "trait_type"), ("Delimiter", "delimiter")):
+        value = (sample_columns or {}).get(key)
+        if optional_text(value) is not None:
+            lines.append(screen_field("info", label,
+                _display_file_reference(value) if key == "sumstat_file" else value,
+                indent=8, label_width=22))
+    lines.extend([
         screen_field("count", "Variants assessed", _count(report.get("input_rows")), indent=8, label_width=22),
         screen_field(
             "info", "Count timing",
@@ -743,7 +772,7 @@ def _field_completeness_block(report):
             "rows remaining after initial missing-field and coordinate filtering.",
             indent=8, label_width=22,
         ),
-    ]
+    ])
     for field in report.get("fields") or []:
         name = field.get("field")
         missing = field.get("post_parse_missing")
@@ -755,7 +784,9 @@ def _field_completeness_block(report):
         elif not column and name not in {"beta", "zscore", "se"}:
             values = field.get("source_values") or {}
             if values:
-                source = "; ".join(str(value) for value in values.values())
+                source = "; ".join(str(_display_file_reference(value))
+                    if key in {"eaffile", "infofile"} else str(value)
+                    for key, value in values.items())
         lines.append("")
         lines.extend(screen_field(
             "warning" if missing or conversion.get("invalid") or field.get("source_kind") == "configured_column_absent"
@@ -809,12 +840,15 @@ def _field_completeness_block(report):
             value,
             indent=8, label_width=24,
         ).splitlines())
-    lines.extend(screen_field(
-        "loss" if report.get("rows_removed_at_read_mandatory_gate") else "success",
-        "Initial removals",
-        "%s variants removed for missing required inputs" % _count(report.get("rows_removed_at_read_mandatory_gate")),
-        indent=8, label_width=24,
-    ).splitlines())
+    if consolidated:
+        lines.extend(["", _input_validation_summary_block(**validation_summary, include_heading=False)])
+    else:
+        lines.extend(screen_field(
+            "loss" if report.get("rows_removed_at_read_mandatory_gate") else "success",
+            "Initial removals",
+            "%s variants removed for missing required inputs" % _count(report.get("rows_removed_at_read_mandatory_gate")),
+            indent=8, label_width=24,
+        ).splitlines())
     lines.extend(screen_field(
         "info", "Further checks",
         "Present values and successful numeric conversion do not confirm valid ranges "
@@ -939,10 +973,11 @@ def _input_validation_summary_block(
     ready_snps,
     ready_indels_or_other,
     excluded_chromosomes=0,
+    include_heading=True,
 ):
     """Render input-QC accounting and its ready-row variant-type breakdown."""
-    return "\n".join([
-        screen_line("count", "Input validation summary", indent=4),
+    return "\n".join(([screen_line("count", "Input validation summary", indent=4)]
+                       if include_heading else []) + [
         screen_field(
             "count", "Input variants", _count(input_variants),
             indent=8, label_width=30,
@@ -1999,7 +2034,7 @@ def _activate_eaf_replacement_resources(
         or study_decisions.get("eaf_reference_validation", {}).get("status")
         != "replacement_selected"
     ):
-        raise PipelineError("EAF replacement requires a supported internal MAF decision.")
+        raise PipelineError("EAF replacement requires a supported initial MAF decision.")
     replacement = dict(study_decisions.get("eaf_replacement") or {})
     specification = optional_text(replacement.get("file"))
     column = optional_text(replacement.get("column"))
@@ -2985,25 +3020,25 @@ def _prepare_dataset_for_chromosome_processing(
         "Initial field-completeness QC written to %s."
         % field_completeness_path
     )
-    _announce(logger, "\n" + _field_completeness_block(field_completeness))
-
     ready_variant_types = _ready_variant_type_counts(df, sample_column_dict)
     _announce(
         logger,
-        "\n" + _input_validation_summary_block(
-            input_variants=file_cvariant_count,
-            variants_read=polars_rows,
-            excluded_chromosomes=removed_excluded_chromosomes,
-            missing_required=removed_missing_count,
-            invalid_coordinates=removed_coords,
-            unsupported_chromosomes=removed_unsupported_chromosomes,
-            non_standard_alleles=non_standard_allele_count,
-            duplicate_variants=removed_duplicates_count,
-            ready_variants=df.height,
-            ready_snps=ready_variant_types["snps"],
-            ready_indels_or_other=ready_variant_types[
-                "indels_or_other_variants"
-            ],
+        "\n" + _field_completeness_block(
+            field_completeness,
+            sample_columns=sample_column_dict,
+            validation_summary=dict(
+                input_variants=file_cvariant_count,
+                variants_read=polars_rows,
+                excluded_chromosomes=removed_excluded_chromosomes,
+                missing_required=removed_missing_count,
+                invalid_coordinates=removed_coords,
+                unsupported_chromosomes=removed_unsupported_chromosomes,
+                non_standard_alleles=non_standard_allele_count,
+                duplicate_variants=removed_duplicates_count,
+                ready_variants=df.height,
+                ready_snps=ready_variant_types["snps"],
+                ready_indels_or_other=ready_variant_types["indels_or_other_variants"],
+            ),
         ),
     )
 
@@ -3188,6 +3223,7 @@ def _prepare_dataset_for_chromosome_processing(
             logger=logger,
             step_number=7,
             step_total=DATASET_STEP_TOTAL,
+            report_inference_warnings=False,
         )
     except StudyPropertyError as exc:
         decisions = {**(getattr(exc, "study_decisions", None) or {}), **strand_decision}
@@ -3210,13 +3246,6 @@ def _prepare_dataset_for_chromosome_processing(
         "declaration_mismatches": list(study_decisions.get("declaration_mismatches") or []),
         "strand_consensus": dict(strand_decision),
     }
-    _announce(
-        logger,
-        "\n" + _validated_column_mapping_block(
-            sample_column_dict, study_decisions,
-        ),
-    )
-
     if x_z_only_policy is not None:
         dataset_study_decisions["x_chromosome_z_only_policy"] = dict(
             x_z_only_policy
@@ -3398,16 +3427,14 @@ def _prepare_dataset_for_chromosome_processing(
     logger.info("Dataset AF decision: %s" % json.dumps(
         dataset_study_decisions["eaf_reference_validation"], sort_keys=True,
     ))
-    _announce(logger, "\n" + _study_decisions_block(
-        study_decisions, genome_build_info=genome_build_info,
-        build_reference_files=build_reference_files,
-        policies=policies, resource_maps=resource_maps,
-    ))
-
     # ------------------------------------------------------------------
     # 08/08  split by chromosome and stage shared user references
     # ------------------------------------------------------------------
-    with logger.step(
+    with _report_preparation_errors(logger, lambda: dict(
+        study_decisions=study_decisions, genome_build_info=genome_build_info,
+        build_reference_files=build_reference_files, policies=policies,
+        resource_maps=resource_maps,
+    )), logger.step(
         8, DATASET_STEP_TOTAL, "Split by chromosome",
         "chromosome_partition.write_chromosome_partitions + "
         "external_reference_staging.stage_shared_external_reference_files + "
@@ -3459,6 +3486,7 @@ def _prepare_dataset_for_chromosome_processing(
                 external_reference_staging=external_reference_staging,
                 policies=policies,
             )
+            _record_info_score_decision(info_score_decision, study_decisions, dataset_study_decisions)
         chromosome_partitions = write_chromosome_partitions(
             df,
             sample_gwas_dict=sample_column_dict,
@@ -3483,6 +3511,16 @@ def _prepare_dataset_for_chromosome_processing(
                 ", ".join(sorted(chr_file_by_chrom, key=_chromosome_sort_key)),
             )
         )
+        def stage_frequency_resources(current_maps, specification, frequency_column):
+            return stage_shared_external_reference_files(
+                current_maps, chromosomes=observed_chromosomes, dataset_id=sample_id,
+                output_directory=output_dir_path, output_layout=output_layout,
+                user_eaf_specification=specification, user_eaf_column=frequency_column,
+                external_eaf_mapping=external_eaf_colmap,
+                user_info_specification=user_info_file, user_info_column=user_info_column,
+                external_info_mapping=external_info_colmap, settings=external_reference_staging,
+                policies=policies, logger=logger)
+
         external_source_bindings = None
         try:
             if study_decisions.get("eaf_selected_source") == "external_eaf":
@@ -3490,24 +3528,7 @@ def _prepare_dataset_for_chromosome_processing(
                     error_type=StudyAlleleFrequencyError, label="Whole-study external AF validation inputs")
                 external_source_bindings = capture_external_frequency_sources(resource_maps,
                     expected_identities=resource_preflight["file_identities"])
-            resource_maps, staging_summary = (
-                stage_shared_external_reference_files(
-                    resource_maps,
-                    chromosomes=observed_chromosomes,
-                    dataset_id=sample_id,
-                    output_directory=output_dir_path,
-                    output_layout=output_layout,
-                    user_eaf_specification=user_eaf_file,
-                    user_eaf_column=user_eaf_column,
-                    external_eaf_mapping=external_eaf_colmap,
-                    user_info_specification=user_info_file,
-                    user_info_column=user_info_column,
-                    external_info_mapping=external_info_colmap,
-                    settings=external_reference_staging,
-                    policies=policies,
-                    logger=logger,
-                )
-            )
+            resource_maps, staging_summary = stage_frequency_resources(resource_maps, user_eaf_file, user_eaf_column)
             if external_source_bindings is not None:
                 require_unchanged_preflight_files(preflight_resource_identities(resource_preflight),
                     error_type=StudyAlleleFrequencyError, label="Whole-study external AF validation inputs")
@@ -3523,10 +3544,9 @@ def _prepare_dataset_for_chromosome_processing(
                 "decision_reason": reason, "study_variant_count": study_decisions.get("eaf_external_study_variant_count")}
             error = StudyAlleleFrequencyError("Whole-study external AF validation: %s" % exc,
                 study_decisions=failed_decisions)
-            _report_study_failure(logger, error, failed_decisions, genome_build_info=genome_build_info,
-                build_reference_files=build_reference_files, policies=policies, resource_maps=resource_maps)
             raise error from exc
         resource_preflight["external_reference_staging"] = staging_summary
+        replacement_staging = staging_summary
         try:
             study_decisions = validate_external_allele_frequency(
                 chromosome_partitions, sample_column_dict, study_decisions,
@@ -3535,12 +3555,27 @@ def _prepare_dataset_for_chromosome_processing(
                 source_bindings=external_source_bindings, staging_summary=staging_summary,
                 policies=policies, logger=logger,
             )
+            if (study_decisions.get("eaf_selected_source") == "replacement_reference"
+                    and (study_decisions.get("eaf_initial_frequency") or {}).get("source_kind") == "external_eaf"):
+                resource_maps, late_preflight = _activate_eaf_replacement_resources(
+                    resource_maps, study_decisions, grch_version=grch_version,
+                    default_eaf_colmap=default_eaf_colmap, external_eaf_colmap=external_eaf_colmap,
+                    executables=executables, vcf_config=vcf_config, policies=policies, logger=logger)
+                user_eaf_file = study_decisions["eaf_replacement"]["file"]
+                user_eaf_column = study_decisions["eaf_replacement"]["column"]
+                resource_maps, replacement_staging = stage_frequency_resources(
+                    resource_maps, user_eaf_file, user_eaf_column)
+                resource_preflight["replacement_resource_preflight"] = late_preflight
+                resource_preflight["replacement_external_reference_staging"] = replacement_staging
+                resource_preflight["file_identities"] = list({str(item["path"]): item
+                    for item in (*resource_preflight["file_identities"], *late_preflight["file_identities"])}.values())
             if external_source_bindings is not None:
                 require_unchanged_preflight_files(preflight_resource_identities(resource_preflight),
                     error_type=StudyAlleleFrequencyError, label="Whole-study external AF validation inputs")
             study_decisions = validate_replacement_allele_frequency(
                 chromosome_partitions, sample_column_dict, study_decisions,
                 resource_maps, external_eaf_colmap, policies=policies, logger=logger,
+                staging_summary=replacement_staging,
             )
         except Exception as exc:
             if external_source_bindings is not None and getattr(exc, "study_decisions", None) is None:
@@ -3550,22 +3585,11 @@ def _prepare_dataset_for_chromosome_processing(
                 evidence.pop("contract", None)
                 failed_decisions["eaf_external_validation"] = evidence
                 exc.study_decisions = failed_decisions
-            _report_study_failure(
-                logger, exc, study_decisions, genome_build_info=genome_build_info,
-                build_reference_files=build_reference_files, policies=policies,
-                resource_maps=resource_maps,
-            )
             raise
-        for key in ("eaf_external_validation", "eaf_external_source", "eaf_external_study_variant_count", "eaf_external_validation_required"):
-            if key in study_decisions:
-                dataset_study_decisions[key] = study_decisions[key]
-                ctx.extra[key] = study_decisions[key]
-        if "eaf_external_validation" in study_decisions:
-            _announce(logger, render_external_frequency_validation(study_decisions))
-        if "eaf_replacement_validation" in study_decisions:
-            dataset_study_decisions["eaf_replacement_validation"] = study_decisions["eaf_replacement_validation"]
-            ctx.extra["eaf_replacement_validation"] = study_decisions["eaf_replacement_validation"]
-            _announce(logger, render_replacement_frequency_validation(study_decisions))
+        for key, value in study_decisions.items():
+            if key.startswith("eaf_"):
+                dataset_study_decisions[key] = value
+                ctx.extra[key] = value
         if staging_summary["status"] == "staged":
             ctx.info(
                 "Read %d shared whole-genome external reference file%s once "
@@ -3592,20 +3616,11 @@ def _prepare_dataset_for_chromosome_processing(
                 external_reference_staging=external_reference_staging,
                 policies=policies,
             )
+            _record_info_score_decision(info_score_decision, study_decisions, dataset_study_decisions)
         resolved_info_score_type = info_score_decision["resolved_type"]
         info_score_type_source = info_score_decision["decision_source"]
         sample_column_dict["resolved_info_score_type"] = resolved_info_score_type
         sample_column_dict["info_score_type_source"] = info_score_type_source
-        study_decisions["info_score_type"] = resolved_info_score_type
-        study_decisions["info_score_type_source"] = info_score_type_source
-        study_decisions["info_score_type_evidence"] = dict(info_score_decision)
-        dataset_study_decisions["info_score_type"] = resolved_info_score_type
-        dataset_study_decisions[
-            "info_score_type_source"
-        ] = info_score_type_source
-        dataset_study_decisions[
-            "info_score_type_evidence"
-        ] = dict(info_score_decision)
         ctx.decide(
             "Dataset-wide INFO score type",
             {
@@ -3662,23 +3677,23 @@ def _prepare_dataset_for_chromosome_processing(
             )
         ctx.extra["external_reference_staging"] = staging_summary
         ctx.extra["info_score_type"] = dict(info_score_decision)
+        all_chromosomes = sorted(chr_file_by_chrom, key=_chromosome_sort_key)
+        if not all_chromosomes:
+            raise PipelineError(
+                "No per-chromosome files found after splitting. "
+                "Check that 'CHR' and 'POS' columns are correctly mapped."
+            )
+        if all_chromosomes != observed_chromosomes:
+            raise PipelineError(
+                "Chromosome partitioning produced a different chromosome set from "
+                "resource preflight. Preflight=%s; partitions=%s. No chromosome "
+                "worker was started."
+                % (", ".join(observed_chromosomes), ", ".join(all_chromosomes))
+            )
+
         ctx.set_rows(ready_variants, removed=0)
 
-    all_chromosomes = sorted(chr_file_by_chrom, key=_chromosome_sort_key)
-    if not all_chromosomes:
-        raise PipelineError(
-            "No per-chromosome files found after splitting. "
-            "Check that 'CHR' and 'POS' columns are correctly mapped."
-        )
-    if all_chromosomes != observed_chromosomes:
-        raise PipelineError(
-            "Chromosome partitioning produced a different chromosome set from "
-            "resource preflight. Preflight=%s; partitions=%s. No chromosome "
-            "worker was started."
-            % (", ".join(observed_chromosomes), ", ".join(all_chromosomes))
-        )
-
-    return _DatasetPreparation(
+    prepared = _DatasetPreparation(
         sample_columns=sample_column_dict,
         chromosome_files=chr_file_by_chrom,
         resource_maps=resource_maps,
@@ -3707,6 +3722,13 @@ def _prepare_dataset_for_chromosome_processing(
         partition_rows=dict(partition_rows),
         removed_excluded_chromosomes=removed_excluded_chromosomes,
     )
+
+    _announce(logger, "\n" + _study_decisions_block(
+        study_decisions, genome_build_info=genome_build_info,
+        build_reference_files=build_reference_files, policies=policies,
+        resource_maps=resource_maps,
+    ))
+    return prepared
 
 
 def harmonise_chromosomes(

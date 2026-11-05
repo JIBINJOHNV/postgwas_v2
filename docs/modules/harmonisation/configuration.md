@@ -11,7 +11,7 @@ postgwas harmonisation \
 Explicit CLI values override the user YAML, which overrides packaged YAML.
 Argparse does not own configurable defaults.
 
-For an internal frequency column confirmed as MAF, see the paired
+For a selected study or external frequency input supported as MAF, see the paired
 [optional EAF replacement options](eaf_replacement.md).
 
 ## Sample sheet
@@ -414,9 +414,11 @@ postgwas harmonisation --sample-sheet /absolute/path/to/studies.csv --run-config
 The returned `genome_build` evidence in the dataset manifest records
 `acceptance_path` (`normal`, `declared`, `low_coverage_fallback` or `ambiguous`),
 all failed normal gates, distinct SNP-locus counts, per-chromosome row counts and
-fractions, scope omissions, vetoes and fallback gate outcomes. The canonical
-log, study-wide report and HTML report retain this evidence, including on
-failure. QC summaries label fallback acceptance as experimental. All resolved
+fractions, scope omissions, vetoes and fallback gate outcomes, including on
+failure. Structured stage evidence and manifests retain the full chromosome
+detail. The readable study-wide report shows one dataset build decision and
+pooled evidence, without routine chromosome build rows. QC summaries label
+fallback acceptance as experimental. All resolved
 policies participate in the existing scientific checkpoint identity; changing
 any of them follows the global restart/resume policy.
 
@@ -438,9 +440,13 @@ OR-scale SE to canonical log-odds BETA and SE. Complementing both alleles then
 preserves BETA, Z and true EAF. Changing the effect allele negates BETA and Z
 and replaces true EAF with `1-EAF`; log-scale SE, p-value, INFO and sample size
 remain unchanged. Study AF acceptance now happens once, before chromosome processing.
-The whole-study screen triggers a reference check only when more than
-`eaf.maf_decision_cutoff` (default 95%) of usable study AF values are at or below
-0.5. Otherwise the declared EAF contract is accepted without another frequency
+The common screen counts finite values in [0,1] for native or initially external
+A in original listed GWAS effect-allele direction, across GWAS rows before
+diagnostic exclusions. Unrelated external-panel rows do not contribute. Only a
+share strictly greater than `eaf.maf_decision_cutoff` (default 95%) at or below
+0.5 triggers the reference diagnostic. Equality does not trigger it; zero usable
+values stop. Pool chromosome counts, never chromosome percentages.
+Otherwise the declared EAF contract is accepted without another frequency
 concordance check. For a MAF-like distribution, PostGWAS first tests the study's
 original effect-allele frequencies against `default_eaf` across the dataset.
 Accepted EAF stays unchanged. Otherwise the same eligible pairs may support a
@@ -480,15 +486,15 @@ through `strand.palindromic_af_discordance_action`. These decisions follow the
 [GWAS Catalog summary-statistics harmonisation method](https://www.ebi.ac.uk/gwas/docs/methods/summary-statistics).
 
 External EAF and INFO annotations use the same row-preserving direct/swapped
-allele matcher after strand orientation. Before alignment of an ordinary
-sample-sheet external EAF source, its deduplicated raw frequency column is screened with
-`eaf.maf_decision_cutoff`. This screen does not prove allele meaning and never
-auto-converts MAF: a non-MAF-like result retains the declared external ALT/EAF
-contract, while a MAF-like result must pass the independent comparison below.
-An explicitly selected MAF replacement instead uses its declared ALT-frequency
-semantics and bypasses this ordinary raw-frequency classifier. After provisional
-selection it must pass the separate whole-study replacement gate before adoption;
-numerical, coverage and allele-matching safeguards still apply. `default_eaf`
+allele matcher after strand orientation. Initially external A is merged and
+screened once before workers in original GWAS-EA direction. A non-MAF-like A
+skips the additional semantic comparison; a MAF-like A requires the independent
+default-panel diagnostic and can select the explicit replacement. Replacement B
+is merged and screened over all GWAS rows in the same direction. No usable B or
+MAF-like B is terminal, without further default comparison, source switching,
+retry or fallback. A non-MAF-like B still must pass the separate whole-study
+replacement consistency gate before adoption. These screens are QC heuristics,
+not proof of column semantics. `default_eaf`
 supplies the initial study-AF decision and orientation evidence. Replacement
 frequencies supply consistency evidence only for the later gate, never strand
 or palindrome orientation.
@@ -683,10 +689,14 @@ chromosome processing and request an explicit effect type. A high fraction and
 a median outside the interval is classified as beta. For a confirmed OR
 column, individual non-positive rows are rejected before `ln(OR)` by default.
 Whenever this automatic detector supplies the applied study-level answer,
-PostGWAS prints and records a prominent warning with the inferred type, median,
+PostGWAS records a prominent warning with the inferred type, median,
 non-positive fraction and expected transformation. The warning explains that
 values alone cannot distinguish every all-positive beta distribution from an
 odds-ratio distribution and recommends an explicit sample-sheet `effect_type`.
+In orchestrated runs, routine effect/P-value inference notices appear inline
+once in the consolidated report at the end of preparation. Direct library
+calls retain immediate inference notices by default. Declaration conflicts and
+fatal warnings remain immediate; this display timing does not alter inference.
 
 ### Effect-statistic concordance
 
@@ -927,6 +937,23 @@ alternative, recovery step, final-check requirement, final action, and
 post-recovery missing count. BETA and Z also receive an explicit alternative-
 group row showing how many variants lacked both. The same structure is retained
 in the run manifest and summarized in the canonical log and screen report.
+
+The readable **Input validation** section combines dataset/source identity,
+effective field mappings, missing/conversion results and the read-stage removal
+ledger once. It reuses established file references, with exact declarations for
+unregistered paths/templates, and does not repeat a verbose sample-sheet dump.
+Field-level missing counts and the disjoint removal ledger retain their
+different meanings and denominators.
+
+One **Study-wide decisions and evidence** report follows AF approval, INFO
+resolution, partition validation and chromosome-set checks, immediately before
+preparation returns worker inputs. It includes the saved build, effect, SE,
+P-value, BETA/Z, strand, AF A/B and INFO decisions. An earlier preparation failure
+produces one report with the known partial evidence and original stop reason.
+Later failures add their stage/new findings without replaying unchanged
+decisions. Mandatory progress and final output/completeness summaries remain;
+preparation approval is not final output success. No scientific values,
+thresholds, source contracts or checkpoint identities change with this display.
 
 Input missingness is measured after explicit chromosome exclusion and
 configured missing-token parsing but before
@@ -1384,6 +1411,16 @@ The default `postgwas_*` headers record:
   `FORMAT/NEF` destination, plus the exact population-AF annotation resources
   and configured VCF INFO fields.
 
+AF headers distinguish initial A from final replacement B. `af_input_column`
+names A's original scientific input column; `af_native_input_column` separately
+records the mapped native GWAS column, or the configured missing marker when
+none was supplied. `af_initial_source` and `af_initial_reference_files` retain
+initial external A provenance, while `af_reference_column` and the existing
+reference file/template fields identify final B. The packaged header names have
+the `postgwas_` prefix. Private evidence-column names never replace original
+source columns in these headers. These metadata fields do not alter scientific
+frequencies or QC policies.
+
 In particular, `postgwas_resource_directory` is the resolved
 `--resource-directory`, `postgwas_output_directory` is the resolved
 command-level `--output-directory`, and
@@ -1426,20 +1463,26 @@ panel- and build-dependent, so dataset preflight verifies every chromosome
 actually required by the study. Direct allele matches use the ALT frequency;
 swapped matches use `1-AF`.
 
-For a study-supplied AF column, additional reference comparison is required only
-when the whole-study share of usable values at or below 0.5 is **greater than 95%**
+For native or initially external selected AF A, additional reference comparison
+is required only when the whole-GWAS share of usable original-EA values at or
+below 0.5 is **greater than 95%**
 (or the configured `eaf.maf_decision_cutoff`). The paired diagnostic set contains
 finite, uniquely allele-matched, non-palindromic variants across all chromosomes
-at reference sites eligible for biallelic frequency inference. Known extra
-alleles exclude a site from these diagnostics; complete site membership in the
-supplied reference remains an input assumption. Reference AF is aligned to the
+with independently resolved orientation. Resolved multiallelic status alone does
+not exclude diagnostic evidence. Compatible builds/alleles, palindrome safeguards,
+valid mapped values and duplicate/conflict handling still apply. Reference AF is aligned to the
 **original study effect allele** before comparing. Let `x` be the unchanged
 supplied AF, `r` the aligned reference frequency, and `m = min(r, 1-r)`.
+The diagnostic uses `other_AF=1-r`: r=.8 gives .2 and folded .2; r=.3 gives
+folded .3. At multiallelic sites this is effect allele versus all other alleles,
+not a universal site-MAF definition. Preserve raw r beside m so the profile gates
+still see r>0.5. This convention does not change complete-site attachment,
+final strand guards or export behavior.
 
 First require at least 1,000 usable diagnostic pairs and coverage >= 0.50.
 Coverage divides pooled pairs by **all study rows entering AF preflight after
 upstream preparation**, before diagnostic exclusions. Missing/invalid AF,
-palindromes, ambiguous matches and non-biallelic sites stay in that fixed
+palindromes, ambiguous matches and other diagnostic-ineligible rows stay in that fixed
 denominator. Equality passes both gates; insufficient count or coverage stops
 that dataset as inconclusive before correlation calculation, investigation,
 replacement selection or chromosome analysis. No retry is attempted.
@@ -1541,9 +1584,15 @@ metrics do not decide whole-study rule 2. The new
 
 Original `eaf_reference_validation` remains unchanged. After step-08 replacement
 staging, `eaf_replacement_validation` separately records candidate consistency
-against unchanged original A. B is attached with the existing declared-allele
-join and expressed in the original listed study-EA direction. C=min(B,1-B).
-All five conditions must pass on the same eligible pairs: n >=
+against frozen original A, whether native or initially external. External A
+remains private row-bound evidence with its own descriptor; native AF stays
+absent. B is attached with the existing declared-allele join in original GWAS-EA
+direction. First screen B over all merged GWAS rows with the common cutoff.
+Zero usable B records `no_usable_replacement_frequencies`; a MAF-like B records
+`replacement_frequency_maf_like`. Both stop before consistency measurement,
+workers or approval, without further default comparison, retry or fallback.
+For a non-MAF-like B, preserve raw B and define C=min(B,1-B).
+All five conditions must then pass on the same eligible pairs: n >=
 `maf_reference_min_overlap`, n/N >= `maf_reference_min_overlap_fraction`,
 corr(A,C) >= `study_reference_min_correlation`, mean(abs(A-C)) <=
 `maf_reference_max_mean_absolute_difference`, and proportion(B>0.5) strictly
@@ -1551,13 +1600,14 @@ greater than `study_reference_min_major_fraction`. Packaged values are 1,000,
 0.50, 0.95, 0.10 and 0.20, respectively; no new configuration key or flag is added.
 
 N is the original fixed preflight study-row count. Original-orientation
-ambiguity, palindromes, non-biallelic sites, missing/non-finite/out-of-range
-frequencies and unmatched replacements cannot shrink it. n and every metric
-use the same finite valid unique non-palindromic biallelic paired set. Count
+ambiguity, palindromes, missing/non-finite/out-of-range frequencies and unmatched
+replacements cannot shrink it. n and every metric use the same finite valid
+unique non-palindromic paired set, including independently resolved multiallelic
+evidence under the scoped effect-versus-other diagnostic convention. Count
 and coverage failure stops before correlation/ranking, whose values remain
 unavailable. Equality passes count, coverage, correlation and MAE; exactly
 the configured major fraction fails, and B=0.5 is not major. Multiallelic
-attachment remains supported through complete-site sums; these diagnostic
+attachment retains its complete-site sums; these diagnostic
 exclusions do not remove source rows. Chromosome attachment coverage retains
 its separate `external_min_match_fraction` requirement.
 
@@ -1603,11 +1653,16 @@ contract, checked again at worker adoption. Changing scientific inputs or
 policies follows the existing checkpoint restart policy; resume/overwrite
 semantics are unchanged.
 
-Terminal and canonical logs distinguish the initial provisional selection from
-the later preparation outcome; HTML uses the same recorded replacement fields.
-They show source/column/mapping/identities, reuse, fixed N, paired input rows,
-usable count/coverage, exclusions, method, all thresholds, correlation, MAE,
-major count/fraction and failures. Numeric `passed` without the final contract
+Saved evidence distinguishes the initial provisional selection from the later
+preparation outcome. The terminal and readable logs show A, conditional default
+comparison and B together in the single study report after AF/INFO and partition
+checks, or in its partial-evidence failure report. A separate pending replacement
+card is not followed by another full report. HTML uses the same recorded fields.
+They show source/column/mapping/identities; A/B roles; original-EA GWAS-row
+screen scope, rows, usable/unusable counts, numerator, fraction, cutoff and result;
+reuse; fixed N and diagnostic n/coverage; exclusions; computed method and metrics;
+thresholds; and exact stop reasons. Source-panel statistics are descriptive and
+cannot decide the GWAS-row screen. Numeric `passed` without the final contract
 is not reported as approval. A late invalid identity overrides an earlier
 numeric passing log. Original study MAF remains preserved; working EAF retains
 population-reference-imputed provenance.
@@ -1644,14 +1699,17 @@ discusses reference-frequency QC; [Polars correlation](https://docs.pola.rs/py-p
 provides the configured correlation implementation. Subsequent swaps follow the
 [GWAS Catalog harmonisation rules](https://ebispot.github.io/gwas-sumstats-harmoniser-documentation/Introduction/Harmonising-the-variants/).
 
-When no native study AF is mapped, the sample-sheet external source now uses a
-whole-study validation after staging and before workers. Raw deduplicated counts are
-pooled over observed chromosomes. MAF-like sources require the same count, fixed-N
-coverage and dual-rule gates as study AF, with default AF aligned to the SAME external
-counted allele. Rule 1 alone accepts; rule 2 alone, both, or neither stop without
-replacement. The same physical source, including aliases/different population columns,
-cannot independently confirm itself. Approved workers reuse checked assignments and
-retain all per-variant QC. See [initial external AF](eaf_replacement.md#initially-selected-external-af-when-study-af-is-absent)
+When no native study AF is mapped, the sample-sheet external source supplies A
+after staging and before workers. Its merged GWAS-row values use the original
+GWAS EA; raw source-panel values do not decide the screen. MAF-like A requires
+the same count, fixed-N coverage and dual-rule gates as native AF. Rule 1 alone
+accepts; rule 2 alone selects the explicit replacement, which must pass its own
+screen and consistency gate. Both/neither passing stops. The same physical
+source, including aliases/different population columns, cannot independently
+confirm itself. B acquires its own resource/cache bindings; A's descriptor
+cannot approve B. Workers reuse saved decisions and assignments without
+repeating chromosome-level semantic checks, while ordinary coverage, missing,
+allele and final-output QC remains active. See [initial external AF](eaf_replacement.md#initially-selected-external-af-when-study-af-is-absent)
 for exact direction, publication, provenance and scale contracts. Direct library
 classifiers without dataset preparation retain the documented 0.90 correlation,
 0.02 directional-margin and 0.95 upper minor-profile controls.

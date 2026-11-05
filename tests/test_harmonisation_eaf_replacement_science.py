@@ -105,14 +105,14 @@ def test_same_reference_replacement_is_fresh_column_without_reclassification_or_
     assert qc["eaf_selected_source"] == "replacement_reference"
 
 
-def test_split_multiallelic_site_is_not_semantic_diagnostic_evidence(tmp_path):
+def test_resolved_multiallelic_site_contributes_to_effect_frequency_diagnostics(tmp_path):
     reference, frame, policies = fixture(tmp_path)
     with reference.open("a") as handle:
         handle.write("1\t100\tG\tC\t0.1\n")
     decision, prepared = prepare(frame, reference, policies,
         eaf_replacement_file=str(reference), eaf_replacement_column="EUR")
-    assert decision["eaf_reference_validation"]["comparable_variants"] == 4
-    assert decision["eaf_reference_validation"]["diagnostic_excluded_non_biallelic_rows"] == 1
+    assert decision["eaf_reference_validation"]["comparable_variants"] == 5
+    assert decision["eaf_reference_validation"]["diagnostic_excluded_non_biallelic_rows"] == 0
     assert prepared.select(frame.columns).equals(frame)
 
 
@@ -123,7 +123,7 @@ def test_constant_frequency_does_not_activate_replacement(tmp_path):
         prepare(frame, reference, policies, eaf_replacement_file=str(reference), eaf_replacement_column="EUR")
 
 
-def test_declared_replacement_does_not_screen_its_minor_alt_values(tmp_path):
+def test_replacement_screen_uses_effect_aligned_gwas_values_instead_of_minor_raw_alt_values(tmp_path):
     reference, frame, policies = fixture(tmp_path)
     replacement = tmp_path / "replacement.tsv"
     replacement.write_text("CHROM\tPOS\tREF\tALT\tEUR\n1\t100\tG\tA\t0.2\n1\t200\tA\tC\t0.3\n1\t300\tA\tAC\t0.4\n2\t100\tC\tT\t0.2\n2\t200\tC\tA\t0.3\n")
@@ -133,7 +133,7 @@ def test_declared_replacement_does_not_screen_its_minor_alt_values(tmp_path):
     columns = dict(COLUMNS, output_folder=str(tmp_path / "out"), gwas_outputname="study")
     layout = load_configuration().modules.harmonisation.output_layout.model_dump()
     with patch("postgwas.modules.harmonisation.shared.allele_join.frequency_maf_screen",
-               side_effect=AssertionError("replacement distribution screened")):
+               side_effect=AssertionError("raw replacement panel screened again")):
         decision = approve(prepared, reference, policies, decision)
         result, qc, selected = af.harmonise_allele_frequency("1", pl.read_parquet(tmp_path / "approved_1.parquet"),
             columns, layout, "\t", eaffile=str(replacement), external_eaf_colmap=MAPPING,
@@ -142,6 +142,36 @@ def test_declared_replacement_does_not_screen_its_minor_alt_values(tmp_path):
     assert result[selected["eaf_col"]].to_list() == pytest.approx([0.2, 0.3, 0.4])
     assert result["AF"].to_list() == pytest.approx([0.2, 0.3, 0.4])
     assert "external_raw_af_maf_like" not in qc
+    screen = decision["eaf_replacement_validation"]["effective_frequency_screen"]
+    assert screen["rows"] == screen["usable"] == 5
+    assert screen["at_or_below_0_5"] == 3
+    assert screen["maf_like"] is False
+
+
+def test_maf_like_merged_replacement_stops_before_consistency_or_adoption(tmp_path, monkeypatch):
+    reference, frame, policies = fixture(tmp_path)
+    replacement = tmp_path / "replacement.tsv"
+    replacement.write_text("CHROM\tPOS\tREF\tALT\tEUR\n1\t100\tG\tA\t0.2\n1\t200\tA\tC\t0.3\n1\t300\tA\tAC\t0.4\n2\t100\tC\tT\t0.8\n2\t200\tC\tA\t0.7\n")
+    decision, prepared = prepare(frame, reference, policies,
+        eaf_replacement_file=str(replacement), eaf_replacement_column="EUR")
+    before = prepared.clone()
+    monkeypatch.setattr(af, "validate_replacement_frequency_pairs",
+                        lambda *a, **k: pytest.fail("MAF-like replacement reached consistency validation"))
+
+    with pytest.raises(af.StudyAlleleFrequencyError, match="replacement_frequency_maf_like") as caught:
+        approve(prepared, reference, policies, decision)
+
+    evidence = caught.value.study_decisions["eaf_replacement_validation"]
+    assert evidence["status"] == "inconclusive"
+    assert evidence["failed_requirements"] == ["replacement_frequency_maf_like"]
+    screen = evidence["effective_frequency_screen"]
+    assert screen["rows"] == screen["usable"] == screen["at_or_below_0_5"] == 5
+    assert screen["maf_like"] is True
+    assert "contract" not in evidence
+    assert prepared.equals(before)
+    for chrom in ("1", "2"):
+        assert pl.read_parquet(tmp_path / ("approved_" + chrom + ".parquet")).equals(
+            before.filter(pl.col("CHR") == chrom))
 
 
 def test_declared_replacement_ref_frequency_uses_all_known_alt_alleles(tmp_path):
