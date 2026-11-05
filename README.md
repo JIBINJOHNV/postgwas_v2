@@ -423,7 +423,10 @@ postgwas harmonisation \
 Harmonisation prepares each dataset once, processes its chromosomes, then
 merges and assesses the outputs. Study-wide decisions—including build, strand
 consensus, effect type, OR SE scale, P-value scale and EAF/MAF interpretation—are
-recorded as `DECIDE` entries in the log. Dataset rows currently run sequentially;
+recorded as `DECIDE` entries in the log and displayed as soon as each decision
+finishes. Rejected samples stop before chromosome workers and independent samples
+continue. Resource checks use a compact purpose-labelled table, with individual
+paths for problems and a complete audit. Dataset rows run sequentially;
 chromosome work uses bounded parallelism.
 
 #### Optional: replace a confirmed MAF column with reference EAF

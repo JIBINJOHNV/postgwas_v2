@@ -256,6 +256,17 @@ def _records(container: Mapping, total: int) -> dict:
             and isinstance(step.get("number"), int)}
 
 
+def chromosome_stage_evidence(summary: Mapping[str, Any], *, by_name: bool = False) -> dict:
+    """Copy saved step evidence, with explicit stage QC taking precedence."""
+    records = _records(summary, len(_CHROMOSOME))
+    qc = _mapping(summary.get("stage_qc"))
+    return {(definition[3] if by_name else number): {
+        **_mapping(_mapping(records.get(number)).get("extra")),
+        **_mapping(qc.get(definition[3]))}
+        for number, definition in enumerate(_CHROMOSOME, 1)
+        if not by_name or definition[3] is not None}
+
+
 def _evidence_coverage(expected: list[str], recorded: list[str]) -> dict:
     """Coverage describes evidence, never successful scientific execution."""
     missing = [chromosome for chromosome in expected if chromosome not in recorded]
@@ -345,10 +356,7 @@ def summarise_chromosome_evidence(manifest: Mapping[str, Any]) -> dict:
     payloads = {name: {} for name in ("effects", "frequency", "pvalues", "validation", "sample_size", "info", "vcf")}
     for chromosome, summary in summaries.items():
         records = _records(summary, len(_CHROMOSOME))
-        qc = _mapping(summary.get("stage_qc"))
-        stages = {number: {**_mapping(_mapping(records.get(number)).get("extra")),
-                           **_mapping(qc.get(definition[3]))}
-                  for number, definition in enumerate(_CHROMOSOME, 1)}
+        stages = chromosome_stage_evidence(summary)
         payloads["effects"][chromosome] = _effect_evidence(stages)
         for name, number in (("frequency", 4), ("pvalues", 7), ("validation", 10), ("info", 11)):
             payloads[name][chromosome] = dict(stages[number])
@@ -477,12 +485,11 @@ def dataset_steps(manifest: Mapping[str, Any]) -> list[dict]:
 def chromosome_steps(summary: Mapping[str, Any], policies: Mapping | None = None) -> list[dict]:
     """Return sixteen stages without adding overlapping exclusion counts."""
     records = _records(summary, len(_CHROMOSOME))
-    stages = _mapping(summary.get("stage_qc"))
+    stages = chromosome_stage_evidence(summary)
     cards = []
     for number, definition in enumerate(_CHROMOSOME, 1):
         record = records.get(number, {})
-        payload = _mapping(record.get("extra"))
-        payload.update(_mapping(stages.get(definition[3])))
+        payload = stages[number]
         card = _card(number, definition, record, payload, _mapping(policies), row_counts=number < 15)
         actions = [deepcopy(action) for action in summary.get("qc_actions") or []
                    if isinstance(action, Mapping)

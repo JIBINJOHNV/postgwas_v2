@@ -1,5 +1,6 @@
 """Structural startup and immutable per-study preparation contracts."""
 import csv
+import json
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import Mock
@@ -8,6 +9,7 @@ import pytest
 
 from postgwas.config import load_configuration
 from postgwas.core.errors import ConfigurationError
+from postgwas.core.paths import configured_output_path
 from postgwas.core.input_validation import InputValidationSession, capture_preflight_file_identities
 from postgwas.modules.harmonisation import cli, service, resource_preflight as resources
 from postgwas.modules.harmonisation.policies import default_policies
@@ -18,6 +20,18 @@ from test_harmonisation_resource_preflight import _resource_maps, _mock_bcftools
 # Existing local compressed-input tests import this path; the portable batch
 # fixtures below generate their own inputs and never read this local manifest.
 FIXTURE = Path(__file__).parent / 'data/harmonisation/manifest_v2.csv'
+
+
+def successful_engine_result(**kwargs):
+    """Persist the required report contract for a mocked successful engine."""
+    columns=kwargs['sample_column_dict']
+    manifest=configured_output_path(columns['output_folder'],
+        kwargs['default_cfg']['output_layout']['run_manifest'],dataset_id=columns['gwas_outputname'])
+    manifest.parent.mkdir(parents=True,exist_ok=True)
+    assessment=manifest.parent/'fixture_assessment.json'
+    assessment.write_text(json.dumps({'raw':{},'qc_passed':{}}))
+    manifest.write_text(json.dumps({'status':'OK','qc_assessment':{'reports':{'json':str(assessment)}}}))
+    return {'status':'OK','manifest':str(manifest)}
 
 
 def sheet(tmp_path, count=3):
@@ -94,7 +108,7 @@ def test_malformed_row_and_blank_lines_keep_actual_line_numbers(tmp_path):
     assert {item['row'] for item in issues} == {4, 6}
 
 
-def test_bad_csv_still_reports_good_rows_without_reading_any_study(tmp_path, monkeypatch):
+def test_bad_csv_dispatches_only_valid_rows_with_failed_row_evidence(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, 'preflight_configured_reference_scope', lambda *a, **k: None)
     cfg = config(tmp_path)
     records = sheet(tmp_path, 4)
@@ -106,12 +120,13 @@ def test_bad_csv_still_reports_good_rows_without_reading_any_study(tmp_path, mon
         events.append(name)
         raise AssertionError('Malformed CSV must stop before scientific preparation')
     monkeypatch.setattr(cli, 'run_harmonisation_pipeline', engine)
-    launch = Mock(side_effect=AssertionError('analysis must not start'))
+    launch = Mock(return_value={'dispatched': True})
     monkeypatch.setattr(cli, '_run_validated_rows', launch)
-    with pytest.raises(ConfigurationError, match='No chromosome analysis'):
-        cli.run_harmonisation(Namespace(sample_sheet=path), configuration=cfg, resolved_executables={})
+    assert cli.run_harmonisation(Namespace(sample_sheet=path), configuration=cfg, resolved_executables={}) == {'dispatched': True}
     assert events == []
-    launch.assert_not_called()
+    launch.assert_called_once()
+    assert [r.dataset_id for r in launch.call_args.args[2]] == ['study1', 'study2', 'study3']
+    assert set(launch.call_args.kwargs['preflight_failures']) == {'study0'}
     assert (cfg.run.output_directory / 'run_metadata' / cfg.modules.harmonisation.runtime.resolved_config_file).is_file()
     rows = report(cfg)
     assert {row['dataset_id'] for row in rows if row['status']=='failed'} == {'study0'}

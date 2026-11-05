@@ -775,8 +775,10 @@ opening the study tables. Each dataset's input availability, header, values
 and active external EAF/INFO resources are checked when its turn begins.
 The dataset then completes the full harmonisation pipeline before the next
 study is read. A dataset-specific failure is recorded while independent later
-datasets continue. Invalid configuration or sheet declarations, shared resource
-failures, mandatory reporting failures and user interruption stop the batch.
+datasets continue. Invalid sample-specific declarations with safe unique IDs
+are recorded and skipped. Shared configuration/resource failures, unsafe or
+duplicate output identities, mandatory reporting failures and interruption stop
+the batch.
 After all independent datasets have been attempted, any failed or partial
 dataset makes the command exit nonzero. Successful dataset outputs remain
 available, but the incomplete batch cannot receive a completed checkpoint.
@@ -945,15 +947,38 @@ unregistered paths/templates, and does not repeat a verbose sample-sheet dump.
 Field-level missing counts and the disjoint removal ledger retain their
 different meanings and denominators.
 
-One **Study-wide decisions and evidence** report follows AF approval, INFO
-resolution, partition validation and chromosome-set checks, immediately before
-preparation returns worker inputs. It includes the saved build, effect, SE,
-P-value, BETA/Z, strand, AF A/B and INFO decisions. An earlier preparation failure
-produces one report with the known partial evidence and original stop reason.
-Later failures add their stage/new findings without replaying unchanged
-decisions. Mandatory progress and final output/completeness summaries remain;
-preparation approval is not final output success. No scientific values,
-thresholds, source contracts or checkpoint identities change with this display.
+The **Study-wide decisions and evidence** report grows as each decision finishes.
+Build, strand and statistic decisions appear immediately, before chromosome
+partition preparation. External AF/replacement EAF and external INFO remain
+pending until their whole-study validation finishes. Final AF and INFO outcomes
+appear as soon as they are resolved; workers start only after required approval.
+Completed sections appear once. A later failure adds its stop reason and any
+newly completed evidence, preserving the original error.
+
+A study/preparation rejection stops that sample without retrying and continues
+with independent samples. Safe, uniquely identified invalid sheet rows receive
+`PREFLIGHT_FAILED` reports; malformed scientific mappings never reach workers.
+Unsafe or duplicate output identities, shared configuration/resource failures,
+mandatory reporting failures and interruption still stop the batch. A failed or
+partial batch exits nonzero and preserves successful sample outputs. Report/input
+collisions are refused before initialization and failure reporting, including
+expanded external templates, configured references and filesystem aliases.
+
+Resource checks use a compact table by declared purpose: dbSNP VCF, population
+AF VCF, strand/reference AF table, supplied external AF, replacement EAF, external
+INFO, source/target FASTA, annotation GFF and liftover chain. Rows show configured
+filename patterns, formats, passed/expected physical files, recorded checks and
+index types. Counts overlap where purposes share files; indexes are companions.
+Missing, failed or warning resources retain individual exact-path details. Full
+file identities and metrics remain in the validation audit. Later observations
+update the relevant group without repeating successful chromosome file cards.
+
+Each completed chromosome report includes saved decisions and QC actions,
+BETA/SE/Z and Z/P validation statuses, AF coverage, duplicate/degenerate-frequency
+handling, and recorded stage outcomes. Earlier completed step metadata remains
+visible if a later stage fails. Unvisited or unrecorded checks are not labelled
+passed. Counts for different QC checks may overlap. These are presentation and
+orchestration changes; scientific formulas and thresholds are unchanged.
 
 Input missingness is measured after explicit chromosome exclusion and
 configured missing-token parsing but before
@@ -1654,10 +1679,11 @@ policies follows the existing checkpoint restart policy; resume/overwrite
 semantics are unchanged.
 
 Saved evidence distinguishes the initial provisional selection from the later
-preparation outcome. The terminal and readable logs show A, conditional default
-comparison and B together in the single study report after AF/INFO and partition
-checks, or in its partial-evidence failure report. A separate pending replacement
-card is not followed by another full report. HTML uses the same recorded fields.
+preparation outcome. The terminal and readable logs publish completed study
+sections immediately. AF approval follows its required comparison and replacement
+validation; a pending notice is followed by that final AF section without replaying
+the earlier build, strand or statistic decisions. A failure retains known evidence
+and the stop reason. HTML uses the same recorded fields.
 They show source/column/mapping/identities; A/B roles; original-EA GWAS-row
 screen scope, rows, usable/unusable counts, numerator, fraction, cutoff and result;
 reuse; fixed N and diagnostic n/coverage; exclusions; computed method and metrics;

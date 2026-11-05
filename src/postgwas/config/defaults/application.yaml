@@ -168,6 +168,16 @@ logging:
       pops_matrix_validation: Matrix validation
       pops_unique_bundle_files: Physical files checked
     role_labels:
+      default allele-frequency table: Strand/reference AF table
+      comparison allele-frequency VCF: Population AF VCF
+      external allele-frequency table: Supplied external AF
+      replacement allele-frequency table: Replacement EAF
+      external INFO table: External INFO
+      dbSNP VCF: dbSNP VCF
+      source-build FASTA: Source-build FASTA
+      target-build FASTA: Target-build FASTA
+      gene annotation GFF: Gene annotation GFF
+      liftover chain: Liftover chain
       LDSC chromosome reference bundle: LDSC chromosome reference resources
       LDSC cell-type reference bundle: LDSC cell-type reference resources
       PRED-LD chromosome reference bundle: PRED-LD chromosome reference resources

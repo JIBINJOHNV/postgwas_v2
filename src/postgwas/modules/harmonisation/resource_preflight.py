@@ -29,6 +29,7 @@ from .shared.csq_contigs import (
 from postgwas.core.io.delimiters import open_text, resolve_delimiter
 from postgwas.core.processes import run_checked_command
 from postgwas.core.vcf import annotation_vcf_fields, declared_vcf_tag_definitions
+from postgwas.core.validation_reporting import register_file_validation_bundle
 
 
 _RESOURCE_LABELS = {
@@ -51,6 +52,32 @@ _ALWAYS_REQUIRED_KEYS = (
     "annot_path",
     "chain_file",
 )
+
+_RESOURCE_FORMATS = {
+    "default_eaf_file": "AF table", "default_comparison_af_file": "VCF",
+    "user_eaf_file": "AF table", "user_info_file": "INFO table",
+    "dbsnp_file": "VCF", "genome_fasta_file": "FASTA", "target_fasta": "FASTA",
+    "annot_path": "GFF", "chain_file": "chain",
+}
+
+
+def register_resource_summaries(resource_maps, keys, *, patterns=None, roles=None):
+    """Bind display purposes to explicit resource keys, never filename guesses."""
+    for key in dict.fromkeys(keys):
+        paths = list(dict.fromkeys(str(resources[key]) for resources in resource_maps.values() if resources.get(key)))
+        if not paths:
+            continue
+        names = list(dict.fromkeys(Path(path).name for path in paths))
+        pattern = (patterns or {}).get(key) or (", ".join(names) if len(names) <= 2 else "%s (+%d filenames; audit)" % (names[0], len(names) - 1))
+        role = (roles or {}).get(key) or _RESOURCE_LABELS[key]
+        column_key = {"default_eaf_file": "default_eaf_reference_column",
+            "default_comparison_af_file": "default_comparison_af_column",
+            "user_eaf_file": "user_eaf_column", "user_info_file": "user_info_column"}.get(key)
+        columns = list(dict.fromkeys(str(resources[column_key]) for resources in resource_maps.values()
+            if column_key and resources.get(column_key)))
+        file_format = _RESOURCE_FORMATS[key] + ("; column " + ", ".join(columns) if columns else "")
+        register_file_validation_bundle(paths, role, (), covered_checks=(),
+            table=(Path(str(pattern)).name, file_format))
 
 
 class ResourcePreflightError(RuntimeError):
@@ -444,6 +471,9 @@ def validate_harmonisation_resource_maps(
     logger=None,
     resource_keys: Sequence[str] | None = None,
     validate_frequency_semantics: bool = True,
+    resource_patterns: Mapping[str, str] | None = None,
+    resource_roles: Mapping[str, str] | None = None,
+    summarise_resources: bool = True,
 ) -> dict[str, Any]:
     """Validate every resolved resource and return serialisable provenance."""
     resource_maps = {
@@ -727,6 +757,9 @@ def validate_harmonisation_resource_maps(
             _add_issue(issues, chromosome, "external/default AF compatibility", external, str(exc))
             record_file_validation(external, "External allele-frequency source", status="failed", message=str(exc))
 
+    if summarise_resources:
+        register_resource_summaries(resource_maps, [*required_keys, "user_eaf_file", "user_info_file"],
+            patterns=resource_patterns, roles=resource_roles)
     records = _issue_records(issues)
     if records:
         raise ResourcePreflightError(records)

@@ -746,7 +746,7 @@ def _strand_fields(decisions, policies):
 
 def render_study_decisions(
     study_decisions, *, genome_build_info=None, build_reference_files=None,
-    policies=None, resource_maps=None,
+    policies=None, resource_maps=None, only=None, include_title=True,
 ) -> str:
     """Render only recorded evidence, keeping pending and failed states explicit.
 
@@ -769,12 +769,54 @@ def render_study_decisions(
         ("genetic", "Strand consensus", _strand_fields(decisions, policy)),
         ("analysis", "Imputation-quality score", _info_fields(decisions)),
     ])
-    lines = [screen_line("error" if failure else "decision", "Study-wide decisions and evidence", indent=4)]
+    lines = ([screen_line("error" if failure else "decision", "Study-wide decisions and evidence", indent=4)]
+        if include_title else [])
     for kind, title, fields in sections:
-        lines.extend(screen_summary_card(kind, title, fields))
+        if only is None or title in only:
+            lines.extend(screen_summary_card(kind, title, fields))
     if failure:
         lines.extend(screen_summary_card("error", "Dataset stopped", [("error", "Reason", str(failure))]))
     return "\n".join(lines)
+
+
+class StudyDecisionReporter:
+    """Publish each completed section once, using invocation-local scalar state."""
+
+    sections = ("Genome build", "Effect type", "Standard-error scale", "P-value type",
+        "BETA/Z direction for missing-SE recovery", "Allele frequency", "Strand consensus",
+        "Imputation-quality score")
+
+    def __init__(self, emit, render=render_study_decisions):
+        self.emit = emit
+        self.render = render
+        self.published = set()
+        self.pending_checks = set()
+        self.started = False
+        self.failed = False
+
+    def publish(self, decisions, names, **context):
+        unknown = set(names) - set(self.sections)
+        if unknown:
+            raise ValueError("Unknown study report sections: %s" % sorted(unknown))
+        pending = tuple(name for name in names if name not in self.published)
+        if not pending and not decisions.get("report_failure"):
+            return
+        text = self.render(decisions, only=pending, include_title=not self.started, **context)
+        self.emit(text)
+        self.started = True
+        self.published.update(pending)
+
+    def pending(self, name, message):
+        if name not in self.pending_checks:
+            self.emit("\n".join(screen_summary_card("decision", "Pending study-wide check",
+                [("info", name, message)])))
+            self.pending_checks.add(name)
+
+    def fail(self, decisions, error, **context):
+        if self.failed:
+            return
+        self.failed = True
+        self.publish({**decisions, "report_failure": str(error)}, self.sections, **context)
 
 
 __all__ = ["render_study_decisions", "render_replacement_frequency_validation", "replacement_frequency_fields",

@@ -52,11 +52,13 @@ def _template_glob(value: str) -> tuple[set[str], str, re.Pattern | None]:
 
 def matching_external_resource_files(
     value: str | Path, *, excluded_chromosomes: Sequence[str] = (),
+    include_empty: bool = False,
 ) -> tuple[Path, ...]:
     """Return scoped template matches; literal shared files remain dependencies.
 
     A declared ``{chromosome}`` token uses the canonical labels supplied to
     ``resolve_resource_file``. Exclusion never guesses a label from a filename.
+    Ownership guards include empty files; validation keeps its nonempty default.
     """
     text = str(Path(value))
     fields, pattern, chromosome_match = _template_glob(text)
@@ -73,7 +75,7 @@ def matching_external_resource_files(
             if match is not None and match.group("chromosome").strip().upper() in excluded:
                 continue
         try:
-            if candidate.is_file() and candidate.stat().st_size > 0:
+            if candidate.is_file() and (include_empty or candidate.stat().st_size > 0):
                 files.append(candidate.resolve())
         except OSError:
             continue

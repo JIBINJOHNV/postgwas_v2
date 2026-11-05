@@ -448,6 +448,7 @@ def load_harmonisation_sample_sheet(
                     "row": row_number, "dataset_id": record.get("dataset_id") or "",
                     "input_file": record.get("input_file") or "",
                     "stage": "sample sheet", "status": "failed",
+                    "source_paths": [str(record[key]) for key in ("input_file", "external_eaf_file", "external_info_file") if record.get(key)],
                     "problem": "Invalid sample-sheet row %d for dataset %r: %s"
                     % (row_number, record.get("dataset_id"), problem),
                 })

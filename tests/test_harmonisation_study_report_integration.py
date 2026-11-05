@@ -150,9 +150,10 @@ def test_resolved_report_and_manifest_evidence_follow_real_af_decision(tmp_path,
     assert partition["AF"].to_list() == [.1, .2, .7, .8]
     assert partition["BETA"].to_list() == [-.1, .1, .2, -.2]
     log = next((tmp_path / "logs").glob("*dataset.log")).read_text()
-    assert log.index("Study AF accepted as declared EAF") < log.index("Study-wide decisions and evidence")
-    assert log.index("Split by chromosome") < log.index("Dataset-wide INFO score type")
-    assert log.index("Dataset-wide INFO score type") < log.index("Study-wide decisions and evidence")
+    assert log.index("Study-wide decisions and evidence") < log.index("Study AF accepted as declared EAF")
+    assert log.index("Study AF accepted as declared EAF") < log.index("Declared study EAF retained")
+    assert log.index("Selected build") < log.index("Prepare chromosome files")
+    assert log.index("Imputation-quality score") < log.index("typed Parquet chromosome work")
     assert screen.count("Selected build") == 1
     assert "Chromosome 1 build evidence" not in screen
     assert "Imputation-quality score" in screen.split("Study-wide decisions and evidence", 1)[1]

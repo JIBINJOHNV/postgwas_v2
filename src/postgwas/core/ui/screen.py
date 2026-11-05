@@ -119,6 +119,28 @@ def screen_section_lines(kind, title, indent=6):
     return ["", "", screen_line(kind, title, indent=indent), ""]
 
 
+def screen_table(headers, rows, *, width=None, indent=6, min_widths=()):
+    """Wrap a compact text table on the shared terminal indentation grid."""
+    indent = _screen_indent(indent)
+    available = max(32, (width or shutil.get_terminal_size(fallback=(128, 24)).columns) - indent)
+    values = [tuple(str(value) for value in row) for row in (headers, *rows)]
+    widths = [max(cell_len(row[column]) for row in values) for column in range(len(headers))]
+    while sum(widths) + 3 * (len(widths) - 1) > available:
+        candidates = [column for column, size in enumerate(widths)
+                      if size > (min_widths[column] if column < len(min_widths) else 1)]
+        column = max(candidates or range(len(widths)), key=widths.__getitem__)
+        widths[column] -= 1
+    lines = []
+    for row in values:
+        cells = [textwrap.wrap(value, width=max(1, size), break_long_words=True) or [""]
+                 for value, size in zip(row, widths)]
+        for number in range(max(map(len, cells))):
+            parts = [cell[number] if number < len(cell) else "" for cell in cells]
+            lines.append(" " * indent + " | ".join(value + " " * max(0, size - cell_len(value))
+                for value, size in zip(parts, widths)).rstrip())
+    return "\n".join(lines)
+
+
 def _wrap_path(value: str, width: int) -> list[str]:
     """Wrap a POSIX path at directory boundaries without changing its text."""
     segments = [part + "/" for part in value.split("/")[:-1]]

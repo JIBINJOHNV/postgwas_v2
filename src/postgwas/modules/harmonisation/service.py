@@ -124,7 +124,7 @@ from postgwas.modules.harmonisation.allele_frequency import (
     capture_external_frequency_sources,
     StudyAlleleFrequencyError,
 )
-from postgwas.modules.harmonisation.study_reporting import render_study_decisions
+from postgwas.modules.harmonisation.study_reporting import render_study_decisions, StudyDecisionReporter
 from postgwas.modules.harmonisation.sample_size import (
     harmonise_sample_sizes,
     prepare_missing_sample_sizes,
@@ -178,6 +178,7 @@ from postgwas.modules.harmonisation.resource_preflight import (
     resource_preflight_file_paths,
     preflight_resource_identities,
     validate_harmonisation_resource_maps,
+    register_resource_summaries,
 )
 from postgwas.modules.harmonisation.qc_results import qc_results_to_dataframe
 from postgwas.core.completion import configuration_digest
@@ -505,14 +506,17 @@ def _study_decisions_block(study_decisions, **context):
     return render_study_decisions(study_decisions, **context)
 
 
-def _report_study_failure(logger, error, study_decisions, **context):
+def _report_study_failure(logger, error, study_decisions, *, reporter=None, **context):
     """Retain and present only the evidence available at the failing boundary."""
     decisions = getattr(error, "study_decisions", None) or study_decisions
     error.study_decisions = dict(decisions)
     error.genome_build_info = context.get("genome_build_info")
-    _announce(logger, "\n" + _study_decisions_block(
-        {**decisions, "report_failure": str(error)}, **context,
-    ))
+    if reporter is not None:
+        reporter.fail(decisions, error, **context)
+    else:
+        _announce(logger, "\n" + _study_decisions_block(
+            {**decisions, "report_failure": str(error)}, **context,
+        ))
 
 
 @contextmanager
@@ -1963,6 +1967,17 @@ def preflight_harmonisation_resources(
                 logger=logger,
                 resource_keys=resource_keys,
                 validate_frequency_semantics=validate_frequency_semantics,
+                resource_patterns={
+                    "default_eaf_file": resource_layout["default_eaf"].replace("{source}", str(default_eaf_reference_source)),
+                    "default_comparison_af_file": resource_layout["comparison_af"].replace("{source}", str(default_comparison_af_file)),
+                    "dbsnp_file": resource_layout["dbsnp"].replace("{source}", str(dbsnp)),
+                    "genome_fasta_file": resource_layout["fasta"],
+                    "target_fasta": resource_layout["fasta"],
+                    "annot_path": resource_layout["annotation"],
+                    "chain_file": resource_layout["chain"],
+                    "user_eaf_file": user_eaf_file,
+                    "user_info_file": user_info_file,
+                },
             )
         except ResourcePreflightError as exc:
             issues.extend(exc.issues)
@@ -2081,6 +2096,10 @@ def _activate_eaf_replacement_resources(
                 "user_eaf_file": resolved_files[chromosome], "user_eaf_column": column,
             }
 
+    register_resource_summaries(
+        {chromosome: {"user_eaf_file": path, "user_eaf_column": column} for chromosome, path in resolved_files.items()},
+        ("user_eaf_file",), patterns={"user_eaf_file": specification},
+        roles={"user_eaf_file": "replacement allele-frequency table"})
     # Only new source structure is checked here. In particular, this declared
     # ALT-frequency source never becomes MAF/EAF comparison evidence.
     summary = validate_harmonisation_resource_maps(
@@ -2090,6 +2109,7 @@ def _activate_eaf_replacement_resources(
         external_eaf_colmap=external_eaf_colmap,
         external_info_colmap={}, policies=policies, require_default_eaf=False,
         resource_keys=(), validate_frequency_semantics=False, logger=logger,
+        summarise_resources=False,
     )
     summary["reused_default_chromosomes"] = sorted(reused, key=_chromosome_sort_key)
     replacement["resolved_files"] = resolved_files
@@ -2956,6 +2976,10 @@ def _prepare_dataset_for_chromosome_processing(
     function returns.
     """
     sample_id = sample_column_dict["gwas_outputname"]
+    reporter = StudyDecisionReporter(lambda text: _announce(logger, "\n" + text),
+        render=_study_decisions_block)
+    def report_failure(*args, **context):
+        return _report_study_failure(*args, reporter=reporter, **context)
 
     # ------------------------------------------------------------------
     # 03/08  read_summary_statistics — the expensive read
@@ -3179,11 +3203,14 @@ def _prepare_dataset_for_chromosome_processing(
             % genome_build_info["ambiguous_reason"]
         )
 
-        _report_study_failure(
+        report_failure(
             logger, error, {}, genome_build_info=genome_build_info,
             build_reference_files=build_reference_files, policies=policies,
         )
         raise error
+
+    reporter.publish({}, ("Genome build",), genome_build_info=genome_build_info,
+        build_reference_files=build_reference_files, policies=policies)
 
     # ------------------------------------------------------------------
     # 06/08  strand_detection
@@ -3212,6 +3239,8 @@ def _prepare_dataset_for_chromosome_processing(
         ctx.extra["strand_consensus"] = dict(strand_decision)
         ctx.set_rows(df.height, removed=0)
 
+    reporter.publish(strand_decision, ("Strand consensus",), policies=policies)
+
     # ------------------------------------------------------------------
     # 07/08  resolve_study_properties
     # ------------------------------------------------------------------
@@ -3228,12 +3257,14 @@ def _prepare_dataset_for_chromosome_processing(
     except StudyPropertyError as exc:
         decisions = {**(getattr(exc, "study_decisions", None) or {}), **strand_decision}
         exc.study_decisions = decisions
-        _report_study_failure(
+        report_failure(
             logger, exc, decisions, genome_build_info=genome_build_info,
             build_reference_files=build_reference_files, policies=policies,
         )
         raise
     study_decisions.update(strand_decision)
+    reporter.publish(study_decisions, ("Effect type", "Standard-error scale", "P-value type",
+        "BETA/Z direction for missing-SE recovery"), policies=policies)
     # Retain already-computed scalar evidence for manifest reconstruction.
     dataset_study_decisions = {
         # These optional fields were always present in the manifest contract.
@@ -3315,7 +3346,7 @@ def _prepare_dataset_for_chromosome_processing(
         ))
         _announce(logger, "\n" + "\n".join(failure_lines), marker="ERROR")
         error = ConfigError([], message=message)
-        _report_study_failure(
+        report_failure(
             logger, error, study_decisions, genome_build_info=genome_build_info,
             build_reference_files=build_reference_files, policies=policies,
         )
@@ -3382,7 +3413,7 @@ def _prepare_dataset_for_chromosome_processing(
     except StudyAlleleFrequencyError as exc:
         decisions = getattr(exc, "study_decisions", None) or study_decisions
         exc.study_decisions = decisions
-        _report_study_failure(
+        report_failure(
             logger, exc, decisions, genome_build_info=genome_build_info,
             build_reference_files=build_reference_files,
             policies=policies, resource_maps=resource_maps,
@@ -3396,7 +3427,7 @@ def _prepare_dataset_for_chromosome_processing(
             vcf_config=vcf_config, policies=policies, logger=logger,
         )
     except (ResourcePreflightError, PipelineError) as exc:
-        _report_study_failure(
+        report_failure(
             logger, exc, study_decisions, genome_build_info=genome_build_info,
             build_reference_files=build_reference_files,
             policies=policies, resource_maps=resource_maps,
@@ -3421,6 +3452,11 @@ def _prepare_dataset_for_chromosome_processing(
         )
         user_eaf_file = study_decisions["eaf_replacement"]["file"] if needs_external_source else None
         user_eaf_column = study_decisions["eaf_replacement"]["column"] if needs_external_source else None
+    if study_decisions.get("eaf_selected_source") == "study_supplied":
+        reporter.publish(study_decisions, ("Allele frequency",), policies=policies, resource_maps=resource_maps)
+    else:
+        reporter.pending("Frequency validation", "Pending external/replacement approval; chromosome workers have not started")
+    reporter.pending("INFO validation", "Pending dataset-wide source check")
     dataset_study_decisions.update({
         key: value for key, value in study_decisions.items() if key.startswith("eaf_")
     })
@@ -3431,11 +3467,11 @@ def _prepare_dataset_for_chromosome_processing(
     # 08/08  split by chromosome and stage shared user references
     # ------------------------------------------------------------------
     with _report_preparation_errors(logger, lambda: dict(
-        study_decisions=study_decisions, genome_build_info=genome_build_info,
+        reporter=reporter, study_decisions=study_decisions, genome_build_info=genome_build_info,
         build_reference_files=build_reference_files, policies=policies,
         resource_maps=resource_maps,
     )), logger.step(
-        8, DATASET_STEP_TOTAL, "Split by chromosome",
+        8, DATASET_STEP_TOTAL, "Prepare chromosome files and validate external sources",
         "chromosome_partition.write_chromosome_partitions + "
         "external_reference_staging.stage_shared_external_reference_files + "
         "imputation_quality.resolve_dataset_info_score_type",
@@ -3487,6 +3523,7 @@ def _prepare_dataset_for_chromosome_processing(
                 policies=policies,
             )
             _record_info_score_decision(info_score_decision, study_decisions, dataset_study_decisions)
+            reporter.publish(study_decisions, ("Imputation-quality score",), policies=policies)
         chromosome_partitions = write_chromosome_partitions(
             df,
             sample_gwas_dict=sample_column_dict,
@@ -3586,6 +3623,7 @@ def _prepare_dataset_for_chromosome_processing(
                 failed_decisions["eaf_external_validation"] = evidence
                 exc.study_decisions = failed_decisions
             raise
+        reporter.publish(study_decisions, ("Allele frequency",), policies=policies, resource_maps=resource_maps)
         for key, value in study_decisions.items():
             if key.startswith("eaf_"):
                 dataset_study_decisions[key] = value
@@ -3617,6 +3655,7 @@ def _prepare_dataset_for_chromosome_processing(
                 policies=policies,
             )
             _record_info_score_decision(info_score_decision, study_decisions, dataset_study_decisions)
+        reporter.publish(study_decisions, ("Imputation-quality score",), policies=policies)
         resolved_info_score_type = info_score_decision["resolved_type"]
         info_score_type_source = info_score_decision["decision_source"]
         sample_column_dict["resolved_info_score_type"] = resolved_info_score_type
@@ -3723,11 +3762,6 @@ def _prepare_dataset_for_chromosome_processing(
         removed_excluded_chromosomes=removed_excluded_chromosomes,
     )
 
-    _announce(logger, "\n" + _study_decisions_block(
-        study_decisions, genome_build_info=genome_build_info,
-        build_reference_files=build_reference_files, policies=policies,
-        resource_maps=resource_maps,
-    ))
     return prepared
 
 

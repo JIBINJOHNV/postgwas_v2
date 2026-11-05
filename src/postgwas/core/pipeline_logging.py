@@ -998,7 +998,8 @@ def _chromosome_section(title, fields, width, kind="analysis"):
 
 def _chromosome_analysis_lines(summary, width):
     """Show recorded chromosome stages in execution order."""
-    stages = summary.get("stage_qc") or {}
+    from postgwas.modules.harmonisation.report_steps import chromosome_stage_evidence
+    stages = chromosome_stage_evidence(summary, by_name=True)
     lines = []
 
     def section(title, fields, kind="analysis"):
@@ -1075,6 +1076,24 @@ def _chromosome_analysis_lines(summary, width):
                                if interpretation == "EAF" else "No EAF inversion asserted while frequency type is unresolved"))
                 outside = eaf.get("internal_af_outside_unit_interval_count", eaf.get("internal_af_out_of_range_count"))
                 fields.append(("Out-of-range detected", _count(outside) if outside is not None else "not recorded"))
+        if eaf.get("external_merge_usable_match_fraction") is not None:
+            minimum = eaf.get("external_merge_min_match_fraction")
+            fields.append(("External AF coverage", "%.2f%%; required %s" % (
+                100 * eaf["external_merge_usable_match_fraction"],
+                "%.2f%%" % (100 * minimum) if minimum is not None else "not recorded")))
+        if eaf.get("eaf_degenerate_count") is not None:
+            fields.append(("Degenerate frequency", "%s detected; action %s; %s removed" % (
+                count(eaf, "eaf_degenerate_count"), value(eaf, "eaf_degenerate_action"), count(eaf, "eaf_degenerate_removed"))))
+        if eaf.get("missing_eaf_count") is not None:
+            fields.append(("Missing frequency", count(eaf, "missing_eaf_count")))
+        duplicates = eaf.get("post_orientation_duplicates") or {}
+        if duplicates:
+            fields.append(("Aligned duplicates", "; ".join("%s=%s" % (key.replace("_", " "), val)
+                for key, val in duplicates.items() if key != "report")))
+        duplicate_policy = eaf.get("post_orientation_duplicate_policy") or {}
+        if duplicate_policy:
+            fields.append(("Duplicate policy", "; ".join("%s=%s" % (key.replace("_", " "), val)
+                for key, val in duplicate_policy.items())))
         if eaf.get("strand_af_tolerance") is not None:
             fields.append(("Reference AF tolerance", "|aligned study EAF − reference AF| ≤ %s" % eaf["strand_af_tolerance"]))
         for label, prefix, action_key in [
@@ -1167,13 +1186,16 @@ def _chromosome_analysis_lines(summary, width):
             ("Invalid BETA/SE removed", count(validation, "variants_removed_invalid_beta_se")),
         ])
     if validation:
-        concordance = validation.get("z_pval_concordance") or {}
-        section("Effect-statistic QC", [
-            ("Checked", "BETA, SE and Z"), ("Z/P disagreement action", value(concordance, "action")),
-            ("Z/P comparable", count(concordance, "checked")),
-            ("Z/P disagreements", count(concordance, "discordant")),
-            ("Removed", count(validation, "removed_total")),
-        ])
+        fields = []
+        for label, key in (("BETA/SE/Z", "beta_se_z_concordance"), ("Z/P", "z_pval_concordance")):
+            concordance = validation.get(key) or {}
+            fields.append((label + " status", value(concordance, "status")))
+            for title, field in (("action", "action"), ("comparable", "checked"),
+                                 ("disagreements", "discordant"), ("removed", "removed")):
+                if field in concordance:
+                    fields.append((label + " " + title, value(concordance, field)))
+        fields.append(("Total removed at this step", count(validation, "removed_total")))
+        section("Effect-statistic QC", fields)
 
     info = stages.get("info_qc") or {}
     if info:
@@ -1210,6 +1232,28 @@ def _chromosome_analysis_lines(summary, width):
             ("Missing-value action", value(final, "on_missing")),
             ("Removed", count(final, "removed_total")),
         ])
+    if final.get("missing_by_field"):
+        section("Missing values by field", list(final["missing_by_field"].items()))
+    decisions = summary.get("decisions") or []
+    if decisions:
+        section("Recorded decisions", [(item.get("what") or "Decision", item.get("decision") or "not recorded")
+            for item in decisions])
+    actions = summary.get("qc_actions") or []
+    if actions:
+        section("Recorded checks (counts overlap)", [(item.get("check") or "Check",
+            "%s; %s → %s; removed %s; changed %s; matched %s" % (
+                item.get("outcome") or "outcome not recorded", value(item, "before"), value(item, "after"),
+                value(item, "removed"), value(item, "changed"), value(item, "matched"))) for item in actions])
+    steps = [item for item in summary.get("steps") or [] if item.get("total") == 16]
+    if steps:
+        states = {}
+        for item in steps:
+            states.setdefault(item.get("status") or "not recorded", []).append(str(item["number"]))
+        fields = [(state, "Stages " + ", ".join(numbers)) for state, numbers in states.items()]
+        fields.extend((item.get("title") or "Failed stage", item["error"]) for item in steps if item.get("error"))
+        fields.append(("Unvisited stages", ", ".join(str(number) for number in range(1, 17)
+            if number not in {item["number"] for item in steps}) or "None"))
+        section("Stage outcomes", fields)
     return lines
 
 

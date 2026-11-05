@@ -166,8 +166,8 @@ def test_real_preparation_report_contains_only_terminal_replacement_outcome(tmp_
         assert "Replacement approved" in report
         assert "INFO" in report.split("Study-wide decisions and evidence", 1)[1]
         log = (tmp_path / "logs" / "study_dataset.log").read_text()
-        assert log.index("Split by chromosome") < log.index("Dataset-wide INFO score type")
-        assert log.index("Dataset-wide INFO score type") < log.index("Study-wide decisions and evidence")
+        assert log.index("Prepare chromosome files") < log.index("Dataset-wide INFO score type")
+        assert log.index("Study-wide decisions and evidence") < log.index("Prepare chromosome files")
     else:
         assert "Inconclusive; dataset stopped before chromosome analysis" in report
         assert "accepted for assignment" not in report

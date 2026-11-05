@@ -2752,6 +2752,9 @@ def _resolve_reference_aligned_duplicates(
     statistics["report"] = str(report_path)
     if ctx is not None:
         ctx.extra["post_orientation_duplicates"] = dict(statistics)
+        ctx.extra["post_orientation_duplicate_policy"] = {
+            key: policies.get("duplicates." + key) for key in (
+                "conflicting_action", "selection_order", "post_orientation_relative_tolerance")}
         if report.height:
             ctx.info(
                 "Reference-aligned duplicate evidence for %s row%s was written "

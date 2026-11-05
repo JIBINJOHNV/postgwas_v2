@@ -25,14 +25,15 @@ from postgwas.config.cli_overrides import explicit_overrides
 from postgwas.cli.compute import get_compute_parser
 from postgwas.core.errors import ConfigurationError
 from postgwas.core.input_validation import record_file_validation
-from postgwas.core.paths import configured_output_path
+from postgwas.core.paths import configured_output_path, validate_filename_component
 from postgwas.core.screen_logging import screen_recording_active
 from postgwas.modules.harmonisation.sample_sheet import (
     HarmonisationSampleSheetRow,
     load_harmonisation_sample_sheet,
     to_harmonisation_input,
 )
-from postgwas.modules.harmonisation.resource_paths import validate_external_resource_spec
+from postgwas.modules.harmonisation.resource_paths import validate_external_resource_spec, matching_external_resource_files
+from postgwas.modules.harmonisation.resource_preflight import resource_preflight_file_paths
 from postgwas.modules.harmonisation.policies import POLICIES, load_policies
 from postgwas.modules.harmonisation.allele_frequency import StudyAlleleFrequencyError
 from postgwas.modules.harmonisation.errors import SummaryStatisticsReadError
@@ -50,6 +51,7 @@ from postgwas.modules.harmonisation.service import (
     PipelineError,
     run_harmonisation_pipeline,
     preflight_configured_reference_scope,
+    build_resource_map,
 )
 from postgwas.modules.harmonisation.concordance.errors import (
     ConcordanceValidationError,
@@ -216,6 +218,10 @@ class ScreenReportError(PipelineError):
     """A required per-dataset screen transcript could not be written."""
 
 
+class ReportInputCollisionError(ConfigurationError):
+    """Reporting cannot safely write, including its failure-finalization paths."""
+
+
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -225,44 +231,46 @@ def _dataset_output_paths(
     *,
     output_key: str,
     error_type: type[PipelineError],
+    extra_dataset_ids=(),
 ) -> dict[str, Path]:
     """Resolve one configured dataset-root output for every selected row."""
     output_root = Path(config.run.output_directory).expanduser().resolve()
     layout = config.modules.harmonisation.output_layout.root
     paths = {}
-    for row in rows:
+    for dataset_id in dict.fromkeys([row.dataset_id for row in rows] + list(extra_dataset_ids)):
+        validate_filename_component(dataset_id, "dataset_id", error_type=ConfigurationError)
         dataset_root = configured_output_path(
             output_root,
             layout["dataset_directory"],
             error_type=error_type,
-            dataset_id=row.dataset_id,
+            dataset_id=dataset_id,
         )
-        paths[row.dataset_id] = configured_output_path(
+        paths[dataset_id] = configured_output_path(
             dataset_root,
             layout[output_key],
             error_type=error_type,
-            dataset_id=row.dataset_id,
+            dataset_id=dataset_id,
         )
     return paths
 
 
 def _screen_report_paths(
     config,
-    rows: list[HarmonisationSampleSheetRow],
+    rows: list[HarmonisationSampleSheetRow], *, extra_dataset_ids=(),
 ) -> dict[str, Path]:
     """Resolve the configured screen-report path for every selected dataset."""
     return _dataset_output_paths(
-        config, rows, output_key="screen_report", error_type=ScreenReportError,
+        config, rows, output_key="screen_report", error_type=ScreenReportError, extra_dataset_ids=extra_dataset_ids,
     )
 
 
 def _html_report_paths(
     config,
-    rows: list[HarmonisationSampleSheetRow],
+    rows: list[HarmonisationSampleSheetRow], *, extra_dataset_ids=(),
 ) -> tuple[dict[str, Path], Path]:
     """Resolve the per-dataset and combined HTML-report paths."""
     dataset_paths = _dataset_output_paths(
-        config, rows, output_key="html_report", error_type=HtmlReportError,
+        config, rows, output_key="html_report", error_type=HtmlReportError, extra_dataset_ids=extra_dataset_ids,
     )
     output_root = Path(config.run.output_directory).expanduser().resolve()
     metadata = _runtime_path(config, output_root, "top_metadata_directory")
@@ -781,13 +789,13 @@ def _write_text(path: Path, text: str) -> None:
 
 
 def _initial_run_summary_record(
-    row: HarmonisationSampleSheetRow,
+    row: HarmonisationSampleSheetRow | None = None, *, dataset_id=None, input_file=None,
 ) -> dict[str, Any]:
     """Create one row before analysis so every selected dataset is represented."""
     record = {field: None for field in _RUN_SUMMARY_FIELDS}
     record.update({
-        "dataset_id": row.dataset_id,
-        "input_file": str(row.input_file),
+        "dataset_id": row.dataset_id if row is not None else dataset_id,
+        "input_file": str(row.input_file) if row is not None else input_file,
         "status": "NOT_RUN",
     })
     return record
@@ -1246,6 +1254,7 @@ def _write_preflight_failure_run_summary(
     sample_sheet: str | Path | None = None,
 ) -> Path:
     """Represent every selected dataset when command preflight stops the run."""
+    _assert_safe_reporting(config, rows, source_files=(sample_sheet,))
     output_root = Path(config.run.output_directory).expanduser().resolve()
     report_paths = _screen_report_paths(config, rows)
     html_paths, run_html_path = _html_report_paths(config, rows)
@@ -1310,6 +1319,79 @@ def _top_run_log(config, root) -> Path:
     return configured_output_path(metadata, config.logging.filename)
 
 
+def _declared_reporting_sources(config, rows, issues, source_files):
+    """Collect declared sources and existing template members without reading data."""
+    sources = [value for row in rows for value in (row.input_file, row.external_eaf_file, row.external_info_file) if value]
+    sources.extend(value for issue in issues for value in issue.get("source_paths", [issue.get("input_file")]) if value)
+    sources.extend(value for value in source_files if value)
+    if config.modules.harmonisation.eaf_replacement_file:
+        sources.append(config.modules.harmonisation.eaf_replacement_file)
+    expanded = []
+    for value in sources:
+        declared = Path(value).expanduser()
+        expanded.append(declared)
+        try:
+            expanded.extend(matching_external_resource_files(declared, include_empty=True))
+        except ValueError:
+            pass  # Invalid syntax retains its original preflight diagnostic.
+    if config.resources.root is not None:
+        defaults = _engine_defaults(config)
+        resource_maps = {}
+        scope = config.modules.harmonisation.resource_preflight
+        for build in defaults["vcf_processing"]["target_builds"]:
+            expanded.append(configured_output_path(config.resources.root, defaults["resource_layout"]["build_check"], build=build))
+            for chromosome in scope.chromosomes:
+                resource_maps[(build, chromosome)] = build_resource_map(
+                    chromosome=chromosome, grch_version=build,
+                    target_build=defaults["vcf_processing"]["target_builds"][build],
+                    resource_folder=config.resources.root, resource_layout=defaults["resource_layout"],
+                    default_eaf_reference_source=defaults["default_eaf_reference_source"],
+                    default_comparison_af_file=defaults["default_comparison_af_file"], dbsnp=defaults["default_dbsnp"],
+                    default_eaf_reference_column=defaults["default_eaf_reference_column"],
+                    default_comparison_af_column=defaults["default_comparison_af_column"],
+                    user_eaf_file=None, user_eaf_column=None, user_info_file=None, user_info_column=None,
+                    validate_files=False)
+        expanded.extend(resource_preflight_file_paths(resource_maps))
+    return {path.resolve() for path in expanded}
+
+
+def _assert_safe_reporting(config, rows, issues=(), *, source_files=()):
+    """Refuse input/report aliases before any report writer can mutate a source."""
+    sources = _declared_reporting_sources(config, rows, issues, source_files)
+    safe_ids = []
+    for issue in issues:
+        try:
+            safe_ids.append(validate_filename_component(issue.get("dataset_id") or "", "dataset_id"))
+        except ValueError:
+            pass  # Unsafe IDs are reported by the existing global identity gate.
+    root = Path(config.run.output_directory).expanduser().resolve()
+    metadata = _runtime_path(config, root, "top_metadata_directory")
+    destinations = [_runtime_path(config, metadata, key) for key in
+        ("resolved_config_file", "preflight_report_file", "run_summary_file", "run_html_report")]
+    destinations.append(_top_run_log(config, root))
+    destinations.append(configured_output_path(root, config.logging.screen_log_file))
+    destinations.extend(_screen_report_paths(config, rows, extra_dataset_ids=safe_ids).values())
+    html_paths, _ = _html_report_paths(config, rows, extra_dataset_ids=safe_ids)
+    destinations.extend(html_paths.values())
+    for dataset_id in dict.fromkeys([row.dataset_id for row in rows] + safe_ids):
+        metadata = _runtime_path(config, root, "metadata_directory", dataset_id=dataset_id)
+        destinations.extend(_runtime_path(config, metadata, key) for key in
+            ("resolved_config_file", "sample_sheet_row_file", "command_file", "supplied_config_file"))
+        destinations.append(configured_output_path(metadata, config.logging.filename))
+    source_identities = set()
+    for path in sources:
+        if path.is_file():
+            metadata = path.stat()
+            source_identities.add((metadata.st_dev, metadata.st_ino))
+    for path in destinations:
+        collision = path.resolve() in sources
+        if not collision and path.is_file():
+            metadata = path.stat()
+            collision = (metadata.st_dev, metadata.st_ino) in source_identities
+        if collision:
+            raise ReportInputCollisionError("Required reporting destination would overwrite a declared scientific input: %s" % path)
+
+
 def _fixed_info_cli_value(args, config) -> float | None:
     """Return the explicit fallback while rejecting run-config activation."""
     if hasattr(args, "fixed_info"):
@@ -1320,25 +1402,6 @@ def _fixed_info_cli_value(args, config) -> float | None:
             "the explicit command-line option --fixed-info VALUE instead."
         )
     return None
-
-
-def _validate_info_fallback(
-    rows: list[HarmonisationSampleSheetRow], fixed_info: float | None,
-) -> None:
-    """Fail preflight when any selected dataset has no usable INFO source."""
-    missing = [
-        row.dataset_id
-        for row in rows
-        if row.imputation_info_column is None
-        and not (row.external_info_file and row.external_info_column)
-    ]
-    if missing and fixed_info is None:
-        raise ConfigurationError(
-            "No imputation-quality source is available for dataset(s): %s. "
-            "Provide imputation_info_column, provide external_info_file together "
-            "with external_info_column, or explicitly supply --fixed-info VALUE."
-            % ", ".join(missing)
-        )
 
 
 def _sample_sheet_display(sample_sheet: str | Path | None) -> str | Path:
@@ -1438,9 +1501,13 @@ def _run_validated_rows(
     rows: list[HarmonisationSampleSheetRow],
     resolved_executables=None,
     screen_router: _DatasetScreenRouter | None = None,
+    preflight_failures=None,
 ):
+    preflight_failures = preflight_failures or {}
     if screen_router is None:
-        report_paths = _screen_report_paths(config, rows)
+        _assert_safe_reporting(config, rows, preflight_failures.values(),
+            source_files=(getattr(args, "sample_sheet", None), getattr(args, "run_config", None)))
+        report_paths = _screen_report_paths(config, rows, extra_dataset_ids=preflight_failures)
         with _DatasetScreenRouter(
             report_paths,
             display=config.logging.show_screen,
@@ -1450,11 +1517,10 @@ def _run_validated_rows(
                 config,
                 rows,
                 resolved_executables=resolved_executables,
-                screen_router=managed_router,
+                screen_router=managed_router, preflight_failures=preflight_failures,
             )
 
     fixed_info_from_cli = _fixed_info_cli_value(args, config)
-    _validate_info_fallback(rows, fixed_info_from_cli)
     resource_root = config.resources.root
     if resource_root is None:
         raise ConfigurationError(
@@ -1470,7 +1536,7 @@ def _run_validated_rows(
     sample_sheet_display = _sample_sheet_display(sample_sheet)
     preparation = _preparation_block(
         sample_sheet=sample_sheet,
-        dataset_count=len(rows),
+        dataset_count=len({row.dataset_id for row in rows} | set(preflight_failures)),
         resource_directory=resource_root,
         output_directory=output_root,
     )
@@ -1495,7 +1561,7 @@ def _run_validated_rows(
     run_summary_path = _runtime_path(
         config, top_metadata, "run_summary_file",
     )
-    html_report_paths, run_html_report_path = _html_report_paths(config, rows)
+    html_report_paths, run_html_report_path = _html_report_paths(config, rows, extra_dataset_ids=preflight_failures)
     run_summary_records = {}
     run_summary_manifests: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -1511,6 +1577,23 @@ def _run_validated_rows(
                 config, row, sample_sheet=sample_sheet,
             ),
         }
+    for dataset_id, issue in preflight_failures.items():
+        record = run_summary_records.get(dataset_id) or _initial_run_summary_record(
+            dataset_id=dataset_id, input_file=issue.get("input_file"))
+        record.update(status="PREFLIGHT_FAILED", failure_stage="initial preflight",
+            failure_reason=issue["problem"], screen_report=str(screen_router.report_path(dataset_id)),
+            html_report=str(html_report_paths[dataset_id]))
+        run_summary_records[dataset_id] = record
+        run_summary_manifests.setdefault(dataset_id, {"report_context": {
+            "input_mapping": {"dataset_id": dataset_id, "input_file": issue.get("input_file")}}})
+        run_summary_manifests[dataset_id]["failure"] = {"stage": "initial preflight", "message": issue["problem"]}
+        screen_router.select(dataset_id)
+        print(screen_field("error", "Sample stopped", "%s: %s; continuing with remaining samples" %
+            (dataset_id, issue["problem"]), indent=4))
+    order = {row.dataset_id: row._row_number or index for index, row in enumerate(rows, 1)}
+    order.update({key: value["row"] for key, value in preflight_failures.items() if value.get("row") is not None})
+    run_summary_records = dict(sorted(run_summary_records.items(), key=lambda item: order.get(item[0], len(order))))
+    screen_router.select(None)
     _write_run_summary(run_summary_path, list(run_summary_records.values()))
     _write_html_reports(
         run_path=run_html_report_path,
@@ -1522,8 +1605,8 @@ def _run_validated_rows(
     defaults = _engine_defaults(config, resolved_executables=resolved_executables)
     results: dict[str, Any] = {}
     # Keep IDs only: an exception's traceback would retain failed study frames.
-    failures: list[str] = []
-    dataset_count = len(rows)
+    failures: list[str] = list(preflight_failures)
+    dataset_count = len(run_summary_records)
     strand_reference = config.modules.harmonisation.default_eaf
     comparison_reference = config.modules.harmonisation.comparison_af
 
@@ -1576,7 +1659,11 @@ def _run_validated_rows(
             changed_dataset=row.dataset_id,
         )
 
-    for dataset_index, row in enumerate(rows, start=1):
+    dataset_positions = {dataset_id: index for index, dataset_id in enumerate(run_summary_records, 1)}
+    for row in rows:
+        if row.dataset_id in preflight_failures:
+            continue
+        dataset_index = dataset_positions[row.dataset_id]
         # Collect after the previous handler has released its exception.
         gc.collect()
         screen_router.select(row.dataset_id)
@@ -1915,6 +2002,14 @@ def _run_validated_rows(
                 failures.append(row.dataset_id)
                 break
             except Exception as exc:
+                if active_stage == "dataset preparation":
+                    record_dataset(row, "FAILED", active_manifest_path, failure=exc, failure_stage=active_stage)
+                    message = "Dataset %s preparation failed without retry; continuing with remaining samples: %s" % (row.dataset_id, exc)
+                    _append_run_log(dataset_log, "ERROR", "Dataset failed permanently.\n%s\n%s" % (message, traceback.format_exc()))
+                    _append_run_log(top_log, "ERROR", message)
+                    print(screen_field("error", "Sample stopped", message, indent=4))
+                    failures.append(row.dataset_id)
+                    break
                 _append_run_log(
                     dataset_log,
                     "ERROR",
@@ -2032,6 +2127,8 @@ class HarmonisationPreflightError(ConfigurationError, RuntimeError):
 
 def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavailable_tools=None):
     """Validate declarations and shared resources without reading study variants."""
+    _assert_safe_reporting(config, rows, issues,
+        source_files=(getattr(args, "sample_sheet", None), getattr(args, "run_config", None)))
     output_root = Path(config.run.output_directory).expanduser().resolve()
     metadata = _runtime_path(config, output_root, "top_metadata_directory")
     report_path = _runtime_path(config, metadata, "preflight_report_file")
@@ -2105,6 +2202,25 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
         )
         for warning in row.normalisation_warnings:
             records.append({**record, "stage": "sample sheet", "status": "warning", "problem": warning})
+    ownership = {"dataset_id": {}, "input_file": {}}
+    declarations = [{"row": row._row_number, "dataset_id": row.dataset_id, "input_file": str(row.input_file)} for row in rows]
+    declarations.extend(item for item in records if item.get("row") is not None)
+    for declaration in declarations:
+        for key, values in ownership.items():
+            value = declaration.get(key)
+            if value:
+                identity = str(value).casefold() if key == "dataset_id" else str(value)
+                values.setdefault(identity, set()).add(declaration["row"])
+    if any(len(owners) > 1 for values in ownership.values() for owners in values.values()):
+        records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "sample identities",
+            "status": "failed", "problem": "Duplicate dataset or input identities prevent safe sample-specific output ownership"})
+    for item in tuple(records):
+        if item.get("status") == "failed" and item.get("row") is not None:
+            try:
+                validate_filename_component(item.get("dataset_id") or "", "dataset_id")
+            except ValueError as exc:
+                records.append({"row": None, "dataset_id": "", "input_file": "", "stage": "sample identities",
+                    "status": "failed", "problem": str(exc)})
     failures = [item for item in records if item["status"] == "failed"]
     failed_rows = {item["row"] for item in failures if item["row"] is not None}
     checked_rows = {item["row"] for item in records if item["row"] is not None}
@@ -2116,7 +2232,7 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
     buffer = io.StringIO(newline="")
     writer = csv.DictWriter(buffer, fieldnames=("row", "dataset_id", "input_file", "stage", "status", "problem"))
     writer.writeheader()
-    writer.writerows(records)
+    writer.writerows({field: item.get(field, "") for field in writer.fieldnames} for item in records)
     _write_text(report_path, buffer.getvalue())
     _append_run_log(top_log, "ERROR" if failures else "INFO", summary)
     print(screen_field("error" if failures else "success", "Initial preflight", summary, indent=4))
@@ -2130,6 +2246,15 @@ def _preflight_rows(args, config, rows, issues, resolved_executables, *, unavail
                     print(screen_field(
                         "error", "Sample sheet", item["problem"], indent=4,
                     ))
+        if not any(item["row"] is None for item in failures):
+            isolated = {}
+            for item in failures:
+                identifier = item["dataset_id"]
+                if identifier not in isolated:
+                    isolated[identifier] = dict(item)
+                else:
+                    isolated[identifier]["problem"] += "; " + item["problem"]
+            return isolated
         global_problems = "; ".join(item["problem"] for item in failures
                                     if item["row"] is None and item["stage"] != "expected references")
         raise HarmonisationPreflightError(
@@ -2171,10 +2296,14 @@ def run_harmonisation(
                 )
             except Exception as exc:
                 unavailable_tools = str(exc)
-        _preflight_rows(
+        preflight_failures = _preflight_rows(
             args, config, rows, issues, resolved_executables, unavailable_tools=unavailable_tools,
         )
+    except ReportInputCollisionError:
+        raise  # Even failure-report destinations are unsafe; preserve sources.
     except Exception as exc:
+        _assert_safe_reporting(config, rows, issues,
+            source_files=(getattr(args, "sample_sheet", None), getattr(args, "run_config", None)))
         _append_run_log(preflight_log, "ERROR", "Harmonisation preflight failed: %s" % exc)
         if rows:
             try:
@@ -2184,7 +2313,7 @@ def run_harmonisation(
                 _append_run_log(preflight_log, "ERROR", "Cannot save preflight failure reports: %s" % summary_exc)
         raise
     return _run_validated_rows(
-        args, config, rows, resolved_executables=resolved_executables,
+        args, config, rows, resolved_executables=resolved_executables, preflight_failures=preflight_failures,
     )
 
 

@@ -23,7 +23,7 @@ from postgwas.core.input_validation import (
 from postgwas.core.io.reports import write_yaml_report
 from postgwas.core.paths import configured_output_path, validate_filename_component
 from postgwas.core.ui import print_screen_block
-from postgwas.core.ui.screen import SUMMARY_CARD_LABEL_WIDTH, screen_field, screen_line
+from postgwas.core.ui.screen import SUMMARY_CARD_LABEL_WIDTH, screen_field, screen_line, screen_table
 
 
 # Serialization/check vocabulary and standard companion extensions, not
@@ -68,6 +68,7 @@ class FileValidationBundle:
     covered_checks: frozenset[str]
     covered_metric_keys: frozenset[str]
     availability_only: bool
+    table: tuple[str, str] | None = None
 
 
 def group_file_validations(records):
@@ -169,7 +170,7 @@ def _display_metric_key(key, value, records, settings):
     return key
 
 
-def _file_fields(group, settings, *, duplicate_name=False, file_number=None, update=False):
+def _file_fields(group, settings, *, duplicate_name=False, file_number=None, update=False, exact_path=False):
     records = group.records or group.all_records
     substantive = [record for record in records if set(record.checks) - _AVAILABILITY]
     named_records = [record for record in records if record.path is not None]
@@ -200,9 +201,10 @@ def _file_fields(group, settings, *, duplicate_name=False, file_number=None, upd
         fields.append(screen_field(kind, label, value, indent=10,
                                    label_width=SUMMARY_CARD_LABEL_WIDTH, path_value=path_value))
 
-    if not update:
-        add("info", "File", group.path if duplicate_name else Path(group.path).name,
-            path_value=duplicate_name)
+    if not update or exact_path:
+        full_path = duplicate_name or exact_path
+        add("info", "File", group.path if full_path else Path(group.path).name,
+            path_value=full_path)
     if group.companions:
         add("info", "Index", "; ".join(
             "%s: %s" % (Path(path).suffix.lstrip("."),
@@ -278,6 +280,25 @@ def _validation_bundle_fields(bundle, settings, file_numbers):
     return fields
 
 
+def _resource_table_row(bundle, members, settings):
+    """Summarize observations without adding counts from overlapping checks."""
+    records = [record for member in members if member is not None for record in member.all_records]
+    checks = sorted({("availability" if check in _AVAILABILITY else
+        check.removeprefix("harmonisation.").replace("_", " ")) for record in records for check in record.checks})
+    indexes = sorted({Path(path).suffix[1:].upper() for member in members if member is not None for path in member.companions})
+    metrics = []
+    for key, label in settings.metric_labels.items():
+        values = [record.metrics[key] for record in records if key in record.metrics]
+        if values and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+            low, high = min(values), max(values)
+            metrics.append("%s %s%s (observed)" % (label, _value_text(low, settings.max_list_items),
+                "–" + _value_text(high, settings.max_list_items) if low != high else ""))
+    passed = sum(member is not None and member.status == "passed" for member in members)
+    pattern, file_format = bundle.table
+    return (settings.role_labels[bundle.role], "%d/%d · %s" % (passed, len(members), file_format),
+        pattern, "; ".join([*checks, *indexes, *metrics]))
+
+
 def render_file_validation(
     records,
     configuration,
@@ -290,6 +311,8 @@ def render_file_validation(
     validation_bundles=(),
     total_group_count=None,
     total_status_counts=None,
+    resource_rows=(),
+    exact_problem_paths=(),
 ):
     """Return a shared, compact screen block; retain all details in the audit."""
     settings = configuration.logging.file_validation
@@ -308,6 +331,10 @@ def render_file_validation(
             indent=6, label_width=SUMMARY_CARD_LABEL_WIDTH,
         ))
     names = name_counts if name_counts is not None else Counter(Path(group.path).name for group in groups)
+    if resource_rows:
+        fields.extend(("", screen_line("analysis", "Resource summary", indent=6),
+            screen_table(("Purpose", "Passed/files · format", "Filename / configured pattern", "Recorded checks / index"), resource_rows, indent=10, min_widths=(18, 15, 40, 20)),
+            screen_field("info", "Scope", "Counts are per purpose; shared files overlap. Indexes are companions. Full paths and all check metrics remain in the audit.", indent=10, label_width=SUMMARY_CARD_LABEL_WIDTH)))
     limit = settings.max_screen_files
     shown = [group for number, group in enumerate(groups)
              if limit is None or number < limit or group.status != "passed"]
@@ -316,6 +343,7 @@ def render_file_validation(
             group, settings, duplicate_name=names[Path(group.path).name] > 1,
             file_number=(file_numbers or {}).get(group.path),
             update=group.path in updated_paths,
+            exact_path=group.path in exact_problem_paths,
         )))
     for bundle in validation_bundles:
         fields.extend(("", *_validation_bundle_fields(
@@ -625,6 +653,7 @@ class FileValidationDisplay:
         covered_checks=(),
         covered_metric_keys=(),
         availability_only,
+        table=None,
     ):
         """Register compact screen metadata without changing validation evidence."""
         resolved_paths = tuple(dict.fromkeys(
@@ -650,6 +679,8 @@ class FileValidationDisplay:
                 str(kind), str(key), value,
                 bool(item[3]) if len(item) == 4 else False,
             ))
+        if table is not None and (len(table) != 2 or not all(str(value).strip() for value in table)):
+            raise ValueError("Resource table metadata requires a filename pattern and declared format")
         bundle = FileValidationBundle(
             str(role),
             resolved_paths,
@@ -657,10 +688,13 @@ class FileValidationDisplay:
             frozenset(str(value) for value in covered_checks),
             frozenset(str(value) for value in covered_metric_keys),
             bool(availability_only),
+            tuple(map(str, table)) if table is not None else None,
         )
-        key = (bundle.role, bundle.paths)
+        key = (bundle.role, bundle.paths) if bundle.table is None else (bundle.role, "table", bundle.table)
         previous = self.validation_bundles.get(key)
-        if previous is not None and previous != bundle:
+        if previous is not None and bundle.table is not None:
+            bundle = replace(bundle, paths=tuple(dict.fromkeys((*previous.paths, *bundle.paths))))
+        if previous is not None and previous != bundle and bundle.table is None:
             raise ValueError(
                 "Conflicting summaries registered for file-validation bundle %s"
                 % role
@@ -749,9 +783,26 @@ class FileValidationDisplay:
         omitted_count = 0
         groups_by_path = {group.path: group for group in groups}
         pending_bundles = []
+        resource_rows = []
+        exact_problem_paths = set()
         bundled_paths = set()
         for key, bundle in self.validation_bundles.items():
             members = [groups_by_path.get(path) for path in bundle.paths]
+            if bundle.table is not None:
+                # Typed resource rows summarize the exact observations at this
+                # boundary. New checks/metrics update the row; problems always
+                # retain their individual cards. No validation is performed here.
+                observed = [{key: value for key, value in record.to_dict().items() if key != "consumers"}
+                    for member in members if member is not None for record in member.all_records]
+                if self._new(("resource_table", key), observed):
+                    resource_rows.append(_resource_table_row(bundle, members, settings))
+                for member in members:
+                    if member is not None and member.status == "passed":
+                        bundled_paths.add(member.path)
+                        self._mark_bundle_group_displayed(member)
+                    elif member is not None:
+                        exact_problem_paths.add(member.path)
+                continue
             if (
                 not (set(bundle.paths) & bundled_paths)
                 and all(
@@ -813,7 +864,7 @@ class FileValidationDisplay:
             value.pop("consumers", None)
             if self._new("requirement", value):
                 pending.append(record)
-        if pending or pending_bundles:
+        if pending or pending_bundles or resource_rows:
             print_screen_block(render_file_validation(
                 pending, self.configuration,
                 report_path=report_path if not self.report_path_displayed else None,
@@ -821,11 +872,13 @@ class FileValidationDisplay:
                 name_counts=Counter(Path(group.path).name for group in groups),
                 omitted_count=omitted_count,
                 validation_bundles=pending_bundles,
-                total_group_count=len(groups) if pending_bundles else None,
+                total_group_count=len(groups) if pending_bundles or resource_rows else None,
                 total_status_counts=(
                     Counter(group.status for group in groups)
-                    if pending_bundles else None
+                    if pending_bundles or resource_rows else None
                 ),
+                resource_rows=resource_rows,
+                exact_problem_paths=exact_problem_paths,
             ))
             if report_path is not None:
                 self.report_path_displayed = True
@@ -877,12 +930,16 @@ def register_file_validation_bundle(
     *,
     covered_checks,
     covered_metric_keys=(),
+    table=None,
 ):
     """Request compact display of an explicitly summarized validated bundle.
 
     Every member and check remains in the audit. The bundle is rendered only
     when every member passed and every recorded substantive check and metric is
     declared here; otherwise ordinary per-file cards remain visible.
+    An explicit ``table=(filename_pattern, format)`` instead presents observed
+    checks and numeric metric ranges per purpose; problems retain exact-path
+    cards and every detailed observation remains in the unchanged audit.
     """
     session = current_validation_recorder()
     display = getattr(session, "display", None)
@@ -894,6 +951,7 @@ def register_file_validation_bundle(
             covered_checks=covered_checks,
             covered_metric_keys=covered_metric_keys,
             availability_only=False,
+            table=table,
         )
 
 
