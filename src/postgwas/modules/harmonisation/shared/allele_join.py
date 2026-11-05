@@ -140,6 +140,7 @@ def deduplicate_reference_values(
     frequency_site_columns: Mapping[str, str] | None = None,
     frequency_output_columns: tuple[str, str, str] | None = None,
     frequency_sites: pl.DataFrame | None = None,
+    frequency_site_metadata: dict | None = None,
 ) -> tuple[pl.DataFrame, dict[str, int]]:
     """Resolve repeated allele keys without selecting among different values."""
     if exact_action not in ("keep_one", "discard_all", "fail"):
@@ -254,6 +255,8 @@ def deduplicate_reference_values(
             ~discard & (pl.col(distinct_name) == 1), frequency_output_columns,
             relevant_sites=frequency_sites,
         )
+        if frequency_site_metadata is not None:
+            frequency_site_metadata["sites"] = sites
         frequency, reason, multiallelic = frequency_output_columns
         statistics.update(sites.select(
             (pl.col(multiallelic) & pl.col(frequency).is_not_null()).sum()
@@ -272,6 +275,7 @@ def prepare_reference_values(
     reference, columns, value_column, policies, *, exact_action,
     non_identical_action, error_type=RuntimeError, warn=None, label="reference table",
     output_columns=None, frequency_output_columns=None, frequency_sites=None,
+    frequency_site_metadata=None,
 ):
     """Normalize allele keys and resolve duplicates before AF screening/joining."""
     keys = [columns[key] for key in ("chr", "pos", "ea", "oa")]
@@ -292,8 +296,36 @@ def prepare_reference_values(
         frequency_site_columns=site_columns,
         frequency_output_columns=frequency_output_columns,
         frequency_sites=frequency_sites,
+        frequency_site_metadata=frequency_site_metadata,
     )
     return reference, statistics, rows_before
+
+
+def summarise_allele_assignments(joined, orientation_name, value_name, frequency_columns=None):
+    """Recount raw key/value assignments on exactly the caller's surviving rows."""
+    count_expressions = [
+        (pl.col(orientation_name) == 0).sum().alias("direct_key_matches"),
+        (pl.col(orientation_name) == 1).sum().alias("swapped_key_matches"),
+        pl.col(orientation_name).is_null().sum().alias("unmatched_rows"),
+        (
+            (pl.col(orientation_name) == 0) & pl.col(value_name).is_not_null()
+        ).sum().alias("direct_value_matches"),
+        (
+            (pl.col(orientation_name) == 1) & pl.col(value_name).is_not_null()
+        ).sum().alias("swapped_value_matches"),
+        pl.col(value_name).is_null().sum().alias("missing_values"),
+    ]
+    if frequency_columns is not None:
+        count_expressions.extend([
+            ((pl.col(orientation_name) == 1) & pl.col(frequency_columns[2])
+             & pl.col(value_name).is_not_null()).sum()
+            .alias("reference_frequency_reconstructed_rows"),
+            ((pl.col(orientation_name) == 1) & pl.col(value_name).is_null()).sum()
+            .alias("reference_frequency_unresolved_rows"),
+        ])
+    counts = joined.select(count_expressions).row(0, named=True)
+    stats = {key: int(value or 0) for key, value in counts.items()}
+    return stats
 
 
 def allele_oriented_left_join(
@@ -318,6 +350,7 @@ def allele_oriented_left_join(
     require_complete_frequency_site: bool = False,
     frequency_reason_column: str | None = None,
     frequency_biallelic_column: str | None = None,
+    retain_assignment_metadata: bool = False,
 ) -> tuple[pl.DataFrame, str, dict[str, object]]:
     """Attach one numeric annotation using direct and/or swapped alleles.
 
@@ -334,6 +367,9 @@ def allele_oriented_left_join(
     ``require_complete_frequency_site`` resolves the other-allele frequency
     once per complete reference site, including common-REF multiallelic SNPs.
     Unresolved swaps remain null for the caller's configured missing policy.
+    Private ``retain_assignment_metadata`` keeps raw assignment/site columns
+    and returns their descriptor in statistics for delayed shared finalization.
+    It does not select strand or apply final frequency/palindrome policies.
     Study and reference chromosome keys use the same resolved chromosome
     policies before deduplication and matching.
     """
@@ -407,11 +443,13 @@ def allele_oriented_left_join(
             planned.append(name)
             frequency_columns.append(name)
         frequency_columns = tuple(frequency_columns)
+    site_metadata = {} if retain_assignment_metadata else None
     reference, duplicate_stats, rows_before_deduplication = prepare_reference_values(
         reference, reference_columns, value_column, policies,
         exact_action=duplicate_exact_action, non_identical_action=duplicate_non_identical_action,
         error_type=error_type, warn=warn, label=reference_label, output_columns=study_columns,
         frequency_output_columns=frequency_columns,
+        frequency_site_metadata=site_metadata,
         frequency_sites=(
             study.select(study_columns["chr"], study_columns["pos"]).unique()
             if frequency_columns is not None else None
@@ -504,36 +542,68 @@ def allele_oriented_left_join(
             % (reference_label, rows_before_join, joined.height)
         )
 
-    count_expressions = [
-        (pl.col(orientation_name) == 0).sum().alias("direct_key_matches"),
-        (pl.col(orientation_name) == 1).sum().alias("swapped_key_matches"),
-        pl.col(orientation_name).is_null().sum().alias("unmatched_rows"),
-        (
-            (pl.col(orientation_name) == 0) & pl.col(value_name).is_not_null()
-        ).sum().alias("direct_value_matches"),
-        (
-            (pl.col(orientation_name) == 1) & pl.col(value_name).is_not_null()
-        ).sum().alias("swapped_value_matches"),
-        pl.col(value_name).is_null().sum().alias("missing_values"),
-    ]
-    if frequency_columns is not None:
-        count_expressions.extend([
-            ((pl.col(orientation_name) == 1) & pl.col(frequency_columns[2])
-             & pl.col(value_name).is_not_null()).sum()
-            .alias("reference_frequency_reconstructed_rows"),
-            ((pl.col(orientation_name) == 1) & pl.col(value_name).is_null()).sum()
-            .alias("reference_frequency_unresolved_rows"),
-        ])
-    counts = joined.select(count_expressions).row(0, named=True)
-    stats = {key: int(value or 0) for key, value in counts.items()}
-    stats.update({
+    stats = {
         "reference_rows_before_deduplication": rows_before_deduplication,
         "reference_rows_after_deduplication": rows_after_deduplication,
         "reference_duplicate_rows_removed": (
             rows_before_deduplication - rows_after_deduplication
         ),
-    })
+    }
     stats.update(duplicate_stats)
+    if retain_assignment_metadata:
+        # Coordinate facts cover unmatched keys and discarded allele groups too.
+        # They must be recounted on the actual worker coordinates, not copied
+        # from the larger preparation candidate set.
+        site_columns = []
+        if frequency_columns is not None:
+            sites = site_metadata["sites"]
+            for role in ("multiallelic_resolved_site", "unresolved_site"):
+                site_columns.append(unused_column_name("__postgwas_" + role, joined, reserved=site_columns))
+            site_keys = [study_columns["chr"], study_columns["pos"]]
+            site_facts = sites.select(
+                *site_keys,
+                (pl.col(frequency_columns[2]) & pl.col(frequency_columns[0]).is_not_null()).alias(site_columns[0]),
+                pl.col(frequency_columns[1]).is_not_null().alias(site_columns[1]),
+            )
+            joined = (joined.with_row_index(row_order_name)
+                .join(site_facts, on=site_keys, how="left", coalesce=True)
+                .sort(row_order_name).drop(row_order_name))
+        stats["assignment_metadata"] = {
+            "value": value_name, "orientation": orientation_name,
+            "frequency_columns": frequency_columns, "site_columns": site_columns,
+        }
+        return joined, orientation_name, stats
+    return finish_allele_assignments(
+        joined, orientation_name, value_name, stats, output_column=output_column,
+        orientations=requested, frequency_columns=frequency_columns, frequency_reason_column=frequency_reason_column,
+        frequency_biallelic_column=frequency_biallelic_column, warn=warn,
+        reference_label=reference_label,
+    )
+
+
+def finish_allele_assignments(
+    joined, orientation_name, value_name, stats, *, output_column, orientations,
+    frequency_columns=None, frequency_reason_column=None, frequency_biallelic_column=None,
+    site_columns=(), site_keys=(), warn=None, reference_label="reference table",
+):
+    """Finalize either fresh or cached assignments with identical row/subset QC."""
+    stats = dict(stats)
+    if frequency_columns is not None and "swap" not in orientations and frequency_biallelic_column is None:
+        # Preparation retains complete-site evidence for diagnostics even when
+        # the worker's direct-only attachment has no site/reconstruction QC.
+        # Apply the same metadata condition as fresh preparation above.
+        joined = joined.drop([*frequency_columns, *site_columns])
+        frequency_columns, site_columns = None, ()
+        for key in ("reference_multiallelic_sites", "reference_frequency_unresolved_sites"):
+            stats.pop(key, None)
+    stats.update(summarise_allele_assignments(joined, orientation_name, value_name, frequency_columns))
+    if site_columns:
+        sites = joined.select(*site_keys, *site_columns).unique()
+        stats.update(sites.select(
+            pl.col(site_columns[0]).sum().alias("reference_multiallelic_sites"),
+            pl.col(site_columns[1]).sum().alias("reference_frequency_unresolved_sites"),
+        ).row(0, named=True))
+        joined = joined.drop(list(site_columns))
     if frequency_columns is not None:
         unresolved = (pl.col(orientation_name) == 1) & pl.col(value_name).is_null()
         if stats["reference_frequency_unresolved_rows"]:

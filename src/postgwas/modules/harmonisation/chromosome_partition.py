@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import polars as pl
@@ -54,12 +54,26 @@ def _select_partition_rows(frame: pl.DataFrame, indices: pl.Series) -> pl.DataFr
 
 
 def _write_parquet_atomically(
-    frame: pl.DataFrame,
+    frame: pl.DataFrame | pl.LazyFrame,
     destination: Path,
     *,
     compression: str,
+    expected_rows: int | None = None,
+    validate_before_replace: Callable[[], None] | None = None,
 ) -> None:
-    """Publish one validated Parquet shard without exposing a partial file."""
+    """Publish one validated Parquet shard without exposing a partial file.
+
+    An in-place lazy rewrite can provide an input-identity validator. It runs
+    after streaming/output checks while the original destination still exists,
+    so changed input content is never accepted as the new output identity.
+    """
+    if isinstance(frame, pl.LazyFrame):
+        if isinstance(expected_rows, bool) or not isinstance(expected_rows, int) or expected_rows < 0:
+            raise ValueError("Streaming Parquet publication requires an explicit nonnegative expected row count.")
+    else:
+        if expected_rows is not None and expected_rows != frame.height:
+            raise ValueError("Parquet row-count expectation differs from the supplied frame.")
+        expected_rows = frame.height
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
@@ -69,7 +83,11 @@ def _write_parquet_atomically(
             delete=False,
         ) as handle:
             temporary_path = Path(handle.name)
-        frame.write_parquet(temporary_path, compression=compression)
+        if isinstance(frame, pl.LazyFrame):
+            # Fail if this plan cannot stream; never silently collect a wide shard.
+            frame.sink_parquet(temporary_path, compression=compression, maintain_order=True)
+        else:
+            frame.write_parquet(temporary_path, compression=compression)
 
         scan = pl.scan_parquet(temporary_path)
         observed_schema = list(dict(scan.schema).items())
@@ -83,12 +101,14 @@ def _write_parquet_atomically(
         observed_rows = int(
             scan.select(pl.len().alias("rows")).collect().item()
         )
-        if observed_rows != frame.height:
+        if observed_rows != expected_rows:
             raise ValueError(
                 "Parquet row-count validation failed for chromosome work file "
                 "%s: observed %d, expected %d."
-                % (destination, observed_rows, frame.height)
+                % (destination, observed_rows, expected_rows)
             )
+        if validate_before_replace is not None:
+            validate_before_replace()
         os.replace(temporary_path, destination)
     finally:
         if temporary_path is not None:

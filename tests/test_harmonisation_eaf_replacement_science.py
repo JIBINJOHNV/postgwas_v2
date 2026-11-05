@@ -135,7 +135,7 @@ def test_declared_replacement_does_not_screen_its_minor_alt_values(tmp_path):
     with patch("postgwas.modules.harmonisation.shared.allele_join.frequency_maf_screen",
                side_effect=AssertionError("replacement distribution screened")):
         decision = approve(prepared, reference, policies, decision)
-        result, qc, selected = af.harmonise_allele_frequency("1", prepared.filter(pl.col("CHR") == "1"),
+        result, qc, selected = af.harmonise_allele_frequency("1", pl.read_parquet(tmp_path / "approved_1.parquet"),
             columns, layout, "\t", eaffile=str(replacement), external_eaf_colmap=MAPPING,
             default_eaf_file=str(reference), default_eaf_column="EUR", default_eaf_colmap=MAPPING,
             study_decision=decision, policies=policies)
@@ -222,7 +222,7 @@ def test_replacement_count_reports_final_nonmissing_values_after_endpoint_policy
     decision = approve(prepared, reference, policies, decision)
     columns = dict(COLUMNS, output_folder=str(tmp_path / "out"), gwas_outputname="study")
     layout = load_configuration().modules.harmonisation.output_layout.model_dump()
-    result, qc, selected = af.harmonise_allele_frequency("1", prepared, columns, layout, "\t",
+    result, qc, selected = af.harmonise_allele_frequency("1", pl.read_parquet(tmp_path / "approved_1.parquet"), columns, layout, "\t",
         eaffile=str(replacement), external_eaf_colmap=MAPPING, default_eaf_file=str(reference),
         default_eaf_column="EUR", default_eaf_colmap=MAPPING, study_decision=decision, policies=policies)
     assert result.height == expected_rows

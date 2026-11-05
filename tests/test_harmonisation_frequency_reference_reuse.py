@@ -68,7 +68,7 @@ def _approved(source, columns, comparison, replacement):
     decisions = af.validate_replacement_allele_frequency(
         ChromosomePartitions({"1": str(path)}, {"1": work.height}), columns, decisions,
         maps, REFERENCE_MAPPING, policies=policies)
-    return work, decisions, policies
+    return pl.read_parquet(path), decisions, policies
 
 
 @pytest.mark.parametrize("prepared", [False, True])
@@ -117,7 +117,7 @@ def test_fresh_replacement_preserves_source_columns_without_export_guard_metadat
             default_eaf_column="EUR", default_eaf_colmap=REFERENCE_MAPPING,
             study_decision=decisions, policies=policies,
         )
-    assert reads.call_count == 1
+    assert reads.call_count == 0
     assert result.select(source.columns).equals(source)
     assert result[resolved["eaf_col"]].to_list() == pytest.approx([.6, .7, .8, .6])
     assert GUARD_KEY not in resolved

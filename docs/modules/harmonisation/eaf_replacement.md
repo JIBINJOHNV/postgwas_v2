@@ -222,16 +222,47 @@ build/chromosome coverage and table contents are validated during dataset
 preparation. A shared whole-genome replacement uses the same bounded staging
 and worker memory accounting as existing external EAF tables.
 
-Replacement diagnostics process one narrow chromosome and its reference/merge
-working set at a time, then replay temporary paired Parquet files; they do not
-repeat reference parsing/merging for numeric passes. Distinct candidates are
-attached again during workers because diagnostics omit ineligible output rows.
-The premerge preparation step has no configured RAM-admission check: a large
-chromosome or reference can exceed memory despite this structural bound.
+Replacement preparation processes one narrow chromosome and its reference/merge
+working set at a time. One source read and allele match per distinct chromosome
+source supplies both the diagnostic pairs and complete candidate assignments.
+The private cache covers every prepared default-reference orientation, including
+palindromes and multiallelic sites, plus canonical forward and reverse-complement
+keys for default-unmatched rows. Replacement AF never chooses among those keys:
+the worker selects the exact source-row ID and final allele key only after the
+existing strand/effect processing. Identical default/replacement sources retain
+their zero-additional-read path.
+
+After the whole-study gate passes and original bindings remain unchanged,
+preparation appends a collision-safe list-of-struct assignment column atomically
+to each existing Parquet work partition. The shared writer uses
+[Polars streaming Parquet publication](https://docs.pola.rs/api/python/version/0.20/reference/api/polars.LazyFrame.sink_parquet.html)
+with an explicit expected row count and schema validation; it fails if streaming
+is unsupported rather than eagerly collecting the wide partition. Approval is
+issued only after every write and a final source, alias, and partition identity
+check. Publication failure records `invalid` with
+`replacement_cache_publication_failed`; earlier published shards may contain
+private cache columns, but no worker approval contract is issued.
+
+Workers verify the updated partition fingerprint, descriptor digest and exact
+row-bound cached values, accepting legitimate reordered subsets. Missing,
+changed or unknown assignments fail without a source-reread fallback. Shared
+finalization recalculates row counts, unresolved-site reasons, coordinate-level
+site counts and coverage on the actual surviving worker rows. Private cache
+fields are removed before strand rejection/output handling. The original AF,
+all five gates, original-EA diagnostic B, complete-site REF arithmetic and effect
+transformations remain unchanged. The worker records
+`reused_prepared_replacement_assignments` and zero `external_rows_loaded`.
+
+Numeric passes replay temporary paired Parquet files. Cache publication adds a
+compressed partition rewrite and retains a narrow chromosome cache/join build
+side in memory. The premerge preparation step has no configured RAM-admission
+check: a large chromosome or reference can exceed memory despite this structural
+bound. This optimization covers replacement validation and adoption; independent
+later reference-concordance checks keep their existing reference access.
 Exact global Spearman materializes eligible pairs/ranks only after its existing
 execution-budget estimate; a null direct-library budget is unbounded. That
 planning check is not an OS memory limit or a disk-spill ranking implementation.
-Temporary diagnostic files are removed on success/failure. Full-workflow
+Temporary diagnostic and cache-spool files are removed on success/failure. Full-workflow
 100–200-million-row capacity remains unverified; numeric-only and smaller shared
 merge timings cannot establish reference I/O, staging or full-run capacity.
 

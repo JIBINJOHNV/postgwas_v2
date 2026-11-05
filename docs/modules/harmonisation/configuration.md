@@ -1572,15 +1572,26 @@ reference/merge working set, without a configured RAM-admission check before
 that merge. Later worker scheduling cannot guarantee this preparation fits.
 Large individual chromosomes/references therefore remain a memory limitation.
 
-One diagnostic shared merge per distinct chromosome source feeds temporary
-paired Parquet files; numeric passes replay those files without reparsing or
-remerging the source. Matching same-source aliases/columns/mappings reuse
-default prepared AF and record `same_source_evidence_reused` and
-`reused_default_chromosomes`. Reuse is not independent scientific evidence;
-different paths alone do not establish independence. Distinct sources are
-attached again during workers because the diagnostic subset does not contain
-all output rows or multiallelic assignments. Temporary pairs are removed on
-both success and failure.
+One complete shared merge per distinct chromosome source feeds both temporary
+diagnostic pairs and row/key-bound assignments for all potential output keys,
+including palindromes, multiallelic candidates and retained unmatched rows.
+Numeric passes replay the paired files without reparsing or remerging. After
+all gates and input checks pass, preparation atomically appends the private
+cache to existing work partitions with the shared checked streaming writer and
+updates their fingerprints. It checks all source/partition bindings again before
+issuing approval. Workers select the independently oriented row/key assignment
+and recalculate shared finalization/coverage on surviving rows without reading
+the replacement again. Cache corruption or unknown keys fail without fallback;
+publication failures are `invalid` with `replacement_cache_publication_failed`
+and never issue approval, including after partial publication.
+
+Matching same-source aliases/columns/mappings reuse default prepared AF and
+record `same_source_evidence_reused` and `reused_default_chromosomes`. Reuse is
+not independent scientific evidence; different paths alone do not establish
+independence. Temporary pairs and cache spools are removed on success/failure.
+The narrow cache and streaming join state add memory and compressed partition
+rewrite costs; the preceding preparation-memory limitations remain. See the
+[replacement guide](eaf_replacement.md) for publication and integrity details.
 
 Numeric failure is `inconclusive` and stops before chromosome workers, with
 all failed requirements recorded and no fallback/retry. A source/work identity
