@@ -28,6 +28,7 @@ from postgwas.core.vcf import (
     read_vcf_header,
     validate_postgwas_vcf_provenance,
 )
+from postgwas.modules.harmonisation.effect_type import OR_STANDARD_ERROR_SCALES
 from postgwas.modules.harmonisation.resource_paths import (
     external_resource_template_fields,
     resolve_resource_file,
@@ -1726,10 +1727,10 @@ def run_concordance_validation(
         se_scale = decisions.get("se_scale")
         if effect_type == "odds_ratio" and row.standard_error_column:
             configured_se_scale = policies.get("effect.se_scale")
-            if se_scale not in ("log_odds", "as_given"):
+            if se_scale not in OR_STANDARD_ERROR_SCALES:
                 se_scale = (
                     configured_se_scale
-                    if configured_se_scale in ("log_odds", "as_given")
+                    if configured_se_scale in OR_STANDARD_ERROR_SCALES
                     else None
                 )
             if se_scale is None:
@@ -1737,7 +1738,7 @@ def run_concordance_validation(
                     "Odds-ratio concordance cannot compare the supplied standard "
                     "error because its study-level scale is unresolved. Keep the "
                     "harmonisation run manifest beside the VCF, or explicitly set "
-                    "effect.se_scale to 'log_odds' or 'as_given'."
+                    "effect.se_scale to one of %s." % ", ".join(OR_STANDARD_ERROR_SCALES)
                 )
         eaf_is_maf = decisions.get("eaf_is_maf")
         input_eaf_is_maf = {"maf": True, "eaf": False}.get(decisions.get("eaf_input_interpretation"))

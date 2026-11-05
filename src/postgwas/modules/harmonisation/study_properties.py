@@ -848,7 +848,11 @@ def _decide_or_se_scale(df, sample_column_dict, pol, ctx, decisions, logger=None
         )
         return
 
-    from .effect_type import EffectTypeError, detect_or_standard_error_scale
+    from .effect_type import (
+        EffectTypeError,
+        decode_exponentiated_standard_error,
+        detect_or_standard_error_scale,
+    )
 
     try:
         detected, evidence = detect_or_standard_error_scale(
@@ -877,12 +881,13 @@ def _decide_or_se_scale(df, sample_column_dict, pol, ctx, decisions, logger=None
             source = evidence.get("comparison_source") or "no usable Z or p-value comparison"
             raise StudyPropertyError(
                 "The study effect is odds_ratio and a standard-error column is supplied, "
-                "but PostGWAS could not determine whether SE is on the log-odds or raw "
-                "odds-ratio scale. The %s comparison provided %s informative variants; "
+                "but PostGWAS could not determine whether SE is log-odds, raw "
+                "odds-ratio, or exponentiated log-odds SE. The %s comparison provided %s informative variants; "
                 "%s are required, and one interpretation must reach "
                 "effect.se_scale_min_agreement_fraction with the configured agreement margin. "
-                "Set effect.se_scale explicitly to 'log_odds' (usual GWAS output) or "
-                "'as_given' (raw OR-scale SE), or provide consistent Z scores or "
+                "Set effect.se_scale explicitly to 'log_odds' (usual GWAS output), "
+                "'as_given' (raw OR-scale SE), or 'exponentiated_log_odds' "
+                "(stored exp(SE_logOR)), or provide consistent Z scores or "
                 "non-zero p-values. No chromosome processing was started."
                 % (
                     source,
@@ -922,6 +927,17 @@ def _decide_or_se_scale(df, sample_column_dict, pol, ctx, decisions, logger=None
                 "validate that declaration." % configured
             )
 
+    if selected == "exponentiated_log_odds":
+        parse_failures = int(sample_column_dict.get("_se_input_parse_failures", 0))
+        if parse_failures:
+            raise StudyPropertyError(
+                "Exponentiated log-odds SE column %r had %d unparseable provided "
+                "value(s) during input normalization. Correct these source values; "
+                "they cannot be treated as originally missing SE for recovery."
+                % (se_col, parse_failures)
+            )
+        decode_exponentiated_standard_error(df, se_col, error_type=StudyPropertyError)
+
     decisions["se_scale"] = selected
     decisions["se_scale_source"] = decision_source
     decisions["se_scale_matches_declaration"] = matches
@@ -936,6 +952,10 @@ def _decide_or_se_scale(df, sample_column_dict, pol, ctx, decisions, logger=None
             ),
             "raw-OR agreement": _percent(
                 evidence.get("raw_odds_ratio_matches", 0),
+                evidence.get("informative_variants", 0),
+            ),
+            "exponentiated-SE agreement": _percent(
+                evidence.get("exponentiated_log_odds_matches", 0),
                 evidence.get("informative_variants", 0),
             ),
             "decided by": decision_source,
@@ -1025,7 +1045,7 @@ def resolve_study_properties(
           "effect_type_source": "policy" | "detector" | "no_effect_column",
           "effect_evidence": {...},          # every denominator non-null
           "beta_z_sign_consistency": {...},  # complete-study missing-SE guard
-          "se_scale": "log_odds" | "as_given" | None,
+          "se_scale": "log_odds" | "as_given" | "exponentiated_log_odds" | None,
           "se_scale_source": ...,
           "se_scale_evidence": {...},
           "pvalue_type": "raw" | "neglog10" | None,

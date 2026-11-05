@@ -3058,11 +3058,11 @@ policies:
       default: auto
       help: |-
         What it does: Determines or declares which scale an odds-ratio study's standard error is
-          on, and therefore whether SE must be divided by OR before allele orientation.
+          on, and converts it to log-odds SE before allele orientation.
         When it applies: dataset step 07, only when effect type is odds_ratio and a standard-error
           column is supplied. The selected study-wide answer is applied at chromosome step 03.
         Values:
-          auto - compare the two candidate identities log(OR)/SE and log(OR)/(SE/OR) with the
+          auto - compare log(OR)/SE, log(OR)/(SE/OR), and log(OR)/ln(SE) with the
             study's supplied Z scores, or with its two-sided p-values when no sufficiently
             informative Z comparison exists. Ambiguous or insufficient evidence stops before
             chromosome processing instead of guessing.
@@ -3072,13 +3072,21 @@ policies:
           as_given - the standard error is on the raw odds-ratio scale, so chromosome step 03
             divides it by the original OR using the first-order delta method before changing
             allele orientation. The explicit declaration is cross-checked when possible.
+          exponentiated_log_odds - the stored value is exp(SE_logOR), so take its natural
+            logarithm in a separate working column and preserve the supplied column. Provided
+            values must be finite and greater than 1; otherwise the dataset fails because the
+            decoded SE would not be finite and positive. Null values keep existing SE recovery.
         Example: A variant with OR 2.00 and SE 0.30. Under 'log_odds' the exported effect is
           ln(2) = 0.693147 and the SE stays 0.30. Under 'as_given' the SE becomes
           0.30 / 2.00 = 0.15 alongside the same effect size.
+          Under 'exponentiated_log_odds', stored SE 1.13037330491772 becomes
+          ln(1.13037330491772) = 0.1225479365022153.
         Note: Most logistic-regression GWAS files report the SE of log(OR), even when the effect
           column is exponentiated to OR. Auto exists because a raw OR-scale SE is also possible
           and applying the wrong interpretation changes Z, confidence intervals and p-values.
           Raw p=0 is excluded because it is censored/underflowed rather than an exact probability.
+          Automatic selection requires one candidate to meet the agreement threshold and exceed
+          every other candidate by the configured margin. Column names alone do not select a scale.
           The p-value fallback assumes a two-sided Wald p-value; studies reporting score-test,
           likelihood-ratio or one-sided p-values should provide Z or set se_scale explicitly.
       origin: effect_type.py:detect_or_standard_error_scale
@@ -3091,20 +3099,21 @@ policies:
         - auto
         - log_odds
         - as_given
+        - exponentiated_log_odds
     se_scale_min_variants:
       default: 100
       help: |-
-        What it does: Sets how many variants must distinguish the log-odds and raw-OR SE
+        What it does: Sets how many variants must distinguish the supported OR-study SE
           interpretations before automatic SE-scale detection may make a study-wide decision.
         When it applies: dataset step 07 for an odds-ratio study with effect.se_scale=auto. A
           variant is informative only when OR and SE are positive and finite, Z or p is usable,
-          and the two candidate interpretations differ by more than the configured validation
+          and at least two valid candidate interpretations differ by more than the configured validation
           tolerance.
         Values: A positive whole-variant count. Larger values require broader evidence and are
           safer for rounded or heterogeneous files; smaller values permit small studies or
           selected-variant files to be classified from less evidence.
         Example: with the default 100, 99 otherwise usable variants cannot decide the scale and
-          the dataset stops before splitting. An explicit log_odds or as_given declaration may
+          the dataset stops before splitting. An explicit supported SE-scale declaration may
           continue, while the log records that it could not be independently validated.
       origin: effect_type.py:detect_or_standard_error_scale
       recommendation: null
@@ -3142,9 +3151,9 @@ policies:
       default: 0.1
       help: |-
         What it does: Requires the selected interpretation's agreement fraction to exceed the
-          alternative interpretation by at least this amount.
+          best alternative interpretation by at least this amount.
         When it applies: dataset step 07 together with effect.se_scale_min_agreement_fraction.
-        Values: A fraction from 0 to 1. It prevents both interpretations from being accepted when
+        Values: A fraction from 0 to 1. It prevents competing interpretations from being accepted when
           rounded effects near OR=1 make them observationally similar.
         Example: log-odds agreement 0.97 and raw-OR agreement 0.20 has margin 0.77 and passes;
           0.97 versus 0.92 has margin 0.05 and remains ambiguous at the default 0.10.

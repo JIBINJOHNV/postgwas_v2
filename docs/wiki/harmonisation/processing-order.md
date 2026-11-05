@@ -421,7 +421,7 @@ These eight steps run once on the complete study.
 7. **Dataset step 7 — Determine statistic types.** PostGWAS decides or verifies:
 
    - BETA versus odds ratio;
-   - for odds ratios, log-odds SE versus raw OR-scale SE;
+   - for odds ratios, log-odds SE, raw OR-scale SE, or exponentiated log-odds SE;
    - complete-study BETA/signed-Z direction agreement for rows that need SE recovery;
    - raw P versus negative-log10 P (other logarithmic representations are refused); and
    - EAF-like versus MAF-like frequency distribution.
@@ -585,8 +585,9 @@ See [Authoritative input mappings](sample-sheet.md#authoritative-input-mappings)
    schema and bcftools validation.
 
 3. **Chromosome step 3 — Put effects on the BETA scale.** A beta remains beta.
-   An odds ratio becomes `BETA = ln(OR)`. If SE was determined to be raw
-   OR-scale, it is converted before allele swapping. This ordering is important:
+   An odds ratio becomes `BETA = ln(OR)`. A raw OR-scale SE becomes `SE/OR`;
+   exponentiated log-odds SE becomes `ln(SE)` in a separate working column,
+   preserving the source. Both conversions occur before allele swapping:
    after conversion, swapping negates BETA while leaving log-odds SE unchanged.
 
 4. **Chromosome step 4 — Orient alleles and obtain EAF.** Every variant is

@@ -516,6 +516,44 @@ Standalone frequency validation uses the resolved `eaf.maf_decision_cutoff`,
 arguments are omitted or `None`. Explicit helper arguments, including zero,
 retain precedence. The chromosome workflow delegates to that same resolution.
 
+### Odds-ratio standard-error representation
+
+`modules.harmonisation.policies.effect.se_scale` controls how an odds-ratio
+study's supplied SE becomes the canonical SE of `ln(OR)`:
+
+| Setting | Canonical log-odds SE |
+|---|---|
+| `log_odds` | Supplied SE unchanged. |
+| `as_given` | Supplied raw OR-scale SE divided by the original OR, using the first-order delta method. |
+| `exponentiated_log_odds` | `ln(supplied SE)`, for a column storing `exp(SE of ln(OR))`. |
+| `auto` (default) | Compare the three interpretations with supplied Z or two-sided Wald P evidence. |
+
+For example, a stored SE of `1.13037330491772` under
+`exponentiated_log_odds` decodes to `0.1225479365022153`. This is an encoding
+repair, distinct from the delta-method conversion. The stored value must be
+finite and greater than one to decode to a finite, positive SE. When this
+encoding is selected, a provided value that cannot meet that requirement stops
+with an actionable error; a missing value remains eligible for the existing
+missing-SE recovery. Invalid decoded values cannot support automatic inference;
+a column name alone does not establish its representation.
+
+Automatic inference is performed once for the whole study before chromosome
+processing. The existing defaults require at least 100 discriminating variants,
+at least 95% agreement, and a margin of at least 10 percentage points over every
+competing interpretation. The comparisons use the configured Z/P tolerances.
+Insufficient or ambiguous evidence stops instead of choosing a scale. The
+P-based comparison assumes a two-sided Wald test and excludes raw `P=0`.
+An explicit `effect.se_scale` declaration is cross-checked when possible and
+follows the existing declaration-mismatch policy.
+
+When decoding is selected, PostGWAS preserves the supplied SE column and uses a
+separate working column before allele orientation. The resolved scale and
+conversion are logged and carried into VCF provenance. Input-to-VCF concordance
+applies the same decoding to the original input. This preserves the
+[GWAS-VCF requirement](https://github.com/MRCIEU/gwas-vcf-specification/blob/1.0.0/README.md) that
+SE accompanies the canonical effect estimate; it does not establish how a
+provider produced the original encoding.
+
 ### Effect scale before Z-based recovery
 
 The study-wide effect decision is passed unchanged to every chromosome. At
@@ -1643,7 +1681,8 @@ left-aligns and normalizes indels before concordance.
 For allele-aware matches, PostGWAS compares log-scale effect, canonical
 log-scale standard error, effect-allele frequency, and Z score after orienting
 allele-specific values to the VCF ALT allele. Odds ratios are converted to
-log(OR); a study-level `as_given` OR-scale SE is divided by OR before comparison.
+log(OR); a study-level `as_given` OR-scale SE is divided by OR before comparison,
+while `exponentiated_log_odds` SE is decoded with `ln(supplied SE)`.
 Swapped matches negate BETA and Z and use `1-EAF`; log-scale SE remains
 unchanged. When the input has no Z column, Z is calculated from effect/standard
 error, or from signed effect and the configured p-value scale when standard

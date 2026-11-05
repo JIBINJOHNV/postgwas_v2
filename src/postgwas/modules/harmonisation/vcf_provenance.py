@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from postgwas.core.values import optional_text
+from postgwas.modules.harmonisation.effect_type import OR_STANDARD_ERROR_SCALES
 from postgwas.modules.harmonisation.effect_from_z import (
     describe_effect_from_z_reconstruction,
 )
@@ -157,15 +158,19 @@ def _se_provenance(
 
     if se_column is not None:
         source = "study column"
-        if effect_type == "odds_ratio" and se_scale not in ("log_odds", "as_given"):
+        if effect_type == "odds_ratio" and se_scale not in OR_STANDARD_ERROR_SCALES:
             raise ValueError(
                 "VCF provenance requires the validated OR standard-error scale; "
-                "expected 'log_odds' or 'as_given', got %r." % se_scale
+                "expected one of %s, got %r." % (", ".join(OR_STANDARD_ERROR_SCALES), se_scale)
             )
         if effect_type == "odds_ratio" and se_scale == "as_given":
             input_scale = "raw odds-ratio scale"
             harmonisation = "Converted raw odds-ratio SE to log-odds SE"
             formula = "SE_logOR = SE_OR / OR"
+        elif effect_type == "odds_ratio" and se_scale == "exponentiated_log_odds":
+            input_scale = "exponentiated log-odds SE"
+            harmonisation = "Decoded exponentiated SE into a separate log-odds SE working column"
+            formula = "SE_logOR = ln(stored_SE)"
         else:
             input_scale = (
                 "log-odds" if effect_type == "odds_ratio" else "BETA scale"

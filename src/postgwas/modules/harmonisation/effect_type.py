@@ -10,8 +10,8 @@ Three entry points:
 
 ``detect_or_standard_error_scale(...)``
     Pure study-level validation for odds-ratio studies. It compares the Z score
-    or two-sided p-value implied when SE is interpreted as log-OR SE with the
-    corresponding value implied when SE is interpreted as raw OR-scale SE.
+    or two-sided p-value implied by ordinary log-OR SE, raw OR-scale SE, and
+    exponentiated log-OR SE.
 
 ``harmonise_effect_estimates(chromosome, df, sample_column_dict, ...)``
     Applies a decision - the study-level one when it is handed in through
@@ -32,6 +32,7 @@ Everything numeric is a policy loaded from the canonical harmonisation YAML
 """
 
 import math
+from itertools import combinations
 from typing import Any, Dict, Optional, Tuple
 
 import polars as pl
@@ -39,6 +40,7 @@ import polars as pl
 from postgwas.core.values import format_number as _fmt, optional_text
 
 from .shared.allele_join import unused_column_name
+from .shared.column_mapping import column_mapping_groups
 from .shared.runtime import (
     emit_high_visibility_warning,
     format_inference_warning,
@@ -55,7 +57,14 @@ __all__ = [
     "detect_effect_type",
     "detect_or_standard_error_scale",
     "harmonise_effect_estimates",
+    "decode_exponentiated_standard_error",
+    "OR_STANDARD_ERROR_SCALES",
 ]
+
+
+# These names identify implemented uncertainty transformations, not defaults.
+# Exponentiated uncertainty is decoded with ln(SE); it is not raw OR-scale SE.
+OR_STANDARD_ERROR_SCALES = ("log_odds", "as_given", "exponentiated_log_odds")
 
 
 # The label written into the reject file's `reject_step` column, and the
@@ -92,12 +101,40 @@ def _normalise_se_scale(value):
     text = str(value).strip().lower()
     if text in ("", "auto", "na", "none"):
         return None
-    if text in ("log_odds", "as_given"):
+    if text in OR_STANDARD_ERROR_SCALES:
         return text
     raise EffectTypeError(
-        "unknown standard-error scale %r - expected 'auto', 'log_odds' or "
-        "'as_given'" % (value,)
+        "unknown standard-error scale %r - expected 'auto' or one of %s"
+        % (value, ", ".join(repr(scale) for scale in OR_STANDARD_ERROR_SCALES))
     )
+
+
+def decode_exponentiated_standard_error(
+    df: pl.DataFrame, se_col: str, *, error_type=EffectTypeError,
+) -> pl.Series:
+    """Decode exp(SE_logOR), retaining nulls and refusing noninvertible values.
+
+    A finite, positive standard error has an exponential strictly above one.
+    A stored value of one has lost the information needed for a positive SE;
+    a non-finite, nonnumeric or smaller value is not a usable encoding.
+    """
+    if not se_col or se_col not in df.columns:
+        raise error_type("Exponentiated standard-error column %r is absent." % se_col)
+    source = df.get_column(se_col)
+    values = source.cast(pl.Float64, strict=False)
+    invalid = source.is_not_null() & (
+        values.is_null() | ~values.is_finite() | (values <= 1.0)
+    ).fill_null(True)
+    count = int(invalid.sum())
+    if count:
+        raise error_type(
+            "Exponentiated log-odds SE column %r contains %d provided value(s) "
+            "that are not finite numbers greater than 1. They cannot decode "
+            "to a finite, positive standard error with ln(). Correct the column "
+            "or its effect.se_scale declaration; missing values may remain null."
+            % (se_col, count)
+        )
+    return values.log()
 
 
 def _decision_se_scale(decision, configured):
@@ -275,33 +312,38 @@ def _effect_type_statistic_expressions(
     ]
 
 
-def _se_scale_result(method, comparable, informative, log_matches, raw_matches, policies):
+def _se_scale_result(method, comparable, informative, matches, policies):
     """Summarize one Z- or p-based SE-scale comparison."""
     comparable_count = int(comparable.sum())
     informative_count = int(informative.sum())
-    log_count = int((log_matches & informative).sum())
-    raw_count = int((raw_matches & informative).sum())
-    log_fraction = log_count / informative_count if informative_count else 0.0
-    raw_fraction = raw_count / informative_count if informative_count else 0.0
+    counts = {scale: int((mask & informative).sum()) for scale, mask in matches.items()}
+    fractions = {
+        scale: count / informative_count if informative_count else 0.0
+        for scale, count in counts.items()
+    }
     minimum = int(policies.effect.se_scale_min_variants)
     required = float(policies.effect.se_scale_min_agreement_fraction)
     margin = float(policies.effect.se_scale_min_agreement_margin)
 
     decision = None
-    if informative_count >= minimum:
-        if log_fraction >= required and log_fraction - raw_fraction >= margin:
-            decision = "log_odds"
-        elif raw_fraction >= required and raw_fraction - log_fraction >= margin:
-            decision = "as_given"
+    best, runner_up = sorted(counts, key=counts.get, reverse=True)[:2]
+    observed_margin = (
+        (counts[best] - counts[runner_up]) / informative_count
+        if informative_count else 0.0
+    )
+    unique_best = counts[best] > counts[runner_up]
+    if (
+        informative_count >= minimum and unique_best
+        and fractions[best] >= required and observed_margin >= margin
+    ):
+        decision = best
 
-    return decision, {
+    evidence = {
         "comparison_source": method,
         "comparable_variants": comparable_count,
         "informative_variants": informative_count,
-        "log_odds_matches": log_count,
-        "raw_odds_ratio_matches": raw_count,
-        "log_odds_agreement_fraction": round(log_fraction, 6),
-        "raw_odds_ratio_agreement_fraction": round(raw_fraction, 6),
+        "best_supported_scale": best if unique_best else None,
+        "observed_agreement_margin": round(observed_margin, 6),
         "minimum_informative_variants": minimum,
         "minimum_agreement_fraction": required,
         "minimum_agreement_margin": margin,
@@ -314,6 +356,43 @@ def _se_scale_result(method, comparable, informative, log_matches, raw_matches, 
             else "ambiguous_or_inconsistent"
         ),
     }
+    for scale, prefix in (
+        ("log_odds", "log_odds"), ("as_given", "raw_odds_ratio"),
+        ("exponentiated_log_odds", "exponentiated_log_odds"),
+    ):
+        evidence[prefix + "_matches"] = counts[scale]
+        evidence[prefix + "_agreement_fraction"] = round(fractions[scale], 6)
+    return decision, evidence
+
+
+def _compare_se_candidates(method, reference, candidates, comparable, absolute, relative, policies):
+    """Score every candidate on one union of pairwise-discriminating rows."""
+    import numpy as np
+
+    informative = np.zeros_like(comparable, dtype=bool)
+    pair_counts = {}
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        for left, right in combinations(candidates, 2):
+            first, second = candidates[left], candidates[right]
+            pair = (
+                comparable & np.isfinite(first) & np.isfinite(second)
+                & (np.abs(first - second) > absolute + relative * np.maximum(
+                    np.abs(first), np.abs(second),
+                ))
+            )
+            informative |= pair
+            pair_counts[left + "_vs_" + right] = int(pair.sum())
+        matches = {
+            scale: comparable & np.isfinite(values) & (
+                np.abs(reference - values) <= absolute + relative * np.abs(values)
+            )
+            for scale, values in candidates.items()
+        }
+    decision, evidence = _se_scale_result(
+        method, comparable, informative, matches, policies,
+    )
+    evidence["pairwise_discriminating_variants"] = pair_counts
+    return decision, evidence
 
 
 def detect_or_standard_error_scale(
@@ -326,15 +405,16 @@ def detect_or_standard_error_scale(
     pvalue_type: Optional[str] = None,
     policies: Optional[Any] = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Determine whether an OR study's SE is on the log-OR or raw-OR scale.
+    """Determine which supported uncertainty representation an OR study uses.
 
     A supplied Z score is the strongest check because it directly tests
     ``Z = log(OR) / SE_log``. When no sufficiently informative Z comparison is
-    available, the same two candidate Z scores are compared with the reported
+    available, the candidate Z scores are compared with the reported
     two-sided p-value on the numerically stable ``-log10(p)`` scale. Variants
-    for which the two candidate interpretations are indistinguishable under the
-    configured tolerance are excluded from the decision rather than counted for
-    both sides. A score-test, likelihood-ratio or one-sided p-value is not a
+    for which all viable interpretations are indistinguishable under the
+    configured tolerance are excluded. Each candidate is scored on the same
+    union of pairwise-discriminating rows; a unique winner must clear the
+    agreement and runner-up margin gates. A score-test, likelihood-ratio or one-sided p-value is not a
     Wald identity and therefore requires a supplied Z or an explicit SE scale.
     """
     pol = resolve_policies(policies)
@@ -368,8 +448,13 @@ def detect_or_standard_error_scale(
     )
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         beta = np.log(odds_ratio)
-        candidate_log = beta / standard_error
-        candidate_raw = beta / (standard_error / odds_ratio)
+        candidates = {
+            "log_odds": beta / standard_error,
+            "as_given": beta / (standard_error / odds_ratio),
+            "exponentiated_log_odds": np.where(
+                standard_error > 1.0, beta / np.log(standard_error), np.nan,
+            ),
+        }
 
     evidence = {
         "rows": int(df.height),
@@ -385,23 +470,8 @@ def detect_or_standard_error_scale(
     if z_col and z_col in numeric.columns:
         reference = numeric.get_column(z_col).to_numpy()
         comparable = usable & np.isfinite(reference)
-        candidate_difference = np.abs(candidate_log - candidate_raw)
-        discrimination_tolerance = absolute + relative * np.maximum(
-            np.abs(candidate_log), np.abs(candidate_raw)
-        )
-        informative = comparable & np.isfinite(candidate_difference) & (
-            candidate_difference > discrimination_tolerance
-        )
-        log_matches = comparable & (
-            np.abs(reference - candidate_log)
-            <= absolute + relative * np.abs(candidate_log)
-        )
-        raw_matches = comparable & (
-            np.abs(reference - candidate_raw)
-            <= absolute + relative * np.abs(candidate_raw)
-        )
-        decision, attempt = _se_scale_result(
-            "supplied_z", comparable, informative, log_matches, raw_matches, pol,
+        decision, attempt = _compare_se_candidates(
+            "supplied_z", reference, candidates, comparable, absolute, relative, pol,
         )
         attempt["absolute_z_tolerance"] = absolute
         attempt["relative_z_tolerance"] = relative
@@ -423,8 +493,10 @@ def detect_or_standard_error_scale(
             observed = values
 
         try:
-            expected_log = two_sided_negative_log10_p_from_z(candidate_log)
-            expected_raw = two_sided_negative_log10_p_from_z(candidate_raw)
+            expected = {
+                scale: two_sided_negative_log10_p_from_z(values)
+                for scale, values in candidates.items()
+            }
         except Exception as exc:  # pragma: no cover - environment dependent
             raise EffectTypeError(
                 "OR standard-error scale detection from p-values requires scipy, "
@@ -435,23 +507,9 @@ def detect_or_standard_error_scale(
 
         comparable = usable & valid_p & np.isfinite(observed)
         p_tolerance = float(pol.get("validation.z_pval_tolerance_log10"))
-        candidate_difference = np.abs(expected_log - expected_raw)
-        informative = comparable & np.isfinite(candidate_difference) & (
-            candidate_difference > p_tolerance
-        )
-        log_matches = comparable & (
-            np.abs(observed - expected_log) <= p_tolerance
-        )
-        raw_matches = comparable & (
-            np.abs(observed - expected_raw) <= p_tolerance
-        )
-        decision, attempt = _se_scale_result(
+        decision, attempt = _compare_se_candidates(
             "reported_two_sided_pvalue",
-            comparable,
-            informative,
-            log_matches,
-            raw_matches,
-            pol,
+            observed, expected, comparable, p_tolerance, 0.0, pol,
         )
         attempt["pvalue_type"] = pvalue_type
         attempt["pvalue_tolerance_log10"] = p_tolerance
@@ -856,8 +914,8 @@ def harmonise_effect_estimates(
                     "Chromosome %s has odds ratios and a supplied standard-error "
                     "column, but the study-level SE-scale decision is missing. Run "
                     "dataset-level study-property resolution first, or explicitly set "
-                    "effect.se_scale to 'log_odds' or 'as_given'."
-                    % chromosome
+                    "effect.se_scale to one of %s."
+                    % (chromosome, ", ".join(OR_STANDARD_ERROR_SCALES))
                 )
 
             # Preserve an unrelated input column literally named ``beta``.
@@ -891,6 +949,26 @@ def harmonise_effect_estimates(
                 .otherwise(None)
             )
             transformations = [beta_expression.alias(beta_col)]
+            if resolved_se_scale == "exponentiated_log_odds" and se_available:
+                decoded = decode_exponentiated_standard_error(df, se_col)
+                output_se_col = unused_column_name(
+                    se_col, df,
+                    reserved=(*column_mapping_groups(sample_column_dict), beta_col),
+                )
+                transformations.append(decoded.alias(output_se_col))
+                sample_column_dict["se_col"] = output_se_col
+                qc_info.update({
+                    "se_exponentiated_decoded": True,
+                    "se_input_column": se_col,
+                    "se_output_column": output_se_col,
+                    "se_values_decoded": df.height - decoded.null_count(),
+                })
+                ctx.output(
+                    "decoded exponentiated standard errors",
+                    source_column=se_col, output_column=output_se_col,
+                    decoded_rows=df.height - decoded.null_count(),
+                    missing_rows=decoded.null_count(), formula="SE_logOR = ln(stored_SE)",
+                )
             if resolved_se_scale == "as_given" and se_available:
                 transformations.append(
                     pl.when(odds_ratio > 0.0)

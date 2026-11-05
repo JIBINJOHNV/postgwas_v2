@@ -1862,6 +1862,14 @@ def read_summary_statistics(
             compound_numeric_columns=compound_numeric_columns,
             conversion_counts=field_completeness["numeric_conversion_by_column"],
         )
+        # A selected encoding must not mistake a failed source cast for an
+        # originally missing SE eligible for recovery. Reuse the existing audit
+        # count rather than reading or scanning the study again.
+        sample_column_dict["_se_input_parse_failures"] = int(
+            field_completeness["numeric_conversion_by_column"].get(
+                optional_text(sample_column_dict.get("se_col")), {},
+            ).get("invalid", 0)
+        )
 
         _emit(logger, "Recovery successful: %d rows loaded." % df.height)
 

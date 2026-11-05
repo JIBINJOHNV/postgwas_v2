@@ -18,6 +18,7 @@ import polars as pl
 
 from postgwas.core.statistics import normal_z_magnitude_from_ln_p
 
+from ..effect_type import OR_STANDARD_ERROR_SCALES, decode_exponentiated_standard_error
 from ..p_values import P_VALUE_LOG_KEY, harmonise_p_values
 from ..shared.allele_join import allele_oriented_left_join, unused_column_name
 from ..shared.variant_columns import (
@@ -253,11 +254,11 @@ def prepare_input_table(
     if (
         effect_type == "odds_ratio"
         and row.standard_error_column
-        and se_scale not in ("log_odds", "as_given")
+        and se_scale not in OR_STANDARD_ERROR_SCALES
     ):
         raise ValueError(
             "Odds-ratio concordance requires the study-level SE-scale decision "
-            "('log_odds' or 'as_given')."
+            "(%s)." % ", ".join(OR_STANDARD_ERROR_SCALES)
         )
     standard_error = (
         pl.when(effect > 0)
@@ -266,6 +267,13 @@ def prepare_input_table(
         if effect_type == "odds_ratio" and se_scale == "as_given"
         else supplied_standard_error
     )
+    if (
+        effect_type == "odds_ratio" and se_scale == "exponentiated_log_odds"
+        and row.standard_error_column
+    ):
+        standard_error = decode_exponentiated_standard_error(
+            frame, row.standard_error_column, error_type=ValueError,
+        )
     input_af = _numeric(frame, row.effect_allele_frequency_column)
     p_value = _numeric(frame, row.p_value_column)
     p_value_source = _source_text(frame, row.p_value_column)

@@ -196,6 +196,7 @@ def _se_fields(decisions, policies):
             fields.extend([
                 ("info", "Log-odds agreement", _pair(evidence.get("log_odds_matches"), informative)),
                 ("info", "Raw-OR agreement", _pair(evidence.get("raw_odds_ratio_matches"), informative)),
+                ("info", "Exponentiated-SE agreement", _pair(evidence.get("exponentiated_log_odds_matches"), informative)),
             ])
         fields.extend([
             ("info", "Minimum informative count", format_count(evidence.get("minimum_informative_variants", policies.get("effect.se_scale_min_variants")))),
@@ -211,6 +212,8 @@ def _se_fields(decisions, policies):
         fields.append(("info", "Declaration cross-check", _agreement(decisions["se_scale_matches_declaration"])))
     if scale in ("log_odds", "as_given"):
         fields.append(("info", "Planned action", "Keep the supplied SE on the log-odds scale." if scale == "log_odds" else "Divide raw OR-scale SE by the original OR before allele orientation."))
+    elif scale == "exponentiated_log_odds":
+        fields.append(("info", "Planned action", "Decode SE_logOR = ln(stored_SE) in a separate working column; preserve the supplied values."))
     return fields
 
 
